@@ -39,6 +39,8 @@ pub struct CrashLedger {
     pub inner: Arc<MemoryLedger>,
     writes: AtomicU64,
     crash: Mutex<Option<(u64, bool)>>,
+    /// Every read of open records fails (ledger unavailable).
+    pub unavailable: std::sync::atomic::AtomicBool,
 }
 
 impl CrashLedger {
@@ -47,6 +49,7 @@ impl CrashLedger {
             inner,
             writes: AtomicU64::new(0),
             crash: Mutex::new(None),
+            unavailable: std::sync::atomic::AtomicBool::new(false),
         }
     }
     pub fn crash_at(&self, write: u64, after: bool) {
@@ -152,6 +155,11 @@ impl Ledger for CrashLedger {
         r
     }
     async fn open_effects(&self, f: &ScopeFilter) -> Result<Vec<Effect>, LedgerError> {
+        if self.unavailable.load(Ordering::SeqCst) {
+            return Err(LedgerError::Unavailable(StorageFault::Corrupt(
+                "test".into(),
+            )));
+        }
         self.inner.open_effects(f).await
     }
     async fn compact(&self) -> Result<usize, LedgerError> {
@@ -213,9 +221,14 @@ impl World {
 
     /// A fresh engine over the same ledger and system (a host restart).
     pub fn engine(&self) -> ReclaimEngineImpl {
+        self.engine_with(self.sys.reclaimers())
+    }
+
+    /// An engine with only these reclaimers.
+    pub fn engine_with(&self, reclaimers: Vec<Arc<dyn Reclaimer>>) -> ReclaimEngineImpl {
         ReclaimEngineImpl::new(ReclaimDeps {
             ledger: self.ledger.clone(),
-            reclaimers: self.sys.reclaimers(),
+            reclaimers,
             sweeper: self.sys.sweeper(),
             boot_id: self.sys.boot_id_source(),
             repair_index: self.index.clone(),

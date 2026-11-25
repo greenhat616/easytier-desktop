@@ -104,7 +104,7 @@ pub(super) fn held_observation(found: &Observation, expected: Option<Credential>
     }
 }
 
-fn found_credential(e: &Effect) -> Option<Credential> {
+pub(super) fn found_credential(e: &Effect) -> Option<Credential> {
     let detail = e.observation.as_ref()?.detail.as_ref()?;
     let json = detail.strip_prefix(FOUND_PREFIX)?.lines().next()?;
     serde_json::from_str(json).ok().flatten()

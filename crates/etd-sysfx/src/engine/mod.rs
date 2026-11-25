@@ -55,6 +55,9 @@ struct Memory {
     kept: BTreeSet<String>,
     /// Notes of the latest run.
     notes: Vec<String>,
+    /// Latest diagnose / recover-without-ledger report, for `report()` while
+    /// the ledger cannot be read.
+    offline: Option<ReclaimReport>,
 }
 
 impl ReclaimEngineImpl {
@@ -101,11 +104,14 @@ impl ReclaimEngineImpl {
 
     /// Run one group of records (a generation, or product / core-binary
     /// records) rank by rank.
-    async fn run_group(
-        &self,
-        ctx: &mut Ctx<'_>,
-        mut records: Vec<Effect>,
-    ) -> Result<(), LedgerError> {
+    async fn run_group(&self, ctx: &mut Ctx<'_>, records: Vec<Effect>) -> Result<(), LedgerError> {
+        // Record-only effects never take part in the rank order.
+        let (record_only, mut records): (Vec<Effect>, Vec<Effect>) = records
+            .into_iter()
+            .partition(|e| record::record_only(e.persistence));
+        for e in &record_only {
+            ctx.step(e).await?;
+        }
         records.sort_by(|a, b| (ctx.rank(a.kind), &a.id).cmp(&(ctx.rank(b.kind), &b.id)));
         let mut process_open = false;
         let mut blocked = false;
@@ -257,6 +263,120 @@ impl ReclaimEngineImpl {
         ))
     }
 
+    /// Report of a run without the ledger; kept for `report()`.
+    fn offline_report(&self) -> ReclaimReport {
+        let mut memory = self.memory();
+        let report = report::build(&[], Some(Vec::new()), &memory.swept, memory.notes.clone());
+        memory.offline = Some(report.clone());
+        report
+    }
+
+    /// Product and core-binary records that may be reclaimed now: product
+    /// records once no instance generation is open, core-binary records once
+    /// no open generation launched from that binary. The others wait.
+    async fn shared_ready(&self, notes: &mut Vec<String>) -> Result<Vec<Effect>, LedgerError> {
+        let open_generations = self.open_generations(&ScopeFilter::default()).await?;
+        let mut binaries = BTreeSet::new();
+        let mut unknown = false;
+        for (instance, epoch) in &open_generations {
+            match self.deps.ledger.generation(instance, *epoch).await? {
+                Some(g) => {
+                    binaries.insert(report::hex(&g.inputs.core.sha256));
+                }
+                None => unknown = true,
+            }
+        }
+        let mut ready = Vec::new();
+        for e in self.deps.ledger.open_effects(&ScopeFilter::all()).await? {
+            let waits = match &e.scope {
+                EffectScope::Instance { .. } => continue,
+                EffectScope::CoreBinary { sha256 } => {
+                    unknown || binaries.contains(&sha256.to_ascii_lowercase())
+                }
+                _ => !open_generations.is_empty(),
+            };
+            if waits && !record::record_only(e.persistence) {
+                notes.push(format!(
+                    "{}: waiting for the instance generations that may use it to close",
+                    report::pending_note(&e)
+                ));
+            } else {
+                ready.push(e);
+            }
+        }
+        Ok(ready)
+    }
+
+    /// Why an administrator's DELETE on this record must wait, if it must:
+    /// the same gates as automatic reclaim (lower ranks of its group still
+    /// ours and open; fences until the kernel process record is closed).
+    async fn delete_gate(&self, e: &Effect) -> Result<Option<String>, LedgerError> {
+        let group: Vec<Effect> = self
+            .deps
+            .ledger
+            .open_effects(&ScopeFilter::all())
+            .await?
+            .into_iter()
+            .filter(|o| o.id != e.id && o.scope == e.scope)
+            .collect();
+        let rank = record::rank_of(&self.reclaimers, e.kind);
+        if group
+            .iter()
+            .any(|o| record::rank_of(&self.reclaimers, o.kind) < rank && record::blocking_state(o))
+        {
+            return Ok(Some(
+                "lower-rank records of its generation are still open".into(),
+            ));
+        }
+        if rank >= crate::rank::FENCE && group.iter().any(|o| o.kind == EffectKind::Process) {
+            return Ok(Some("the kernel process is not verified dead".into()));
+        }
+        Ok(None)
+    }
+
+    /// An administrator's DELETE on a swept object: only the object as it
+    /// was reported (same key and identity, confirmed now), and a fence only
+    /// while no kernel process record is open. `Ok(Err(why))`: refused.
+    async fn delete_swept(&self, object: &FoundObject) -> Result<Result<(), String>, LedgerError> {
+        let Some(reclaimer) = self.reclaimers.get(&object.kind) else {
+            return Ok(Err(format!("no reclaimer for {}", object.kind)));
+        };
+        if record::rank_of(&self.reclaimers, object.kind) >= crate::rank::FENCE {
+            let processes = ScopeFilter {
+                kinds: vec![EffectKind::Process],
+                ..ScopeFilter::default()
+            };
+            if !self.deps.ledger.open_effects(&processes).await?.is_empty() {
+                return Ok(Err(
+                    "delete refused, a kernel process is not verified dead".into()
+                ));
+            }
+        }
+        let effect = report::synthetic_effect(object);
+        let reported = object.observation.credential.as_ref();
+        match reclaimer.probe(&effect).await {
+            Probe::Absent => return Ok(Ok(())),
+            Probe::Present(now)
+                if reported.is_some()
+                    && now.credential.as_ref() == reported
+                    && now.key.as_ref().is_none_or(|k| *k == object.key) => {}
+            Probe::Present(_) => {
+                return Ok(Err(
+                    "delete refused, the object changed since it was reported or its identity cannot be confirmed".into(),
+                ));
+            }
+            Probe::Indeterminate(m) => {
+                return Ok(Err(format!(
+                    "delete refused, cannot confirm the object: {m}"
+                )));
+            }
+        }
+        Ok(self
+            .remove_swept(object)
+            .await
+            .map_err(|e| format!("delete failed: {e}")))
+    }
+
     fn set_notes(&self, notes: Vec<String>) {
         self.memory().notes = notes;
     }
@@ -298,15 +418,8 @@ impl ReclaimEngine for ReclaimEngineImpl {
                 generations.push(self.run_generation(&mut ctx, &instance, epoch).await?);
             }
             if scope == ReclaimScope::Everything {
-                let shared: Vec<Effect> = self
-                    .deps
-                    .ledger
-                    .open_effects(&ScopeFilter::all())
-                    .await?
-                    .into_iter()
-                    .filter(|e| e.scope.generation().is_none())
-                    .collect();
-                self.run_group(&mut ctx, shared).await?;
+                let ready = self.shared_ready(ctx.notes).await?;
+                self.run_group(&mut ctx, ready).await?;
             }
         }
         // Sweep: exclusive containers are cleaned, the rest are candidates.
@@ -384,9 +497,12 @@ impl ReclaimEngine for ReclaimEngineImpl {
                         notes.push(format!("{}: no such open record", d.candidate_id));
                         continue;
                     };
-                    let boot = None;
-                    let mut ctx = self.ctx(boot, &mut notes);
-                    ctx.decide(&e, action).await?;
+                    let gate = match action {
+                        CandidateAction::Delete => self.delete_gate(&e).await?,
+                        _ => None,
+                    };
+                    let mut ctx = self.ctx(None, &mut notes);
+                    ctx.decide(&e, action, gate).await?;
                 }
                 Some(report::CandidateRef::Swept) => {
                     let object = self.memory().swept.get(&d.candidate_id).cloned();
@@ -395,11 +511,11 @@ impl ReclaimEngine for ReclaimEngineImpl {
                         continue;
                     };
                     match action {
-                        CandidateAction::Delete => match self.remove_swept(&object).await {
+                        CandidateAction::Delete => match self.delete_swept(&object).await? {
                             Ok(()) => {
                                 self.memory().swept.remove(&d.candidate_id);
                             }
-                            Err(e) => notes.push(format!("{}: delete failed: {e}", d.candidate_id)),
+                            Err(why) => notes.push(format!("{}: {why}", d.candidate_id)),
                         },
                         CandidateAction::Keep => {
                             let mut m = self.memory();
@@ -426,13 +542,7 @@ impl ReclaimEngine for ReclaimEngineImpl {
         self.sweep(key.as_ref(), &known, &[], true, &mut notes)
             .await?;
         self.set_notes(notes);
-        let memory = self.memory();
-        Ok(report::build(
-            &[],
-            Some(Vec::new()),
-            &memory.swept,
-            memory.notes.clone(),
-        ))
+        Ok(self.offline_report())
     }
 
     async fn diagnose(&self) -> Result<ReclaimReport, ReclaimError> {
@@ -442,13 +552,7 @@ impl ReclaimEngine for ReclaimEngineImpl {
         self.sweep(key.as_ref(), &known, &[], false, &mut notes)
             .await?;
         self.set_notes(notes);
-        let memory = self.memory();
-        Ok(report::build(
-            &[],
-            Some(Vec::new()),
-            &memory.swept,
-            memory.notes.clone(),
-        ))
+        Ok(self.offline_report())
     }
 
     async fn reclaim_core(&self, sha256: &str) -> Result<ReclaimReport, LedgerError> {
@@ -496,6 +600,10 @@ impl ReclaimEngine for ReclaimEngineImpl {
     }
 
     async fn report(&self) -> Result<ReclaimReport, LedgerError> {
-        self.build_report(None).await
+        match self.build_report(None).await {
+            Ok(report) => Ok(report),
+            // Ledger unreadable: the latest diagnose / recovery report.
+            Err(e) => self.memory().offline.clone().ok_or(e),
+        }
     }
 }

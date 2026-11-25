@@ -690,9 +690,8 @@ impl ProcessEngine for ProcessKitEngine {
         Ok(Box::new(handle))
     }
     async fn liveness(&self, id: &ProcessIdentity) -> Liveness {
-        match registry_entry(id) {
-            Some(RegistryEntry::Quarantined(_)) => return Liveness::Uncertain,
-            _ => {}
+        if matches!(registry_entry(id), Some(RegistryEntry::Quarantined(_))) {
+            return Liveness::Uncertain;
         }
         let query = id.clone();
         let result = tokio::task::spawn_blocking(move || liveness(&query))

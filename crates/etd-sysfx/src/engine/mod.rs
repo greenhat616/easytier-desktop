@@ -374,8 +374,9 @@ impl ReclaimEngineImpl {
 
     /// Why an administrator's DELETE on this record must wait, if it must:
     /// the same gates as automatic reclaim (shared scopes wait for the
-    /// generations that may use them; lower ranks of its group still ours
-    /// and open; fences until the kernel process record is closed).
+    /// generations that may use them; every other record of a generation
+    /// until its kernel process record is closed; lower ranks of its group
+    /// still ours and open).
     async fn delete_gate(&self, e: &Effect) -> Result<Option<String>, LedgerError> {
         if e.scope.generation().is_none() && self.shared_gate().await?.waits(e) {
             return Ok(Some(
@@ -390,6 +391,12 @@ impl ReclaimEngineImpl {
             .into_iter()
             .filter(|o| o.id != e.id && o.scope == e.scope)
             .collect();
+        // Process first, as in automatic reclaim: no other record of a
+        // generation goes while its kernel process record is open (the
+        // kernel may still own and recreate its objects).
+        if e.kind != EffectKind::Process && group.iter().any(|o| o.kind == EffectKind::Process) {
+            return Ok(Some("the kernel process is not verified dead".into()));
+        }
         let rank = record::rank_of(&self.reclaimers, e.kind);
         if group
             .iter()
@@ -398,9 +405,6 @@ impl ReclaimEngineImpl {
             return Ok(Some(
                 "lower-rank records of its generation are still open".into(),
             ));
-        }
-        if rank >= crate::rank::FENCE && group.iter().any(|o| o.kind == EffectKind::Process) {
-            return Ok(Some("the kernel process is not verified dead".into()));
         }
         Ok(None)
     }

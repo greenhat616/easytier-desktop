@@ -163,6 +163,7 @@ async fn unsolicited_root_exit_does_not_leave_its_descendant_or_block_wait() {
     let dir = tempfile::tempdir().unwrap();
     let ready = dir.path().join("ready");
     let child = dir.path().join("child");
+    let exit_file = dir.path().join("exit");
     let engine = engine();
     let handle = engine
         .spawn(command(vec![
@@ -172,8 +173,8 @@ async fn unsolicited_root_exit_does_not_leave_its_descendant_or_block_wait() {
             ready.into_os_string(),
             "--spawn-child".into(),
             child.clone().into_os_string(),
-            "--exit-after-ms".into(),
-            "1500".into(),
+            "--exit-file".into(),
+            exit_file.clone().into_os_string(),
             "--exit-code".into(),
             "17".into(),
         ]))
@@ -187,6 +188,7 @@ async fn unsolicited_root_exit_does_not_leave_its_descendant_or_block_wait() {
         .into_iter()
         .find(|id| id.pid == child_pid)
         .unwrap();
+    std::fs::write(exit_file, "exit").unwrap();
     let exit = timeout(Duration::from_secs(10), handle.wait())
         .await
         .unwrap();

@@ -63,6 +63,7 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
     let mut config = None;
     let mut signal_log = None;
     let mut delay = None;
+    let mut exit_file = None;
     let mut code = 0;
     let mut host_probe = None;
     while let Some(arg) = args.next() {
@@ -82,6 +83,7 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
                     value.to_str().ok_or("invalid delay")?.parse()?,
                 ))
             }
+            "--exit-file" => exit_file = Some(PathBuf::from(value)),
             "--exit-code" => code = value.to_str().ok_or("invalid exit code")?.parse()?,
             "--host-probe" => host_probe = Some(PathBuf::from(value)),
             _ => return Err(format!("unknown argument: {arg:?}").into()),
@@ -116,7 +118,7 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
                 })
                 .await?;
             let id = handle.identity();
-            std::fs::write(
+            publish_ready(
                 path,
                 format!("{}\n{}\n{}", id.pid, id.start_token, id.exe.display()),
             )?;
@@ -149,7 +151,7 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
         None
     };
     if let Some(path) = ready {
-        std::fs::write(path, std::process::id().to_string())?;
+        publish_ready(path, std::process::id().to_string())?;
     }
     println!("READY {}", std::process::id());
     eprintln!("fake-core ready");
@@ -169,9 +171,19 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
                 return Ok(code);
             }
         }
-        if delay.is_some_and(|duration| start.elapsed() >= duration) {
+        if delay.is_some_and(|duration| start.elapsed() >= duration)
+            || exit_file.as_ref().is_some_and(|path| path.exists())
+        {
             return Ok(code);
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn publish_ready(path: PathBuf, content: String) -> std::io::Result<()> {
+    // Tests treat the ready path as a publication point, not a partially
+    // written file. Use a unique sibling and rename into place.
+    let tmp = path.with_extension(format!("ready-{}", std::process::id()));
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(tmp, path)
 }

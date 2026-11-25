@@ -1,0 +1,13 @@
+version: v2
+modules:
+  - path: crates/etd-contract/proto
+lint:
+  use:
+    - STANDARD
+  except:
+    # Hello/Welcome are intentional handshake names.
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_RESPONSE_STANDARD_NAME
+breaking:
+  use:
+    - FILE

@@ -32,10 +32,12 @@ async fn full_disk_refuses_transaction() {
     .await
     .unwrap();
     let mut change = put("a", Desired::Running, &[]);
+    let mut generation = plan("a", 1, &[]);
     if let Change::PutInstance { instance, .. } = &mut change {
         instance.spec.as_mut().unwrap().network_name = "x".repeat(1024 * 1024);
+        generation.inputs.spec = instance.spec.clone().unwrap();
     }
-    let request = changes("a", 1, vec![change], vec![plan("a", 1, &[])]);
+    let request = changes("a", 1, vec![change], vec![generation]);
     assert_eq!(
         ledger.commit(0, request.clone()).await,
         Err(LedgerError::Unavailable(StorageFault::DiskFull))

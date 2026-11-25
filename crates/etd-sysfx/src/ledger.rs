@@ -252,6 +252,17 @@ pub enum LedgerError {
     UnknownInstance(InstanceId),
     #[error("unknown effect {0:?}")]
     UnknownEffect(EffectId),
+    #[error("unknown ticket {0}")]
+    UnknownTicket(String),
+    #[error("instance {instance} is pending removal")]
+    RemovalPending { instance: InstanceId },
+    #[error("invalid generation plan for instance {instance}: {reason}")]
+    InvalidPlan {
+        instance: InstanceId,
+        reason: String,
+    },
+    #[error("ledger counter exhausted: {0}")]
+    CounterExhausted(&'static str),
     #[error("invalid transition {from:?} -> {to:?}")]
     InvalidTransition { from: EffectState, to: EffectState },
     #[error("ledger storage unavailable: {0:?}")]

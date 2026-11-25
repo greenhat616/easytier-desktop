@@ -25,15 +25,13 @@ pub(super) struct GenerationEntry {
     pub(super) shared: Vec<EffectId>,
 }
 
-fn invalid(message: &str) -> LedgerError {
-    LedgerError::Unreadable(message.into())
-}
-
 impl LedgerState {
     pub fn request_status(&self, request: &RequestRecord) -> RequestStatus {
         match self.requests.get(&request.request_id) {
             None => RequestStatus::New,
-            Some((original, ticket)) if original.digest == request.digest => {
+            Some((original, ticket))
+                if original.digest == request.digest && original.caller == request.caller =>
+            {
                 RequestStatus::Done(ticket.receipt.clone())
             }
             Some(_) => RequestStatus::Reused,
@@ -59,9 +57,19 @@ impl LedgerState {
             .requests
             .values_mut()
             .find(|(_, t)| t.receipt.ticket == ticket)
-            .ok_or_else(|| invalid("unknown ticket"))?;
+            .ok_or_else(|| LedgerError::UnknownTicket(ticket.to_owned()))?;
         t.done = true;
+        // Completed tickets are not replayed; the request, caller, digest
+        // and original receipt are enough for idempotency.
+        t.changes.clear();
+        t.generations.clear();
         Ok(())
+    }
+
+    pub(super) fn has_pending_purge(&self) -> bool {
+        self.requests
+            .values()
+            .any(|(_, t)| !t.done && t.changes.iter().any(|c| matches!(c, Change::PurgeAll)))
     }
 
     pub fn desired(&self) -> (Revision, Vec<DesiredInstance>) {
@@ -109,7 +117,7 @@ impl LedgerState {
         Ok(Epoch(
             previous
                 .checked_add(1)
-                .ok_or_else(|| invalid("epoch exhausted"))?,
+                .ok_or(LedgerError::CounterExhausted("epoch"))?,
         ))
     }
 
@@ -129,9 +137,9 @@ impl LedgerState {
 
     fn reject_pending_removal(&self, instance: &InstanceId) -> Result<(), LedgerError> {
         if self.removal_pending.contains(instance) {
-            // The open epoch is exactly the reason removal is still pending.
-            self.ensure_closed(instance)?;
-            return Err(invalid("inconsistent removal-pending instance"));
+            return Err(LedgerError::RemovalPending {
+                instance: instance.clone(),
+            });
         }
         Ok(())
     }
@@ -213,6 +221,8 @@ impl LedgerState {
                     self.remove_instance(&instance)?;
                 }
                 self.settings = HostSettings::default();
+                self.requests.clear();
+                self.compact_closed_effects();
             }
         }
         Ok(())
@@ -246,6 +256,10 @@ impl LedgerState {
                 staged.check_claims(id, resources, true)?;
             }
         }
+        staged.revision = staged
+            .revision
+            .checked_add(1)
+            .ok_or(LedgerError::CounterExhausted("revision"))?;
         let generations = change
             .generations
             .iter()
@@ -254,10 +268,6 @@ impl LedgerState {
         for plan in change.generations {
             staged.reserve(plan, boot, now)?;
         }
-        staged.revision = staged
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| invalid("revision exhausted"))?;
         let receipt = Receipt {
             request_id: change.request.request_id.0.clone(),
             revision: staged.revision,
@@ -306,16 +316,47 @@ impl LedgerState {
                 got: plan.epoch,
             });
         }
-        if !self.instances.contains_key(&plan.instance) {
-            return Err(LedgerError::UnknownInstance(plan.instance));
-        }
+        let (desired, _) = self
+            .instances
+            .get(&plan.instance)
+            .ok_or_else(|| LedgerError::UnknownInstance(plan.instance.clone()))?;
+        self.reject_pending_removal(&plan.instance)?;
         self.ensure_closed(&plan.instance)?;
+        if desired.desired() != Desired::Running {
+            return Err(LedgerError::InvalidPlan {
+                instance: plan.instance,
+                reason: "instance is not desired RUNNING".into(),
+            });
+        }
+        if plan.inputs.spec_revision != self.revision {
+            return Err(LedgerError::Conflict {
+                current: self.revision,
+            });
+        }
+        if desired.spec.as_ref() != Some(&plan.inputs.spec) {
+            return Err(LedgerError::InvalidPlan {
+                instance: plan.instance,
+                reason: "planned spec differs from committed config".into(),
+            });
+        }
         self.check_claims(&plan.instance, &plan.claims, false)?;
+        if !plan.effects.iter().any(|e| {
+            e.kind == EffectKind::Process
+                && e.scope.generation() == Some((&plan.instance, plan.epoch))
+        }) {
+            return Err(LedgerError::InvalidPlan {
+                instance: plan.instance,
+                reason: "missing generation-scoped process intent".into(),
+            });
+        }
         for intent in &plan.effects {
             if let Some((instance, epoch)) = intent.scope.generation()
                 && (instance != &plan.instance || epoch != plan.epoch)
             {
-                return Err(invalid("effect scoped to wrong generation"));
+                return Err(LedgerError::InvalidPlan {
+                    instance: plan.instance,
+                    reason: "effect scoped to wrong generation".into(),
+                });
             }
         }
         let mut claims = plan.claims;
@@ -370,7 +411,21 @@ impl LedgerState {
         if let Some((instance, epoch)) = intent.scope.generation()
             && !self.open_generation(instance, epoch)
         {
-            return Err(invalid("effect requires an existing open generation"));
+            let next = self.next_epoch(instance)?;
+            if epoch < next {
+                return Err(LedgerError::InvalidTransition {
+                    from: EffectState::Reclaimed,
+                    to: EffectState::Planned,
+                });
+            }
+            if !self.instances.contains_key(instance) {
+                return Err(LedgerError::UnknownInstance(instance.clone()));
+            }
+            return Err(LedgerError::EpochNotNext {
+                instance: instance.clone(),
+                next,
+                got: epoch,
+            });
         }
         self.insert_effect(intent, boot, now)
     }
@@ -394,7 +449,7 @@ impl LedgerState {
         self.next_effect = self
             .next_effect
             .checked_add(1)
-            .ok_or_else(|| invalid("effect id exhausted"))?;
+            .ok_or(LedgerError::CounterExhausted("effect id"))?;
         let effect = Effect {
             id: EffectId(format!("{:020}", self.next_effect)),
             scope: intent.scope,
@@ -456,10 +511,13 @@ impl LedgerState {
                 self.revision = self
                     .revision
                     .checked_add(1)
-                    .ok_or_else(|| invalid("revision exhausted"))?;
+                    .ok_or(LedgerError::CounterExhausted("revision"))?;
                 self.instances.remove(&instance);
                 self.removal_pending.remove(&instance);
             }
+        }
+        if to == Reclaimed && self.has_pending_purge() {
+            self.compact_closed_effects();
         }
         Ok(())
     }
@@ -501,6 +559,31 @@ impl LedgerState {
     }
 
     pub fn compact(&mut self) -> usize {
+        self.compact_receipts(jiff::Timestamp::now());
+        self.compact_closed_effects()
+    }
+
+    fn compact_receipts(&mut self, now: jiff::Timestamp) {
+        const KEEP_COUNT: usize = 1000;
+        const KEEP_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+        let cutoff = now.as_millisecond().saturating_sub(KEEP_MS);
+        let mut done: Vec<_> = self
+            .requests
+            .iter()
+            .filter_map(|(id, (_, t))| {
+                t.done
+                    .then_some((id.clone(), t.receipt.revision, t.receipt.accepted_unix_ms))
+            })
+            .collect();
+        done.sort_by_key(|(_, rev, _)| std::cmp::Reverse(*rev));
+        for (id, _, at) in done.into_iter().skip(KEEP_COUNT) {
+            if at < cutoff {
+                self.requests.remove(&id);
+            }
+        }
+    }
+
+    fn compact_closed_effects(&mut self) -> usize {
         let closed: Vec<_> = self
             .generations
             .keys()
@@ -523,5 +606,48 @@ impl LedgerState {
                     .any(|entry| entry.shared.contains(&e.id))
         });
         before - self.effects.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_keeps_recent_or_newest_thousand_and_pending() {
+        let now = jiff::Timestamp::from_millisecond(1_000_000_000).unwrap();
+        let mut state = LedgerState::default();
+        for n in 0..1004 {
+            let request_id = RequestId(format!("request-{n}"));
+            let receipt = Receipt {
+                request_id: request_id.0.clone(),
+                revision: n + 1,
+                ticket: format!("ticket-{n}"),
+                accepted_unix_ms: if n == 1 { now.as_millisecond() } else { 0 },
+            };
+            state.requests.insert(
+                request_id.clone(),
+                (
+                    RequestRecord {
+                        request_id,
+                        caller: "test".into(),
+                        digest: RequestDigest([0; 32]),
+                    },
+                    Ticket {
+                        receipt,
+                        changes: vec![],
+                        generations: vec![],
+                        done: n != 0,
+                    },
+                ),
+            );
+        }
+        state.compact_receipts(now);
+        assert!(state.requests.contains_key(&"request-0".into())); // pending
+        assert!(state.requests.contains_key(&"request-1".into())); // recent
+        assert!(!state.requests.contains_key(&"request-2".into())); // old and outside 1000
+        assert!(!state.requests.contains_key(&"request-3".into()));
+        assert!(state.requests.contains_key(&"request-4".into()));
+        assert_eq!(state.requests.len(), 1002);
     }
 }

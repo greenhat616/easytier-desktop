@@ -6,3 +6,7 @@ Versioned JSON payloads are stored in typed rows, with request/ticket,
 desired state, revision, epoch high-water, generation and ownership records
 committed in a single SQLite transaction. Unsigned counters use decimal
 TEXT to avoid the SQLite signed integer range limit.
+
+A migration that changes the payload format or interpretation must not run
+until reclaim has finished against the prior version's records (v7).
+The v0 -> v1 migration is additive and preserves the prior payload format.

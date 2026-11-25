@@ -25,13 +25,21 @@ pub(super) fn storage_error(error: Error) -> LedgerError {
         Some(ErrorCode::SystemIoFailure) | Some(ErrorCode::CannotOpen) => {
             LedgerError::Unavailable(StorageFault::Io("SQLite I/O failure".into()))
         }
-        _ => LedgerError::Unreadable("unsupported or unreadable SQLite schema/record".into()),
+        _ => match error {
+            Error::QueryReturnedNoRows
+            | Error::InvalidColumnType(..)
+            | Error::FromSqlConversionFailure(..) => {
+                LedgerError::Unreadable("unsupported or unreadable SQLite record".into())
+            }
+            _ => LedgerError::Unavailable(StorageFault::Io("SQLite operation failed".into())),
+        },
     }
 }
 
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, LedgerError> {
-    serde_json::to_vec(value)
-        .map_err(|_| LedgerError::Unreadable("could not encode ledger row".into()))
+    serde_json::to_vec(value).map_err(|_| {
+        LedgerError::Unavailable(StorageFault::Io("could not encode ledger row".into()))
+    })
 }
 fn decode<T: DeserializeOwned>(data: &[u8]) -> Result<T, LedgerError> {
     serde_json::from_slice(data)
@@ -89,6 +97,8 @@ pub(super) fn open(
         )));
     }
     conn.pragma_update(None, "synchronous", "FULL")
+        .map_err(storage_error)?;
+    conn.pragma_update(None, "secure_delete", "ON")
         .map_err(storage_error)?;
     #[cfg(target_os = "macos")]
     conn.pragma_update(None, "fullfsync", true)
@@ -435,7 +445,22 @@ pub(super) fn pragmas(conn: &Connection) -> Result<super::LedgerPragmas, LedgerE
         fullfsync: conn
             .pragma_query_value(None, "fullfsync", |r| r.get(0))
             .map_err(storage_error)?,
+        secure_delete: conn
+            .pragma_query_value(None, "secure_delete", |r| r.get(0))
+            .map_err(storage_error)?,
     })
+}
+
+pub(super) fn checkpoint_truncate(conn: &Connection) -> Result<(), LedgerError> {
+    let (busy, _, _): (i64, i64, i64) = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(storage_error)?;
+    if busy != 0 {
+        return Err(LedgerError::Unavailable(StorageFault::Locked));
+    }
+    Ok(())
 }
 
 pub(super) fn reload(conn: &Connection) -> Result<LedgerState, LedgerError> {

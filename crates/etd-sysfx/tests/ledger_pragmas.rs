@@ -11,6 +11,7 @@ async fn pragmas_and_reopen() {
     let pragmas = ledger.pragmas().await.unwrap();
     assert_eq!(pragmas.journal_mode, "wal");
     assert_eq!(pragmas.synchronous, 2);
+    assert!(pragmas.secure_delete);
     #[cfg(target_os = "macos")]
     assert!(pragmas.fullfsync);
 
@@ -72,9 +73,9 @@ async fn pragmas_and_reopen() {
         .unwrap()
         .remove(0);
     let observation = Observation {
-        credential: Some(Credential::File {
-            file_id: 123,
-            device: 4,
+        credential: Some(Credential::Process {
+            pid: 123,
+            start_token: "fixture".into(),
         }),
         key: Some(effect.key.clone()),
         observed_at: jiff::Timestamp::now(),
@@ -127,9 +128,72 @@ async fn pragmas_and_reopen() {
             .unwrap()
             .is_none()
     );
+    let mut next = plan("a", 2, &["X"]);
+    next.inputs.spec = generation.inputs.spec;
     assert_eq!(
-        ledger.begin_epoch(plan("a", 2, &["X"])).await.unwrap()[0].boot,
+        ledger.begin_epoch(next).await.unwrap()[0].boot,
         BootId("boot-b".into())
     );
+    ledger.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn completed_ticket_and_purge_remove_historical_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite");
+    let boot = BootId("boot".into());
+    let ledger = SqliteLedger::open(&path, boot.clone()).await.unwrap();
+    let mut change = put("a", Desired::Stopped, &[]);
+    if let Change::PutInstance { instance, .. } = &mut change {
+        instance.spec.as_mut().unwrap().network_secret = Some("synthetic-history-fixture".into());
+    }
+    let receipt = ledger
+        .commit(0, changes("first", 1, vec![change], vec![]))
+        .await
+        .unwrap();
+    ledger.complete_ticket(&receipt.ticket).await.unwrap();
+    // Current config retains the secret, completed request payload does not.
+    assert_eq!(
+        ledger.desired().await.unwrap().1[0]
+            .spec
+            .as_ref()
+            .unwrap()
+            .network_secret
+            .as_deref(),
+        Some("synthetic-history-fixture")
+    );
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let payload: Vec<u8> = conn
+            .query_row("SELECT payload FROM requests WHERE id='first'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(
+            !String::from_utf8(payload)
+                .unwrap()
+                .contains("synthetic-history-fixture")
+        );
+    }
+    let purge = ledger
+        .commit(1, changes("purge", 2, vec![Change::PurgeAll], vec![]))
+        .await
+        .unwrap();
+    assert_eq!(ledger.desired().await.unwrap(), (2, vec![]));
+    assert_eq!(
+        std::fs::metadata(path.with_extension("sqlite-wal"))
+            .unwrap()
+            .len(),
+        0
+    );
+    let db = std::fs::read(&path).unwrap();
+    assert!(
+        !db.windows(b"synthetic-history-fixture".len())
+            .any(|s| s == b"synthetic-history-fixture")
+    );
+    ledger.close().await.unwrap();
+    let ledger = SqliteLedger::open(&path, boot).await.unwrap();
+    assert_eq!(ledger.receipt(&"purge".into()).await.unwrap(), Some(purge));
+    assert!(ledger.receipt(&"first".into()).await.unwrap().is_none());
     ledger.close().await.unwrap();
 }

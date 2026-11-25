@@ -41,6 +41,7 @@ pub struct LedgerPragmas {
     pub journal_mode: String,
     pub synchronous: i64,
     pub fullfsync: bool,
+    pub secure_delete: bool,
 }
 
 type Job = Box<dyn FnOnce(&mut Worker) + Send>;
@@ -60,6 +61,7 @@ struct Worker {
     // A failed transaction never publishes a staged state. If commit failed
     // ambiguously, reload the durable state before accepting the next call.
     reload: bool,
+    pending_checkpoint: bool,
 }
 
 fn worker_gone() -> LedgerError {
@@ -70,7 +72,17 @@ impl Worker {
     fn refresh(&mut self) -> Result<(), LedgerError> {
         if self.reload {
             self.state = storage::reload(&self.conn)?;
+            self.pending_checkpoint |= self.state.has_pending_purge();
             self.reload = false;
+        }
+        self.finish_checkpoint()?;
+        Ok(())
+    }
+
+    fn finish_checkpoint(&mut self) -> Result<(), LedgerError> {
+        if self.pending_checkpoint && !self.options.read_only {
+            storage::checkpoint_truncate(&self.conn)?;
+            self.pending_checkpoint = false;
         }
         Ok(())
     }
@@ -94,7 +106,13 @@ impl Worker {
             self.reload = true;
             return Err(error);
         }
+        // A purge's transaction can delete historical credentials from the
+        // main database, but older WAL frames must also be removed. A
+        // pending purge ticket survives crashes and forces this checkpoint
+        // on reopen before its receipt can be returned.
+        self.pending_checkpoint |= self.state.has_pending_purge() || staged.has_pending_purge();
         self.state = staged;
+        self.finish_checkpoint()?;
         Ok(value)
     }
 }
@@ -117,6 +135,7 @@ impl SqliteLedger {
             .spawn(move || {
                 let mut worker = match storage::open(&path, &options) {
                     Ok((conn, state)) => Worker {
+                        pending_checkpoint: state.has_pending_purge(),
                         conn,
                         state,
                         boot,
@@ -128,6 +147,10 @@ impl SqliteLedger {
                         return;
                     }
                 };
+                if let Err(error) = worker.finish_checkpoint() {
+                    let _ = ready.send(Err(error));
+                    return;
+                }
                 if ready.send(Ok(())).is_err() {
                     return;
                 }

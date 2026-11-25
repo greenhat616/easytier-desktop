@@ -129,7 +129,7 @@ async fn sqlite_pending_removal_survives_reopen() {
             changes("revive", 3, vec![put("a", Desired::Running, &[])], vec![])
         )
         .await,
-        Err(LedgerError::EpochOpen { .. })
+        Err(LedgerError::RemovalPending { .. })
     ));
     let id = l
         .open_effects(&ScopeFilter::all())
@@ -145,4 +145,21 @@ async fn sqlite_pending_removal_survives_reopen() {
     assert_eq!(l.desired().await.unwrap(), (3, vec![]));
     assert!(l.claims().await.unwrap().is_empty());
     l.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn memory_reservation_validation() {
+    ledger::reservation_validation(&MemoryLedger::default()).await;
+}
+#[tokio::test]
+async fn sqlite_reservation_validation() {
+    sqlite_case(|l| Box::pin(ledger::reservation_validation(l))).await;
+}
+#[tokio::test]
+async fn memory_caller_and_purge() {
+    ledger::caller_and_purge(&MemoryLedger::default()).await;
+}
+#[tokio::test]
+async fn sqlite_caller_and_purge() {
+    sqlite_case(|l| Box::pin(ledger::caller_and_purge(l))).await;
 }

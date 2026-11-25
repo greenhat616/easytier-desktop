@@ -159,7 +159,7 @@ fn every_commit_stage() {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(12))]
+    #![proptest_config(ProptestConfig { cases: 12, failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::Direct(concat!(env!("CARGO_MANIFEST_DIR"), "/proptest-regressions/ledger_crash.txt")))), ..ProptestConfig::default() })]
     #[test]
     fn arbitrary_transaction_size_and_crash_stage(stage in 0..STAGES.len(), count in 1usize..6) {
         kill_and_reopen(stage, count);

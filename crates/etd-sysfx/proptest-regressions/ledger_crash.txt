@@ -1,0 +1,4 @@
+# Deterministic baseline coverage seeds for the crash-stage property.
+# Actual minimized failing seeds are appended automatically by proptest.
+cc 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+cc fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210

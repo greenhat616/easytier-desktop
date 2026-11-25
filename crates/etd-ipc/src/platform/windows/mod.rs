@@ -30,7 +30,7 @@ use windows::{
         },
         Storage::FileSystem::{
             FILE_FLAG_OVERLAPPED, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_WRITE_DATA,
-            SECURITY_IDENTIFICATION, SYNCHRONIZE,
+            READ_CONTROL, SECURITY_IDENTIFICATION, SYNCHRONIZE,
         },
         System::Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId},
     },
@@ -56,7 +56,7 @@ fn pipe_name(endpoint: &Endpoint) -> io::Result<&str> {
 }
 
 fn client_mask() -> u32 {
-    (FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE).0
+    (FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE).0
 }
 
 fn descriptor(policy: &ListenerPolicy) -> io::Result<identity::Allocation> {
@@ -70,7 +70,8 @@ fn descriptor(policy: &ListenerPolicy) -> io::Result<identity::Allocation> {
     // host account needs that bit and WRITE_DAC for live policy updates.
     let host_mask = 0x0012019f | 0x00040000; // FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC
     let rw = client_mask();
-    let mut acl = format!("D:P(A;;0x{host_mask:x};;;{host})(A;;0x{rw:x};;;SY)(A;;0x{rw:x};;;BA)");
+    let mut acl =
+        format!("O:{host}D:P(A;;0x{host_mask:x};;;{host})(A;;0x{rw:x};;;SY)(A;;0x{rw:x};;;BA)");
     let mut add = |sid: &str| -> io::Result<()> {
         // Only numeric SIDs may be interpolated into SDDL. The OS parser
         // validates their structure and bounds.

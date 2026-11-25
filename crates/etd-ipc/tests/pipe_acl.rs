@@ -85,7 +85,8 @@ async fn first_instance_local_only_and_live_kernel_dacl() {
         .read(true)
         .open(local)
         .unwrap();
-    let rw = (FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE).0;
+    let rw =
+        (FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE).0;
     let OsUserId::WindowsSid(host) = current_user().unwrap() else {
         unreachable!()
     };

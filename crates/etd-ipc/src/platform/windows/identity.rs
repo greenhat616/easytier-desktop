@@ -137,6 +137,65 @@ pub(super) fn client_peer(pipe: &NamedPipeServer) -> io::Result<PeerIdentity> {
     }
 }
 
+fn pipe_owner(pipe: HANDLE) -> io::Result<String> {
+    use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+    let mut sid = PSID::default();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        GetSecurityInfo(
+            pipe,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut sid),
+            None,
+            None,
+            None,
+            Some(&mut sd),
+        )
+        .ok()
+        .map_err(win_error)?;
+    }
+    let _allocation = Allocation(HLOCAL(sd.0));
+    sid_string(sid)
+}
+
+fn service_peer(
+    expected: &OsUserId,
+    owner: String,
+    pid: u32,
+    session: Option<u32>,
+    token: io::Result<PeerIdentity>,
+) -> io::Result<PeerIdentity> {
+    let OsUserId::WindowsSid(expected) = expected else {
+        return Err(denied("expected a Windows service SID"));
+    };
+    if !owner.eq_ignore_ascii_case(expected) {
+        return Err(denied("unexpected pipe owner SID"));
+    }
+    if let Ok(peer) = token {
+        let is_account =
+            matches!(&peer.user,OsUserId::WindowsSid(sid) if sid.eq_ignore_ascii_case(expected));
+        let is_service_group = peer
+            .groups
+            .iter()
+            .any(|g| matches!(g,OsGroupId::WindowsSid(sid) if sid.eq_ignore_ascii_case(expected)));
+        if !is_account && !is_service_group {
+            return Err(denied("service token does not contain the expected SID"));
+        }
+        return Ok(peer);
+    }
+    // Standard UIs can read the kernel pipe owner and process image while
+    // TOKEN_QUERY on LocalSystem is denied. Leave optional token evidence
+    // empty/conservative. No server-side RPC is authorized from these fields.
+    Ok(PeerIdentity {
+        user: OsUserId::WindowsSid(owner),
+        groups: vec![],
+        pid,
+        session,
+        elevated: false,
+    })
+}
+
 pub(super) fn server_identity(
     pipe: &NamedPipeClient,
     expect: &ServerExpectation,
@@ -169,16 +228,9 @@ pub(super) fn server_identity(
     let created_at = std::time::UNIX_EPOCH
         + std::time::Duration::from_secs(unix_ticks / 10_000_000)
         + std::time::Duration::from_nanos((unix_ticks % 10_000_000) * 100);
-    if created_at > opened_after || exit.dwHighDateTime != 0 || exit.dwLowDateTime != 0 {
+    if created_at > opened_after {
         return Err(denied("server process changed"));
     }
-    let peer = token_peer(&process_token(handle)?, pid)?;
-    verify_user(
-        expect,
-        &peer.user,
-        current_user()?,
-        OsUserId::WindowsSid("S-1-5-18".into()),
-    )?;
     let mut path = vec![0u16; 32768];
     let mut len = path.len() as u32;
     unsafe {
@@ -191,8 +243,61 @@ pub(super) fn server_identity(
         .map_err(|e| io::Error::other(format!("QueryFullProcessImageNameW: {e}")))?;
     }
     let path = PathBuf::from(OsString::from_wide(&path[..len as usize]));
-    Ok(ServerIdentity {
-        peer,
-        exe: verify_image(&expect.exe_dir, &path)?,
-    })
+    let exe = verify_image(&expect.exe_dir, &path)?;
+    let pipe_handle = HANDLE(pipe.as_raw_handle());
+    let system = OsUserId::WindowsSid("S-1-5-18".into());
+    let token = process_token(handle).and_then(|token| token_peer(&token, pid));
+    let peer = if expect.privileged {
+        let owner = pipe_owner(pipe_handle)?;
+        let mut session = 0;
+        let session = unsafe {
+            windows::Win32::System::Pipes::GetNamedPipeServerSessionId(pipe_handle, &mut session)
+        }
+        .ok()
+        .map(|_| session);
+        service_peer(
+            expect.user.as_ref().unwrap_or(&system),
+            owner,
+            pid,
+            session,
+            token,
+        )?
+    } else {
+        let peer = token?;
+        verify_user(expect, &peer.user, current_user()?, system)?;
+        peer
+    };
+    // Keep the process object pinned through image and owner verification.
+    let mut final_pid = 0;
+    let mut exit_code = 0;
+    unsafe {
+        GetNamedPipeServerProcessId(pipe_handle, &mut final_pid).map_err(win_error)?;
+        GetExitCodeProcess(handle, &mut exit_code).map_err(win_error)?;
+    }
+    if final_pid != pid || exit_code != windows::Win32::Foundation::STILL_ACTIVE.0 as u32 {
+        return Err(denied("pipe server process changed"));
+    }
+    Ok(ServerIdentity { peer, exe })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn service_owner_proof_survives_token_access_denied() {
+        let system = OsUserId::WindowsSid("S-1-5-18".into());
+        let peer = service_peer(
+            &system,
+            "S-1-5-18".into(),
+            123,
+            Some(0),
+            Err(io::ErrorKind::PermissionDenied.into()),
+        )
+        .unwrap();
+        assert_eq!(peer.user, system);
+        assert_eq!(peer.pid, 123);
+        assert!(peer.groups.is_empty());
+        assert!(!peer.elevated);
+        assert!(service_peer(&system, "S-1-5-19".into(), 123, Some(0), Ok(peer)).is_err());
+    }
 }

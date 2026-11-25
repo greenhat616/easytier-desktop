@@ -1,6 +1,6 @@
 #![cfg(unix)]
+#[cfg(target_os = "linux")]
 mod common;
-use common::*;
 use etd_ipc::{ListenerPolicy, OsUserId};
 use nix::unistd::{Uid, User};
 use std::{
@@ -45,6 +45,7 @@ async fn privileged_second_account_denied_then_granted_then_revoked() {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use common::*;
     use etd_ipc::{Connector, Endpoint, Listener, platform::LocalListener};
     use nix::unistd::chown;
     use std::process::Stdio;

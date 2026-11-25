@@ -8,6 +8,40 @@ use tokio::{
     process::Command,
 };
 
+#[cfg(windows)]
+#[tokio::test]
+async fn service_requires_both_installed_image_and_pipe_owner() {
+    use etd_ipc::{OsUserId, platform::current_user};
+    if !run_as_host("service_requires_both_installed_image_and_pipe_owner") {
+        return;
+    }
+    let mut c = connector();
+    c.expectation.privileged = true;
+    c.expectation.user = Some(current_user().unwrap());
+    let f = Fixture::new();
+    let _listener = f.listener();
+    let (_, server) = c.connect(&f.ep).await.unwrap();
+    assert_eq!(Some(server.peer.user), c.expectation.user);
+
+    let f = Fixture::new();
+    let _listener = f.listener();
+    let installed = c.expectation.exe_dir.clone();
+    c.expectation.exe_dir = f.dir.path().into();
+    assert_eq!(
+        c.connect(&f.ep).await.err().unwrap().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+
+    let f = Fixture::new();
+    let _listener = f.listener();
+    c.expectation.exe_dir = installed;
+    c.expectation.user = Some(OsUserId::WindowsSid("S-1-5-21-111-222-333-444".into()));
+    assert_eq!(
+        c.connect(&f.ep).await.err().unwrap().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+}
+
 #[tokio::test]
 async fn impostor_process() {
     let Some(arg) = std::env::var_os("ETD_TEST_IMPOSTOR_SOCKET") else {

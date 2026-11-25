@@ -805,19 +805,7 @@ impl Actor {
             .await
             .map_err(|e| ledger_detail(&e, instance))?;
         let current = desired.iter().find(|d| d.instance_id == instance.0);
-        // Kernel output is redacted line by line (`logs::LineBuffer`): a
-        // secret spanning a line break could never be matched.
-        if spec
-            .as_ref()
-            .and_then(|s| s.network_secret.as_deref())
-            .is_some_and(|s| s.contains(['\n', '\r']))
-        {
-            return Err(error(
-                ErrorCode::InvalidSpec,
-                "the network secret must not contain a line break",
-                instance.as_str(),
-            ));
-        }
+
         let (spec, spec_revision) = match spec {
             // PutInstance: the commit's own revision.
             Some(new) => (
@@ -842,6 +830,20 @@ impl Actor {
                 (spec, rev)
             }
         };
+        // Kernel output is redacted line by line (`logs::LineBuffer`): a
+        // secret spanning a line break could never be matched. Checked on
+        // the effective configuration, so a stored one is held to it too.
+        if spec
+            .network_secret
+            .as_deref()
+            .is_some_and(|s| s.contains(['\n', '\r']))
+        {
+            return Err(error(
+                ErrorCode::InvalidSpec,
+                "the network secret must not contain a line break",
+                instance.as_str(),
+            ));
+        }
         let epoch = ledger
             .next_epoch(instance)
             .await

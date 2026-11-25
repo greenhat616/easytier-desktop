@@ -492,3 +492,54 @@ async fn a_secret_with_a_line_break_is_refused() {
         assert_eq!(e.code(), ErrorCode::InvalidSpec, "{e:?}");
     }
 }
+
+#[tokio::test]
+async fn a_stored_secret_with_a_line_break_is_refused() {
+    use etd_sysfx::Ledger;
+    let world = World::new();
+    // Written by an earlier version, never through Plan.
+    let mut d = DesiredInstance {
+        instance_id: "a".into(),
+        spec: Some(etd_contract::NetworkSpec {
+            network_secret: Some("two\nlines".into()),
+            ..spec("net")
+        }),
+        ..Default::default()
+    };
+    d.set_desired(Desired::Stopped);
+    let revision = world.ledger.inner.desired().await.unwrap().0;
+    world
+        .ledger
+        .inner
+        .commit(
+            revision,
+            etd_sysfx::ChangeSet {
+                request: etd_sysfx::RequestRecord {
+                    request_id: etd_contract::RequestId("stored".into()),
+                    caller: "test".into(),
+                    digest: etd_sysfx::RequestDigest([7; 32]),
+                },
+                changes: vec![etd_sysfx::Change::PutInstance {
+                    instance: Box::new(d),
+                    claims: Vec::new(),
+                }],
+                generations: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let mut h = world.start();
+    h.wait_serving().await;
+    // Starting it, or saving a new configuration that keeps the stored
+    // secret, is refused.
+    let e = h.plan("a", None, true).await.unwrap_err();
+    assert_eq!(e.code(), ErrorCode::InvalidSpec, "{e:?}");
+    let keeps = etd_contract::NetworkSpec {
+        network_secret: None,
+        ..spec("net")
+    };
+    let e = h.plan("a", Some(keeps), true).await.unwrap_err();
+    assert_eq!(e.code(), ErrorCode::InvalidSpec, "{e:?}");
+    // A new secret replaces it.
+    assert!(h.plan("a", Some(spec("net")), true).await.is_ok());
+}

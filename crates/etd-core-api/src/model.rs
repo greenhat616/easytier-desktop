@@ -45,6 +45,8 @@ pub struct RuntimeDirs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchContext {
     pub instance: InstanceId,
+    /// Reserved epoch (`Ledger::next_epoch`); it appears in the runtime
+    /// directory and in every planned record.
     pub epoch: Epoch,
     pub dirs: RuntimeDirs,
     /// Derived from the install key and instance id (`etd-` + 8 hex).
@@ -52,6 +54,14 @@ pub struct LaunchContext {
     /// Loopback management (RPC portal) address forced on the kernel.
     pub management: SocketAddr,
     pub privilege: Privilege,
+    /// How the host will protect the management port for this launch. The
+    /// host asks for `Fence` when a fence is available on a privileged host;
+    /// when fencing is unavailable or failed it re-plans the next
+    /// generation with `DenyAll` (v7 fence step 4), which the driver accepts
+    /// only if the profile's deny-all configuration is verified
+    /// ([`CoreError::GuardUnavailable`] otherwise). User hosts ask for
+    /// `Unguarded`, or `LifecycleOnly` for a kernel without a profile.
+    pub management_guard: ManagementGuard,
     pub core: CoreDescriptor,
     /// Binary inside the protected kernel store.
     pub binary: PathBuf,
@@ -84,6 +94,10 @@ impl std::fmt::Debug for PlannedFile {
 pub enum ReadinessCondition {
     /// The expected interface exists and carries an address.
     InterfaceAddress(ObjectKey),
+    /// System-assigned interface name (macOS utun): an interface held by the
+    /// kernel process (`SystemObserver::interfaces_owned_by`) carries an
+    /// address.
+    OwnedInterfaceAddress,
     /// Instances without an interface: the expected listening port.
     Listener(SocketAddr),
 }
@@ -138,8 +152,12 @@ pub struct LaunchPlan {
     pub command: Command,
     pub files: Vec<PlannedFile>,
     pub readiness: Readiness,
-    /// Recorded (as `Planned`) before the process is spawned.
+    /// Effects the kernel will cause, recorded (as `Planned`) before the
+    /// process is spawned. The host adds its own records to the same
+    /// generation (process, runtime directory, fence); the driver never
+    /// produces those.
     pub effects: Vec<EffectIntent>,
+    /// The guard this plan implements (echoes `LaunchContext`).
     pub management: ManagementGuard,
     pub endpoint: CoreEndpoint,
     /// Single-writer resources this launch claims (host enforces one owner).
@@ -211,6 +229,11 @@ pub enum CoreError {
     /// time; a privileged host must refuse it.
     #[error("unmodelled side effects: {features:?}")]
     UnmodelledEffects { features: Vec<String> },
+    /// The requested management guard cannot be planned (e.g. `DenyAll`
+    /// without a verified deny-all configuration, `Unguarded` on a
+    /// privileged host).
+    #[error("management guard {0:?} unavailable for this kernel")]
+    GuardUnavailable(ManagementGuard),
     /// A configured feature is disabled or rejected on this platform.
     #[error("feature {feature} rejected: {reason}")]
     FeatureRejected { feature: String, reason: String },

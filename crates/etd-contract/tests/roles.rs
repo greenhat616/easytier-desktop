@@ -14,6 +14,7 @@ const EXPECTED: &[(&str, Role)] = &[
     ("StreamLogs", Role::Viewer),
     ("GetReclaimReport", Role::Viewer),
     ("RetryReclaim", Role::Control),
+    ("RetryStart", Role::Control),
     ("ResolveCandidates", Role::Admin),
     ("ReleaseLease", Role::Control),
     ("GetAllowList", Role::Admin),

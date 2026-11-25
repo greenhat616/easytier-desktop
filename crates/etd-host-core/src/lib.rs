@@ -3,7 +3,8 @@
 //! through [`api::HostDeps`].
 //!
 //! Frozen (F0): `api` (H1/H2 handle), the traits in `auth` and `core_store`.
-//! H1 owns `lifecycle/`, `supervisor`, `boot`, `poller`, `fence_seq`.
+//! H1 owns `lifecycle/`, `supervisor`, `boot`, `poller`, `fence_seq`,
+//! `reclaimers`.
 //! H2 owns `service/`, `auth/`, `core_store/`, `negotiate`, `events`.
 pub mod api;
 pub mod auth;
@@ -19,6 +20,7 @@ pub mod boot;
 pub mod fence_seq;
 pub mod lifecycle;
 pub mod poller;
+pub mod reclaimers;
 pub mod supervisor;
 
 // H2

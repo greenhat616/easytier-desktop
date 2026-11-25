@@ -28,7 +28,7 @@
 分别生成 client/server stubs（各自的 `stub` 模块），通过 extern_path 复用同一个
 消息类型。契约 `etd.v1` 已包含架构 v7 列出的全部方法，每个方法用
 `(etd.v1.required_role)` 自定义选项标注所需角色，`etd_contract::required_role`
-从描述符读出同一张表。
+从描述符读出同一张表。契约 1.0 不含用户宿主的“远程”模式（连别处的 rpc-portal、不启动内核），以后作为兼容新增补上。
 
 ## 接口冻结与文件归属
 

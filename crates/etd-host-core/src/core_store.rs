@@ -49,9 +49,14 @@ pub enum StoreError {
     Io(String),
 }
 
+/// Async because resolving hashes the binary (blocking I/O must run off the
+/// executor). Implementations derive `VerifiedCore::usage` from
+/// `CoreDriver::profile` of the identified descriptor; the orchestrator
+/// treats `usage` as the single source for launches.
+#[async_trait::async_trait]
 pub trait CoreStore: Send + Sync {
     /// Verify and return the kernel to launch.
-    fn resolve(&self, want: &CoreSelector) -> Result<VerifiedCore, StoreError>;
+    async fn resolve(&self, want: &CoreSelector) -> Result<VerifiedCore, StoreError>;
     /// Every kernel in the store with its support level, for ListCores.
-    fn list(&self) -> Result<Vec<CoreEntry>, StoreError>;
+    async fn list(&self) -> Result<Vec<CoreEntry>, StoreError>;
 }

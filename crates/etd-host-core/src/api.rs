@@ -4,10 +4,18 @@
 //! `negotiate`, `events`, `core_store`).
 //!
 //! Division of work:
-//! - H2 authenticates, authorises, validates (via [`Command::Validate`]),
-//!   commits mutations to the ledger and answers with the receipt; then it
-//!   tells H1 with [`Command::Committed`]. H1 executes accepted tickets
-//!   (`Ledger::pending_tickets`) and reconciles actual toward desired state.
+//! - H2 authenticates and authorises, asks H1 to plan ([`Command::Plan`]),
+//!   commits the mutation together with the returned generation plan in one
+//!   ledger transaction (`ChangeSet::generations`; single-writer claims are
+//!   checked by the ledger inside that transaction against committed state)
+//!   and answers with the receipt; then it tells H1 with
+//!   [`Command::Committed`]. H1 executes accepted tickets
+//!   (`Ledger::pending_tickets`), spawns committed generations (re-running
+//!   the pure `plan_launch` with the same inputs and checking the result
+//!   against `Ledger::generation`), and reconciles actual toward desired
+//!   state. Supervised restarts use `Ledger::begin_epoch` directly.
+//! - A stale plan cannot commit: the commit carries the revision the plan
+//!   was made against, and the ledger checks the epoch.
 //! - H1 publishes every state change as a [`HostEvent`] with a gap-free
 //!   sequence number and keeps a [`HostView`] reflecting all events up to
 //!   `HostView::seq`. H2 turns `seq` into contract cursors (with its
@@ -17,12 +25,13 @@ use crate::{auth::Authorizer, core_store::CoreStore};
 use etd_contract::v1::{LeaseRelease, StreamLogsRequest, event};
 use etd_contract::{
     ErrorDetail, HostMode, HostSnapshot, InstanceId, LogLine, NetworkSpec, QueryKind,
-    QueryResponse, Receipt,
+    QueryResponse, Receipt, Revision,
 };
 use etd_core_api::CoreDriver;
 use etd_proc::{Clock, ProcessEngine, RestartPolicy};
 use etd_sysfx::{
-    BootIdSource, Ledger, PortFence, Reclaimer, RepairIndexStore, Sweeper, SystemObserver,
+    BootIdSource, GenerationPlan, InstallKey, Ledger, PortFence, ReclaimEngine, RepairIndexStore,
+    SystemObserver,
 };
 use futures_util::stream::BoxStream;
 use std::{path::PathBuf, sync::Arc};
@@ -46,13 +55,17 @@ pub struct ClientPresence {
 /// H2 -> H1.
 #[non_exhaustive]
 pub enum Command {
-    /// Before committing an Apply: classify the spec for this host form and
-    /// selected kernel (plan_launch feature classes, single-writer claims
-    /// against other instances). Unsupported -> rejection, nothing commits.
-    Validate {
+    /// Before committing Apply, SetDesired(RUNNING) or RetryStart: plan the
+    /// instance under this host form and the selected kernel. `spec` is the
+    /// new configuration (Apply) or `None` for the stored one; `start` says
+    /// whether desired state will be running after the mutation. Rejections
+    /// (feature classes, guard, kernel) come back as `ErrorDetail`; nothing
+    /// commits then.
+    Plan {
         instance: InstanceId,
-        spec: Box<NetworkSpec>,
-        reply: Reply<()>,
+        spec: Option<Box<NetworkSpec>>,
+        start: bool,
+        reply: Reply<Planned>,
     },
     /// A mutation is durable; its ticket is pending in the ledger.
     Committed {
@@ -85,6 +98,22 @@ pub enum Command {
     Shutdown {
         reply: oneshot::Sender<()>,
     },
+}
+
+/// Result of [`Command::Plan`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Planned {
+    /// Single-writer claims of the configuration, for `Change::PutInstance`.
+    pub claims: Vec<String>,
+    /// The generation the mutation starts, to commit in the same
+    /// transaction: present when `start` and the instance has no live or
+    /// open generation; `None` when the start must wait (the running
+    /// generation is stopped and reclaimed first, then the supervisor uses
+    /// `Ledger::begin_epoch`).
+    pub generation: Option<GenerationPlan>,
+    /// Ledger revision the plan was computed against; H2 commits with this
+    /// expected revision.
+    pub revision: Revision,
 }
 
 /// H1 -> H2: one state change. `seq` increases by exactly one per event
@@ -191,9 +220,12 @@ pub struct HostDeps {
     pub clock: Arc<dyn Clock>,
     pub ledger: Arc<dyn Ledger>,
     pub repair_index: Arc<dyn RepairIndexStore>,
-    pub reclaimers: Vec<Arc<dyn Reclaimer>>,
-    pub sweeper: Arc<dyn Sweeper>,
+    /// Built from `etd_sysfx::ReclaimDeps` (OS reclaimers plus this crate's
+    /// `reclaimers` for Process and RuntimeDir).
+    pub reclaim: Arc<dyn ReclaimEngine>,
     pub boot_id: Arc<dyn BootIdSource>,
+    /// For `etd_sysfx::naming::interface_name`.
+    pub install_key: InstallKey,
     pub observer: Arc<dyn SystemObserver>,
     /// `None` when the platform cannot fence.
     pub fence: Option<Arc<dyn PortFence>>,

@@ -11,10 +11,15 @@ pub const GIVE_UP_WINDOW: Duration = Duration::from_secs(5 * 60);
 /// The n-th abnormal exit inside [`GIVE_UP_WINDOW`] gives up.
 pub const GIVE_UP_AFTER: u32 = 5;
 
-/// Monotonic time source; faked in tests.
+/// Time source; faked in tests. `now`/`sleep` are monotonic (timeouts,
+/// backoff); `wall_now` is wall-clock time for persisted timestamps, lease
+/// expiry and event times, so fakes can control both.
 pub trait Clock: Send + Sync {
     fn now(&self) -> Instant;
     fn sleep(&self, d: Duration) -> BoxFuture<'static, ()>;
+    fn wall_now(&self) -> jiff::Timestamp {
+        jiff::Timestamp::now()
+    }
 }
 
 /// Deliberately exhaustive.
@@ -27,6 +32,8 @@ pub enum RestartDecision {
     Stay,
 }
 
+/// One per instance. The orchestrator calls `reset` when it executes a
+/// RetryStart ticket (manual retry after GAVE_UP).
 pub trait RestartPolicy: Send {
     fn on_exit(&mut self, now: Instant, exit: &Exit) -> RestartDecision;
     /// Manual retry after giving up: forget the exit history.

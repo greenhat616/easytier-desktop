@@ -152,6 +152,7 @@ fn report() -> ReclaimReport {
             expected: "luid=1".into(),
             found: "luid=2".into(),
             effect_id: "e-2".into(),
+            conflict_id: "k-1".into(),
         }],
         notes: vec![notice()],
     }
@@ -259,6 +260,11 @@ all_messages! {
     ReclaimReport => report(),
     RetryReclaimRequest => RetryReclaimRequest { header: header(), instance_id: "3f9a1c2e".into() },
     RetryReclaimResponse => RetryReclaimResponse { receipt: receipt() },
+    RetryStartRequest => RetryStartRequest {
+        header: header(),
+        instance_id: "3f9a1c2e".into(),
+    },
+    RetryStartResponse => RetryStartResponse { receipt: receipt() },
     CandidateDecision => CandidateDecision { candidate_id: "c-1".into(), action: CandidateAction::Delete as i32 },
     ResolveCandidatesRequest => ResolveCandidatesRequest {
         header: header(),

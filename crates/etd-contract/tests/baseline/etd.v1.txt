@@ -107,6 +107,7 @@ field .etd.v1.Candidate.kind = 2 single String
 field .etd.v1.Candidate.origin = 4 single Enum .etd.v1.CandidateOrigin
 field .etd.v1.CandidateDecision.action = 2 single Enum .etd.v1.CandidateAction
 field .etd.v1.CandidateDecision.candidate_id = 1 single String
+field .etd.v1.Conflict.conflict_id = 6 single String
 field .etd.v1.Conflict.effect_id = 5 single String
 field .etd.v1.Conflict.expected = 3 single String
 field .etd.v1.Conflict.found = 4 single String
@@ -295,6 +296,9 @@ field .etd.v1.ResyncRequired.reason = 1 single String
 field .etd.v1.RetryReclaimRequest.header = 1 single Message .etd.v1.MutationHeader
 field .etd.v1.RetryReclaimRequest.instance_id = 2 single String
 field .etd.v1.RetryReclaimResponse.receipt = 1 single Message .etd.v1.Receipt
+field .etd.v1.RetryStartRequest.header = 1 single Message .etd.v1.MutationHeader
+field .etd.v1.RetryStartRequest.instance_id = 2 single String
+field .etd.v1.RetryStartResponse.receipt = 1 single Message .etd.v1.Receipt
 field .etd.v1.Route.cost = 6 single Uint32
 field .etd.v1.Route.hostname = 2 single String
 field .etd.v1.Route.ipv4_cidr = 3 single String
@@ -386,6 +390,8 @@ message .etd.v1.ResolveCandidatesResponse
 message .etd.v1.ResyncRequired
 message .etd.v1.RetryReclaimRequest
 message .etd.v1.RetryReclaimResponse
+message .etd.v1.RetryStartRequest
+message .etd.v1.RetryStartResponse
 message .etd.v1.Route
 message .etd.v1.RouteList
 message .etd.v1.SelectCoreRequest
@@ -411,6 +417,7 @@ role /etd.v1.HostService/ReleaseLease = Some(Control)
 role /etd.v1.HostService/RemoveInstance = Some(Control)
 role /etd.v1.HostService/ResolveCandidates = Some(Admin)
 role /etd.v1.HostService/RetryReclaim = Some(Control)
+role /etd.v1.HostService/RetryStart = Some(Control)
 role /etd.v1.HostService/SelectCore = Some(Admin)
 role /etd.v1.HostService/SetAllowList = Some(Admin)
 role /etd.v1.HostService/SetDesired = Some(Control)
@@ -429,6 +436,7 @@ rpc .etd.v1.HostService.ReleaseLease(.etd.v1.ReleaseLeaseRequest) returns (.etd.
 rpc .etd.v1.HostService.RemoveInstance(.etd.v1.RemoveInstanceRequest) returns (.etd.v1.RemoveInstanceResponse)
 rpc .etd.v1.HostService.ResolveCandidates(.etd.v1.ResolveCandidatesRequest) returns (.etd.v1.ResolveCandidatesResponse)
 rpc .etd.v1.HostService.RetryReclaim(.etd.v1.RetryReclaimRequest) returns (.etd.v1.RetryReclaimResponse)
+rpc .etd.v1.HostService.RetryStart(.etd.v1.RetryStartRequest) returns (.etd.v1.RetryStartResponse)
 rpc .etd.v1.HostService.SelectCore(.etd.v1.SelectCoreRequest) returns (.etd.v1.SelectCoreResponse)
 rpc .etd.v1.HostService.SetAllowList(.etd.v1.SetAllowListRequest) returns (.etd.v1.SetAllowListResponse)
 rpc .etd.v1.HostService.SetDesired(.etd.v1.SetDesiredRequest) returns (.etd.v1.SetDesiredResponse)

@@ -46,6 +46,21 @@ pub enum EffectScope {
     /// Belongs to the product (driver, service registration, program
     /// firewall rules); only `uninstall` / `reclaim --all --purge` remove it.
     Product,
+    /// Shared by every instance launched from one kernel-store binary
+    /// (identified by its SHA-256, lower-case hex); removable once no open
+    /// generation uses that binary. Reserved so that either ruling on the
+    /// program firewall rules' scope (msg#264) stays additive.
+    CoreBinary { sha256: String },
+}
+
+impl EffectScope {
+    /// Instance generation this record belongs to, if any.
+    pub fn generation(&self) -> Option<(&InstanceId, Epoch)> {
+        match self {
+            EffectScope::Instance { instance, epoch } => Some((instance, *epoch)),
+            EffectScope::Product | EffectScope::CoreBinary { .. } => None,
+        }
+    }
 }
 
 /// Concrete object type. One [`crate::Reclaimer`] handles one kind. The
@@ -182,15 +197,20 @@ impl FromStr for EffectKind {
 
 /// Natural key: enough to find the object with no in-memory state. Names are
 /// visible to others and only locate; see [`Credential`] for deletion.
+///
+/// A key holds only what is known *before* the action (it is written while
+/// the record is `Planned`). Facts that exist only afterwards (pid and start
+/// token, a system-assigned interface name, a router-assigned port) are
+/// recorded later as an [`Observation`]: its `credential` and its concrete
+/// `key`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ObjectKey {
-    /// Kernel process, by its persisted identity and the epoch directory its
-    /// command line references.
+    /// Kernel process, by its image and the epoch directory its command line
+    /// references. pid and start token are observed after spawn
+    /// ([`Credential::Process`]).
     Process {
-        pid: u32,
-        start_token: String,
         exe: PathBuf,
         cmdline_marker: PathBuf,
     },
@@ -203,7 +223,10 @@ pub enum ObjectKey {
         guid: Option<String>,
     },
     /// Routes whose next hop is the named interface.
-    RoutesVia { interface: String },
+    /// `None` while the interface name is not known yet (macOS utun): the
+    /// interface of the same generation, taken from that record's
+    /// observation.
+    RoutesVia { interface: Option<String> },
     /// Named rule (firewall, NRPT): exact rule name, optional group.
     Rule { name: String, group: Option<String> },
     /// Registry value or key (`value: None` = the key itself).
@@ -218,9 +241,10 @@ pub enum ObjectKey {
     /// systemd-resolved link configuration.
     ResolvedLink { interface: String },
     /// Router port mapping.
+    /// The external port is assigned by the router and observed later.
     PortMapping {
         protocol: String,
-        external_port: u16,
+        internal_port: u16,
         description: String,
     },
     /// Driver or service, by its registered name.
@@ -306,6 +330,15 @@ pub enum Persistence {
     Expiring { until: jiff::Timestamp },
 }
 
+impl Persistence {
+    /// Records closed without probing when the boot id differs from the one
+    /// they were written under (doc#2 v7: volatile records are closed
+    /// directly after a reboot).
+    pub fn closes_on_reboot(self) -> bool {
+        matches!(self, Persistence::WithProcess | Persistence::UntilReboot)
+    }
+}
+
 /// Ledger record state. See the record state machine in doc#2 v7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -324,6 +357,11 @@ pub enum EffectState {
     /// exclusive container: never deleted automatically. Open until an
     /// administrator decides.
     Candidate,
+    /// The key now names an object with a different identity: ours is gone,
+    /// the name is taken by someone else. Never deleted. Open (the
+    /// generation stays quarantined, so the next generation cannot clash on
+    /// the same derived name) until an administrator releases it.
+    Conflict,
 }
 
 impl EffectState {
@@ -359,7 +397,8 @@ pub struct Effect {
     /// Latest observation; carries the creation credential once applied.
     pub observation: Option<Observation>,
     /// Consecutive reclaim failures (quarantine at
-    /// [`crate::QUARANTINE_AFTER`]).
+    /// [`crate::QUARANTINE_AFTER`]). Reset to 0 when the record closes and
+    /// when a retry (RetryReclaim ticket) moves it out of `Quarantined`.
     pub failures: u32,
     pub last_error: Option<String>,
     pub recorded_at: jiff::Timestamp,
@@ -487,9 +526,11 @@ pub struct Candidate {
 }
 
 /// Same key as our record, different identity: not ours any more; never
-/// deleted, reported.
+/// deleted, reported. The record is in [`EffectState::Conflict`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conflict {
+    /// Stable id for the decision round trip (KEEP only).
+    pub id: String,
     pub effect: EffectId,
     pub kind: EffectKind,
     pub key: ObjectKey,

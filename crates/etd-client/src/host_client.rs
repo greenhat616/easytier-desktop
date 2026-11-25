@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use etd_contract::v1::{
     ApplyRequest, GetAllowListResponse, LeaseRelease, ListCoresResponse, PurgeAllDataRequest,
     ReleaseLeaseResponse, RemoveInstanceRequest, ResolveCandidatesRequest, RetryReclaimRequest,
-    SelectCoreRequest, SetAllowListRequest, SetDesiredRequest, StreamLogsRequest,
+    RetryStartRequest, SelectCoreRequest, SetAllowListRequest, SetDesiredRequest,
+    StreamLogsRequest,
 };
 use etd_contract::{
     ErrorDetail, Event, EventCursor, HostSnapshot, InstanceId, LogLine, Negotiated, QueryKind,
@@ -82,6 +83,8 @@ pub trait HostClient: Send + Sync {
     fn logs(&self, req: StreamLogsRequest) -> BoxStream<'static, Result<LogLine, CallError>>;
     async fn reclaim_report(&self) -> Result<ReclaimReport, CallError>;
     async fn retry_reclaim(&self, req: RetryReclaimRequest) -> Result<Receipt, CallError>;
+    /// Manual restart of a GAVE_UP instance (resets the circuit breaker).
+    async fn retry_start(&self, req: RetryStartRequest) -> Result<Receipt, CallError>;
     async fn resolve_candidates(&self, req: ResolveCandidatesRequest)
     -> Result<Receipt, CallError>;
     async fn release_lease(

@@ -75,3 +75,62 @@ pub trait Sweeper: Send + Sync {
 pub trait BootIdSource: Send + Sync {
     fn current(&self) -> Result<BootId, ReclaimError>;
 }
+
+/// Everything the reclaim engine needs; assembled by the composition root.
+/// `reclaimers` holds one per kind: OS kinds from etd-sysfx-os, `Process`
+/// and `RuntimeDir` from etd-host-core (`reclaimers`, H1).
+pub struct ReclaimDeps {
+    pub ledger: std::sync::Arc<dyn Ledger>,
+    pub reclaimers: Vec<std::sync::Arc<dyn Reclaimer>>,
+    pub sweeper: std::sync::Arc<dyn Sweeper>,
+    pub boot_id: std::sync::Arc<dyn BootIdSource>,
+    pub repair_index: std::sync::Arc<dyn RepairIndexStore>,
+}
+
+/// What a whole-ledger reclaim covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReclaimScope {
+    /// Every open instance generation (startup self-check).
+    Instances,
+    /// Instances plus product and core-binary scope (`reclaim --all
+    /// --purge`, uninstall).
+    Everything,
+}
+
+/// The reclaim engine's entry points, as called by the orchestrator (H1).
+/// Implementation: `engine::ReclaimEngineImpl` (R1), built with
+/// [`ReclaimDeps`]. Every entry point is idempotent: running the same
+/// recovery twice performs no system write the second time.
+#[async_trait]
+pub trait ReclaimEngine: Send + Sync {
+    /// After a generation's process has exited (or was verified dead):
+    /// probe, delete, verify its open records in rank order. `Closed` means
+    /// the next epoch may start.
+    async fn reclaim_generation(
+        &self,
+        instance: &etd_contract::InstanceId,
+        epoch: Epoch,
+    ) -> Result<GenerationReport, LedgerError>;
+    /// Startup self-check step 4: boot-id comparison (volatile records closed
+    /// unprobed), every open record in rank order, exclusive-container sweep,
+    /// candidates. One failing generation never stops the others.
+    async fn reclaim_all(&self, scope: ReclaimScope) -> Result<ReclaimReport, LedgerError>;
+    /// RetryReclaim: reset failure counters of a quarantined generation and
+    /// run it again.
+    async fn retry(
+        &self,
+        instance: &etd_contract::InstanceId,
+    ) -> Result<GenerationReport, LedgerError>;
+    /// Apply administrator decisions on candidate / conflict ids.
+    async fn resolve(
+        &self,
+        decisions: &[etd_contract::CandidateDecision],
+    ) -> Result<ReclaimReport, LedgerError>;
+    /// Ledger unusable (cannot open, unknown schema): clean exclusive
+    /// containers only and list everything else as candidates, using the
+    /// repair index if present.
+    async fn sweep_without_ledger(&self) -> Result<ReclaimReport, ReclaimError>;
+    /// The latest report (for snapshots and GetReclaimReport).
+    async fn report(&self) -> Result<ReclaimReport, LedgerError>;
+}

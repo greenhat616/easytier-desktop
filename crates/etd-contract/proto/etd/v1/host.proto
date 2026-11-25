@@ -16,11 +16,16 @@ import "etd/v1/options.proto";
 //
 // Mutations: every state change carries a client-generated request id and the
 // revision the client last saw. The host commits the request record, desired
-// state, new revision and operation ticket in one ledger transaction before it
-// answers. Retrying the same request id with the same content returns the
+// state, new revision, operation ticket and, when the request starts a new
+// generation of an instance, that generation's reserved epoch and planned side
+// effects, all in one ledger transaction before it answers. Retrying the same request id with the same content returns the
 // original receipt; the same id with different content is rejected; a stale
 // expected revision is a conflict. A receipt only means "durably accepted";
 // progress is reported on the event stream.
+//
+// Not in contract 1.0: the user host's "remote" mode (attach to another
+// machine's kernel management port without starting a kernel). Adding it later
+// is additive (a NetworkSpec alternative plus a capability).
 service HostService {
   // Version negotiation. Major mismatch fails with VERSION_MISMATCH.
   rpc Handshake(Hello) returns (Welcome) {
@@ -41,7 +46,10 @@ service HostService {
     option (required_role) = ROLE_CONTROL;
   }
   // Change an instance's desired state (running or stopped). Also the
-  // "retry confirm" path for an instance shown as CUT_UNCONFIRMED.
+  // "retry confirm" path for an instance shown as CUT_UNCONFIRMED: resend the
+  // stop with the same request id. Setting the value the instance already has
+  // commits a ticket but changes nothing else; in particular it does not
+  // restart a GAVE_UP instance (use RetryStart).
   rpc SetDesired(SetDesiredRequest) returns (SetDesiredResponse) {
     option (required_role) = ROLE_CONTROL;
   }
@@ -70,7 +78,13 @@ service HostService {
   rpc RetryReclaim(RetryReclaimRequest) returns (RetryReclaimResponse) {
     option (required_role) = ROLE_CONTROL;
   }
-  // Item-by-item decision on reclaim candidates.
+  // Manual retry of an instance in GAVE_UP (desired still running): resets the
+  // restart policy's circuit breaker and starts a new generation. Rejected with
+  // INSTANCE_BUSY in any other state.
+  rpc RetryStart(RetryStartRequest) returns (RetryStartResponse) {
+    option (required_role) = ROLE_CONTROL;
+  }
+  // Item-by-item decision on reclaim candidates and conflicts.
   rpc ResolveCandidates(ResolveCandidatesRequest) returns (ResolveCandidatesResponse) {
     option (required_role) = ROLE_ADMIN;
   }
@@ -281,7 +295,7 @@ enum InstanceState {
   // Waiting for the restart policy's delay.
   INSTANCE_STATE_BACKOFF = 7;
   // Circuit breaker: fifth abnormal exit within five minutes. Desired state
-  // is still running; a manual retry restarts.
+  // is still running; RetryStart restarts.
   INSTANCE_STATE_GAVE_UP = 8;
   // Reclaim failed five times, a candidate awaits confirmation, or process
   // liveness is uncertain. The epoch stays open; no new epoch starts.
@@ -630,14 +644,18 @@ message Candidate {
   string detail = 7;
 }
 
-// Same name as one of our objects, but a different identity: never deleted,
-// reported only.
+// Same name as one of our objects, but a different identity. Never deleted.
+// The record stays open (the generation stays quarantined) so that the next
+// generation does not reuse the clashing name, until an administrator
+// releases it with CANDIDATE_ACTION_KEEP on conflict_id.
 message Conflict {
   string kind = 1;
   string identity = 2;
   string expected = 3;
   string found = 4;
   string effect_id = 5;
+  // Accepted in CandidateDecision.candidate_id (KEEP only).
+  string conflict_id = 6;
 }
 
 message GetReclaimReportRequest {}
@@ -660,6 +678,15 @@ message RetryReclaimResponse {
   Receipt receipt = 1;
 }
 
+message RetryStartRequest {
+  MutationHeader header = 1;
+  string instance_id = 2;
+}
+
+message RetryStartResponse {
+  Receipt receipt = 1;
+}
+
 enum CandidateAction {
   CANDIDATE_ACTION_UNSPECIFIED = 0;
   // Ours: delete it.
@@ -669,6 +696,7 @@ enum CandidateAction {
 }
 
 message CandidateDecision {
+  // Candidate.candidate_id, or Conflict.conflict_id (KEEP only).
   string candidate_id = 1;
   CandidateAction action = 2;
 }

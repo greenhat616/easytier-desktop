@@ -17,6 +17,7 @@ pub const SERVICE_SOCKET_GROUP: &str = "easytier-desk";
 /// Which host owns a listener and its singleton lock. Independent of the
 /// endpoint name and of the access list used for an individual connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HostForm {
     Service,
     User,

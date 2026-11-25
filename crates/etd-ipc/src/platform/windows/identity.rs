@@ -68,9 +68,16 @@ pub(super) fn current_user() -> io::Result<OsUserId> {
 fn token_peer(token: &OwnedHandle, pid: u32) -> io::Result<PeerIdentity> {
     let user = token_user(token)?;
     let data = info(token, TokenGroups)?;
-    let groups = unsafe { &*data.as_ptr().cast::<TOKEN_GROUPS>() };
-    let entries =
-        unsafe { std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize) };
+    // TOKEN_GROUPS has a variable-length trailing array, possibly empty.
+    // Address it through raw pointers without borrowing a fictitious first entry.
+    let ptr = data.as_ptr().cast::<TOKEN_GROUPS>();
+    let entries = unsafe {
+        let count = (*ptr).GroupCount as usize;
+        std::slice::from_raw_parts(
+            (&raw const (*ptr).Groups).cast::<SID_AND_ATTRIBUTES>(),
+            count,
+        )
+    };
     let groups = entries
         .iter()
         .filter(|g| {

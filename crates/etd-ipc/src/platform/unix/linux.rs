@@ -48,19 +48,45 @@ pub(super) fn peer(stream: &UnixStream) -> io::Result<PeerIdentity> {
     })
 }
 
-pub(super) fn root_socket(path: &Path) -> io::Result<(u64, u64)> {
-    directory_chain(path, 0, true)?;
+/// Directory for the per-user endpoint. The launcher creates it mode 0700.
+/// Machines without a login-session runtime directory use a per-uid directory
+/// under /tmp, validated with the same ownership and mode requirements.
+pub fn user_runtime_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/tmp/easytier-desk-{}", Uid::effective())))
+}
+
+pub(super) fn socket_identity(path: &Path, service: bool) -> io::Result<(u64, u64)> {
+    let uid = if service {
+        0
+    } else {
+        Uid::effective().as_raw()
+    };
+    directory_chain(path, uid, service)?;
+    if !service {
+        let runtime = user_runtime_dir();
+        if !runtime.is_absolute() || !path.starts_with(&runtime) {
+            return Err(denied("user socket outside the runtime directory"));
+        }
+        for dir in [runtime.as_path(), path.parent().unwrap()] {
+            let m = fs::symlink_metadata(dir)?;
+            if !m.is_dir() || m.uid() != uid || m.mode() & 0o7777 != 0o700 {
+                return Err(denied(
+                    "user socket requires a private 0700 runtime directory",
+                ));
+            }
+        }
+    }
     let m = fs::symlink_metadata(path)?;
-    if m.uid() != 0 || !m.file_type().is_socket() {
-        return Err(denied("expected root-owned service socket"));
+    if m.uid() != uid || !m.file_type().is_socket() {
+        return Err(denied("unexpected local socket type or owner"));
     }
     Ok(inode(&m))
 }
 
-pub(super) fn image(stream: &UnixStream, pid: u32) -> io::Result<PathBuf> {
-    let image = fs::read_link(format!("/proc/{pid}/exe"))?;
-    // Check liveness through the socket's own pidfd *after* looking up the
-    // numeric PID. A dead/recycled peer cannot authorize another image.
+pub(super) fn pidfd(stream: &UnixStream) -> io::Result<OwnedFd> {
     let mut fd = -1i32;
     let mut len = size_of::<i32>() as libc::socklen_t;
     if unsafe {
@@ -75,17 +101,57 @@ pub(super) fn image(stream: &UnixStream, pid: u32) -> io::Result<PathBuf> {
     {
         return Err(io::Error::last_os_error());
     }
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let mut probe = libc::pollfd {
-        fd: fd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+// The primary service proof is uid 0 on a root-owned socket whose entire
+// directory chain is root-owned and protected. The user form requires the
+// current uid and its private runtime directory. Never substitute an expected
+// filename for an unavailable process image in ServerIdentity.
+pub(super) fn verified_image(
+    expect: &ServerExpectation,
+    pid: u32,
+    pidfd: io::Result<OwnedFd>,
+) -> io::Result<PathBuf> {
+    let fd = match pidfd {
+        Ok(fd) => Some(fd),
+        Err(e) if e.raw_os_error() == Some(libc::ENOPROTOOPT) => {
+            tracing::debug!(
+                "SO_PEERPIDFD unavailable; verified the socket owner, path and peer uid"
+            );
+            if !expect.privileged {
+                return Ok(PathBuf::new());
+            }
+            None
+        }
+        Err(e) => return Err(denied(e)),
     };
-    match unsafe { libc::poll(&mut probe, 1, 0) } {
-        0 => Ok(image),
-        -1 => Err(io::Error::last_os_error()),
-        _ => Err(denied("server process exited")),
+    let image = match fs::read_link(format!("/proc/{pid}/exe")) {
+        Ok(path) => verify_image(&expect.exe_dir, &path)?,
+        Err(e)
+            if expect.privileged
+                && matches!(
+                    e.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
+                ) =>
+        {
+            PathBuf::new()
+        }
+        Err(e) => return Err(denied(e)),
+    };
+    if let Some(fd) = fd {
+        let mut probe = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        match unsafe { libc::poll(&mut probe, 1, 0) } {
+            0 => (),
+            -1 => return Err(denied(io::Error::last_os_error())),
+            _ => return Err(denied("server process exited")),
+        }
     }
+    Ok(image)
 }
 
 pub(super) fn set_acl(
@@ -136,4 +202,32 @@ pub(super) fn set_acl(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn only_missing_peer_pidfd_uses_legacy_user_host_evidence() {
+        let expect = ServerExpectation {
+            exe_dir: PathBuf::new(),
+            user: None,
+            privileged: false,
+        };
+        let old_kernel = io::Error::from_raw_os_error(libc::ENOPROTOOPT);
+        assert!(
+            verified_image(&expect, std::process::id(), Err(old_kernel))
+                .unwrap()
+                .as_os_str()
+                .is_empty()
+        );
+        assert!(
+            verified_image(
+                &expect,
+                std::process::id(),
+                Err(io::Error::from_raw_os_error(libc::EBADF))
+            )
+            .is_err()
+        );
+    }
 }

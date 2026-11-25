@@ -14,6 +14,8 @@ mod native;
 #[cfg(unix)]
 #[path = "unix/mod.rs"]
 mod native;
+#[cfg(target_os = "linux")]
+pub use native::user_runtime_dir;
 pub use native::{LocalListener, PolicyHandle};
 
 /// Account of the process running the user host or client.

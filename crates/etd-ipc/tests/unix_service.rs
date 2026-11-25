@@ -46,6 +46,42 @@ mod linux {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     #[tokio::test]
+    async fn user_socket_requires_private_runtime_path() {
+        if !run_as_host("linux::user_socket_requires_private_runtime_path") {
+            return;
+        }
+        let f = Fixture::new();
+        let _listener = f.listener();
+        let c = connector();
+        let ep = endpoint_arg(&f.ep);
+        let alias = f.dir.path().join("alias");
+        symlink(f.dir.path(), &alias).unwrap();
+        assert_eq!(
+            c.connect(&Endpoint::UnixSocket(alias.join("host.sock")))
+                .await
+                .err()
+                .unwrap()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+        fs::set_permissions(f.dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            c.connect(&f.ep).await.err().unwrap().kind(),
+            ErrorKind::PermissionDenied
+        );
+        let elsewhere = tempfile::tempdir().unwrap();
+        let external = elsewhere.path().join("host.sock");
+        fs::hard_link(ep, &external).unwrap();
+        assert_eq!(
+            c.connect(&Endpoint::UnixSocket(external))
+                .await
+                .err()
+                .unwrap()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+    }
+    #[tokio::test]
     async fn writable_service_ancestor_refused() {
         let f = Fixture::new();
         let _listener = f.listener();

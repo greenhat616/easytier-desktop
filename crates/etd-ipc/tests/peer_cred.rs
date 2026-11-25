@@ -17,17 +17,26 @@ async fn kernel_identity_matches_process() {
     let (_, peer) = accepted.unwrap();
     assert_eq!(peer.pid, std::process::id());
     assert_eq!(peer, server.peer);
-    assert_eq!(
-        server.exe,
-        std::env::current_exe().unwrap().canonicalize().unwrap()
-    );
+    if verifies_user_image() {
+        assert_eq!(
+            server.exe,
+            std::env::current_exe().unwrap().canonicalize().unwrap()
+        );
+    } else {
+        assert!(server.exe.as_os_str().is_empty());
+    }
     #[cfg(unix)]
     {
-        use nix::unistd::{Gid, Uid, getgroups};
+        use nix::unistd::{Gid, Uid};
         assert_eq!(peer.user, OsUserId::UnixUid(Uid::effective().as_raw()));
         assert_eq!(peer.elevated, Uid::effective().is_root());
         assert_eq!(peer.session, None);
-        for group in getgroups().unwrap().into_iter().chain([Gid::effective()]) {
+        assert!(
+            peer.groups
+                .contains(&etd_ipc::OsGroupId::UnixGid(Gid::effective().as_raw()))
+        );
+        #[cfg(target_os = "linux")]
+        for group in nix::unistd::getgroups().unwrap() {
             assert!(
                 peer.groups
                     .contains(&etd_ipc::OsGroupId::UnixGid(group.as_raw()))

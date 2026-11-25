@@ -15,7 +15,18 @@ pub struct Fixture {
 }
 impl Fixture {
     pub fn new() -> Self {
+        #[cfg(target_os = "linux")]
+        let dir = match std::env::var_os("ETD_TEST_RUNTIME") {
+            Some(root) => tempfile::tempdir_in(root).unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        #[cfg(not(target_os = "linux"))]
         let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         #[cfg(unix)]
         let ep = Endpoint::UnixSocket(dir.path().canonicalize().unwrap().join("host.sock"));
         #[cfg(windows)]
@@ -54,7 +65,15 @@ pub fn run_as_host(test: &str) -> bool {
     let install = tempfile::tempdir().unwrap();
     let host = install.path().join(host_name());
     std::fs::copy(exe, &host).unwrap();
-    let result = Command::new(host)
+    let mut cmd = Command::new(host);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(install.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        cmd.env("ETD_TEST_RUNTIME", install.path())
+            .env("XDG_RUNTIME_DIR", install.path());
+    }
+    let result = cmd
         .args(["--include-ignored", "--exact", test, "--nocapture"])
         .output()
         .unwrap();
@@ -83,4 +102,34 @@ pub fn from_arg(arg: PathBuf) -> Endpoint {
     {
         Endpoint::UnixSocket(arg)
     }
+}
+
+/// Pre-6.5 Linux authenticates a user host by its private directory and uid.
+/// Probe the actual running kernel rather than its release string.
+pub fn verifies_user_image() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut fd = -1i32;
+        let mut len = size_of::<i32>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                a.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERPIDFD,
+                (&raw mut fd).cast(),
+                &mut len,
+            )
+        } != 0
+        {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENOPROTOOPT)
+            );
+            return false;
+        }
+        drop(unsafe { OwnedFd::from_raw_fd(fd) });
+    }
+    true
 }

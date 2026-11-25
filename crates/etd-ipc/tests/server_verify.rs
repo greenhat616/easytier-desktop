@@ -45,8 +45,16 @@ async fn impostor_process() {
 
 #[tokio::test]
 async fn rejects_another_process_before_writing() {
+    if !run_as_host("rejects_another_process_before_writing") {
+        return;
+    }
     let f = Fixture::new();
-    let mut child = Command::new(std::env::current_exe().unwrap())
+    let decoy = f
+        .dir
+        .path()
+        .join(format!("impostor{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(std::env::current_exe().unwrap(), &decoy).unwrap();
+    let mut child = Command::new(decoy)
         .args(["--exact", "impostor_process", "--nocapture"])
         .env("ETD_TEST_IMPOSTOR_SOCKET", endpoint_arg(&f.ep))
         .kill_on_drop(true)
@@ -72,7 +80,13 @@ async fn rejects_another_process_before_writing() {
             break;
         }
     }
-    let result = connector().connect(&f.ep).await;
+    let mut expected = connector();
+    // On old Linux, a matching uid inside its 0700 runtime directory is
+    // the full identity proof. Exercise the account mismatch on that kernel.
+    if !verifies_user_image() {
+        expected.expectation.user = Some(etd_ipc::OsUserId::UnixUid(u32::MAX));
+    }
+    let result = expected.connect(&f.ep).await;
     assert_eq!(
         result.err().unwrap().kind(),
         std::io::ErrorKind::PermissionDenied

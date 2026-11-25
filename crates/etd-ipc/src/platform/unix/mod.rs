@@ -31,6 +31,9 @@ mod os;
 #[path = "macos.rs"]
 mod os;
 
+#[cfg(target_os = "linux")]
+pub use os::user_runtime_dir;
+
 fn path(endpoint: &Endpoint) -> io::Result<&Path> {
     let Endpoint::UnixSocket(path) = endpoint else {
         return Err(invalid("expected a Unix domain socket"));
@@ -241,36 +244,24 @@ pub(super) async fn connect(
 ) -> io::Result<(BoxConn, ServerIdentity)> {
     let path = path(endpoint)?;
     #[cfg(target_os = "linux")]
-    let root_socket = if expect.privileged {
-        Some(os::root_socket(path).map_err(denied)?)
-    } else {
-        None
-    };
+    let id = os::socket_identity(path, expect.privileged).map_err(denied)?;
     let stream = UnixStream::connect(path).await?;
     let peer = os::peer(&stream).map_err(denied)?;
-    verify_user(
-        expect,
-        &peer.user,
-        OsUserId::UnixUid(Uid::effective().as_raw()),
-        OsUserId::UnixUid(0),
-    )?;
+    verify_user(expect, &peer.user, current_user()?, OsUserId::UnixUid(0))?;
     #[cfg(target_os = "linux")]
-    if let Some(id) = root_socket {
-        if id != os::root_socket(path).map_err(denied)? {
-            return Err(denied("service socket changed during connect"));
+    let exe = {
+        if id != os::socket_identity(path, expect.privileged).map_err(denied)? {
+            return Err(denied("socket changed during connect"));
         }
-        // A non-root UI normally cannot inspect /proc/<root-pid>/exe.
-        // The root-owned socket in a protected root-owned directory chain
-        // and the kernel's uid 0 are the service proof. An empty image
-        // denotes an unavailable path, never a path inferred from policy.
-        let image = match os::image(&stream, peer.pid) {
-            Ok(image) => verify_image(&expect.exe_dir, &image)?,
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => PathBuf::new(),
-            Err(e) => return Err(denied(e)),
-        };
-        return Ok((Box::new(stream), ServerIdentity { peer, exe: image }));
-    }
-    let image = os::image(&stream, peer.pid).map_err(denied)?;
-    let exe = verify_image(&expect.exe_dir, &image)?;
+        if !expect.privileged && peer.user != current_user()? {
+            return Err(denied("user host must run as the current user"));
+        }
+        os::verified_image(expect, peer.pid, os::pidfd(&stream))?
+    };
+    #[cfg(target_os = "macos")]
+    let exe = verify_image(
+        &expect.exe_dir,
+        &os::image(&stream, peer.pid).map_err(denied)?,
+    )?;
     Ok((Box::new(stream), ServerIdentity { peer, exe }))
 }

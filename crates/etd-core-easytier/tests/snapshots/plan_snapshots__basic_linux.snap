@@ -1,0 +1,50 @@
+---
+source: crates/etd-core-easytier/tests/plan_snapshots.rs
+expression: render(&plan)
+---
+command:
+  exe: <CORE>
+  arg: -c
+  arg: <RUN>/config.toml
+  arg: --rpc-portal
+  arg: 127.0.0.1:15999
+  arg: --rpc-portal-whitelist
+  arg: 127.0.0.1/32
+  arg: --disable-env-parsing
+  arg: --console-log-level
+  arg: info
+  arg: --file-log-dir
+  arg: <RUN>
+  cwd: <RUN>
+  env: []
+file <RUN>/config.toml:
+instance_name = "etd-3f9a1c2e-5b7d-4e21-9c4a-7d2f8e1b6a90"
+instance_id = "3f9a1c2e-5b7d-4e21-9c4a-7d2f8e1b6a90"
+hostname = "laptop"
+ipv4 = "10.144.144.2/24"
+listeners = []
+
+[network_identity]
+network_name = "office-net"
+network_secret = '<SECRET>'
+
+[[peer]]
+uri = "tcp://public.example.org:11010"
+
+[flags]
+dev_name = "etd-e58b9f57"
+no_tun = false
+latency_first = false
+enable_encryption = true
+enable_ipv6 = true
+enable_exit_node = false
+use_smoltcp = false
+disable_p2p = false
+relay_all_peer_rpc = false
+disable_udp_hole_punching = false
+multi_thread = false
+bind_device = false
+enable_kcp_proxy = false
+enable_quic_proxy = false
+accept_dns = false
+private_mode = false

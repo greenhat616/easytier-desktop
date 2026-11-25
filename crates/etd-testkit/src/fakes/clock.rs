@@ -37,11 +37,17 @@ impl FakeClock {
     pub fn set_wall(&self, wall: jiff::Timestamp) {
         self.time.send_modify(|(_, current)| *current = wall);
     }
+
+    /// Inherent access also works in etd-proc's own unit tests, where Cargo
+    /// links the testkit against the non-test copy of the Clock trait.
+    pub fn now(&self) -> Instant {
+        self.origin + self.time.borrow().0
+    }
 }
 
 impl Clock for FakeClock {
     fn now(&self) -> Instant {
-        self.origin + self.time.borrow().0
+        FakeClock::now(self)
     }
 
     fn sleep(&self, d: Duration) -> BoxFuture<'static, ()> {

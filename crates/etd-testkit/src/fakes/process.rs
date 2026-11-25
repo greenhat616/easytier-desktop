@@ -70,7 +70,7 @@ struct Process {
     command: Command,
     containment: Containment,
     graceful_exit: Option<Exit>,
-    exit: watch::Sender<Option<Exit>>,
+    exit: watch::Sender<Option<Result<Exit, String>>>,
     events: Mutex<Option<mpsc::UnboundedSender<ProcessEvent>>>,
 }
 
@@ -78,6 +78,7 @@ impl Process {
     fn event(&self, event: ProcessEvent) -> bool {
         match event {
             ProcessEvent::Exited(exit) => self.finish(exit),
+            ProcessEvent::CleanupUncertain(reason) => self.terminal(Err(reason)),
             other => self
                 .events
                 .lock()
@@ -88,25 +89,42 @@ impl Process {
     }
 
     fn finish(&self, exit: Exit) -> bool {
+        self.terminal(Ok(exit))
+    }
+
+    fn terminal(&self, result: Result<Exit, String>) -> bool {
         // One terminal event and result, even when stop/kill and an injected
         // exit race. No lock is held across await.
         let mut events = self.events.lock().unwrap();
         if let Some(tx) = events.take() {
-            let _ = tx.send(ProcessEvent::Exited(exit.clone()));
-            self.exit.send_replace(Some(exit));
+            let _ = tx.send(match &result {
+                Ok(exit) => ProcessEvent::Exited(exit.clone()),
+                Err(reason) => ProcessEvent::CleanupUncertain(reason.clone()),
+            });
+            self.exit.send_replace(Some(result));
             true
         } else {
             false
         }
     }
 
-    async fn wait(&self) -> Exit {
+    async fn result(&self) -> Result<Exit, ProcessError> {
         let mut rx = self.exit.subscribe();
         let result = rx
             .wait_for(Option::is_some)
             .await
             .expect("process owns exit sender");
-        result.clone().unwrap()
+        result
+            .clone()
+            .unwrap()
+            .map_err(ProcessError::CleanupUncertain)
+    }
+
+    async fn wait(&self) -> Exit {
+        match self.result().await {
+            Ok(exit) => exit,
+            Err(_) => std::future::pending().await,
+        }
     }
 
     fn killed(&self) {
@@ -184,6 +202,7 @@ impl State {
         }
         match self.processes.get(&id.pid) {
             Some(p) if p.identity != *id => Liveness::Reused,
+            Some(p) if matches!(&*p.exit.borrow(), Some(Err(_))) => Liveness::Uncertain,
             Some(p) if p.exit.borrow().is_none() => Liveness::Same,
             _ => Liveness::Gone,
         }
@@ -210,7 +229,7 @@ impl ProcessEngine for FakeProcessEngine {
         if state
             .processes
             .get(&identity.pid)
-            .is_some_and(|p| p.exit.borrow().is_none())
+            .is_some_and(|p| !matches!(&*p.exit.borrow(), Some(Ok(_))))
         {
             return Err(ProcessError::Spawn {
                 executable: cmd.executable,
@@ -278,6 +297,18 @@ impl ProcessEngine for FakeProcessEngine {
         if let Some(error) = state.enumeration_errors.pop_front() {
             return Err(error);
         }
+        if state.processes.values().any(|p| {
+            matches!(&*p.exit.borrow(), Some(Err(_)))
+                && p.identity.exe.starts_with(&marker.exe_root)
+                && p.command
+                    .args
+                    .iter()
+                    .any(|arg| Path::new(arg).starts_with(&marker.cmdline_root))
+        }) {
+            return Err(ProcessError::Enumeration(
+                "fake marked process cleanup uncertain".into(),
+            ));
+        }
         let mut found: Vec<_> = state
             .processes
             .values()
@@ -322,10 +353,10 @@ impl ProcessHandle for FakeHandle {
         }
         tokio::select! {
             biased;
-            exit = self.process.wait() => Ok(exit),
+            exit = self.process.result() => exit,
             () = self.engine.clock.sleep(grace) => {
                 self.process.killed();
-                Ok(self.process.wait().await)
+                self.process.result().await
             }
         }
     }
@@ -333,7 +364,7 @@ impl ProcessHandle for FakeHandle {
     async fn kill(&self) -> Result<Exit, ProcessError> {
         self.engine.record(Call::Kill(self.identity().clone()));
         self.process.killed();
-        Ok(self.process.wait().await)
+        self.process.result().await
     }
 
     async fn wait(&self) -> Exit {
@@ -346,6 +377,31 @@ impl ProcessHandle for FakeHandle {
 mod tests {
     use super::*;
     use futures_util::FutureExt;
+
+    #[tokio::test]
+    async fn uncertainty_is_terminal_without_fabricating_exit() {
+        let engine = FakeProcessEngine::default();
+        let mut handle = engine.spawn(command()).await.unwrap();
+        let mut events = handle.take_events().unwrap();
+        assert!(engine.emit(
+            handle.identity(),
+            ProcessEvent::CleanupUncertain("quarantine".into())
+        ));
+        assert_eq!(
+            events.recv().await,
+            Some(ProcessEvent::CleanupUncertain("quarantine".into()))
+        );
+        assert!(events.recv().await.is_none());
+        assert_eq!(
+            engine.liveness(handle.identity()).await,
+            Liveness::Uncertain
+        );
+        assert!(matches!(
+            handle.kill().await,
+            Err(ProcessError::CleanupUncertain(_))
+        ));
+        assert!(handle.wait().now_or_never().is_none());
+    }
 
     fn command() -> Command {
         Command {

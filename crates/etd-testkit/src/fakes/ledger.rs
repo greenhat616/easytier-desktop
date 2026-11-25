@@ -69,6 +69,9 @@ impl Ledger for MemoryLedger {
     async fn desired(&self) -> Result<(Revision, Vec<DesiredInstance>), LedgerError> {
         self.read(|s| Ok(s.desired()))
     }
+    async fn spec_revision(&self, instance: &InstanceId) -> Result<Revision, LedgerError> {
+        self.read(|s| s.spec_revision(instance))
+    }
     async fn settings(&self) -> Result<HostSettings, LedgerError> {
         self.read(|s| Ok(s.settings()))
     }

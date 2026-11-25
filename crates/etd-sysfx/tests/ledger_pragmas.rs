@@ -143,12 +143,14 @@ async fn completed_ticket_and_purge_remove_historical_secret() {
     let path = dir.path().join("ledger.sqlite");
     let boot = BootId("boot".into());
     let ledger = SqliteLedger::open(&path, boot.clone()).await.unwrap();
-    let mut change = put("a", Desired::Stopped, &[]);
+    let mut change = put("a", Desired::Running, &[]);
+    let mut generation = plan("a", 1, &[]);
     if let Change::PutInstance { instance, .. } = &mut change {
         instance.spec.as_mut().unwrap().network_secret = Some("synthetic-history-fixture".into());
+        generation.inputs.spec = instance.spec.clone().unwrap();
     }
     let receipt = ledger
-        .commit(0, changes("first", 1, vec![change], vec![]))
+        .commit(0, changes("first", 1, vec![change], vec![generation]))
         .await
         .unwrap();
     ledger.complete_ticket(&receipt.ticket).await.unwrap();
@@ -179,7 +181,27 @@ async fn completed_ticket_and_purge_remove_historical_secret() {
         .commit(1, changes("purge", 2, vec![Change::PurgeAll], vec![]))
         .await
         .unwrap();
-    assert_eq!(ledger.desired().await.unwrap(), (2, vec![]));
+    assert_eq!(
+        ledger.desired().await.unwrap().1[0].desired(),
+        Desired::Stopped
+    );
+    let effect = ledger
+        .open_effects(&ScopeFilter::all())
+        .await
+        .unwrap()
+        .remove(0);
+    ledger
+        .transition(&effect.id, EffectState::Reclaimed, None)
+        .await
+        .unwrap();
+    assert_eq!(ledger.desired().await.unwrap(), (3, vec![]));
+    assert!(
+        ledger
+            .generation(&"a".into(), Epoch(1))
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(
         std::fs::metadata(path.with_extension("sqlite-wal"))
             .unwrap()

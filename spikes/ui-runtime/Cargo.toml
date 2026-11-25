@@ -1,0 +1,29 @@
+[package]
+name = "ui-runtime-spike"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "LGPL-3.0-or-later"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1.0.105"
+async-channel = "2.5.0"
+gpui-kit = { version = "=0.11.0", default-features = false, features = ["component", "assets", "x11"] }
+muda = { version = "0.21.2", default-features = false }
+prost = "=0.14.6"
+tokio = { version = "1.54.1", default-features = false, features = ["rt-multi-thread", "sync", "time", "net", "io-util"] }
+tokio-stream = { version = "0.1.19", default-features = false, features = ["sync", "net"] }
+tokio-util = { version = "0.7.20", default-features = false }
+tonic = { version = "=0.14.9", default-features = false, features = ["router", "transport", "codegen"] }
+tonic-prost = "=0.14.9"
+tray-icon = { version = "0.26.1", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+muda = { version = "0.21.2", default-features = false, features = ["snapshot"] }
+tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
+
+[build-dependencies]
+tonic-prost-build = "=0.14.9"

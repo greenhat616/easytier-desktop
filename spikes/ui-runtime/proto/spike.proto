@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package spike.v1;
+
+service FakeHost {
+  rpc Ping(PingRequest) returns (PingReply);
+  rpc Subscribe(SubscribeRequest) returns (stream StatusEvent);
+}
+
+message PingRequest {
+  uint64 seq = 1;
+}
+
+message PingReply {
+  uint64 seq = 1;
+  uint64 server_tick = 2;
+}
+
+message SubscribeRequest {
+  uint64 from_seq = 1;
+}
+
+message StatusEvent {
+  uint64 seq = 1;
+  string state = 2;
+}

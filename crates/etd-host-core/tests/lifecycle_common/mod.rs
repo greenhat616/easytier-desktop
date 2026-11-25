@@ -961,6 +961,16 @@ impl Host<'_> {
             .unwrap()
     }
 
+    pub async fn purge(&mut self) -> Receipt {
+        let revision = self.world.ledger.inner.desired().await.unwrap().0;
+        let planned = Planned {
+            claims: Vec::new(),
+            generation: None,
+            revision,
+        };
+        self.commit(planned, vec![Change::PurgeAll]).await.unwrap()
+    }
+
     pub async fn remove(&mut self, instance: &str) -> Receipt {
         let revision = self.world.ledger.inner.desired().await.unwrap().0;
         let planned = Planned {

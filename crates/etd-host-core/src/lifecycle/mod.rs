@@ -78,6 +78,11 @@ pub(crate) struct Ctx {
     /// Set while the self-check's kernel sweep has not succeeded: no
     /// instance starts (the reason is shown while waiting).
     pub hold: std::sync::Mutex<Option<String>>,
+    /// Instances quarantined without a record (the quarantine could not be
+    /// persisted): left out of every automatic reclaim, across re-sweeps,
+    /// until a sweep of their own run directories proves no kernel of
+    /// theirs is alive (RetryReclaim).
+    pub excluded: std::sync::Mutex<std::collections::BTreeSet<InstanceId>>,
 }
 
 impl Ctx {
@@ -86,6 +91,45 @@ impl Ctx {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    pub(crate) fn excluded(&self) -> std::collections::BTreeSet<InstanceId> {
+        self.excluded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn exclude(&self, instances: impl IntoIterator<Item = InstanceId>) {
+        self.excluded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(instances);
+    }
+
+    pub(crate) fn readmit(&self, instance: &InstanceId) {
+        self.excluded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(instance);
+    }
+
+    /// Why no reclaim beyond single generations may run now, if so.
+    pub(crate) fn unproven(&self) -> Option<String> {
+        if let Some(why) = self.held() {
+            return Some(why);
+        }
+        let excluded = self.excluded();
+        (!excluded.is_empty()).then(|| {
+            format!(
+                "instances quarantined without a record: {}",
+                excluded
+                    .iter()
+                    .map(InstanceId::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
     }
 
     fn set_hold(&self, hold: Option<String>) {
@@ -130,6 +174,7 @@ impl Orchestrator {
                 deps,
                 config,
                 hold: std::sync::Mutex::new(None),
+                excluded: std::sync::Mutex::new(Default::default()),
             }),
             port,
         }
@@ -160,6 +205,8 @@ impl Orchestrator {
             tickets_due: None,
             resweep_due: None,
             lease_deadline: None,
+            purge_due: None,
+            purge_wait: None,
             purge: None,
             ending: None,
             shutdown_replies: Vec::new(),
@@ -201,6 +248,10 @@ struct Actor {
     resweep_due: Option<Instant>,
     /// Session-form host: no lease since; the host winds down at this time.
     lease_deadline: Option<Instant>,
+    /// A deferred purge is tried again at this time.
+    purge_due: Option<Instant>,
+    /// Why the purge last waited (logged once per reason).
+    purge_wait: Option<String>,
     /// A PurgeAll ticket waits for every supervisor to end.
     purge: Option<String>,
     ending: Option<Ending>,
@@ -270,6 +321,7 @@ impl Actor {
             let ticket_sleep = until(self.tickets_due);
             let resweep_sleep = until(self.resweep_due);
             let lease_sleep = until(self.lease_deadline);
+            let purge_sleep = until(self.purge_due);
             tokio::select! {
                 biased;
                 report = self.reports_rx.recv() => {
@@ -293,6 +345,14 @@ impl Actor {
                 () = resweep_sleep => {
                     self.resweep_due = None;
                     self.resweep().await;
+                }
+                () = purge_sleep => {
+                    self.purge_due = None;
+                    if self.supervisors.is_empty()
+                        && let Some(ticket) = self.purge.take()
+                    {
+                        self.finish_purge(ticket).await;
+                    }
                 }
                 () = lease_sleep => {
                     self.lease_deadline = None;
@@ -745,6 +805,19 @@ impl Actor {
             .await
             .map_err(|e| ledger_detail(&e, instance))?;
         let current = desired.iter().find(|d| d.instance_id == instance.0);
+        // Kernel output is redacted line by line (`logs::LineBuffer`): a
+        // secret spanning a line break could never be matched.
+        if spec
+            .as_ref()
+            .and_then(|s| s.network_secret.as_deref())
+            .is_some_and(|s| s.contains(['\n', '\r']))
+        {
+            return Err(error(
+                ErrorCode::InvalidSpec,
+                "the network secret must not contain a line break",
+                instance.as_str(),
+            ));
+        }
         let (spec, spec_revision) = match spec {
             // PutInstance: the commit's own revision.
             Some(new) => (
@@ -1009,7 +1082,20 @@ impl Actor {
     /// Every instance is gone: reclaim product and kernel-binary records
     /// too, then complete the purge ticket (refused while a removal is
     /// still pending behind an open generation).
+    ///
+    /// Behind the same proof gate as the self-check (msg#650): while the
+    /// kernel sweep has not succeeded, or an instance is quarantined
+    /// without a record, the purge waits (ticket pending) and is retried.
     async fn finish_purge(&mut self, ticket: String) {
+        if let Some(why) = self.ctx.unproven() {
+            if self.purge_wait.as_ref() != Some(&why) {
+                self.host_log(format!("purge waits: {why}"));
+                self.purge_wait = Some(why);
+            }
+            self.purge = Some(ticket);
+            self.purge_due = Some(self.ctx.deps.clock.now() + self.ctx.config.reclaim_retry);
+            return;
+        }
         match self
             .ctx
             .deps

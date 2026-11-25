@@ -477,3 +477,18 @@ async fn an_unknown_baseline_never_starts_the_generation() {
     let open = world.open_records("a").await;
     assert!(open.iter().all(|e| e.state != EffectState::Conflict));
 }
+
+#[tokio::test]
+async fn a_secret_with_a_line_break_is_refused() {
+    let world = World::new();
+    let mut h = world.start();
+    h.wait_serving().await;
+    for bad in ["two\nlines", "carriage\rreturn"] {
+        let s = etd_contract::NetworkSpec {
+            network_secret: Some(bad.into()),
+            ..spec("net")
+        };
+        let e = h.plan("a", Some(s), true).await.unwrap_err();
+        assert_eq!(e.code(), ErrorCode::InvalidSpec, "{e:?}");
+    }
+}

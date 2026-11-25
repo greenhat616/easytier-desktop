@@ -1891,6 +1891,9 @@ impl Supervisor {
                             self.notice(NoticeLevel::Error, "reclaim.orphan", why);
                             return Flow::Continue;
                         }
+                        // No kernel of this instance is alive outside a
+                        // record: automatic reclaim may include it again.
+                        self.ctx.readmit(&self.id);
                         self.set_state(InstanceState::Reclaiming, "retrying reclaim");
                         return self.reclaim(epoch, Then::Settle, true).await;
                     }

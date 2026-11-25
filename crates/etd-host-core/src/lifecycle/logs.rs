@@ -63,6 +63,10 @@ const MAX_PARTIAL: usize = 64 * 1024;
 /// the last `longest secret - 1` bytes stay behind: any secret not yet
 /// replaced is incomplete, so it starts inside that tail and is matched
 /// once the rest arrives. No secret survives a cut.
+///
+/// Matching is per line, so a secret must not contain a line break: Plan
+/// refuses such a network secret (INVALID_SPEC, msg#650). Only exact
+/// occurrences are replaced; escaped forms are not (accepted, msg#631).
 #[derive(Default)]
 pub(crate) struct LineBuffer {
     partial: Vec<u8>,

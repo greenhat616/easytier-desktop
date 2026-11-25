@@ -350,11 +350,12 @@ pub(crate) async fn self_check(ctx: Arc<Ctx>) -> BootOutcome {
     // Step 4: reclaim every open generation (the engine holds those whose
     // kernel is not verified dead), only once every kernel of ours is
     // accounted for; otherwise it waits for a successful re-sweep.
+    ctx.exclude(excluded);
     let report = if hold.is_some() {
         log.push("self-check: automatic reclaim deferred until the kernel sweep succeeds".into());
         None
     } else {
-        reclaim_proven(&ctx, &excluded, &mut log).await
+        reclaim_proven(&ctx, &ctx.excluded(), &mut log).await
     };
 
     // Step 5: compact closed records.
@@ -691,8 +692,10 @@ pub(crate) async fn resweep(ctx: &Ctx) -> Result<Resweep, String> {
     }
     let mut log = sweep.log;
     let mut notices = Vec::new();
-    let excluded = quarantine_orphans(ctx, &sweep.quarantine, &mut log, &mut notices).await;
-    let report = reclaim_proven(ctx, &excluded, &mut log).await;
+    // Earlier unrecorded quarantines stay excluded: a sweep that no longer
+    // sees their orphan proves nothing about it (msg#650).
+    ctx.exclude(quarantine_orphans(ctx, &sweep.quarantine, &mut log, &mut notices).await);
+    let report = reclaim_proven(ctx, &ctx.excluded(), &mut log).await;
     if let Err(e) = ctx.deps.ledger.compact().await {
         log.push(format!("self-check: compaction failed: {e}"));
     }

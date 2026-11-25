@@ -511,3 +511,125 @@ async fn a_resweep_quarantines_an_attributable_survivor() {
     );
     assert_eq!(world.spawned().len(), 3, "a never restarted");
 }
+
+#[tokio::test]
+async fn an_unrecorded_quarantine_outlives_a_successful_resweep() {
+    let world = World::new();
+    crashed_with(&world, &["a", "b"]).await;
+    // a: unkillable orphan of its closed generation 9 (quarantine held in
+    // memory only); plus a survivor nobody can be blamed for (global hold).
+    let orphan = world
+        .engine
+        .spawn(Command {
+            executable: world.store.binary.clone(),
+            args: vec![world.dirs.run_dir.join("a").join("9").join("c.toml").into()],
+            env: Vec::new(),
+            cwd: None,
+        })
+        .await
+        .unwrap()
+        .identity()
+        .clone();
+    std::fs::create_dir_all(world.dirs.run_dir.join("a").join("9")).unwrap();
+    world
+        .engine
+        .set_liveness(&orphan, Some(Liveness::Uncertain));
+    let stray = unattributable_stray(&world).await;
+    world.engine.set_liveness(&stray, Some(Liveness::Uncertain));
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.wait_state("a", S::Quarantined).await;
+    // The orphan drops out of sight, the stray becomes killable: the
+    // re-sweep succeeds without seeing a's orphan.
+    world.engine.set_liveness(&orphan, None);
+    world.engine.exit(
+        &orphan,
+        etd_proc::Exit {
+            code: None,
+            signal: None,
+            cause: etd_proc::ExitCause::Exited,
+        },
+    );
+    world.engine.set_liveness(&stray, None);
+    h.until("b restarted", |h| {
+        h.status("b")
+            .is_some_and(|s| s.epoch == 2 && s.state() == S::ReadyFull)
+    })
+    .await;
+    assert_eq!(notices(&mut h, "selfcheck.complete").len(), 1);
+    // a is still excluded: its generation 1 untouched, still quarantined.
+    h.idle(
+        std::time::Duration::from_millis(500),
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(h.state("a"), S::Quarantined);
+    let open = world.open_records("a").await;
+    assert!(
+        !open.is_empty()
+            && open
+                .iter()
+                .all(|e| matches!(e.state, EffectState::Applied | EffectState::Planned)),
+        "{open:?}"
+    );
+    // Only a sweep of a's own directories (RetryReclaim) readmits it.
+    h.retry_reclaim("a").await;
+    h.until("a restarted", |h| h.state("a") == S::ReadyFull)
+        .await;
+}
+
+#[tokio::test]
+async fn a_purge_waits_for_the_proof() {
+    let world = World::new();
+    crashed_with(&world, &[]).await;
+    let stray = unattributable_stray(&world).await;
+    world.engine.set_liveness(&stray, Some(Liveness::Uncertain));
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.purge().await;
+    h.idle(
+        std::time::Duration::from_millis(500),
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(
+        world.ledger.inner.pending_tickets().await.unwrap().len(),
+        1,
+        "the purge ticket stays pending"
+    );
+    assert!(
+        host_log(&mut h)
+            .await
+            .iter()
+            .any(|l| l.contains("purge waits"))
+    );
+    world.engine.set_liveness(&stray, None);
+    h.until("purged", |_| true).await;
+    for _ in 0..50 {
+        if world
+            .ledger
+            .inner
+            .pending_tickets()
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            break;
+        }
+        h.idle(
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+    }
+    assert!(
+        world
+            .ledger
+            .inner
+            .pending_tickets()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(world.kernel.liveness(&stray).await, Liveness::Gone);
+}

@@ -20,6 +20,7 @@ use tokio::{
 #[derive(Default, Clone)]
 pub struct ProcessKitEngine {
     console_helper: Option<PathBuf>,
+    markers: Arc<Mutex<HashMap<ProcessIdentity, ProcessMarker>>>,
 }
 
 impl ProcessKitEngine {
@@ -32,6 +33,7 @@ impl ProcessKitEngine {
     pub fn with_console_helper(executable: PathBuf) -> Self {
         Self {
             console_helper: Some(executable),
+            ..Self::default()
         }
     }
 }
@@ -43,49 +45,43 @@ fn registry() -> &'static Registry {
 }
 struct Live {
     requests: mpsc::Sender<Request>,
-    exit: watch::Receiver<Option<Exit>>,
-    failure: watch::Receiver<Option<String>>,
+    terminal: watch::Receiver<Option<Terminal>>,
 }
+type Terminal = Result<Exit, String>;
 struct Request {
     grace: Option<Duration>,
-    ack: oneshot::Sender<Result<(), ProcessError>>,
+    reply: oneshot::Sender<Result<Exit, ProcessError>>,
 }
 impl Live {
     async fn wait(&self) -> Exit {
-        let mut rx = self.exit.clone();
-        if let Ok(exit) = rx.wait_for(Option::is_some).await {
-            return exit.clone().unwrap();
+        let mut rx = self.terminal.clone();
+        if let Ok(terminal) = rx.wait_for(Option::is_some).await
+            && let Some(Ok(exit)) = &*terminal
+        {
+            return exit.clone();
         }
         // Interrupted worker is not proof of death. The frozen wait API
         // cannot represent an error; never fabricate an exit.
         std::future::pending().await
     }
     async fn request(&self, grace: Option<Duration>) -> Result<Exit, ProcessError> {
-        if let Some(exit) = self.exit.borrow().clone() {
-            return Ok(exit);
+        if let Some(terminal) = self.terminal.borrow().clone() {
+            return terminal.map_err(ProcessError::CleanupUncertain);
         }
-        let (ack, response) = oneshot::channel();
-        let mut failure = self.failure.clone();
-        if self.requests.send(Request { grace, ack }).await.is_ok() {
-            tokio::select! {
-                biased;
-                response = response => if let Ok(result) = response { result?; },
-                error = failure.wait_for(Option::is_some) => {
-                    if let Ok(error) = error { return Err(ProcessError::Signal(error.clone().unwrap())); }
-                }
-            }
+        let (reply, response) = oneshot::channel();
+        if self.requests.send(Request { grace, reply }).await.is_ok()
+            && let Ok(result) = response.await
+        {
+            return result;
         }
-        let mut rx = self.exit.clone();
-        tokio::select! {
-            biased;
-            exit = rx.wait_for(Option::is_some) => {
-                let exit = exit.map_err(|_| ProcessError::Signal("worker ended without confirmed exit".into()))?;
-                Ok(exit.clone().unwrap())
-            }
-            error = failure.wait_for(Option::is_some) => {
-                Err(ProcessError::Signal(error.map(|e| e.clone().unwrap()).unwrap_or_else(|_| "worker ended without confirmed exit".into())))
-            }
-        }
+        let mut rx = self.terminal.clone();
+        let terminal = rx.wait_for(Option::is_some).await.map_err(|_| {
+            ProcessError::CleanupUncertain("worker ended without confirmed cleanup".into())
+        })?;
+        terminal
+            .clone()
+            .unwrap()
+            .map_err(ProcessError::CleanupUncertain)
     }
 }
 struct Handle {
@@ -93,6 +89,7 @@ struct Handle {
     containment: Containment,
     live: Arc<Live>,
     events: Option<mpsc::Receiver<ProcessEvent>>,
+    _cancel: oneshot::Sender<()>,
 }
 #[async_trait]
 impl ProcessHandle for Handle {
@@ -190,6 +187,53 @@ fn liveness(id: &ProcessIdentity) -> Liveness {
         _ => Liveness::Uncertain,
     }
 }
+
+/// For a candidate, a missing criterion is unknown, not a negative match.
+/// A positive mismatch in any independently observed criterion excludes it.
+fn match_criteria(
+    owner: Option<bool>,
+    image: Option<bool>,
+    argv: Option<bool>,
+) -> Result<bool, ProcessError> {
+    let fields = [owner, image, argv];
+    if fields.contains(&Some(false)) {
+        return Ok(false);
+    }
+    if fields.contains(&None) {
+        return Err(ProcessError::Enumeration(
+            "candidate marker fields are unobservable".into(),
+        ));
+    }
+    Ok(true)
+}
+
+fn candidate_matches(
+    process: &sysinfo::Process,
+    own: &sysinfo::Uid,
+    marker: &ProcessMarker,
+) -> Result<bool, ProcessError> {
+    if matches!(
+        process.status(),
+        ProcessStatus::Zombie | ProcessStatus::Dead
+    ) {
+        return Ok(false);
+    }
+    match_criteria(
+        process.user_id().map(|user| user == own),
+        process.exe().and_then(|exe| {
+            let exe = identity::normalized(exe).ok()?;
+            let root = identity::normalized(&marker.exe_root).ok()?;
+            Some(exe.starts_with(root))
+        }),
+        (!process.cmd().is_empty()).then(|| {
+            process
+                .cmd()
+                .iter()
+                .skip(1)
+                .any(|arg| identity::under(Path::new(arg), &marker.cmdline_root))
+        }),
+    )
+}
 fn marked(marker: &ProcessMarker) -> Result<Vec<ProcessIdentity>, ProcessError> {
     let snapshot = identity::snapshot(ProcessesToUpdate::All)?;
     let own = snapshot
@@ -203,31 +247,25 @@ fn marked(marker: &ProcessMarker) -> Result<Vec<ProcessIdentity>, ProcessError> 
             .iter()
             .skip(1)
             .any(|arg| identity::under(Path::new(arg), &marker.cmdline_root));
-        let Some(exe) = process.exe() else {
-            if cmd_matches && (process.user_id().is_none() || process.user_id() == Some(own)) {
+        let image_matches = process
+            .exe()
+            .is_some_and(|exe| identity::under(exe, &marker.exe_root));
+        // Positive evidence from either marker component makes this a
+        // candidate. System processes with no matching evidence are not
+        // candidates. Re-inspect every candidate before excluding it.
+        if !cmd_matches && !image_matches {
+            if process.user_id() == Some(own)
+                && process.exe().is_none()
+                && process.cmd().is_empty()
+                && !matches!(
+                    process.status(),
+                    ProcessStatus::Zombie | ProcessStatus::Dead
+                )
+            {
                 return Err(ProcessError::Enumeration(
-                    "cannot inspect possible marked image".into(),
+                    "same-user process image and argv are both unobservable".into(),
                 ));
             }
-            continue;
-        };
-        if !identity::under(exe, &marker.exe_root) {
-            continue;
-        }
-        if process.user_id() != Some(own) {
-            if process.user_id().is_none() && (cmd_matches || process.cmd().is_empty()) {
-                return Err(ProcessError::Enumeration(
-                    "cannot determine candidate user".into(),
-                ));
-            }
-            continue;
-        }
-        if process.cmd().is_empty() {
-            return Err(ProcessError::Enumeration(
-                "cannot inspect candidate command line".into(),
-            ));
-        }
-        if !cmd_matches {
             continue;
         }
         let pid = process.pid().as_u32();
@@ -249,119 +287,274 @@ fn marked(marker: &ProcessMarker) -> Result<Vec<ProcessIdentity>, ProcessError> 
         let pids = [identity::pid(pid)];
         let fresh = identity::snapshot(ProcessesToUpdate::Some(&pids))?;
         let Some(p) = fresh.process(pids[0]) else {
-            continue;
-        };
-        if p.user_id() != Some(own)
-            || !p
-                .exe()
-                .is_some_and(|exe| identity::under(exe, &marker.exe_root))
-            || !p
-                .cmd()
-                .iter()
-                .skip(1)
-                .any(|arg| identity::under(Path::new(arg), &marker.cmdline_root))
-        {
-            continue;
-        }
-        if let Some(current) = inspect(pid)?
-            && current.start_token == token
-            && identity::under(&current.exe, &marker.exe_root)
-        {
-            #[cfg(any(windows, target_os = "linux"))]
-            if pin.gone() {
+            if read_token(pid)?.is_none() {
                 continue;
             }
-            found.push(current);
+            return Err(ProcessError::Enumeration(
+                "candidate disappeared from snapshot but is not confirmed exited".into(),
+            ));
+        };
+        if !candidate_matches(p, own, marker)? {
+            continue;
         }
+        let Some(current) = inspect(pid)? else {
+            continue;
+        };
+        if current.start_token != token || !identity::under(&current.exe, &marker.exe_root) {
+            return Err(ProcessError::Enumeration(
+                "candidate identity changed during marker sweep".into(),
+            ));
+        }
+        #[cfg(any(windows, target_os = "linux"))]
+        if pin.gone() {
+            continue;
+        }
+        found.push(current);
     }
     found.sort_by_key(|id| id.pid);
     Ok(found)
 }
-fn verdict(value: Liveness) -> KillOutcome {
-    match value {
-        Liveness::Same | Liveness::Uncertain => KillOutcome::Uncertain,
-        Liveness::Reused => KillOutcome::Reused,
-        Liveness::Gone => KillOutcome::Gone,
+/// A stale Windows PPID is not ancestry: a real child cannot predate
+/// its parent. Unreadable candidate metadata is an uncertainty, not absence.
+fn possible_children(
+    snapshot: &sysinfo::System,
+    id: &ProcessIdentity,
+) -> Result<Vec<u32>, ProcessError> {
+    let mut children = Vec::new();
+    for p in snapshot.processes().values() {
+        if p.parent() != Some(identity::pid(id.pid))
+            || matches!(p.status(), ProcessStatus::Zombie | ProcessStatus::Dead)
+        {
+            continue;
+        }
+        let pid = p.pid().as_u32();
+        let Some(token) = read_token(pid)? else {
+            continue;
+        };
+        #[cfg(windows)]
+        {
+            let child_time: u64 = token
+                .parse()
+                .map_err(|_| ProcessError::Enumeration("invalid child creation time".into()))?;
+            let parent_time: u64 = id
+                .start_token
+                .parse()
+                .map_err(|_| ProcessError::Enumeration("invalid parent creation time".into()))?;
+            if child_time < parent_time {
+                continue;
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = token;
+        children.push(pid);
     }
+    Ok(children)
 }
 
-/// Orphan: pin before verification, signal only via pin. If descendants
-/// lack a containment credential, quarantine instead of guessing ownership.
+fn verify_marked_identity(
+    id: &ProcessIdentity,
+    marker: &ProcessMarker,
+) -> Result<bool, ProcessError> {
+    let all = identity::snapshot(ProcessesToUpdate::Some(&[
+        identity::pid(id.pid),
+        identity::pid(std::process::id()),
+    ]))?;
+    let own = all
+        .process(identity::pid(std::process::id()))
+        .and_then(|p| p.user_id())
+        .ok_or_else(|| ProcessError::Enumeration("cannot determine host user".into()))?;
+    let p = all
+        .process(identity::pid(id.pid))
+        .ok_or_else(|| ProcessError::Enumeration("candidate missing from snapshot".into()))?;
+    Ok(candidate_matches(p, own, marker)? && liveness(id) == Liveness::Same)
+}
+
+/// Post-termination enumeration. A Unix descendant can be reparented before
+/// this snapshot; a newly observed same-user process in the old group (or
+/// matching the marker) is possible residual work, not proof of absence.
+fn orphan_recheck(
+    before: &sysinfo::System,
+    id: &ProcessIdentity,
+    marker: Option<&ProcessMarker>,
+    group: Option<i32>,
+) -> Result<KillOutcome, ProcessError> {
+    let after = identity::snapshot(ProcessesToUpdate::All)?;
+    if !possible_children(&after, id)?.is_empty() {
+        return Ok(KillOutcome::Uncertain);
+    }
+    #[cfg(unix)]
+    {
+        let uid = before
+            .process(identity::pid(id.pid))
+            .and_then(|p| p.user_id())
+            .ok_or_else(|| ProcessError::Enumeration("missing orphan owner".into()))?;
+        for p in after.processes().values() {
+            if p.pid() == identity::pid(id.pid)
+                || matches!(p.status(), ProcessStatus::Zombie | ProcessStatus::Dead)
+            {
+                continue;
+            }
+            if before
+                .process(p.pid())
+                .is_some_and(|old| old.start_time() == p.start_time())
+            {
+                continue;
+            }
+            if p.user_id().is_some_and(|owner| owner != uid) {
+                continue;
+            }
+            let pid = p.pid().as_u32();
+            // No signals are sent during this independent observation.
+            let same_group = match identity::process_group(pid) {
+                Ok(g) => group == Some(g),
+                Err(_) => {
+                    if read_token(pid)?.is_none() {
+                        continue;
+                    }
+                    return Ok(KillOutcome::Uncertain);
+                }
+            };
+            let same_marker = marker.is_some_and(|m| {
+                p.exe().is_some_and(|exe| identity::under(exe, &m.exe_root))
+                    && p.cmd()
+                        .iter()
+                        .skip(1)
+                        .any(|arg| identity::under(Path::new(arg), &m.cmdline_root))
+            });
+            if same_group || same_marker {
+                return Ok(KillOutcome::Uncertain);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (before, marker, group);
+    Ok(KillOutcome::Killed)
+}
+
+/// Orphan: pin before verification and signal only via that pin on
+/// Windows/Linux. A disappeared/reused root without its recorded containment
+/// is not proof that the previous tree was drained.
 #[cfg(any(windows, target_os = "linux"))]
-fn kill_orphan(id: &ProcessIdentity) -> Result<KillOutcome, ProcessError> {
+fn kill_orphan(
+    id: &ProcessIdentity,
+    marker: Option<&ProcessMarker>,
+) -> Result<KillOutcome, ProcessError> {
     if id.pid == std::process::id() || id.pid == 0 {
         return Ok(KillOutcome::Uncertain);
     }
     let pin = match identity::Pin::open(id.pid, true) {
         Ok(pin) => pin,
-        Err(_) => return Ok(verdict(liveness(id))),
+        Err(_) => return Ok(KillOutcome::Uncertain),
     };
-    let state = liveness(id);
-    if state != Liveness::Same {
-        return Ok(verdict(state));
+    if liveness(id) != Liveness::Same || pin.gone() {
+        return Ok(KillOutcome::Uncertain);
     }
-    if pin.gone() {
-        return Ok(KillOutcome::Gone);
+    if let Some(marker) = marker
+        && !verify_marked_identity(id, marker)?
+    {
+        return Ok(KillOutcome::Uncertain);
     }
-    let snapshot = identity::snapshot(ProcessesToUpdate::All)?;
-    let owner = snapshot
+    let before = identity::snapshot(ProcessesToUpdate::All)?;
+    let owner = before
         .process(identity::pid(id.pid))
         .and_then(|p| p.user_id());
-    let host = snapshot
+    let host = before
         .process(identity::pid(std::process::id()))
         .and_then(|p| p.user_id());
     if owner.is_none() || owner != host {
         return Ok(KillOutcome::Uncertain);
     }
-    let descendants: Vec<_> = snapshot
-        .processes()
-        .values()
-        .filter(|p| p.parent() == Some(identity::pid(id.pid)))
-        .map(|p| p.pid().as_u32())
-        .collect();
-    if !descendants.is_empty() {
-        // Without the original group we cannot prove that a descendant
-        // cannot fork during a multi-process sweep. Preserve the parent
-        // identity so the operator can resolve the entire quarantined tree.
-        for child in descendants {
-            let child_pin = identity::Pin::open(child, false).ok();
-            let token = read_token(child).ok().flatten();
-            let verified = child_pin.as_ref().is_some_and(|pin| !pin.gone())
-                && token.is_some()
-                && identity::snapshot(ProcessesToUpdate::Some(&[identity::pid(child)]))
-                    .ok()
-                    .and_then(|s| s.process(identity::pid(child)).and_then(|p| p.parent()))
-                    == Some(identity::pid(id.pid))
-                && read_token(child).ok().flatten() == token;
-            tracing::warn!(
-                parent = id.pid,
-                child,
-                ?token,
-                verified,
-                "orphan descendant has no verified containment"
-            );
-        }
+    let children = possible_children(&before, id)?;
+    if !children.is_empty() {
+        tracing::warn!(
+            parent = id.pid,
+            ?children,
+            "orphan descendants lack verified containment"
+        );
+        return Ok(KillOutcome::Uncertain);
+    }
+    #[cfg(target_os = "linux")]
+    let group = Some(identity::process_group(id.pid)?);
+    #[cfg(windows)]
+    let group = None;
+    if pin.gone() || liveness(id) != Liveness::Same {
+        return Ok(KillOutcome::Uncertain);
+    }
+    if let Some(marker) = marker
+        && !verify_marked_identity(id, marker)?
+    {
         return Ok(KillOutcome::Uncertain);
     }
     if let Err(e) = pin.stop() {
         return match liveness(id) {
             Liveness::Same => Err(ProcessError::Signal(e.to_string())),
-            other => Ok(verdict(other)),
+            _ => Ok(KillOutcome::Uncertain),
         };
     }
     for _ in 0..100 {
         if pin.gone() {
-            return Ok(KillOutcome::Killed);
+            return orphan_recheck(&before, id, marker, group);
         }
         std::thread::sleep(Duration::from_millis(20));
     }
     Ok(KillOutcome::Uncertain)
 }
-#[cfg(not(any(windows, target_os = "linux")))]
-fn kill_orphan(id: &ProcessIdentity) -> Result<KillOutcome, ProcessError> {
-    Ok(verdict(liveness(id)))
-}
 
+/// Human ruling: macOS lacks a race-free process pin. Verify all marker
+/// criteria immediately before signaling; the narrow verify-to-signal TOCTOU
+/// remains on this platform only. Never signal a foreign process group.
+#[cfg(target_os = "macos")]
+fn kill_orphan(
+    id: &ProcessIdentity,
+    marker: Option<&ProcessMarker>,
+) -> Result<KillOutcome, ProcessError> {
+    let Some(marker) = marker else {
+        return Ok(KillOutcome::Uncertain);
+    };
+    if id.pid == std::process::id() || id.pid == 0 || liveness(id) != Liveness::Same {
+        return Ok(KillOutcome::Uncertain);
+    }
+    let before = identity::snapshot(ProcessesToUpdate::All)?;
+    let group = identity::process_group(id.pid)?;
+    let own_group = group == i32::try_from(id.pid).map_err(io::Error::other)?;
+    let children = possible_children(&before, id)?;
+    if !children.is_empty() {
+        if !own_group {
+            return Ok(KillOutcome::Uncertain);
+        }
+        for child in children {
+            if identity::process_group(child).ok() != Some(group) {
+                return Ok(KillOutcome::Uncertain);
+            }
+        }
+    }
+    // No await or enumeration between final identity observation and signal.
+    if !verify_marked_identity(id, marker)? {
+        return Ok(KillOutcome::Uncertain);
+    }
+    if identity::process_group(id.pid)? != group
+        || read_token(id.pid)?.as_ref() != Some(&id.start_token)
+    {
+        return Ok(KillOutcome::Uncertain);
+    }
+    identity::signal_verified_orphan(id.pid, own_group)?;
+    for _ in 0..100 {
+        if matches!(liveness(id), Liveness::Gone | Liveness::Reused)
+            && (!own_group || identity::group_absent(group)?)
+        {
+            return orphan_recheck(&before, id, Some(marker), Some(group));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(KillOutcome::Uncertain)
+}
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn kill_orphan(
+    _: &ProcessIdentity,
+    _: Option<&ProcessMarker>,
+) -> Result<KillOutcome, ProcessError> {
+    Ok(KillOutcome::Uncertain)
+}
 #[async_trait]
 impl ProcessEngine for ProcessKitEngine {
     async fn spawn(&self, cmd: Command) -> Result<Box<dyn ProcessHandle>, ProcessError> {
@@ -381,29 +574,39 @@ impl ProcessEngine for ProcessKitEngine {
         let handle = receiver
             .await
             .map_err(|_| ProcessError::Signal("process worker failed during spawn".into()))??;
-        let mut registry = registry().lock().unwrap();
-        registry.retain(|_, live| live.strong_count() != 0);
-        registry.insert(handle.id.clone(), Arc::downgrade(&handle.live));
         Ok(Box::new(handle))
     }
     async fn liveness(&self, id: &ProcessIdentity) -> Liveness {
+        let live = registry().lock().unwrap().get(id).and_then(Weak::upgrade);
         let id = id.clone();
-        tokio::task::spawn_blocking(move || liveness(&id))
+        let result = tokio::task::spawn_blocking(move || liveness(&id))
             .await
-            .unwrap_or(Liveness::Uncertain)
+            .unwrap_or(Liveness::Uncertain);
+        if let Some(live) = live {
+            match &*live.terminal.borrow() {
+                Some(Ok(_)) => {}
+                Some(Err(_)) => return Liveness::Uncertain,
+                None if result != Liveness::Same => return Liveness::Uncertain,
+                None => {}
+            }
+        }
+        result
     }
     async fn kill_verified(&self, id: &ProcessIdentity) -> Result<KillOutcome, ProcessError> {
         let live = registry().lock().unwrap().get(id).and_then(Weak::upgrade);
         if let Some(live) = live {
-            let state = self.liveness(id).await;
-            if state != Liveness::Same {
-                return Ok(verdict(state));
-            }
-            live.request(None).await?;
-            return Ok(KillOutcome::Killed);
+            // The exact registered identity owns a private containment;
+            // root liveness alone cannot prove the group is drained.
+            return match live.request(None).await {
+                Ok(exit) if exit.cause == ExitCause::Exited => Ok(KillOutcome::Gone),
+                Ok(_) => Ok(KillOutcome::Killed),
+                Err(ProcessError::CleanupUncertain(_)) => Ok(KillOutcome::Uncertain),
+                Err(error) => Err(error),
+            };
         }
+        let marker = self.markers.lock().unwrap().get(id).cloned();
         let id = id.clone();
-        tokio::task::spawn_blocking(move || kill_orphan(&id))
+        tokio::task::spawn_blocking(move || kill_orphan(&id, marker.as_ref()))
             .await
             .map_err(|e| ProcessError::Signal(e.to_string()))?
     }
@@ -411,10 +614,16 @@ impl ProcessEngine for ProcessKitEngine {
         &self,
         marker: &ProcessMarker,
     ) -> Result<Vec<ProcessIdentity>, ProcessError> {
-        let marker = marker.clone();
-        tokio::task::spawn_blocking(move || marked(&marker))
+        let query = marker.clone();
+        let found = tokio::task::spawn_blocking(move || marked(&query))
             .await
-            .map_err(|e| ProcessError::Enumeration(e.to_string()))?
+            .map_err(|e| ProcessError::Enumeration(e.to_string()))??;
+        let mut bindings = self.markers.lock().unwrap();
+        bindings.retain(|_, existing| existing != marker);
+        for id in &found {
+            bindings.insert(id.clone(), marker.clone());
+        }
+        Ok(found)
     }
 }
 
@@ -460,6 +669,58 @@ fn containment(group: &processkit::ProcessGroup) -> Result<Containment, ProcessE
         )),
     }
 }
+
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Signal success is not an empty-containment observation. Reap the root
+/// before using this bounded confirmation (process-group leaders may be
+/// zombies until waited). Never publish Exited on a failed membership probe.
+async fn confirm_empty(group: &processkit::ProcessGroup) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
+    loop {
+        let result = group.kill_all().and_then(|()| group.members());
+        let reason = match result {
+            Ok(members) if members.is_empty() => return Ok(()),
+            Ok(members) => format!("containment still has {} tracked members", members.len()),
+            Err(error) => error.to_string(),
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(reason);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn rollback_started(
+    group: &processkit::ProcessGroup,
+    running: processkit::RunningProcess,
+) -> Result<Exit, ProcessError> {
+    let mut wait = std::pin::pin!(running.wait());
+    let deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
+    let outcome = loop {
+        tokio::select! {
+            biased;
+            result = &mut wait => break result,
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                if tokio::time::Instant::now() >= deadline { return Err(ProcessError::CleanupUncertain("startup rollback could not observe root exit".into())); }
+                if let Err(error) = group.kill_all() { tracing::warn!(%error, "startup rollback signal failed"); }
+            }
+        }
+    };
+    confirm_empty(group)
+        .await
+        .map_err(ProcessError::CleanupUncertain)?;
+    match outcome {
+        Ok(outcome) => Ok(Exit {
+            code: outcome.code(),
+            signal: outcome.signal(),
+            cause: ExitCause::Exited,
+        }),
+        Err(error) => Err(ProcessError::CleanupUncertain(format!(
+            "rollback wait did not observe an exit: {error}"
+        ))),
+    }
+}
 async fn launch(
     cmd: Command,
     tx: &mpsc::Sender<ProcessEvent>,
@@ -482,10 +743,17 @@ async fn launch(
     let group =
         processkit::ProcessGroup::new().map_err(|e| ProcessError::Containment(e.to_string()))?;
     let kind = containment(&group)?;
+    #[cfg(windows)]
+    let env = cmd.env.into_iter().filter(|(key, _)| {
+        let key = key.to_string_lossy();
+        !key.eq_ignore_ascii_case("SystemRoot") && !key.eq_ignore_ascii_case("windir")
+    });
+    #[cfg(not(windows))]
+    let env = cmd.env;
     let mut backend = processkit::Command::new(&executable)
         .args(cmd.args)
         .env_clear()
-        .envs(cmd.env)
+        .envs(env)
         .create_no_window()
         .kill_on_parent_death()
         .stdout_raw_tee(EventWriter {
@@ -498,24 +766,46 @@ async fn launch(
             stderr: true,
             dropped: false,
         });
+    #[cfg(windows)]
+    {
+        let root = std::env::var_os("SystemRoot")
+            .or_else(|| std::env::var_os("windir"))
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| ProcessError::Spawn {
+                executable: executable.clone(),
+                message: "host SystemRoot is unavailable".into(),
+            })?;
+        backend = backend.env("SystemRoot", &root).env("windir", &root);
+    }
     if let Some(cwd) = cmd.cwd {
         backend = backend.current_dir(cwd);
     }
-    let running = group
-        .start(&backend)
-        .await
-        .map_err(|e| ProcessError::Spawn {
-            executable: executable.clone(),
-            message: e.to_string(),
-        })?;
-    let pid = running
-        .pid()
-        .ok_or_else(|| ProcessError::Containment("backend did not provide PID".into()))?;
-    let id = inspect(pid)?.ok_or_else(|| ProcessError::Spawn {
-        executable: executable.clone(),
-        message: "child exited before identity was captured".into(),
-    })?;
+    let running = match group.start(&backend).await {
+        Ok(running) => running,
+        Err(error) => {
+            confirm_empty(&group)
+                .await
+                .map_err(ProcessError::CleanupUncertain)?;
+            return Err(ProcessError::Spawn {
+                executable: executable.clone(),
+                message: error.to_string(),
+            });
+        }
+    };
+    let inspected = running.pid().map(inspect);
+    let id = match inspected {
+        Some(Ok(Some(id))) => id,
+        other => {
+            tracing::warn!(
+                ?other,
+                "identity unavailable for launched child; rolling back"
+            );
+            let exit = rollback_started(&group, running).await?;
+            return Err(ProcessError::ExitedBeforeIdentity(exit));
+        }
+    };
     if id.exe != executable {
+        let _ = rollback_started(&group, running).await?;
         return Err(ProcessError::Containment(
             "spawned image doesn't match executable".into(),
         ));
@@ -585,31 +875,33 @@ async fn run(
         }
     };
     let (requests, mut rx) = mpsc::channel::<Request>(8);
-    let (exit_tx, exit) = watch::channel(None);
-    let (failure_tx, failure) = watch::channel(None);
+    let (terminal_tx, terminal_rx) = watch::channel(None);
+    let (cancel, mut cancelled) = oneshot::channel();
     let live = Arc::new(Live {
         requests,
-        exit,
-        failure,
+        terminal: terminal_rx,
     });
-    if ready
-        .send(Ok(Handle {
-            id: id.clone(),
-            containment,
-            live,
-            events: Some(events),
-        }))
-        .is_err()
     {
-        return;
+        let mut registry = registry().lock().unwrap();
+        registry.retain(|_, live| live.strong_count() != 0);
+        registry.insert(id.clone(), Arc::downgrade(&live));
     }
+    // Keep the containment discoverable even if its public handle was
+    // dropped. The handle's cancellation sender, not registry Arc count,
+    // requests cleanup. A cancelled spawn follows the same path.
+    let _ = ready.send(Ok(Handle {
+        id: id.clone(),
+        containment,
+        live: live.clone(),
+        events: Some(events),
+        _cancel: cancel,
+    }));
     let mut wait = std::pin::pin!(running.wait());
     let mut cause = ExitCause::Exited;
-    let mut deadline = None;
+    let mut grace_deadline = None;
+    let mut hard_deadline = None;
     let mut closed = false;
-    // The backend wait drains output after reaping the root. A surviving
-    // grandchild can still own the output pipe: independently watch the
-    // root and tear down the known containment once its leader exits.
+    let mut pending = Vec::new();
     #[cfg(any(windows, target_os = "linux"))]
     let root_pin = identity::Pin::open(id.pid, false)
         .ok()
@@ -621,107 +913,168 @@ async fn run(
         }
         matches!(liveness(&id), Liveness::Gone | Liveness::Reused)
     };
-    let mut probe = tokio::time::interval(Duration::from_millis(250));
+    let mut probe = tokio::time::interval(Duration::from_millis(100));
     probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut root_cleaned = false;
     let outcome = loop {
         tokio::select! {
             biased;
-            outcome = &mut wait => break outcome,
-            request = rx.recv(), if !closed => {
-                let Some(request) = request else {
-                    closed = true;
-                    cause = ExitCause::Killed;
-                    if let Err(error) = group.kill_all() {
-                        tracing::error!(%error, "drop cleanup failed; retrying");
-                        deadline = Some(tokio::time::Instant::now() + Duration::from_secs(1));
-                    }
-                    continue;
-                };
-                let result = match request.grace {
-                    _ if root_exited() => group.kill_all().map_err(|e| ProcessError::Signal(e.to_string())),
-                    Some(grace) if cause == ExitCause::Exited => {
-                        cause = ExitCause::Stopped;
-                        let start = tokio::time::Instant::now();
-                        if tokio::time::timeout(grace, graceful(&group, &id, helper.as_deref())).await.is_ok_and(|r| r.is_ok()) {
-                            deadline = Some(start + grace);
-                            Ok(())
-                        } else {
-                            cause = ExitCause::Killed;
-                            group.kill_all().map_err(|e| ProcessError::Signal(e.to_string()))
-                        }
-                    }
-                    Some(_) => Ok(()),
-                    None => {
+            outcome = &mut wait => break Some(outcome),
+            _ = &mut cancelled, if !closed => {
+                closed = true;
+                if !root_exited() { cause = ExitCause::Killed; }
+                grace_deadline = None;
+                hard_deadline.get_or_insert(tokio::time::Instant::now() + CLEANUP_TIMEOUT);
+                if let Err(error) = group.kill_all() { tracing::warn!(%error, "drop cleanup signal failed"); }
+            }
+            request = rx.recv() => {
+                let Some(request) = request else { break None; };
+                let hard = root_exited() || request.grace.is_none() || hard_deadline.is_some();
+                let result = if hard {
+                    if !root_exited() && request.grace.is_none() { cause = ExitCause::Killed; }
+                    grace_deadline = None;
+                    hard_deadline.get_or_insert(tokio::time::Instant::now() + CLEANUP_TIMEOUT);
+                    group.kill_all().map_err(|e| ProcessError::Signal(e.to_string()))
+                } else if cause == ExitCause::Exited {
+                    let grace = request.grace.unwrap();
+                    cause = ExitCause::Stopped;
+                    let start = tokio::time::Instant::now();
+                    if tokio::time::timeout(grace, graceful(&group, &id, helper.as_deref())).await.is_ok_and(|r| r.is_ok()) {
+                        grace_deadline = Some(start + grace);
+                        Ok(())
+                    } else {
                         cause = ExitCause::Killed;
-                        deadline = None;
+                        hard_deadline.get_or_insert(tokio::time::Instant::now() + CLEANUP_TIMEOUT);
                         group.kill_all().map_err(|e| ProcessError::Signal(e.to_string()))
                     }
-                };
-                match &result {
-                    Ok(()) => { failure_tx.send_replace(None); }
-                    Err(error) => {
-                        failure_tx.send_replace(Some(error.to_string()));
-                        if cause == ExitCause::Killed { deadline = Some(tokio::time::Instant::now() + Duration::from_secs(1)); }
-                    }
-                }
-                let _ = request.ack.send(result);
-            }
-            () = async { if let Some(deadline) = deadline { tokio::time::sleep_until(deadline).await } else { std::future::pending().await } } => {
-                if !root_exited() { cause = ExitCause::Killed; }
-                deadline = None;
-                match group.kill_all() {
-                    Ok(()) => { failure_tx.send_replace(None); }
-                    Err(error) => {
-                        tracing::error!(%error, "failed to kill process tree");
-                        failure_tx.send_replace(Some(error.to_string()));
-                        deadline = Some(tokio::time::Instant::now() + Duration::from_secs(1));
-                    }
+                } else { Ok(()) };
+                // Per-request reply: a transient error on this operation is
+                // not sticky state inherited by a later retry.
+                match result {
+                    Ok(()) => pending.push(request.reply),
+                    Err(error) => { let _ = request.reply.send(Err(error)); }
                 }
             }
-            _ = probe.tick(), if !root_cleaned => {
-                if root_exited() {
-                    match group.kill_all() {
-                        Ok(()) => { root_cleaned = true; deadline = None; failure_tx.send_replace(None); }
-                        Err(error) => {
-                            tracing::error!(%error, "cannot confirm descendant cleanup");
-                            failure_tx.send_replace(Some(error.to_string()));
-                        }
-                    }
+            _ = probe.tick() => {
+                let now = tokio::time::Instant::now();
+                if hard_deadline.is_some_and(|deadline| now >= deadline) {
+                    break None;
+                }
+                let root_gone = root_exited();
+                if grace_deadline.is_some_and(|deadline| now >= deadline) {
+                    if !root_gone { cause = ExitCause::Killed; }
+                    grace_deadline = None;
+                    hard_deadline.get_or_insert(now + CLEANUP_TIMEOUT);
+                }
+                if root_gone {
+                    grace_deadline = None;
+                    hard_deadline.get_or_insert(now + CLEANUP_TIMEOUT);
+                }
+                if hard_deadline.is_some() && let Err(error) = group.kill_all() {
+                    tracing::warn!(%error, "containment cleanup signal failed");
                 }
             }
         }
     };
-    // Root wait alone is not proof of containment cleanup.
-    while let Err(error) = group.kill_all() {
-        tracing::error!(%error, "tree cleanup not confirmed; retrying");
-        failure_tx.send_replace(Some(error.to_string()));
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    drop(group);
-    let exit = match outcome {
-        Ok(outcome) => Exit {
-            code: outcome.code(),
-            signal: outcome.signal(),
-            cause,
+    // A natural root outcome does not itself prove descendant teardown.
+    let result: Terminal = match outcome {
+        None => Err("bounded cleanup could not confirm root exit and containment".into()),
+        Some(outcome) => match confirm_empty(&group).await {
+            Err(error) => Err(error),
+            Ok(()) => match outcome {
+                Ok(outcome) => Ok(Exit {
+                    code: outcome.code(),
+                    signal: outcome.signal(),
+                    cause,
+                }),
+                Err(error) if root_exited() => {
+                    tracing::warn!(%error, "wait failed after containment cleanup");
+                    // Confirmed cleanup, but an unrequested observation
+                    // failure must count against the restart policy.
+                    Ok(Exit {
+                        code: None,
+                        signal: None,
+                        cause: ExitCause::Exited,
+                    })
+                }
+                Err(error) => Err(format!(
+                    "wait failed and root death is not independently confirmed: {error}"
+                )),
+            },
         },
-        Err(error) => {
-            tracing::error!(%error, "process wait failed");
-            failure_tx.send_replace(Some(error.to_string()));
-            loop {
-                match liveness(&id) {
-                    Liveness::Gone | Liveness::Reused => {
-                        break Exit {
-                            code: None,
-                            signal: None,
-                            cause: ExitCause::Killed,
-                        };
-                    }
-                    _ => tokio::time::sleep(Duration::from_secs(1)).await,
-                }
-            }
-        }
     };
-    exit_tx.send_replace(Some(exit.clone()));
-    terminal.send(ProcessEvent::Exited(exit));
+    // Send exactly one terminal notification. Uncertainty is neither Exited
+    // nor proof of root death, and the frozen wait() cannot manufacture Exit.
+    terminal_tx.send_replace(Some(result.clone()));
+    for reply in pending {
+        let _ = reply.send(result.clone().map_err(ProcessError::CleanupUncertain));
+    }
+    terminal.send(match result {
+        Ok(exit) => ProcessEvent::Exited(exit),
+        Err(reason) => ProcessEvent::CleanupUncertain(reason),
+    });
+    drop(group);
+    drop(live);
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn missing_marker_metadata_is_not_a_negative_match() {
+        assert!(match_criteria(Some(true), None, Some(true)).is_err());
+        assert!(match_criteria(None, Some(true), Some(true)).is_err());
+        assert!(match_criteria(Some(true), Some(true), None).is_err());
+        assert!(!match_criteria(None, Some(false), None).unwrap());
+        assert!(match_criteria(Some(true), Some(true), Some(true)).unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_does_not_poison_a_new_request() {
+        let (requests, mut rx) = mpsc::channel::<Request>(2);
+        let (terminal_tx, terminal) = watch::channel(None);
+        let live = Live { requests, terminal };
+        let exit = Exit {
+            code: Some(0),
+            signal: None,
+            cause: ExitCause::Killed,
+        };
+        let result = exit.clone();
+        let worker = tokio::spawn(async move {
+            let first = rx.recv().await.unwrap();
+            first
+                .reply
+                .send(Err(ProcessError::Signal("transient".into())))
+                .unwrap();
+            let second = rx.recv().await.unwrap();
+            terminal_tx.send_replace(Some(Ok(result.clone())));
+            second.reply.send(Ok(result)).unwrap();
+        });
+        assert!(matches!(
+            live.request(None).await,
+            Err(ProcessError::Signal(_))
+        ));
+        assert_eq!(live.request(None).await.unwrap(), exit);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_rollback_reaps_already_exited_child() {
+        let group = processkit::ProcessGroup::new().unwrap();
+        let running = group
+            .start(
+                &processkit::Command::new(std::env::current_exe().unwrap())
+                    .arg("--help")
+                    .create_no_window(),
+            )
+            .await
+            .unwrap();
+        // Let the ordinary test harness exit; rollback must acquire its
+        // real exit status rather than returning a generic spawn error.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let exit = rollback_started(&group, running).await.unwrap();
+        assert_eq!(exit.code, Some(0));
+        assert!(exit.abnormal());
+        assert!(group.members().unwrap().is_empty());
+    }
 }

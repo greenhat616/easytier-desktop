@@ -66,6 +66,7 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
     let mut exit_file = None;
     let mut code = 0;
     let mut host_probe = None;
+    let mut check_windows_env = false;
     while let Some(arg) = args.next() {
         let value = args.next().ok_or("missing argument value")?;
         match arg.to_str().ok_or("invalid argument")? {
@@ -86,6 +87,7 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
             "--exit-file" => exit_file = Some(PathBuf::from(value)),
             "--exit-code" => code = value.to_str().ok_or("invalid exit code")?.parse()?,
             "--host-probe" => host_probe = Some(PathBuf::from(value)),
+            "--check-windows-env" => check_windows_env = value == "yes",
             _ => return Err(format!("unknown argument: {arg:?}").into()),
         }
     }
@@ -108,6 +110,8 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
                 "ignore".into(),
                 "--exit-after-ms".into(),
                 deadline.into(),
+                "-c".into(),
+                path.clone().into_os_string(),
             ];
             let handle = ProcessKitEngine::new()
                 .spawn(Command {
@@ -130,6 +134,13 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
 
     if !matches!(mode.as_str(), "graceful" | "ignore") {
         return Err("unknown mode".into());
+    }
+    if check_windows_env {
+        let root = std::env::var_os("SystemRoot").ok_or("missing SystemRoot")?;
+        if std::env::var_os("windir").as_ref() != Some(&root) {
+            return Err("missing or inconsistent windir".into());
+        }
+        let _listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
     }
     install_handlers()?;
     // Keep the child alive until the host's actual containment kills it.

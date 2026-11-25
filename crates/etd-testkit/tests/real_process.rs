@@ -1,6 +1,6 @@
 use etd_proc::{
-    Command, Containment, ExitCause, KillOutcome, Liveness, ProcessEngine, ProcessEvent,
-    ProcessIdentity, ProcessMarker, processkit_engine::ProcessKitEngine,
+    Command, Containment, ExitCause, KillOutcome, Liveness, ProcessEngine, ProcessError,
+    ProcessEvent, ProcessIdentity, ProcessMarker, processkit_engine::ProcessKitEngine,
 };
 use std::{
     ffi::OsString,
@@ -61,22 +61,43 @@ async fn graceful_stop_has_exit_code_and_single_exit_event() {
     let dir = tempfile::tempdir().unwrap();
     let ready = dir.path().join("ready");
     let engine = engine();
-    let mut handle = engine
-        .spawn(command(vec![
-            "--ready-file".into(),
-            ready.clone().into_os_string(),
-            "--exit-code".into(),
-            "23".into(),
-        ]))
-        .await
-        .unwrap();
+    let mut args = vec![
+        "--ready-file".into(),
+        ready.clone().into_os_string(),
+        "--exit-code".into(),
+        "23".into(),
+    ];
+    if cfg!(windows) {
+        args.extend([OsString::from("--check-windows-env"), "yes".into()]);
+    }
+    let mut handle = engine.spawn(command(args)).await.unwrap();
     #[cfg(windows)]
     assert_eq!(handle.containment(), Containment::JobObject);
     #[cfg(target_os = "linux")]
-    assert!(matches!(
-        handle.containment(),
-        Containment::CgroupV2 | Containment::ProcessGroup
-    ));
+    {
+        let cgroup =
+            std::fs::read_to_string(format!("/proc/{}/cgroup", handle.identity().pid)).unwrap();
+        let parent = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+        let expected =
+            if cgroup != parent && cgroup.lines().any(|line| line.contains("/processkit-")) {
+                Containment::CgroupV2
+            } else {
+                let stat = std::fs::read_to_string(format!("/proc/{}/stat", handle.identity().pid))
+                    .unwrap();
+                let pgid: u32 = stat
+                    .rsplit_once(')')
+                    .unwrap()
+                    .1
+                    .split_whitespace()
+                    .nth(2)
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert_eq!(pgid, handle.identity().pid);
+                Containment::ProcessGroup
+            };
+        assert_eq!(handle.containment(), expected);
+    }
     #[cfg(target_os = "macos")]
     assert_eq!(handle.containment(), Containment::ProcessGroup);
     let _ = file(&ready).await;
@@ -107,6 +128,28 @@ async fn graceful_stop_has_exit_code_and_single_exit_event() {
     assert_eq!(exited, 1);
     assert!(String::from_utf8_lossy(&stdout).contains("READY"));
     gone(&engine, handle.identity()).await;
+}
+
+#[tokio::test]
+async fn fast_exit_preserves_exit_code_for_restart_policy() {
+    let engine = engine();
+    let result = engine
+        .spawn(command(vec![
+            "--exit-after-ms".into(),
+            "0".into(),
+            "--exit-code".into(),
+            "37".into(),
+        ]))
+        .await;
+    let exit = match result {
+        Ok(handle) => timeout(Duration::from_secs(10), handle.wait())
+            .await
+            .unwrap(),
+        Err(ProcessError::ExitedBeforeIdentity(exit)) => exit,
+        Err(error) => panic!("unexpected launch failure: {error}"),
+    };
+    assert!(exit.abnormal());
+    assert_eq!(exit.code, Some(37));
 }
 #[tokio::test]
 async fn timeout_kills_tree_and_never_kills_reused_pid() {
@@ -143,7 +186,7 @@ async fn timeout_kills_tree_and_never_kills_reused_pid() {
     assert_eq!(engine.liveness(&stale).await, Liveness::Reused);
     assert_eq!(
         engine.kill_verified(&stale).await.unwrap(),
-        KillOutcome::Reused
+        KillOutcome::Uncertain
     );
     assert_eq!(engine.liveness(handle.identity()).await, Liveness::Same);
     let exit = timeout(
@@ -197,8 +240,19 @@ async fn unsolicited_root_exit_does_not_leave_its_descendant_or_block_wait() {
     assert_eq!(handle.stop(Duration::ZERO).await.unwrap(), exit);
     gone(&engine, &child_id).await;
 }
+#[cfg(not(target_os = "macos"))]
 #[tokio::test]
-async fn unrecorded_marked_process_is_pinned_or_quarantined() {
+async fn unrecorded_marked_process_is_pinned_before_termination() {
+    marked_orphan_fixture().await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn macos_orphan_verify_then_signal_has_explicit_toctou_window() {
+    marked_orphan_fixture().await;
+}
+
+async fn marked_orphan_fixture() {
     let dir = tempfile::tempdir().unwrap();
     let ready = dir.path().join("ready");
     let config = dir.path().join("config");
@@ -219,14 +273,7 @@ async fn unrecorded_marked_process_is_pinned_or_quarantined() {
         .find(|id| Some(id.pid) == child.id())
         .expect("marked orphan");
     let outcome = engine.kill_verified(&id).await.unwrap();
-    #[cfg(any(windows, target_os = "linux"))]
     assert_eq!(outcome, KillOutcome::Killed);
-    #[cfg(target_os = "macos")]
-    {
-        assert_eq!(outcome, KillOutcome::Uncertain);
-        assert_eq!(engine.liveness(&id).await, Liveness::Same);
-        child.kill().await.unwrap();
-    }
     timeout(Duration::from_secs(5), child.wait())
         .await
         .unwrap()
@@ -304,11 +351,19 @@ async fn abrupt_parent_death_platform_guarantee() {
     gone(&engine, &id).await;
     #[cfg(target_os = "macos")]
     {
+        // No cached marker: quarantine rather than signal by persisted PID.
         assert_eq!(
             engine.kill_verified(&id).await.unwrap(),
             KillOutcome::Uncertain
         );
-        // The probe child self-expires instead of using a PID-only kill.
+        let found = engine.find_marked(&marker(&dir)).await.unwrap();
+        assert!(found.contains(&id));
+        // Human-approved verify-then-signal path: unlike Windows/Linux,
+        // macOS retains a narrow TOCTOU between verification and delivery.
+        assert_eq!(
+            engine.kill_verified(&id).await.unwrap(),
+            KillOutcome::Killed
+        );
         gone(&engine, &id).await;
     }
 }

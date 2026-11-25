@@ -60,6 +60,54 @@ pub(crate) fn token(raw: u64) -> io::Result<String> {
     }
 }
 
+#[cfg(unix)]
+pub(crate) fn process_group(pid: u32) -> io::Result<i32> {
+    let pid = i32::try_from(pid).map_err(io::Error::other)?;
+    if pid <= 0 {
+        return Err(io::Error::other("invalid process id"));
+    }
+    // SAFETY: read-only query of this positive process ID.
+    let pgid = unsafe { libc::getpgid(pid) };
+    if pgid < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(pgid)
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn signal_verified_orphan(pid: u32, group: bool) -> io::Result<()> {
+    let pid = i32::try_from(pid).map_err(io::Error::other)?;
+    if pid <= 1 {
+        return Err(io::Error::other("invalid orphan target"));
+    }
+    // SAFETY: caller has just verified start time, image, owner, argv and
+    // (for group=true) the kernel's own process group. macOS has no pidfd;
+    // the human-approved verify-to-signal TOCTOU remains Apple-only.
+    if unsafe { libc::kill(if group { -pid } else { pid }, libc::SIGKILL) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn group_absent(group: i32) -> io::Result<bool> {
+    if group <= 1 {
+        return Err(io::Error::other("invalid group"));
+    }
+    // SAFETY: signal 0 is only a read-only existence/permission probe.
+    if unsafe { libc::kill(-group, 0) } == 0 {
+        return Ok(false);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(true),
+        Some(libc::EPERM) => Ok(false),
+        _ => Err(error),
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn pid_absent(pid: u32) -> io::Result<bool> {
     let pid = i32::try_from(pid).map_err(io::Error::other)?;

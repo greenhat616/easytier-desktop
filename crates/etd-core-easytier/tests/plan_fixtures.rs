@@ -158,11 +158,11 @@ pub fn full() -> NetworkSpec {
             disable_p2p: false,
             disable_udp_hole_punching: true,
             relay_all_peer_rpc: true,
-            multi_thread: true,
+            multi_thread: Some(true),
             private_mode: true,
             disable_ipv6: true,
             use_smoltcp: true,
-            bind_device: true,
+            bind_device: Some(true),
             compression: "zstd".into(),
         }),
         ..Default::default()

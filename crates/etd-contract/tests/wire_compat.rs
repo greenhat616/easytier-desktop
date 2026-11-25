@@ -77,6 +77,8 @@ fn spec() -> NetworkSpec {
         public_ipv6_provider: false,
         flags: Some(NetworkFlags {
             latency_first: true,
+            multi_thread: Some(false),
+            bind_device: Some(true),
             compression: "zstd".into(),
             ..Default::default()
         }),

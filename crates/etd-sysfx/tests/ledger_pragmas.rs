@@ -40,6 +40,8 @@ async fn pragmas_and_reopen() {
         public_ipv6_provider: true,
         flags: Some(v1::NetworkFlags {
             private_mode: true,
+            multi_thread: Some(false),
+            bind_device: None,
             compression: "test".into(),
             ..Default::default()
         }),

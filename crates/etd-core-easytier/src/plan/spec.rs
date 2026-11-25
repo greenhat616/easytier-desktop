@@ -408,8 +408,10 @@ struct Flags<'a> {
     disable_p2p: bool,
     relay_all_peer_rpc: bool,
     disable_udp_hole_punching: bool,
-    multi_thread: bool,
-    bind_device: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    multi_thread: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bind_device: Option<bool>,
     enable_kcp_proxy: bool,
     enable_quic_proxy: bool,
     accept_dns: bool,

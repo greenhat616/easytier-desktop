@@ -86,7 +86,14 @@ async fn lease_records_never_block_and_are_never_reclaimed() {
     let left: Vec<_> = w.sys.ours().iter().map(|o| o.kind).collect();
     assert_eq!(left, vec![EffectKind::UpnpMapping]);
     let all = engine.report().await.unwrap();
-    assert!(all.notes.iter().any(|n| n.contains("recorded only")));
+    // The process record closed in this run: the expiry is absolute.
+    assert!(
+        all.notes
+            .iter()
+            .any(|n| n.contains("recorded only") && n.contains("ended, at ")),
+        "{:?}",
+        all.notes
+    );
     // The next generation may start.
     w.begin("a", w.windows_intents("a", 2)).await;
 }
@@ -322,10 +329,8 @@ async fn delete_decision_respects_rank_gates() {
         )
         .await
         .unwrap();
-    let report = engine
-        .resolve(&[delete(&format!("rec:{}", tun_record.id.0))])
-        .await
-        .unwrap();
+    let id = engine.report().await.unwrap().candidates[0].id.clone();
+    let report = engine.resolve(&[delete(&id)]).await.unwrap();
     assert!(w.sys.foreign_deleted().is_empty());
     assert!(
         report
@@ -355,4 +360,164 @@ async fn offline_report_is_served_while_the_ledger_is_unavailable() {
     let diagnosed = engine.diagnose().await.unwrap();
     assert_eq!(diagnosed.candidates.len(), 1);
     assert_eq!(engine.report().await.unwrap(), diagnosed);
+}
+
+#[tokio::test]
+async fn lease_expiry_is_relative_when_the_process_end_is_unknown() {
+    let w = World::new();
+    w.add_instance("a").await;
+    // No process record closes in this run (it is planned and never
+    // reached because a lower rank fails).
+    let effects = w.begin("a", vec![upnp("a", 1)]).await;
+    for e in &effects {
+        if e.kind != EffectKind::Process {
+            w.settle(e, Fate::Applied).await;
+        }
+    }
+    let process = effects
+        .iter()
+        .find(|e| e.kind == EffectKind::Process)
+        .unwrap();
+    w.memory
+        .transition(&process.id, EffectState::Reclaiming, None)
+        .await
+        .unwrap();
+    w.sys
+        .inject(Fault::on(Step::Probe).kind(EffectKind::Process));
+    let engine = w.engine();
+    engine
+        .reclaim_generation(&InstanceId::from("a"), Epoch(1))
+        .await
+        .unwrap();
+    let notes = engine.report().await.unwrap().notes;
+    assert!(
+        notes.iter().any(
+            |n| n.contains("expires 300s after the kernel process ended") && !n.contains(", at ")
+        ),
+        "{notes:?}"
+    );
+}
+
+#[tokio::test]
+async fn manual_delete_of_shared_records_waits_for_generations() {
+    let w = World::new();
+    w.running("a").await;
+    let rule = EffectIntent {
+        scope: EffectScope::CoreBinary { sha256: core_hex() },
+        kind: EffectKind::WinProgramFirewallRule,
+        key: ObjectKey::Rule {
+            name: "EasyTier core.exe (in)".into(),
+            group: Some("EasyTier".into()),
+        },
+        undo: Undo::EnsureAbsent,
+        persistence: Persistence::Persistent,
+    };
+    // Recorded, never read back; a foreign rule holds the name.
+    w.memory.record(rule.clone()).await.unwrap();
+    w.sys.create_foreign(rule.kind, rule.key.clone());
+    // Process keeps the generation open.
+    w.sys.inject(
+        Fault::on(Step::Reclaim)
+            .kind(EffectKind::Process)
+            .fail(ReclaimError::Busy("running".into())),
+    );
+    let engine = w.engine();
+    engine.reclaim_all(ReclaimScope::Instances).await.unwrap();
+    let shared = w
+        .open()
+        .await
+        .into_iter()
+        .find(|e| e.kind == EffectKind::WinProgramFirewallRule)
+        .unwrap();
+    // Make it a candidate as reclaim_core would once allowed.
+    w.memory
+        .transition(&shared.id, EffectState::Reclaiming, None)
+        .await
+        .unwrap();
+    let found = w.sys.find(rule.kind, &rule.key).unwrap();
+    w.memory
+        .transition(
+            &shared.id,
+            EffectState::Candidate,
+            Some(Observation {
+                credential: None,
+                key: Some(found.key.clone()),
+                observed_at: jiff::Timestamp::now(),
+                detail: Some(format!(
+                    "found credential: {}",
+                    serde_json::to_string(&found.credential).unwrap()
+                )),
+            }),
+        )
+        .await
+        .unwrap();
+    let id = engine
+        .report()
+        .await
+        .unwrap()
+        .candidates
+        .into_iter()
+        .find(|c| c.kind == EffectKind::WinProgramFirewallRule)
+        .unwrap()
+        .id;
+    let report = engine.resolve(&[delete(&id)]).await.unwrap();
+    assert!(w.sys.foreign_deleted().is_empty());
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("generations that may use it")),
+        "{:?}",
+        report.notes
+    );
+}
+
+#[tokio::test]
+async fn stale_decisions_do_not_carry_over() {
+    let w = World::new();
+    w.add_instance("a").await;
+    let key = ObjectKey::Interface {
+        name: Some("etd-0badf00d".into()),
+        guid: None,
+    };
+    w.sys.create_foreign(EffectKind::WinTunAdapter, key.clone());
+    let engine = w.engine();
+    let first = engine.reclaim_all(ReclaimScope::Instances).await.unwrap();
+    let old_id = first.candidates[0].id.clone();
+    // The object is replaced by another one with the same name; the next
+    // report lists it under a new id.
+    w.sys.replace_with_foreign(EffectKind::WinTunAdapter, &key);
+    let second = engine.reclaim_all(ReclaimScope::Instances).await.unwrap();
+    assert_ne!(second.candidates[0].id, old_id);
+    let report = engine.resolve(&[delete(&old_id)]).await.unwrap();
+    assert!(w.sys.foreign_deleted().is_empty());
+    assert!(report.notes.iter().any(|n| n.contains("unknown candidate")));
+}
+
+#[tokio::test]
+async fn exclusive_sweep_waits_for_process_records() {
+    let w = World::new();
+    w.running("a").await;
+    w.sys.create_ours(
+        EffectKind::WinFenceFilter,
+        ObjectKey::Fence {
+            container: etd_testkit::fakes::system::FENCE_CONTAINER.into(),
+            rule: "orphan".into(),
+            port: 15999,
+        },
+    );
+    w.sys.inject(
+        Fault::on(Step::Reclaim)
+            .kind(EffectKind::Process)
+            .fail(ReclaimError::Busy("running".into())),
+    );
+    let engine = w.engine();
+    engine.reclaim_all(ReclaimScope::Instances).await.unwrap();
+    assert!(w.sys.ours().iter().any(|o| matches!(
+        &o.key,
+        ObjectKey::Fence { rule, .. } if rule == "orphan"
+    )));
+    w.sys.clear_faults();
+    engine.reclaim_all(ReclaimScope::Instances).await.unwrap();
+    w.assert_clean();
 }

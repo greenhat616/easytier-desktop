@@ -13,10 +13,7 @@
 //! equals ours (otherwise `Reclaimed::LeftModified`, nothing touched). A
 //! record whose two values are equal has nothing to undo and is closed.
 //!
-//! Undo forms that carry their own authorisation (E1's
-//! `ReplayUpstreamRecovery`: replay upstream's recovery only when no other
-//! EasyTier process runs) are decided by their reclaimer; the record's key
-//! must probe absent afterwards like any delete.
+//! Any other undo form fails closed: the object becomes a candidate.
 //!
 //! Lease and Expiring records (router mappings) are record-only: they are
 //! never reclaimed actively, never block a rank and never hold a generation
@@ -35,6 +32,9 @@ pub(super) struct Ctx<'a> {
     /// Current boot id; `None` if unknown (nothing closed unprobed).
     pub boot: Option<BootId>,
     pub notes: &'a mut Vec<String>,
+    /// When this run closed the group's kernel process record, if it did
+    /// (lease expiry is counted from then).
+    pub process_closed_at: Option<jiff::Timestamp>,
 }
 
 /// Where a record stands after one step.
@@ -63,8 +63,6 @@ enum Authority {
     Restore,
     /// A setting whose undo changes nothing.
     NothingToUndo,
-    /// The undo carries its own authorisation check, done by the reclaimer.
-    ByReclaimer,
     Candidate,
     Conflict,
     /// Present, the record has a credential, the probe could not read one.
@@ -152,10 +150,13 @@ impl Ctx<'_> {
     async fn close_record_only(&mut self, e: &Effect) -> Result<RecordOutcome, LedgerError> {
         let expiry = match e.persistence {
             Persistence::Expiring { until } => format!("expires at {until}"),
-            Persistence::Lease { seconds } => format!(
-                "expires {seconds}s after the kernel process ended (about {})",
-                jiff::Timestamp::now() + jiff::SignedDuration::from_secs(i64::from(seconds))
-            ),
+            Persistence::Lease { seconds } => match self.process_closed_at {
+                Some(at) => format!(
+                    "expires {seconds}s after the kernel process ended, at {}",
+                    at + jiff::SignedDuration::from_secs(i64::from(seconds))
+                ),
+                None => format!("expires {seconds}s after the kernel process ended"),
+            },
             _ => String::new(),
         };
         self.notes.push(format!(
@@ -220,13 +221,11 @@ impl Ctx<'_> {
                 Ok(RecordOutcome::Held)
             }
             Authority::Conflict => self.conflict(e, &found).await,
-            Authority::Delete | Authority::Restore | Authority::ByReclaimer => {
-                match r.reclaim(e).await {
-                    Err(ReclaimError::CredentialMismatch) => self.conflict(e, &found).await,
-                    Err(err) => self.fail(e, &err.to_string()).await,
-                    Ok(done) => self.verify(e, r.as_ref(), done).await,
-                }
-            }
+            Authority::Delete | Authority::Restore => match r.reclaim(e).await {
+                Err(ReclaimError::CredentialMismatch) => self.conflict(e, &found).await,
+                Err(err) => self.fail(e, &err.to_string()).await,
+                Ok(done) => self.verify(e, r.as_ref(), done).await,
+            },
         }
     }
 
@@ -319,11 +318,23 @@ impl Ctx<'_> {
                         return Ok(());
                     }
                 }
-                // A failure leaves the record reclaiming; the next run lists
-                // it again.
+                // The approved, re-checked credential goes to the reclaimer
+                // for this one call only; it is never persisted, so it never
+                // becomes an automatic delete authority. A failure leaves the
+                // record reclaiming; the next run lists it again.
                 self.reclaiming(e).await?;
-                let outcome = match r.reclaim(e).await {
-                    Ok(done) => self.verify(e, r.as_ref(), done).await?,
+                let approved = Effect {
+                    state: EffectState::Reclaiming,
+                    observation: Some(Observation {
+                        credential: reported,
+                        key: Some(report::lookup_key(e).clone()),
+                        observed_at: jiff::Timestamp::now(),
+                        detail: Some("approved by an administrator".into()),
+                    }),
+                    ..e.clone()
+                };
+                let outcome = match r.reclaim(&approved).await {
+                    Ok(done) => self.verify(&approved, r.as_ref(), done).await?,
                     Err(err) => self.fail(e, &err.to_string()).await?,
                 };
                 if outcome != RecordOutcome::Closed {
@@ -350,12 +361,9 @@ fn authority(e: &Effect, found: &Observation) -> Authority {
             Authority::Restore
         };
     }
-    // Any other undo than "ensure absent" (E1's ReplayUpstreamRecovery,
-    // ruling msg#489) is authorised by its reclaimer, which checks its own
-    // gate and refuses with a retryable error otherwise; the record's key
-    // must still probe absent afterwards.
     if !matches!(e.undo, Undo::EnsureAbsent) {
-        return Authority::ByReclaimer;
+        // An undo form this engine does not know: fail closed.
+        return Authority::Candidate;
     }
     if matches!(
         found.credential,

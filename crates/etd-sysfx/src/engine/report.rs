@@ -16,33 +16,70 @@ const FOUND_PREFIX: &str = "found credential: ";
 
 /// What a candidate or conflict id refers to.
 pub(super) enum CandidateRef {
-    /// A candidate or conflict ledger record.
-    Record(EffectId),
-    /// An object found by the sweep (looked up by the full id).
+    /// A candidate ledger record, with the identity version it was reported
+    /// with (`rec:<effect>@<version>`).
+    Candidate(EffectId, String),
+    /// A conflict ledger record (KEEP only).
+    Conflict(EffectId),
+    /// An object found by the sweep (looked up by the full id, which
+    /// carries its identity version).
     Swept,
 }
 
 pub(super) fn parse_id(id: &str) -> Option<CandidateRef> {
     if let Some(rest) = id.strip_prefix(RECORD_PREFIX) {
-        Some(CandidateRef::Record(EffectId(rest.to_owned())))
+        let (effect, version) = rest.rsplit_once('@')?;
+        Some(CandidateRef::Candidate(
+            EffectId(effect.to_owned()),
+            version.to_owned(),
+        ))
     } else if let Some(rest) = id.strip_prefix(CONFLICT_PREFIX) {
-        Some(CandidateRef::Record(EffectId(rest.to_owned())))
+        Some(CandidateRef::Conflict(EffectId(rest.to_owned())))
     } else {
         id.starts_with(SWEPT_PREFIX).then_some(CandidateRef::Swept)
     }
+}
+
+/// Version of an observed object identity: kind, concrete key and
+/// credential. An approval given for one version never applies to another
+/// (a refreshed candidate gets a new id).
+pub(super) fn identity_version(
+    kind: EffectKind,
+    key: &ObjectKey,
+    credential: Option<&Credential>,
+) -> String {
+    let mut h = Sha256::new();
+    h.update(kind.as_str().as_bytes());
+    h.update([0]);
+    h.update(serde_json::to_vec(key).unwrap_or_default());
+    h.update([0]);
+    h.update(serde_json::to_vec(&credential).unwrap_or_default());
+    hex(&h.finalize()[..12])
+}
+
+/// Identity version of a candidate record as reported.
+pub(super) fn candidate_version(e: &Effect) -> String {
+    identity_version(e.kind, lookup_key(e), found_credential(e).as_ref())
+}
+
+pub(super) fn candidate_id(e: &Effect) -> String {
+    format!("{RECORD_PREFIX}{}@{}", e.id.0, candidate_version(e))
 }
 
 pub(super) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Stable id of a swept object: kind and key.
-pub(super) fn swept_id(kind: EffectKind, key: &ObjectKey) -> String {
-    let mut h = Sha256::new();
-    h.update(kind.as_str().as_bytes());
-    h.update([0]);
-    h.update(serde_json::to_vec(key).unwrap_or_default());
-    format!("{SWEPT_PREFIX}{}", hex(&h.finalize()[..12]))
+/// Id of a swept object: its identity version (kind, key, credential).
+pub(super) fn swept_id(object: &FoundObject) -> String {
+    format!(
+        "{SWEPT_PREFIX}{}",
+        identity_version(
+            object.kind,
+            &object.key,
+            object.observation.credential.as_ref()
+        )
+    )
 }
 
 /// The key a record's object is found under: the concrete key observed
@@ -72,7 +109,7 @@ pub(super) fn locates_record(e: &Effect, kind: EffectKind, key: &ObjectKey) -> b
 /// A record-shaped view of a swept object, for its reclaimer.
 pub(super) fn synthetic_effect(object: &FoundObject) -> Effect {
     Effect {
-        id: EffectId(swept_id(object.kind, &object.key)),
+        id: EffectId(swept_id(object)),
         scope: EffectScope::Product,
         kind: object.kind,
         key: object.key.clone(),
@@ -237,7 +274,7 @@ pub(super) fn build(
         .iter()
         .filter(|e| e.state == EffectState::Candidate)
         .map(|e| Candidate {
-            id: format!("{RECORD_PREFIX}{}", e.id.0),
+            id: candidate_id(e),
             kind: e.kind,
             key: lookup_key(e).clone(),
             scope: Some(e.scope.clone()),

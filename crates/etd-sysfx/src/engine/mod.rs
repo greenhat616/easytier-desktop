@@ -38,6 +38,29 @@ use std::{
 /// Notes kept for `report()` between runs.
 const MAX_NOTES: usize = 200;
 
+/// Which shared (product / core-binary) records must wait for open
+/// instance generations.
+#[derive(Default)]
+struct SharedGate {
+    any_open: bool,
+    /// SHA-256 (lower-case hex) of the kernels open generations run.
+    binaries: BTreeSet<String>,
+    /// Some open generation's inputs could not be read.
+    unknown: bool,
+}
+
+impl SharedGate {
+    fn waits(&self, e: &Effect) -> bool {
+        match &e.scope {
+            EffectScope::Instance { .. } => false,
+            EffectScope::CoreBinary { sha256 } => {
+                self.unknown || self.binaries.contains(&sha256.to_ascii_lowercase())
+            }
+            _ => self.any_open,
+        }
+    }
+}
+
 pub struct ReclaimEngineImpl {
     deps: ReclaimDeps,
     reclaimers: HashMap<EffectKind, Arc<dyn Reclaimer>>,
@@ -85,6 +108,7 @@ impl ReclaimEngineImpl {
             reclaimers: &self.reclaimers,
             boot,
             notes,
+            process_closed_at: None,
         }
     }
 
@@ -105,13 +129,12 @@ impl ReclaimEngineImpl {
     /// Run one group of records (a generation, or product / core-binary
     /// records) rank by rank.
     async fn run_group(&self, ctx: &mut Ctx<'_>, records: Vec<Effect>) -> Result<(), LedgerError> {
-        // Record-only effects never take part in the rank order.
+        // Record-only effects never take part in the rank order; they close
+        // after it, whatever it reached.
         let (record_only, mut records): (Vec<Effect>, Vec<Effect>) = records
             .into_iter()
             .partition(|e| record::record_only(e.persistence));
-        for e in &record_only {
-            ctx.step(e).await?;
-        }
+        ctx.process_closed_at = None;
         records.sort_by(|a, b| (ctx.rank(a.kind), &a.id).cmp(&(ctx.rank(b.kind), &b.id)));
         let mut process_open = false;
         let mut blocked = false;
@@ -129,14 +152,21 @@ impl ReclaimEngineImpl {
             }
             for e in &records[i..end] {
                 let outcome = ctx.step(e).await?;
-                if e.kind == EffectKind::Process && outcome != RecordOutcome::Closed {
-                    process_open = true;
+                if e.kind == EffectKind::Process {
+                    if outcome == RecordOutcome::Closed {
+                        ctx.process_closed_at = Some(jiff::Timestamp::now());
+                    } else {
+                        process_open = true;
+                    }
                 }
                 if outcome.blocks() {
                     blocked = true;
                 }
             }
             i = end;
+        }
+        for e in &record_only {
+            ctx.step(e).await?;
         }
         Ok(())
     }
@@ -211,11 +241,19 @@ impl ReclaimEngineImpl {
             {
                 continue;
             }
-            let id = report::swept_id(object.kind, &object.key);
+            let id = report::swept_id(&object);
             if kept.contains(&id) {
                 continue;
             }
-            if remove_exclusive && object.origin == FoundBy::ExclusiveContainer {
+            // Exclusive resources wait until every kernel process record is
+            // closed (kernel verified dead).
+            let process_open = open.iter().any(|e| e.kind == EffectKind::Process);
+            if remove_exclusive && process_open && object.origin == FoundBy::ExclusiveContainer {
+                notes.push(format!(
+                    "exclusive-container object {} {:?}: waiting for kernel process records to close",
+                    object.kind, object.key
+                ));
+            } else if remove_exclusive && object.origin == FoundBy::ExclusiveContainer {
                 match self.remove_swept(&object).await {
                     Ok(()) => continue,
                     Err(e) => notes.push(format!(
@@ -275,27 +313,13 @@ impl ReclaimEngineImpl {
     /// records once no instance generation is open, core-binary records once
     /// no open generation launched from that binary. The others wait.
     async fn shared_ready(&self, notes: &mut Vec<String>) -> Result<Vec<Effect>, LedgerError> {
-        let open_generations = self.open_generations(&ScopeFilter::default()).await?;
-        let mut binaries = BTreeSet::new();
-        let mut unknown = false;
-        for (instance, epoch) in &open_generations {
-            match self.deps.ledger.generation(instance, *epoch).await? {
-                Some(g) => {
-                    binaries.insert(report::hex(&g.inputs.core.sha256));
-                }
-                None => unknown = true,
-            }
-        }
+        let gate = self.shared_gate().await?;
         let mut ready = Vec::new();
         for e in self.deps.ledger.open_effects(&ScopeFilter::all()).await? {
-            let waits = match &e.scope {
-                EffectScope::Instance { .. } => continue,
-                EffectScope::CoreBinary { sha256 } => {
-                    unknown || binaries.contains(&sha256.to_ascii_lowercase())
-                }
-                _ => !open_generations.is_empty(),
-            };
-            if waits && !record::record_only(e.persistence) {
+            if e.scope.generation().is_some() {
+                continue;
+            }
+            if gate.waits(&e) && !record::record_only(e.persistence) {
                 notes.push(format!(
                     "{}: waiting for the instance generations that may use it to close",
                     report::pending_note(&e)
@@ -307,10 +331,34 @@ impl ReclaimEngineImpl {
         Ok(ready)
     }
 
+    /// What open instance generations use, for the shared-scope gate.
+    async fn shared_gate(&self) -> Result<SharedGate, LedgerError> {
+        let open = self.open_generations(&ScopeFilter::default()).await?;
+        let mut gate = SharedGate {
+            any_open: !open.is_empty(),
+            ..SharedGate::default()
+        };
+        for (instance, epoch) in &open {
+            match self.deps.ledger.generation(instance, *epoch).await? {
+                Some(g) => {
+                    gate.binaries.insert(report::hex(&g.inputs.core.sha256));
+                }
+                None => gate.unknown = true,
+            }
+        }
+        Ok(gate)
+    }
+
     /// Why an administrator's DELETE on this record must wait, if it must:
-    /// the same gates as automatic reclaim (lower ranks of its group still
-    /// ours and open; fences until the kernel process record is closed).
+    /// the same gates as automatic reclaim (shared scopes wait for the
+    /// generations that may use them; lower ranks of its group still ours
+    /// and open; fences until the kernel process record is closed).
     async fn delete_gate(&self, e: &Effect) -> Result<Option<String>, LedgerError> {
+        if e.scope.generation().is_none() && self.shared_gate().await?.waits(e) {
+            return Ok(Some(
+                "instance generations that may use it are still open".into(),
+            ));
+        }
         let group: Vec<Effect> = self
             .deps
             .ledger
@@ -341,6 +389,18 @@ impl ReclaimEngineImpl {
         let Some(reclaimer) = self.reclaimers.get(&object.kind) else {
             return Ok(Err(format!("no reclaimer for {}", object.kind)));
         };
+        // A swept object may belong to a running generation: one re-derived
+        // for an instance waits for that instance's open generations, any
+        // other for every open generation.
+        let filter = match &object.origin {
+            FoundBy::DerivedName { instance } => ScopeFilter::instance(instance.clone()),
+            _ => ScopeFilter::default(),
+        };
+        if !self.deps.ledger.open_effects(&filter).await?.is_empty() {
+            return Ok(Err(
+                "delete refused, instance generations that may use it are still open".into(),
+            ));
+        }
         if record::rank_of(&self.reclaimers, object.kind) >= crate::rank::FENCE {
             let processes = ScopeFilter {
                 kinds: vec![EffectKind::Process],
@@ -491,12 +551,27 @@ impl ReclaimEngine for ReclaimEngineImpl {
         for d in decisions {
             let action = d.action();
             match report::parse_id(&d.candidate_id) {
-                Some(report::CandidateRef::Record(id)) => {
+                Some(
+                    report::CandidateRef::Candidate(id, _) | report::CandidateRef::Conflict(id),
+                ) => {
                     let open = self.deps.ledger.open_effects(&ScopeFilter::all()).await?;
                     let Some(e) = open.into_iter().find(|e| e.id == id) else {
                         notes.push(format!("{}: no such open record", d.candidate_id));
                         continue;
                     };
+                    // An approval binds to the identity version it was given
+                    // for; a refreshed candidate has a new id.
+                    if let Some(report::CandidateRef::Candidate(_, version)) =
+                        report::parse_id(&d.candidate_id)
+                        && (e.state != EffectState::Candidate
+                            || version != report::candidate_version(&e))
+                    {
+                        notes.push(format!(
+                            "{}: stale decision, the candidate was refreshed; decide on the current report",
+                            d.candidate_id
+                        ));
+                        continue;
+                    }
                     let gate = match action {
                         CandidateAction::Delete => self.delete_gate(&e).await?,
                         _ => None,

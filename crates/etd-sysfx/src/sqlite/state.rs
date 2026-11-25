@@ -40,7 +40,14 @@ impl LedgerState {
     }
 
     pub fn receipt(&self, request: &RequestId) -> Option<Receipt> {
-        self.requests.get(request).map(|(_, t)| t.receipt.clone())
+        self.receipt_for(request, None)
+    }
+
+    pub fn receipt_for(&self, request: &RequestId, caller: Option<&str>) -> Option<Receipt> {
+        self.requests
+            .get(request)
+            .filter(|(r, _)| caller.is_none_or(|c| r.caller == c))
+            .map(|(_, t)| t.receipt.clone())
     }
 
     pub fn pending_tickets(&self) -> Vec<Ticket> {

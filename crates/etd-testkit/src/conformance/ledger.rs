@@ -667,6 +667,27 @@ pub async fn caller_and_purge(ledger: &dyn Ledger) {
         vec![],
     );
     let receipt = ledger.commit(0, original.clone()).await.unwrap();
+    assert_eq!(
+        ledger
+            .receipt_for(&original.request.request_id, Some(&original.request.caller))
+            .await
+            .unwrap(),
+        Some(receipt.clone())
+    );
+    assert_eq!(
+        ledger
+            .receipt_for(&original.request.request_id, Some("different-caller"))
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        ledger
+            .receipt_for(&original.request.request_id, None)
+            .await
+            .unwrap(),
+        Some(receipt.clone())
+    );
     let mut impersonated = original.clone();
     impersonated.request.caller = "different-caller".into();
     assert_eq!(

@@ -60,6 +60,13 @@ impl Ledger for MemoryLedger {
     async fn receipt(&self, request: &RequestId) -> Result<Option<Receipt>, LedgerError> {
         self.read(|s| Ok(s.receipt(request)))
     }
+    async fn receipt_for(
+        &self,
+        request: &RequestId,
+        caller: Option<&str>,
+    ) -> Result<Option<Receipt>, LedgerError> {
+        self.read(|s| Ok(s.receipt_for(request, caller)))
+    }
     async fn pending_tickets(&self) -> Result<Vec<Ticket>, LedgerError> {
         self.read(|s| Ok(s.pending_tickets()))
     }

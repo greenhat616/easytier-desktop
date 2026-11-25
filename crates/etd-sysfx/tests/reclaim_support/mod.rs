@@ -97,6 +97,13 @@ impl Ledger for CrashLedger {
     ) -> Result<Option<etd_contract::Receipt>, LedgerError> {
         self.inner.receipt(r).await
     }
+    async fn receipt_for(
+        &self,
+        r: &etd_contract::RequestId,
+        caller: Option<&str>,
+    ) -> Result<Option<etd_contract::Receipt>, LedgerError> {
+        self.inner.receipt_for(r, caller).await
+    }
     async fn pending_tickets(&self) -> Result<Vec<Ticket>, LedgerError> {
         self.inner.pending_tickets().await
     }

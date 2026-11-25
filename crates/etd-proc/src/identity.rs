@@ -108,7 +108,7 @@ pub(crate) fn group_absent(group: i32) -> io::Result<bool> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(crate) fn pid_absent(pid: u32) -> io::Result<bool> {
     let pid = i32::try_from(pid).map_err(io::Error::other)?;
     if pid <= 0 {

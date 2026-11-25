@@ -121,8 +121,23 @@ fn read_token(pid: u32) -> Result<Option<String>, ProcessError> {
         Ok(pin) => Some(pin),
         Err(_) => None, // process_info distinguishes access denied from no process
     };
-    let info =
-        processkit::process_info(pid).map_err(|e| ProcessError::Enumeration(e.to_string()))?;
+    let info = match processkit::process_info(pid) {
+        Ok(info) => info,
+        Err(error) => {
+            // The proc snapshot can race a reap (e.g. ENOENT). An independent
+            // negative existence observation establishes exit; other errors
+            // remain unobservable rather than being silently skipped.
+            #[cfg(unix)]
+            if identity::pid_absent(pid).unwrap_or(false) {
+                return Ok(None);
+            }
+            #[cfg(windows)]
+            if _pin.as_ref().is_some_and(|pin| pin.gone()) {
+                return Ok(None);
+            }
+            return Err(ProcessError::Enumeration(error.to_string()));
+        }
+    };
     match info {
         None => {
             // A hidepid mount can make /proc look absent even when a PID
@@ -262,10 +277,19 @@ fn marked(marker: &ProcessMarker) -> Result<Vec<ProcessIdentity>, ProcessError> 
                     ProcessStatus::Zombie | ProcessStatus::Dead
                 )
             {
+                if read_token(process.pid().as_u32())?.is_none() {
+                    continue;
+                }
                 return Err(ProcessError::Enumeration(
                     "same-user process image and argv are both unobservable".into(),
                 ));
             }
+            continue;
+        }
+        // Known mismatch is already proof of unrelatedness, even when the
+        // other marker criterion shares the broad kernel-store root. Avoid
+        // pinning every unrelated short-lived process in that directory.
+        if matches!(candidate_matches(process, own, marker), Ok(false)) {
             continue;
         }
         let pid = process.pid().as_u32();
@@ -297,7 +321,16 @@ fn marked(marker: &ProcessMarker) -> Result<Vec<ProcessIdentity>, ProcessError> 
         if !candidate_matches(p, own, marker)? {
             continue;
         }
-        let Some(current) = inspect(pid)? else {
+        let current = match inspect(pid) {
+            Ok(current) => current,
+            Err(error) => {
+                if read_token(pid)?.is_none() {
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+        let Some(current) = current else {
             continue;
         };
         if current.start_token != token || !identity::under(&current.exe, &marker.exe_root) {
@@ -926,6 +959,25 @@ async fn run(
                 hard_deadline.get_or_insert(tokio::time::Instant::now() + CLEANUP_TIMEOUT);
                 if let Err(error) = group.kill_all() { tracing::warn!(%error, "drop cleanup signal failed"); }
             }
+            _ = probe.tick() => {
+                let now = tokio::time::Instant::now();
+                if hard_deadline.is_some_and(|deadline| now >= deadline) {
+                    break None;
+                }
+                let root_gone = root_exited();
+                if grace_deadline.is_some_and(|deadline| now >= deadline) {
+                    if !root_gone { cause = ExitCause::Killed; }
+                    grace_deadline = None;
+                    hard_deadline.get_or_insert(now + CLEANUP_TIMEOUT);
+                }
+                if root_gone {
+                    grace_deadline = None;
+                    hard_deadline.get_or_insert(now + CLEANUP_TIMEOUT);
+                }
+                if hard_deadline.is_some() && let Err(error) = group.kill_all() {
+                    tracing::warn!(%error, "containment cleanup signal failed");
+                }
+            }
             request = rx.recv() => {
                 let Some(request) = request else { break None; };
                 let hard = root_exited() || request.grace.is_none() || hard_deadline.is_some();
@@ -952,25 +1004,6 @@ async fn run(
                 match result {
                     Ok(()) => pending.push(request.reply),
                     Err(error) => { let _ = request.reply.send(Err(error)); }
-                }
-            }
-            _ = probe.tick() => {
-                let now = tokio::time::Instant::now();
-                if hard_deadline.is_some_and(|deadline| now >= deadline) {
-                    break None;
-                }
-                let root_gone = root_exited();
-                if grace_deadline.is_some_and(|deadline| now >= deadline) {
-                    if !root_gone { cause = ExitCause::Killed; }
-                    grace_deadline = None;
-                    hard_deadline.get_or_insert(now + CLEANUP_TIMEOUT);
-                }
-                if root_gone {
-                    grace_deadline = None;
-                    hard_deadline.get_or_insert(now + CLEANUP_TIMEOUT);
-                }
-                if hard_deadline.is_some() && let Err(error) = group.kill_all() {
-                    tracing::warn!(%error, "containment cleanup signal failed");
                 }
             }
         }

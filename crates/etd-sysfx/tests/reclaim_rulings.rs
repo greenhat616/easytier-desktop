@@ -521,3 +521,92 @@ async fn exclusive_sweep_waits_for_process_records() {
     engine.reclaim_all(ReclaimScope::Instances).await.unwrap();
     w.assert_clean();
 }
+
+/// A record in conflict (adapter recreated by someone else with our name).
+async fn conflict_world() -> (World, ObjectKey) {
+    let w = World::new();
+    w.add_instance("a").await;
+    let tun = w
+        .windows_intents("a", 1)
+        .into_iter()
+        .find(|i| i.kind == EffectKind::WinTunAdapter)
+        .unwrap();
+    let effects = w.begin("a", vec![tun.clone()]).await;
+    for e in &effects {
+        if e.kind == EffectKind::WinTunAdapter {
+            w.settle(e, Fate::Applied).await;
+        }
+    }
+    w.sys.replace_with_foreign(tun.kind, &tun.key);
+    (w, tun.key)
+}
+
+#[tokio::test]
+async fn conflict_reference_allows_keep_only() {
+    let (w, _) = conflict_world().await;
+    let engine = w.engine();
+    let report = engine.reclaim_all(ReclaimScope::Instances).await.unwrap();
+    let conflict = report.conflicts[0].id.clone();
+    let report = engine.resolve(&[delete(&conflict)]).await.unwrap();
+    assert!(w.sys.foreign_deleted().is_empty());
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("a conflict can only be kept"))
+    );
+    assert_eq!(report.conflicts.len(), 1);
+}
+
+#[tokio::test]
+async fn conflict_reference_never_acts_on_a_candidate() {
+    let w = World::new();
+    w.add_instance("a").await;
+    let tun = w
+        .windows_intents("a", 1)
+        .into_iter()
+        .find(|i| i.kind == EffectKind::WinTunAdapter)
+        .unwrap();
+    w.begin("a", vec![tun.clone()]).await;
+    w.sys.create_foreign(tun.kind, tun.key.clone());
+    let engine = w.engine();
+    let report = engine.reclaim_all(ReclaimScope::Instances).await.unwrap();
+    let candidate = &report.candidates[0];
+    let CandidateSource::PlannedRecord { effect } = &candidate.source else {
+        panic!("{candidate:?}");
+    };
+    // A conflict-shaped reference to the candidate record: refused for
+    // both actions, nothing changes.
+    let forged = format!("conflict:{}", effect.0);
+    for action in [CandidateAction::Keep, CandidateAction::Delete] {
+        let report = engine
+            .resolve(&[CandidateDecision {
+                candidate_id: forged.clone(),
+                action: action as i32,
+            }])
+            .await
+            .unwrap();
+        assert!(
+            report.notes.iter().any(|n| n.contains("not a conflict")),
+            "{:?}",
+            report.notes
+        );
+        assert_eq!(report.candidates.len(), 1);
+    }
+    assert!(w.sys.foreign_deleted().is_empty());
+    assert_eq!(w.sys.foreign().len(), 1);
+}
+
+#[tokio::test]
+async fn candidate_reference_never_acts_on_a_conflict() {
+    let (w, _) = conflict_world().await;
+    let engine = w.engine();
+    let report = engine.reclaim_all(ReclaimScope::Instances).await.unwrap();
+    let conflict = &report.conflicts[0];
+    // A candidate-shaped reference to the conflict record.
+    let forged = format!("rec:{}@{}", conflict.effect.0, "0".repeat(24));
+    let report = engine.resolve(&[delete(&forged)]).await.unwrap();
+    assert!(w.sys.foreign_deleted().is_empty());
+    assert!(report.notes.iter().any(|n| n.contains("stale decision")));
+    assert_eq!(report.conflicts.len(), 1);
+}

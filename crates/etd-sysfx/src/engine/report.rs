@@ -26,6 +26,17 @@ pub(super) enum CandidateRef {
     Swept,
 }
 
+impl CandidateRef {
+    /// The record a candidate or conflict reference names (`None` for
+    /// swept objects).
+    pub(super) fn effect(&self) -> Option<&EffectId> {
+        match self {
+            CandidateRef::Candidate(id, _) | CandidateRef::Conflict(id) => Some(id),
+            CandidateRef::Swept => None,
+        }
+    }
+}
+
 pub(super) fn parse_id(id: &str) -> Option<CandidateRef> {
     if let Some(rest) = id.strip_prefix(RECORD_PREFIX) {
         let (effect, version) = rest.rsplit_once('@')?;

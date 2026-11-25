@@ -552,24 +552,41 @@ impl ReclaimEngine for ReclaimEngineImpl {
             let action = d.action();
             match report::parse_id(&d.candidate_id) {
                 Some(
-                    report::CandidateRef::Candidate(id, _) | report::CandidateRef::Conflict(id),
+                    reference @ (report::CandidateRef::Candidate(..)
+                    | report::CandidateRef::Conflict(_)),
                 ) => {
+                    let Some(id) = reference.effect() else {
+                        continue;
+                    };
                     let open = self.deps.ledger.open_effects(&ScopeFilter::all()).await?;
-                    let Some(e) = open.into_iter().find(|e| e.id == id) else {
+                    let Some(e) = open.into_iter().find(|e| e.id == *id) else {
                         notes.push(format!("{}: no such open record", d.candidate_id));
                         continue;
                     };
-                    // An approval binds to the identity version it was given
-                    // for; a refreshed candidate has a new id.
-                    if let Some(report::CandidateRef::Candidate(_, version)) =
-                        report::parse_id(&d.candidate_id)
-                        && (e.state != EffectState::Candidate
-                            || version != report::candidate_version(&e))
-                    {
-                        notes.push(format!(
-                            "{}: stale decision, the candidate was refreshed; decide on the current report",
-                            d.candidate_id
-                        ));
+                    // Each reference kind is checked on its own: a conflict
+                    // reference only ever releases a record still in
+                    // conflict; a candidate reference binds to the identity
+                    // version it was given for (a refreshed candidate has a
+                    // new id).
+                    let refusal = match &reference {
+                        report::CandidateRef::Conflict(_) if e.state != EffectState::Conflict => {
+                            Some("not a conflict (any more); decide on the current report")
+                        }
+                        report::CandidateRef::Conflict(_) if action != CandidateAction::Keep => {
+                            Some("a conflict can only be kept")
+                        }
+                        report::CandidateRef::Candidate(_, version)
+                            if e.state != EffectState::Candidate
+                                || *version != report::candidate_version(&e) =>
+                        {
+                            Some(
+                                "stale decision, the candidate was refreshed; decide on the current report",
+                            )
+                        }
+                        _ => None,
+                    };
+                    if let Some(why) = refusal {
+                        notes.push(format!("{}: {why}", d.candidate_id));
                         continue;
                     }
                     let gate = match action {

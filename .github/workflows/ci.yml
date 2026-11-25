@@ -42,6 +42,8 @@ jobs:
           tool: cargo-nextest@0.9.152
       - name: Tests (nextest if available)
         shell: pwsh
+        env:
+          ETD_IPC_CI_ACCOUNTS: ${{ runner.os == 'Windows' && '1' || '' }}
         run: |
           cargo nextest --version
           if ($LASTEXITCODE -eq 0) {

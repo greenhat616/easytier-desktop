@@ -7,9 +7,21 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// Windows named pipe of the installed service host.
 pub const SERVICE_PIPE_NAME: &str = r"\\.\pipe\easytier-desk-host";
 /// Unix socket of the installed service host; its directory is root-owned.
+#[cfg(not(target_os = "macos"))]
 pub const SERVICE_SOCKET_PATH: &str = "/run/easytier-desk/host.sock";
+#[cfg(target_os = "macos")]
+pub const SERVICE_SOCKET_PATH: &str = "/Library/Application Support/easytier-desk/run/host.sock";
 /// Unix group whose members may connect to the service socket (mode 0660).
 pub const SERVICE_SOCKET_GROUP: &str = "easytier-desk";
+
+/// Which host owns a listener and its singleton lock. Independent of the
+/// endpoint name and of the access list used for an individual connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HostForm {
+    Service,
+    User,
+}
 
 /// Where a host listens.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

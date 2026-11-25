@@ -321,16 +321,17 @@ impl Actor {
             .seed_desired(outcome.revision, outcome.desired.clone());
         self.refresh_default_core().await;
         self.store_repair_index(&outcome.desired);
+        if let Some(why) = outcome.hold_starts {
+            self.ctx.set_hold(Some(why));
+            self.resweep_due = Some(self.ctx.deps.clock.now() + self.ctx.config.reclaim_retry);
+        }
         let mut initial = outcome.initial;
         for desired in outcome.desired {
             let id = InstanceId(desired.instance_id.clone());
             let init = initial.remove(&id).unwrap_or(Initial::Idle);
             self.spawn_supervisor(id, Box::new(desired), init, None);
         }
-        if let Some(why) = outcome.hold_starts {
-            self.ctx.set_hold(Some(why));
-            self.resweep_due = Some(self.ctx.deps.clock.now() + self.ctx.config.reclaim_retry);
-        }
+
         self.set_phase(HostPhase::Serving);
         let at = self.now_ms();
         for notice in outcome.notices {

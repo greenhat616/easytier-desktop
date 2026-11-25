@@ -35,7 +35,7 @@ use etd_testkit::fakes::{
 };
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, oneshot};
@@ -155,6 +155,8 @@ pub struct KernelBehaviour {
     pub listen: bool,
     /// Someone else (this pid) holds the management address instead.
     pub squatter: Option<u32>,
+    /// The created objects show no creation credential.
+    pub no_credentials: bool,
 }
 
 impl Default for KernelBehaviour {
@@ -164,6 +166,7 @@ impl Default for KernelBehaviour {
             address: true,
             listen: true,
             squatter: None,
+            no_credentials: false,
         }
     }
 }
@@ -205,6 +208,13 @@ impl ProcessEngine for KernelSim {
             if b.create_objects {
                 for intent in &plan.effects {
                     self.sys.apply_intent_with_pid(intent, Some(id.pid));
+                    if b.no_credentials
+                        && let Some(mut o) = self.sys.find(intent.kind, &intent.key)
+                    {
+                        self.sys.vanish(intent.kind, &intent.key);
+                        o.credential = None;
+                        self.sys.insert(o);
+                    }
                     if b.address && matches!(intent.key, ObjectKey::Interface { .. }) {
                         self.sys.set_addresses(
                             intent.kind,
@@ -239,10 +249,17 @@ impl ProcessEngine for KernelSim {
 /// The in-memory ledger with switchable faults and a write counter.
 pub struct TestLedger {
     pub inner: Arc<MemoryLedger>,
+    /// Committed (once) right after the next `generation()` read of this
+    /// instance: a concurrent mutation landing just before a launch.
+    pub on_generation_read: Mutex<Option<(InstanceId, Change)>>,
     /// `desired()` fails with this error.
     pub desired_error: Mutex<Option<LedgerError>>,
     /// Every write fails as unavailable.
     pub writes_fail: AtomicBool,
+    /// The next N `begin_epoch` calls fail (storage unavailable).
+    pub fail_begin: AtomicUsize,
+    /// The next N `generation()` reads of this instance fail.
+    pub fail_generation: Mutex<Option<(InstanceId, usize)>>,
     pub writes: AtomicU64,
 }
 
@@ -299,6 +316,13 @@ impl Ledger for TestLedger {
     }
     async fn begin_epoch(&self, plan: GenerationPlan) -> Result<Vec<Effect>, LedgerError> {
         self.write()?;
+        if self
+            .fail_begin
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(LedgerError::Unavailable(StorageFault::DiskFull));
+        }
         self.inner.begin_epoch(plan).await
     }
     async fn generation(
@@ -306,7 +330,42 @@ impl Ledger for TestLedger {
         i: &InstanceId,
         e: Epoch,
     ) -> Result<Option<StoredGeneration>, LedgerError> {
-        self.inner.generation(i, e).await
+        {
+            let mut f = self.fail_generation.lock().unwrap();
+            if let Some((id, n)) = f.as_mut()
+                && id == i
+                && *n > 0
+            {
+                *n -= 1;
+                return Err(LedgerError::Unavailable(StorageFault::DiskFull));
+            }
+        }
+        let read = self.inner.generation(i, e).await;
+        let hook = {
+            let mut h = self.on_generation_read.lock().unwrap();
+            match h.as_ref() {
+                Some((id, _)) if id == i => h.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, change)) = hook {
+            let revision = self.inner.desired().await?.0;
+            self.inner
+                .commit(
+                    revision,
+                    ChangeSet {
+                        request: RequestRecord {
+                            request_id: RequestId(format!("concurrent-{}", uuid::Uuid::new_v4())),
+                            caller: "test".into(),
+                            digest: RequestDigest([9; 32]),
+                        },
+                        changes: vec![change],
+                        generations: Vec::new(),
+                    },
+                )
+                .await?;
+        }
+        read
     }
     async fn record(&self, intent: EffectIntent) -> Result<Effect, LedgerError> {
         self.write()?;
@@ -393,7 +452,10 @@ impl World {
         });
         let ledger = Arc::new(TestLedger {
             inner: Arc::new(MemoryLedger::new(sys.boot())),
+            on_generation_read: Mutex::new(None),
             desired_error: Mutex::new(None),
+            fail_begin: AtomicUsize::new(0),
+            fail_generation: Mutex::new(None),
             writes_fail: AtomicBool::new(false),
             writes: AtomicU64::new(0),
         });
@@ -496,6 +558,8 @@ impl World {
             task: Some(task),
             rt: Some(rt),
             requests: 0,
+            hold_notify: false,
+            held: Vec::new(),
         }
     }
 
@@ -507,6 +571,37 @@ impl World {
             )),
             guid: None,
         }
+    }
+
+    /// The latest kernel spawned for this instance.
+    pub fn kernel_of(&self, instance: &str) -> ProcessIdentity {
+        let dir = self.dirs.run_dir.join(instance);
+        self.kernel
+            .spawned
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(_, cmd)| cmd.cwd.as_ref().is_some_and(|c| c.starts_with(&dir)))
+            .map(|(id, _)| id.clone())
+            .expect("a kernel of this instance was spawned")
+    }
+
+    /// Power loss while the host was down: the machine reboots, every
+    /// process is gone, volatile objects vanish, the boot id changes.
+    pub fn power_loss(&self) {
+        for id in self.spawned() {
+            self.engine.exit(
+                &id,
+                etd_proc::Exit {
+                    code: None,
+                    signal: None,
+                    cause: etd_proc::ExitCause::Exited,
+                },
+            );
+        }
+        let boot = self.sys.reboot();
+        self.ledger.inner.set_boot_id(boot);
     }
 
     pub fn behave(&self, b: KernelBehaviour) {
@@ -559,6 +654,8 @@ pub struct Host<'w> {
     task: Option<tokio::task::JoinHandle<RunOutcome>>,
     rt: Option<tokio::runtime::Runtime>,
     requests: u64,
+    hold_notify: bool,
+    held: Vec<Receipt>,
 }
 
 impl Host<'_> {
@@ -593,7 +690,15 @@ impl Host<'_> {
     ) {
         let mut spent = Duration::ZERO;
         loop {
-            self.settle().await;
+            // Let the host finish what it is doing before time moves on: a
+            // loaded machine must not see virtual timeouts fire early.
+            for _ in 0..50 {
+                let seen = self.log.len();
+                self.settle().await;
+                if self.log.len() == seen {
+                    break;
+                }
+            }
             if pred(self) {
                 return;
             }
@@ -635,7 +740,10 @@ impl Host<'_> {
                 return;
             }
         }
-        panic!("timed out waiting for {what}");
+        panic!(
+            "timed out waiting for {what}; statuses {:#?}",
+            self.statuses()
+        );
     }
 
     pub fn snapshot(&self) -> HostSnapshot {
@@ -690,6 +798,25 @@ impl Host<'_> {
         out
     }
 
+    /// Every state-machine edge the instances took, from the event log
+    /// (the first status of an instance leaves `UNSPECIFIED`).
+    pub fn edges(&mut self) -> std::collections::BTreeSet<(InstanceState, InstanceState)> {
+        self.drain();
+        let mut last: std::collections::BTreeMap<String, InstanceState> = Default::default();
+        let mut out = std::collections::BTreeSet::new();
+        for e in &self.log {
+            if let etd_contract::v1::event::Payload::InstanceStatus(s) = &e.payload {
+                let from = last
+                    .insert(s.instance_id.clone(), s.state())
+                    .unwrap_or(InstanceState::Unspecified);
+                if from != s.state() {
+                    out.insert((from, s.state()));
+                }
+            }
+        }
+        out
+    }
+
     pub fn events_seq_gap_free(&mut self) -> bool {
         self.drain();
         self.log.windows(2).all(|w| w[1].seq == w[0].seq + 1)
@@ -738,6 +865,10 @@ impl Host<'_> {
             generations: planned.generation.into_iter().collect(),
         };
         let receipt = self.world.ledger.commit(planned.revision, change).await?;
+        if self.hold_notify {
+            self.held.push(receipt.clone());
+            return Ok(receipt);
+        }
         self.handle
             .send(Command::Committed {
                 receipt: receipt.clone(),
@@ -745,6 +876,22 @@ impl Host<'_> {
             .await
             .unwrap();
         Ok(receipt)
+    }
+
+    /// Commit without telling the host yet (`notify` sends them): lets a
+    /// test change the world between a commit and its execution.
+    pub fn hold(&mut self) {
+        self.hold_notify = true;
+    }
+
+    pub async fn notify(&mut self) {
+        self.hold_notify = false;
+        for receipt in std::mem::take(&mut self.held) {
+            self.handle
+                .send(Command::Committed { receipt })
+                .await
+                .unwrap();
+        }
     }
 
     /// Apply: put the configuration with a desired state.
@@ -849,6 +996,25 @@ impl Host<'_> {
             .await
             .unwrap();
         rx.await.unwrap()
+    }
+
+    pub async fn leases(&self, lease_holders: usize) {
+        self.handle
+            .send(Command::Clients(ClientPresence {
+                connections: lease_holders,
+                subscribers: lease_holders,
+                lease_holders,
+            }))
+            .await
+            .unwrap();
+    }
+
+    /// Whether the orchestrator has returned, and how.
+    pub async fn finished(&mut self) -> Option<RunOutcome> {
+        if self.task.as_ref().is_some_and(|t| t.is_finished()) {
+            return Some(self.task.take().unwrap().await.unwrap());
+        }
+        None
     }
 
     pub async fn clients(&self, subscribers: usize) {

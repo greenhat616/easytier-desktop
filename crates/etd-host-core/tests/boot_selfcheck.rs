@@ -210,3 +210,128 @@ async fn ledger_unavailable_recovers_containers_only() {
     );
     assert!(world.sys.foreign_deleted().is_empty());
 }
+
+fn notices(h: &mut Host<'_>, code: &str) -> Vec<etd_contract::v1::Notice> {
+    h.settle_sync();
+    h.log
+        .iter()
+        .filter_map(|e| match &e.payload {
+            Payload::Notice(n) if n.code == code => Some(n.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_failed_sweep_holds_every_start_until_a_retry_succeeds() {
+    let world = World::new();
+    crashed_with(&world, &["a"]).await;
+    // Both sweeps of this boot fail (per generation and whole run dir).
+    for _ in 0..2 {
+        world
+            .engine
+            .fail_next_enumeration(etd_proc::ProcessError::Enumeration("denied".into()));
+    }
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.until_still("waiting", |h| h.state("a") == S::Waiting)
+        .await;
+    assert_eq!(notices(&mut h, "selfcheck.incomplete").len(), 1);
+    assert_eq!(
+        world.spawned().len(),
+        1,
+        "nothing starts while the sweep failed"
+    );
+    // Retries run every reclaim period; the enumeration recovers.
+    h.until("a restarted", |h| {
+        h.status("a")
+            .is_some_and(|s| s.epoch == 2 && s.state() == S::ReadyFull)
+    })
+    .await;
+    assert_eq!(notices(&mut h, "selfcheck.complete").len(), 1);
+}
+
+#[tokio::test]
+async fn an_unkillable_orphan_quarantines_its_instance_only() {
+    let world = World::new();
+    crashed_with(&world, &["a", "b"]).await;
+    // An unrecorded kernel of a's (closed) generation 9 that cannot be killed.
+    let stray = world
+        .engine
+        .spawn(Command {
+            executable: world.store.binary.clone(),
+            args: vec![
+                world
+                    .dirs
+                    .run_dir
+                    .join("a")
+                    .join("9")
+                    .join("config.toml")
+                    .into(),
+            ],
+            env: Vec::new(),
+            cwd: None,
+        })
+        .await
+        .unwrap()
+        .identity()
+        .clone();
+    std::fs::create_dir_all(world.dirs.run_dir.join("a").join("9")).unwrap();
+    world.engine.set_liveness(&stray, Some(Liveness::Uncertain));
+
+    let mut h = world.start();
+    h.until("b restarted", |h| {
+        h.status("b")
+            .is_some_and(|s| s.epoch == 2 && s.state() == S::ReadyFull)
+    })
+    .await;
+    h.wait_state("a", S::Quarantined).await;
+    let n = notices(&mut h, "selfcheck.quarantined");
+    assert!(n.iter().any(|n| n.instance_id == "a"), "{n:?}");
+    assert_eq!(world.spawned().len(), 3, "only b got a new kernel");
+
+    // A retry while it still cannot be killed changes nothing ...
+    h.retry_reclaim("a").await;
+    h.idle(
+        std::time::Duration::from_millis(500),
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(h.state("a"), S::Quarantined);
+    // ... once it can, the instance comes back.
+    world.engine.set_liveness(&stray, None);
+    h.retry_reclaim("a").await;
+    h.until("a restarted", |h| h.state("a") == S::ReadyFull)
+        .await;
+    assert_eq!(world.kernel.liveness(&stray).await, Liveness::Gone);
+}
+
+#[tokio::test]
+async fn an_unrecordable_quarantine_reclaims_nothing() {
+    let world = World::new();
+    crashed_with(&world, &["a"]).await;
+    let kernel = world.last_kernel();
+    world
+        .engine
+        .set_liveness(&kernel, Some(Liveness::Uncertain));
+    world.ledger.writes_fail.store(true, Ordering::SeqCst);
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.wait_state("a", S::Quarantined).await;
+    world.ledger.writes_fail.store(false, Ordering::SeqCst);
+    h.idle(
+        std::time::Duration::from_millis(500),
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    // Its objects are all still there, and nothing restarted.
+    assert!(
+        world
+            .sys
+            .find(EffectKind::LinuxTun, &world.interface_key("a"))
+            .is_some()
+    );
+    assert!(world.sys.deleted().is_empty());
+    assert_eq!(world.spawned().len(), 1);
+    assert_eq!(h.state("a"), S::Quarantined);
+}

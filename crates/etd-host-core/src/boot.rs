@@ -115,12 +115,18 @@ pub(crate) async fn self_check(ctx: Arc<Ctx>) -> BootOutcome {
     let deps = &ctx.deps;
 
     // Step 2: ledger and boot id.
-    match deps.boot_id.current() {
-        Ok(b) => log.push(format!("self-check: boot id {}", b.0)),
-        Err(e) => log.push(format!(
-            "self-check: boot id unreadable ({e}); volatile records are probed"
-        )),
-    }
+    let boot = match deps.boot_id.current() {
+        Ok(b) => {
+            log.push(format!("self-check: boot id {}", b.0));
+            Some(b)
+        }
+        Err(e) => {
+            log.push(format!(
+                "self-check: boot id unreadable ({e}); volatile records are probed"
+            ));
+            None
+        }
+    };
     let desired = deps.ledger.desired().await;
     let (revision, desired) = match desired {
         Ok(d) => d,
@@ -173,6 +179,12 @@ pub(crate) async fn self_check(ctx: Arc<Ctx>) -> BootOutcome {
                     quarantined
                         .entry(instance)
                         .or_insert_with(|| (epoch, e.last_error.clone().unwrap_or_default()));
+                    continue;
+                }
+                // A kernel of an earlier boot died with it: the reclaim
+                // engine closes its record unprobed (its pid may belong to
+                // anything now).
+                if boot.as_ref().is_some_and(|b| *b != e.boot) && e.persistence.closes_on_reboot() {
                     continue;
                 }
                 let Some(id) = recorded_identity(&e) else {

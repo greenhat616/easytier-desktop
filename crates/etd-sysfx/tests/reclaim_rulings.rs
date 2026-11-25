@@ -610,3 +610,102 @@ async fn candidate_reference_never_acts_on_a_conflict() {
     assert!(report.notes.iter().any(|n| n.contains("stale decision")));
     assert_eq!(report.conflicts.len(), 1);
 }
+
+fn magic_dns_recovery(id: &str, epoch: u64) -> EffectIntent {
+    EffectIntent {
+        scope: scope(id, epoch),
+        kind: EffectKind::WinMagicDnsRecovery,
+        key: ObjectKey::Registry {
+            key: r"HKLM\SOFTWARE\EasyTier\MagicDNS".into(),
+            value: None,
+        },
+        undo: Undo::ReplayUpstreamRecovery,
+        persistence: Persistence::Persistent,
+    }
+}
+
+#[tokio::test]
+async fn replay_upstream_recovery_is_authorised_by_its_reclaimer() {
+    let w = World::new();
+    w.add_instance("a").await;
+    // Planned only (no credential): still handed to the reclaimer.
+    let effects = w.begin("a", vec![magic_dns_recovery("a", 1)]).await;
+    for e in &effects {
+        if e.kind == EffectKind::WinMagicDnsRecovery {
+            w.settle(e, Fate::PlannedPresent).await;
+        }
+    }
+    let engine = w.engine();
+    // The reclaimer refuses (another EasyTier process runs): retryable.
+    w.sys.inject(
+        Fault::on(Step::Reclaim)
+            .kind(EffectKind::WinMagicDnsRecovery)
+            .once()
+            .fail(ReclaimError::Busy("other EasyTier running".into())),
+    );
+    let a = InstanceId::from("a");
+    let report = engine.reclaim_generation(&a, Epoch(1)).await.unwrap();
+    assert_eq!(report.outcome, GenerationOutcome::Pending);
+    assert_eq!(w.sys.ours().len(), 1);
+    // Gate holds now: replayed, verified absent, closed.
+    let report = engine.reclaim_generation(&a, Epoch(1)).await.unwrap();
+    assert_eq!(report.outcome, GenerationOutcome::Closed);
+    w.assert_clean();
+}
+
+#[tokio::test]
+async fn replay_upstream_recovery_must_leave_its_key_absent() {
+    let w = World::new();
+    w.add_instance("a").await;
+    let effects = w.begin("a", vec![magic_dns_recovery("a", 1)]).await;
+    for e in &effects {
+        if e.kind == EffectKind::WinMagicDnsRecovery {
+            w.settle(e, Fate::Applied).await;
+        }
+    }
+    // The reclaimer reports success but the recovery key stays.
+    let engine = w.engine_with(
+        EffectKind::ALL
+            .iter()
+            .copied()
+            .filter(|k| *k != EffectKind::WinMagicDnsRecovery)
+            .map(|k| w.sys.reclaimer(k))
+            .chain(std::iter::once(
+                std::sync::Arc::new(NoopReclaimer) as std::sync::Arc<dyn Reclaimer>
+            ))
+            .collect(),
+    );
+    let report = engine
+        .reclaim_generation(&InstanceId::from("a"), Epoch(1))
+        .await
+        .unwrap();
+    assert_eq!(report.outcome, GenerationOutcome::Pending);
+    let residue = &report.residues[0];
+    assert!(
+        matches!(&residue.reason, ResidueReason::Failing { last_error, .. } if last_error.contains("still present"))
+    );
+}
+
+/// Claims success without touching anything; probes always find the key.
+struct NoopReclaimer;
+
+#[async_trait::async_trait]
+impl Reclaimer for NoopReclaimer {
+    fn kind(&self) -> EffectKind {
+        EffectKind::WinMagicDnsRecovery
+    }
+    fn rank(&self) -> u8 {
+        EffectKind::WinMagicDnsRecovery.default_rank()
+    }
+    async fn probe(&self, e: &Effect) -> Probe {
+        Probe::Present(Observation {
+            credential: None,
+            key: Some(e.key.clone()),
+            observed_at: jiff::Timestamp::now(),
+            detail: None,
+        })
+    }
+    async fn reclaim(&self, _: &Effect) -> Result<Reclaimed, ReclaimError> {
+        Ok(Reclaimed::Removed)
+    }
+}

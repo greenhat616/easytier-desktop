@@ -13,7 +13,12 @@
 //! equals ours (otherwise `Reclaimed::LeftModified`, nothing touched). A
 //! record whose two values are equal has nothing to undo and is closed.
 //!
-//! Any other undo form fails closed: the object becomes a candidate.
+//! `Undo::ReplayUpstreamRecovery` (E1, Magic DNS recovery) is authorised by
+//! its reclaimer, which replays upstream's recovery only while no other
+//! EasyTier process runs and refuses with a retryable error otherwise; the
+//! record's key must probe absent afterwards like any delete. The undo
+//! match is exhaustive, so a new undo form must be decided before it
+//! compiles.
 //!
 //! Lease and Expiring records (router mappings) are record-only: they are
 //! never reclaimed actively, never block a rank and never hold a generation
@@ -63,6 +68,8 @@ enum Authority {
     Restore,
     /// A setting whose undo changes nothing.
     NothingToUndo,
+    /// The undo carries its own authorisation check, done by the reclaimer.
+    ByReclaimer,
     Candidate,
     Conflict,
     /// Present, the record has a credential, the probe could not read one.
@@ -221,11 +228,13 @@ impl Ctx<'_> {
                 Ok(RecordOutcome::Held)
             }
             Authority::Conflict => self.conflict(e, &found).await,
-            Authority::Delete | Authority::Restore => match r.reclaim(e).await {
-                Err(ReclaimError::CredentialMismatch) => self.conflict(e, &found).await,
-                Err(err) => self.fail(e, &err.to_string()).await,
-                Ok(done) => self.verify(e, r.as_ref(), done).await,
-            },
+            Authority::Delete | Authority::Restore | Authority::ByReclaimer => {
+                match r.reclaim(e).await {
+                    Err(ReclaimError::CredentialMismatch) => self.conflict(e, &found).await,
+                    Err(err) => self.fail(e, &err.to_string()).await,
+                    Ok(done) => self.verify(e, r.as_ref(), done).await,
+                }
+            }
         }
     }
 
@@ -354,16 +363,21 @@ impl Ctx<'_> {
 
 /// What the object a probe found authorises.
 fn authority(e: &Effect, found: &Observation) -> Authority {
-    if let Undo::RestoreIfOurs { ours, original } = &e.undo {
-        return if ours == original {
-            Authority::NothingToUndo
-        } else {
-            Authority::Restore
-        };
-    }
-    if !matches!(e.undo, Undo::EnsureAbsent) {
-        // An undo form this engine does not know: fail closed.
-        return Authority::Candidate;
+    // Exhaustive on purpose: a new undo form must be decided here before
+    // this crate compiles.
+    match &e.undo {
+        Undo::RestoreIfOurs { ours, original } => {
+            return if ours == original {
+                Authority::NothingToUndo
+            } else {
+                Authority::Restore
+            };
+        }
+        // Ruling msg#489: the reclaimer checks its own gate (no other
+        // EasyTier process running) and refuses with a retryable error
+        // otherwise; the record's key must probe absent afterwards.
+        Undo::ReplayUpstreamRecovery => return Authority::ByReclaimer,
+        Undo::EnsureAbsent => {}
     }
     if matches!(
         found.credential,

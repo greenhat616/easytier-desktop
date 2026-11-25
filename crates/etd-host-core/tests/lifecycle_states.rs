@@ -1,0 +1,210 @@
+//! Instance states: give-up after the fifth abnormal exit within five
+//! minutes (desired state stays RUNNING), basic readiness without the
+//! management RPC, a stop that cannot be recorded still cuts the kernel
+//! (CUT_UNCONFIRMED), single-writer waiting, process-cleanup uncertainty,
+//! and a foreign object on the derived interface name.
+mod lifecycle_common;
+
+use etd_contract::v1::{ManagementAccess, event::Payload};
+use etd_contract::{Desired, ErrorCode, InstanceState as S};
+use etd_core_api::CoreError;
+use etd_proc::{Exit, ExitCause, Liveness, ProcessEngine, ProcessEvent};
+use etd_sysfx::{EffectKind, EffectState};
+use etd_testkit::fakes::core::MAGIC_DNS_CLAIM;
+use lifecycle_common::*;
+use std::sync::atomic::Ordering;
+
+fn crash() -> Exit {
+    Exit {
+        code: Some(9),
+        signal: None,
+        cause: ExitCause::Exited,
+    }
+}
+
+#[tokio::test]
+async fn fifth_abnormal_exit_gives_up_with_desired_running() {
+    let world = World::new();
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.apply("a", spec("net"), Desired::Running).await;
+    for n in 1..=5u64 {
+        h.until("ready", |h| {
+            h.status("a")
+                .is_some_and(|s| s.epoch == n && s.state() == S::ReadyFull)
+        })
+        .await;
+        world.engine.exit(&world.last_kernel(), crash());
+        if n < 5 {
+            h.until_still("backoff", |h| h.state("a") == S::Backoff)
+                .await;
+        }
+    }
+    h.wait_state("a", S::GaveUp).await;
+    // 1 + 2 + 4 + 8 s of backoff: well inside five minutes.
+    let status = h.status("a").unwrap();
+    assert_eq!(status.restart_attempt, 5);
+    let desired = h.snapshot().instances[0].desired.clone().unwrap();
+    assert_eq!(desired.desired(), Desired::Running);
+    let gave_up = h
+        .log
+        .iter()
+        .any(|e| matches!(&e.payload, Payload::InstanceExited(x) if x.epoch == 5 && x.gave_up));
+    assert!(gave_up);
+    assert!(
+        world.open_records("a").await.is_empty(),
+        "reclaimed before giving up"
+    );
+    // Stays down on its own ...
+    h.idle(
+        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(600),
+    )
+    .await;
+    assert_eq!(world.spawned().len(), 5);
+    assert_eq!(h.state("a"), S::GaveUp);
+    // ... until a manual retry.
+    h.retry_start("a").await;
+    h.until("epoch 6", |h| {
+        h.status("a")
+            .is_some_and(|s| s.epoch == 6 && s.state() == S::ReadyFull)
+    })
+    .await;
+    assert_eq!(h.status("a").unwrap().restart_attempt, 0);
+}
+
+#[tokio::test]
+async fn basic_readiness_does_not_need_the_rpc() {
+    let world = World::new();
+    world
+        .driver
+        .set_attach_error(Some(CoreError::Connect("refused".into())));
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.apply("a", spec("net"), Desired::Running).await;
+    h.wait_state("a", S::ReadyBasic).await;
+    let status = h.status("a").unwrap();
+    assert_eq!(status.addresses, vec!["10.144.0.1/24".to_string()]);
+    assert_eq!(status.management(), ManagementAccess::Available);
+    // Time passes: still basic, never killed for the missing RPC.
+    for _ in 0..50 {
+        world.clock.advance(std::time::Duration::from_millis(500));
+        h.settle().await;
+    }
+    assert_eq!(h.state("a"), S::ReadyBasic);
+    assert_eq!(world.spawned().len(), 1);
+    let err = h.query("a").await.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ManagementUnavailable);
+    // The RPC comes back: full readiness.
+    world.driver.set_attach_error(None);
+    h.wait_state("a", S::ReadyFull).await;
+    assert!(h.query("a").await.is_ok());
+}
+
+#[tokio::test]
+async fn unrecordable_stop_still_cuts_the_kernel() {
+    let world = World::new();
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.apply("a", spec("net"), Desired::Running).await;
+    h.wait_state("a", S::ReadyFull).await;
+    let kernel = world.last_kernel();
+
+    world.ledger.writes_fail.store(true, Ordering::SeqCst);
+    assert!(h.set_desired("a", Desired::Stopped).await.is_err());
+    // H2 cannot commit the stop: it cuts.
+    h.cut("a").await.unwrap();
+    h.wait_state("a", S::CutUnconfirmed).await;
+    assert_eq!(world.kernel.liveness(&kernel).await, Liveness::Gone);
+    // Nothing is reclaimed while the stop is unconfirmed (records stay).
+    assert!(!world.open_records("a").await.is_empty());
+    h.idle(
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    assert_eq!(h.state("a"), S::CutUnconfirmed);
+    assert_eq!(world.spawned().len(), 1);
+
+    // The retried stop commits: reclaim, then stopped.
+    world.ledger.writes_fail.store(false, Ordering::SeqCst);
+    h.set_desired("a", Desired::Stopped).await.unwrap();
+    h.wait_state("a", S::Stopped).await;
+    assert!(world.open_records("a").await.is_empty());
+}
+
+#[tokio::test]
+async fn single_writer_claims_are_exclusive_and_deferred() {
+    let world = World::new();
+    let mut h = world.start();
+    h.wait_serving().await;
+    let dns = || etd_contract::NetworkSpec {
+        magic_dns: true,
+        ..spec("net")
+    };
+    h.apply("a", dns(), Desired::Running).await;
+    h.wait_state("a", S::ReadyFull).await;
+    // Both running with the same claim: refused.
+    let err = h.plan("b", Some(dns()), true).await.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::SingleWriterTaken);
+    assert_eq!(err.features, vec![MAGIC_DNS_CLAIM.to_string()]);
+
+    // b saved stopped, a stopped; b started while a's generation still
+    // holds the claim: b waits, then starts once a is reclaimed.
+    h.apply("b", dns(), Desired::Stopped).await;
+    world.sys.inject(
+        etd_testkit::fakes::system::Fault::on(etd_testkit::fakes::system::Step::Reclaim)
+            .kind(EffectKind::WinNrptRule)
+            .times(2)
+            .fail(etd_sysfx::ReclaimError::Busy("busy".into())),
+    );
+    h.set_desired("a", Desired::Stopped).await.unwrap();
+    h.until_still("a reclaiming", |h| h.state("a") == S::Reclaiming)
+        .await;
+    let planned = h.plan("b", None, true).await.unwrap();
+    assert!(planned.generation.is_none());
+    h.set_desired("b", Desired::Running).await.unwrap();
+    h.until("b ready", |h| h.state("b") == S::ReadyFull).await;
+    assert_eq!(h.state("a"), S::Stopped);
+    let history = h.history("b");
+    assert!(history.contains(&S::Waiting), "{history:?}");
+}
+
+#[tokio::test]
+async fn cleanup_uncertain_quarantines_without_restart() {
+    let world = World::new();
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.apply("a", spec("net"), Desired::Running).await;
+    h.wait_state("a", S::ReadyFull).await;
+    let kernel = world.last_kernel();
+    world.engine.emit(
+        &kernel,
+        ProcessEvent::CleanupUncertain("job not empty".into()),
+    );
+    h.wait_state("a", S::Quarantined).await;
+    let open = world.open_records("a").await;
+    let process = open.iter().find(|e| e.kind == EffectKind::Process).unwrap();
+    assert_eq!(process.state, EffectState::Quarantined);
+    h.idle(
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(120),
+    )
+    .await;
+    assert_eq!(world.spawned().len(), 1);
+    assert_eq!(h.state("a"), S::Quarantined);
+}
+
+#[tokio::test]
+async fn foreign_interface_name_refuses_the_start() {
+    let world = World::new();
+    world
+        .sys
+        .create_foreign(EffectKind::LinuxTun, world.interface_key("a"));
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.apply("a", spec("net"), Desired::Running).await;
+    h.wait_state("a", S::Quarantined).await;
+    assert!(world.spawned().is_empty());
+    assert!(world.sys.foreign_deleted().is_empty());
+}

@@ -38,11 +38,13 @@ use etd_contract::{
     LogLine, QueryKind, QueryResponse,
 };
 use etd_core_api::{CoreEventCursor, CoreEventKind, CoreSession, LaunchPlan, ReadinessCondition};
-use etd_proc::{Exit, ExitCause, ProcessEvent, ProcessHandle, RestartDecision, RestartPolicy};
+use etd_proc::{
+    Exit, ExitCause, ProcessError, ProcessEvent, ProcessHandle, RestartDecision, RestartPolicy,
+};
 use etd_sysfx::{
     Credential, Effect, EffectKind, EffectState, Epoch, FenceSpec, GenerationOutcome,
     GenerationReport, LaunchInputs, LedgerError, ManagementGuard, ObjectKey, Observation,
-    StoredGeneration,
+    Persistence, StoredGeneration,
 };
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -60,8 +62,11 @@ pub(crate) enum SupCmd {
         retry_start: bool,
     },
     RetryReclaim,
-    /// Candidates were resolved or a claim may have been released.
+    /// Candidates were resolved: a quarantined generation is reclaimed
+    /// again, a deferred start tries again.
     Recheck,
+    /// Another generation closed: a single-writer claim may be free.
+    ClaimsChanged,
     Cut {
         reply: Reply<()>,
     },
@@ -103,6 +108,9 @@ enum Then {
     GiveUp(String),
     /// Plan the next generation with `ManagementGuard::DenyAll`.
     FenceFallback,
+    /// Refused before the spawn (a foreign object holds the derived
+    /// interface name): quarantine until a reclaim retry.
+    Quarantine(String),
     /// End the task.
     Exit,
 }
@@ -115,6 +123,13 @@ enum LaunchFail {
     Fence(String),
     /// Spawn or preparation failed; counts like an abnormal exit.
     Abnormal(String),
+    /// The child started but exited before its identity was captured (its
+    /// containment is confirmed empty): an abnormal exit.
+    Exited(Exit),
+    /// The process tree could not be confirmed empty: quarantine.
+    Uncertain(String),
+    /// A foreign object holds what this generation would create.
+    Taken(String),
 }
 
 struct Live {
@@ -308,14 +323,21 @@ impl Supervisor {
     }
 
     pub(crate) async fn run(mut self) {
-        loop {
+        // Commands queued at creation (a ticket's committed generation) come
+        // before the supervisor drives toward desired state on its own.
+        let mut exit = false;
+        while let Ok(cmd) = self.cmds.try_recv() {
+            if self.on_cmd(cmd).await == Flow::Exit {
+                exit = true;
+                break;
+            }
+        }
+        while !exit {
             if self.drive().await == Flow::Exit {
                 break;
             }
             let input = self.next_input().await;
-            if self.handle(input).await == Flow::Exit {
-                break;
-            }
+            exit = self.handle(input).await == Flow::Exit;
         }
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
@@ -357,7 +379,10 @@ impl Supervisor {
         let from = self.status.state();
         if !machine::allowed(from, to) {
             tracing::error!(instance = %self.id, ?from, ?to, "refused state edge");
-            debug_assert!(false, "instance state edge {from:?} -> {to:?} is not allowed");
+            debug_assert!(
+                false,
+                "instance state edge {from:?} -> {to:?} is not allowed"
+            );
             return;
         }
         if from != to {
@@ -477,8 +502,7 @@ impl Supervisor {
             match &self.phase {
                 Phase::Idle => {
                     if self.shutdown.is_some() || self.desired.is_none() {
-                        if self.desired.is_none() && self.status.state() != InstanceState::Stopped
-                        {
+                        if self.desired.is_none() && self.status.state() != InstanceState::Stopped {
                             self.set_state(InstanceState::Stopped, "removed");
                         }
                         return Flow::Exit;
@@ -514,7 +538,10 @@ impl Supervisor {
                     if self.reclaim(epoch, then, false).await == Flow::Exit {
                         return Flow::Exit;
                     }
-                    if matches!(self.phase, Phase::Reclaim { .. } | Phase::Quarantined { .. }) {
+                    if matches!(
+                        self.phase,
+                        Phase::Reclaim { .. } | Phase::Quarantined { .. }
+                    ) {
                         if self.shutdown.is_some() {
                             return Flow::Exit;
                         }
@@ -578,8 +605,14 @@ impl Supervisor {
                 return Flow::Continue;
             }
         };
-        let revision = match ledger.desired().await {
-            Ok((r, _)) => r,
+        // The revision that committed this configuration (begin_epoch
+        // requires it to match).
+        let revision = match ledger.spec_revision(&self.id).await {
+            Ok(r) => r,
+            Err(LedgerError::UnknownInstance(_)) => {
+                self.waiting = true;
+                return Flow::Continue;
+            }
             Err(e) => {
                 self.retry_later(format!("ledger unavailable: {e}"));
                 return Flow::Continue;
@@ -623,6 +656,17 @@ impl Supervisor {
             Err(LedgerError::EpochNotNext { .. }) => {
                 // A client commit reserved a generation meanwhile; its
                 // ticket brings it here.
+                return Flow::Continue;
+            }
+            Err(LedgerError::RemovalPending { .. } | LedgerError::UnknownInstance(_)) => {
+                // Being removed: the removal ticket ends this task.
+                self.waiting = true;
+                return Flow::Continue;
+            }
+            Err(e @ (LedgerError::InvalidPlan { .. } | LedgerError::CounterExhausted(_))) => {
+                let message = format!("cannot reserve a generation: {e}");
+                self.notice(NoticeLevel::Error, "start.refused", message.clone());
+                self.give_up_now(message);
                 return Flow::Continue;
             }
             Err(e) => {
@@ -703,6 +747,24 @@ impl Supervisor {
                         };
                         self.abnormal_then(&exit)
                     }
+                    LaunchFail::Exited(exit) => {
+                        self.notice(
+                            NoticeLevel::Warning,
+                            "start.failed",
+                            format!("the kernel exited at once (code {:?})", exit.code),
+                        );
+                        let then = self.abnormal_then(&exit);
+                        self.report_exit(epoch, &exit, &then);
+                        then
+                    }
+                    LaunchFail::Uncertain(m) => {
+                        self.quarantine_uncertain(epoch, m).await;
+                        return Flow::Continue;
+                    }
+                    LaunchFail::Taken(m) => {
+                        self.notice(NoticeLevel::Error, "start.refused", m.clone());
+                        Then::Quarantine(m)
+                    }
                 };
                 self.enter_reclaim(epoch, then, "launch failed");
                 Flow::Continue
@@ -739,7 +801,7 @@ impl Supervisor {
             match deps.observer.interface(&key).await {
                 Ok(None) => {}
                 Ok(Some(found)) => {
-                    return Err(LaunchFail::Fatal(format!(
+                    return Err(LaunchFail::Taken(format!(
                         "interface name {name} is held by another object ({:?})",
                         found.credential
                     )));
@@ -786,12 +848,19 @@ impl Supervisor {
         let files = plan.files.clone();
         let write_dir = dir.clone();
         tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            // The directory stays writable (the kernel's file log and panic
+            // log go here); the generated files are read-only, because the
+            // kernel rewrites its config file on RPC configuration changes.
             std::fs::create_dir_all(&write_dir)?;
+            crate::reclaimers::make_writable(&write_dir)?;
             for f in files {
                 if let Some(parent) = f.path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::write(&f.path, &f.contents)?;
+                let mut perms = std::fs::metadata(&f.path)?.permissions();
+                perms.set_readonly(true);
+                std::fs::set_permissions(&f.path, perms)?;
             }
             Ok(())
         })
@@ -821,8 +890,13 @@ impl Supervisor {
             .process
             .spawn(plan.command.clone())
             .await
-            .map_err(|e| LaunchFail::Abnormal(format!("spawn failed: {e}")))?;
+            .map_err(|e| match e {
+                ProcessError::ExitedBeforeIdentity(exit) => LaunchFail::Exited(exit),
+                ProcessError::CleanupUncertain(m) => LaunchFail::Uncertain(m),
+                e => LaunchFail::Abnormal(format!("spawn failed: {e}")),
+            })?;
         let identity = handle.identity().clone();
+        let containment = handle.containment();
         let recorded = deps
             .ledger
             .transition(
@@ -835,23 +909,35 @@ impl Supervisor {
                     }),
                     key: Some(process_record.key.clone()),
                     observed_at: deps.clock.wall_now(),
-                    detail: Some(format!("pid {}", identity.pid)),
+                    detail: Some(crate::reclaimers::process_detail(identity.pid, containment)),
                 }),
             )
             .await;
         if let Err(e) = recorded {
             // Never leave an unrecorded kernel running.
-            let _ = handle.kill().await;
-            return Err(LaunchFail::Abnormal(format!(
-                "kernel identity not recorded: {e}"
-            )));
+            return Err(match handle.kill().await {
+                Err(ProcessError::CleanupUncertain(m)) => LaunchFail::Uncertain(m),
+                Err(k) => LaunchFail::Uncertain(format!(
+                    "kernel identity not recorded ({e}) and the kill failed: {k}"
+                )),
+                Ok(_) => LaunchFail::Abnormal(format!("kernel identity not recorded: {e}")),
+            });
         }
         let events = handle.take_events();
         let now = self.now();
+        // Every kernel object whose creation credential must be read back
+        // (lease and expiring records are record-only: never waited on).
         let pending = stored
             .effects
             .iter()
-            .filter(|e| !is_host_kind(e.kind) && e.state == EffectState::Planned)
+            .filter(|e| {
+                !is_host_kind(e.kind)
+                    && e.state == EffectState::Planned
+                    && !matches!(
+                        e.persistence,
+                        Persistence::Lease { .. } | Persistence::Expiring { .. }
+                    )
+            })
             .cloned()
             .collect();
         Ok(Box::new(Live {
@@ -919,7 +1005,9 @@ impl Supervisor {
             let uptime = now.saturating_duration_since(live.spawned);
             if uptime >= live.plan.readiness.minimum_uptime
                 && (live.fence.is_none() || live.fence_ok)
-                && self.condition_met(live).await
+                && self
+                    .condition_met(&live.plan.readiness.condition.clone(), live.pid)
+                    .await
             {
                 live.basic = true;
                 self.set_state(InstanceState::ReadyBasic, "");
@@ -973,6 +1061,11 @@ impl Supervisor {
         };
         if !live.basic {
             live.next_tick = live.next_tick.min(live.start_deadline.max(now));
+        }
+        if !live.pending.is_empty() {
+            // Credentials still to read back: a crash meanwhile would leave
+            // those records as candidates.
+            live.next_tick = live.next_tick.min(now + self.ctx.config.readiness_tick);
         }
         Ok(())
     }
@@ -1046,9 +1139,9 @@ impl Supervisor {
         live.pending = still;
     }
 
-    async fn condition_met(&mut self, live: &Live) -> bool {
+    async fn condition_met(&mut self, condition: &ReadinessCondition, pid: u32) -> bool {
         let observer = self.ctx.deps.observer.clone();
-        match &live.plan.readiness.condition {
+        match condition {
             ReadinessCondition::InterfaceAddress(key) => match observer.interface(key).await {
                 Ok(Some(info)) if !info.addresses.is_empty() => {
                     self.status.interface_name = info.name;
@@ -1062,7 +1155,7 @@ impl Supervisor {
                 _ => false,
             },
             ReadinessCondition::OwnedInterfaceAddress => {
-                match observer.interfaces_owned_by(live.pid).await {
+                match observer.interfaces_owned_by(pid).await {
                     Ok(found) => match found.into_iter().find(|i| !i.addresses.is_empty()) {
                         Some(info) => {
                             self.status.interface_name = info.name;
@@ -1079,7 +1172,7 @@ impl Supervisor {
                 }
             }
             ReadinessCondition::Listener(address) => {
-                matches!(observer.listener(*address).await, Ok(Some(l)) if l.pid == live.pid)
+                matches!(observer.listener(*address).await, Ok(Some(l)) if l.pid == pid)
             }
             _ => false,
         }
@@ -1095,7 +1188,10 @@ impl Supervisor {
             Ok(session) => {
                 let session: Arc<dyn CoreSession> = Arc::from(session);
                 let deadline = self.now() + self.ctx.config.full_ready_timeout;
-                session.wait_ready(deadline).await.map(|info| (session, info))
+                session
+                    .wait_ready(deadline)
+                    .await
+                    .map(|info| (session, info))
             }
             Err(e) => Err(e),
         };
@@ -1163,6 +1259,12 @@ impl Supervisor {
                 self.exited(live, exit, None);
                 Flow::Continue
             }
+            Some(ProcessEvent::CleanupUncertain(reason)) => {
+                // Terminal, not an exit: no restart, quarantine.
+                self.phase = Phase::Idle;
+                self.quarantine_uncertain(epoch, reason).await;
+                Flow::Continue
+            }
             Some(_) => Flow::Continue,
             None => {
                 let Phase::Live(mut live) = std::mem::replace(&mut self.phase, Phase::Idle) else {
@@ -1174,6 +1276,86 @@ impl Supervisor {
                 Flow::Continue
             }
         }
+    }
+
+    /// The kernel's process tree could not be confirmed empty: never
+    /// restart, never reclaim on our own. The process record is quarantined
+    /// in the ledger so a host restart keeps it so; only a reclaim retry
+    /// (`RetryReclaim`) leaves this state.
+    async fn quarantine_uncertain(&mut self, epoch: Epoch, reason: String) {
+        let reason = format!("process cleanup uncertain: {reason}");
+        let ledger = self.ctx.deps.ledger.clone();
+        if let Ok(Some(stored)) = ledger.generation(&self.id, epoch).await {
+            for e in stored
+                .effects
+                .iter()
+                .filter(|e| e.kind == EffectKind::Process && !e.state.is_closed())
+            {
+                if e.state == EffectState::Quarantined {
+                    continue;
+                }
+                if e.state != EffectState::Reclaiming {
+                    let _ = ledger
+                        .transition(&e.id, EffectState::Reclaiming, None)
+                        .await;
+                }
+                let _ = ledger.record_failure(&e.id, &reason).await;
+                if let Err(err) = ledger
+                    .transition(&e.id, EffectState::Quarantined, None)
+                    .await
+                {
+                    tracing::warn!(instance = %self.id, error = %err, "quarantine not recorded");
+                }
+            }
+        }
+        self.notice(
+            NoticeLevel::Error,
+            "process.cleanup_uncertain",
+            reason.clone(),
+        );
+        self.status.epoch = epoch.0;
+        if self.status.state() != InstanceState::Reclaiming {
+            self.set_state(InstanceState::Reclaiming, reason.clone());
+        }
+        self.phase = Phase::Quarantined { epoch };
+        self.set_state(InstanceState::Quarantined, reason);
+    }
+
+    /// Stop (graceful with `grace`) or kill the kernel. `Err`: its tree
+    /// could not be confirmed gone (quarantine); never waits on a handle
+    /// whose cleanup is uncertain.
+    async fn terminate(
+        handle: &mut dyn ProcessHandle,
+        grace: Option<Duration>,
+    ) -> Result<Exit, String> {
+        if let Some(grace) = grace {
+            match handle.stop(grace).await {
+                Ok(exit) => return Ok(exit),
+                Err(ProcessError::CleanupUncertain(m)) => return Err(m),
+                Err(e) => tracing::warn!(error = %e, "graceful stop failed; killing"),
+            }
+        }
+        handle.kill().await.map_err(|e| match e {
+            ProcessError::CleanupUncertain(m) => m,
+            e => format!("kill failed: {e}"),
+        })
+    }
+
+    fn report_exit(&mut self, epoch: Epoch, exit: &Exit, then: &Then) {
+        self.status.last_exit = Some(exit_info(&self.ctx, exit));
+        let (restart_at, gave_up) = match then {
+            Then::Backoff(until) => (wall_ms(&self.ctx, *until), false),
+            Then::GiveUp(_) => (0, true),
+            _ => (0, false),
+        };
+        self.report(Report::Exited(v1::InstanceExited {
+            instance_id: self.id.to_string(),
+            epoch: epoch.0,
+            exit: Some(exit_info(&self.ctx, exit)),
+            attempt: self.status.restart_attempt,
+            restart_at_unix_ms: restart_at,
+            gave_up,
+        }));
     }
 
     /// The restart decision for an abnormal exit; counts it.
@@ -1192,13 +1374,17 @@ impl Supervisor {
     }
 
     /// The kernel of `live` is gone: publish, then reclaim its generation.
-    fn exited(&mut self, live: Box<Live>, exit: Exit, then: Option<Then>) {
-        while let Some(rx) = live.events.as_ref()
-            && let Ok(ev) = { rx }.try_recv()
-        {
-            if let ProcessEvent::Stdout(b) | ProcessEvent::Stderr(b) = ev {
-                for line in LogBook::split_lines(&b) {
-                    self.log(v1::LogSource::CoreStdout, live.epoch, line);
+    fn exited(&mut self, mut live: Box<Live>, exit: Exit, then: Option<Then>) {
+        // Output still queued behind the exit.
+        if let Some(rx) = live.events.as_mut() {
+            while let Ok(ev) = rx.try_recv() {
+                let (source, bytes) = match ev {
+                    ProcessEvent::Stdout(b) => (v1::LogSource::CoreStdout, b),
+                    ProcessEvent::Stderr(b) => (v1::LogSource::CoreStderr, b),
+                    _ => continue,
+                };
+                for line in LogBook::split_lines(&bytes) {
+                    self.log(source, live.epoch, line);
                 }
             }
         }
@@ -1207,20 +1393,7 @@ impl Supervisor {
             None if exit.abnormal() => self.abnormal_then(&exit),
             None => Then::Settle,
         };
-        self.status.last_exit = Some(exit_info(&self.ctx, &exit));
-        let (restart_at, gave_up) = match &then {
-            Then::Backoff(until) => (wall_ms(&self.ctx, *until), false),
-            Then::GiveUp(_) => (0, true),
-            _ => (0, false),
-        };
-        self.report(Report::Exited(v1::InstanceExited {
-            instance_id: self.id.to_string(),
-            epoch: live.epoch.0,
-            exit: Some(exit_info(&self.ctx, &exit)),
-            attempt: self.status.restart_attempt,
-            restart_at_unix_ms: restart_at,
-            gave_up,
-        }));
+        self.report_exit(live.epoch, &exit, &then);
         let message = if exit.abnormal() {
             format!("kernel exited (code {:?}), reclaiming", exit.code)
         } else {
@@ -1229,7 +1402,7 @@ impl Supervisor {
         self.enter_reclaim(live.epoch, then, message);
     }
 
-    async fn kill_live(&mut self, live: Box<Live>, why: KillFor) -> Flow {
+    async fn kill_live(&mut self, mut live: Box<Live>, why: KillFor) -> Flow {
         let then = match &why {
             KillFor::Fence(m) => {
                 self.notice(NoticeLevel::Warning, "fence.failed", m.clone());
@@ -1249,14 +1422,21 @@ impl Supervisor {
                 self.abnormal_then(&exit)
             }
         };
-        let exit = match live.handle.kill().await {
-            Ok(exit) => exit,
-            Err(e) => {
-                tracing::warn!(instance = %self.id, error = %e, "kill failed; waiting for exit");
-                live.handle.wait().await
-            }
-        };
-        self.exited(live, exit, Some(then));
+        let failed = matches!(why, KillFor::NotReady);
+        match Self::terminate(live.handle.as_mut(), None).await {
+            // A kernel that never became ready failed on its own account,
+            // although the host ended it: report it as abnormal.
+            Ok(exit) if failed => self.exited(
+                live,
+                Exit {
+                    cause: ExitCause::Exited,
+                    ..exit
+                },
+                Some(then),
+            ),
+            Ok(exit) => self.exited(live, exit, Some(then)),
+            Err(m) => self.quarantine_uncertain(live.epoch, m).await,
+        }
         Flow::Continue
     }
 
@@ -1270,7 +1450,7 @@ impl Supervisor {
         let grace = self.ctx.config.stop_grace;
         let mut cut: Option<Reply<()>> = None;
         let result = {
-            let stop = live.handle.stop(grace);
+            let stop = Self::terminate(live.handle.as_mut(), Some(grace));
             tokio::pin!(stop);
             loop {
                 tokio::select! {
@@ -1290,19 +1470,19 @@ impl Supervisor {
                 }
             }
         };
+        let result = match result {
+            Some(r) => r,
+            None => Self::terminate(live.handle.as_mut(), None).await,
+        };
         let exit = match result {
-            Some(Ok(exit)) => exit,
-            Some(Err(e)) => {
-                tracing::warn!(instance = %self.id, error = %e, "graceful stop failed; killing");
-                match live.handle.kill().await {
-                    Ok(exit) => exit,
-                    Err(_) => live.handle.wait().await,
+            Ok(exit) => exit,
+            Err(m) => {
+                if let Some(reply) = cut {
+                    let _ = reply.send(Ok(()));
                 }
+                self.quarantine_uncertain(live.epoch, m).await;
+                return Flow::Continue;
             }
-            None => match live.handle.kill().await {
-                Ok(exit) => exit,
-                Err(_) => live.handle.wait().await,
-            },
         };
         if let Some(reply) = cut {
             self.cut_after_kill(live.epoch, exit, reply);
@@ -1355,7 +1535,7 @@ impl Supervisor {
         self.report(Report::Reclaimed(report.clone()));
         self.status.open_residues = u32::try_from(report.residues.len()).unwrap_or(u32::MAX);
         match report.outcome {
-            GenerationOutcome::Closed => self.closed(then),
+            GenerationOutcome::Closed => self.closed(epoch, then),
             GenerationOutcome::Quarantined(reason) => {
                 self.phase = Phase::Quarantined { epoch };
                 self.set_state(InstanceState::Quarantined, reason);
@@ -1374,7 +1554,7 @@ impl Supervisor {
     }
 
     /// The generation is closed: follow `then` and desired state.
-    fn closed(&mut self, then: Then) -> Flow {
+    fn closed(&mut self, epoch: Epoch, then: Then) -> Flow {
         self.phase = Phase::Idle;
         if then == Then::Exit || self.shutdown.is_some() {
             return Flow::Exit;
@@ -1391,6 +1571,10 @@ impl Supervisor {
                 self.set_state(InstanceState::Backoff, "restarting after backoff");
             }
             Then::FenceFallback if running => self.fence_failed = true,
+            Then::Quarantine(reason) => {
+                self.phase = Phase::Quarantined { epoch };
+                self.set_state(InstanceState::Quarantined, reason);
+            }
             _ => {}
         }
         Flow::Continue
@@ -1430,6 +1614,10 @@ impl Supervisor {
                 } else if self.waiting {
                     self.waiting = false;
                 }
+                Flow::Continue
+            }
+            SupCmd::ClaimsChanged => {
+                self.waiting = false;
                 Flow::Continue
             }
             SupCmd::Cut { reply } => self.on_cut(reply).await,
@@ -1579,13 +1767,14 @@ impl Supervisor {
 
     async fn on_cut(&mut self, reply: Reply<()>) -> Flow {
         match std::mem::replace(&mut self.phase, Phase::Idle) {
-            Phase::Live(live) => {
-                let exit = match live.handle.kill().await {
-                    Ok(exit) => exit,
-                    Err(_) => live.handle.wait().await,
-                };
-                self.cut_after_kill(live.epoch, exit, reply);
-            }
+            Phase::Live(mut live) => match Self::terminate(live.handle.as_mut(), None).await {
+                Ok(exit) => self.cut_after_kill(live.epoch, exit, reply),
+                Err(m) => {
+                    // The kill was attempted; what is left is quarantined.
+                    let _ = reply.send(Ok(()));
+                    self.quarantine_uncertain(live.epoch, m).await;
+                }
+            },
             Phase::Reclaim { epoch, .. } => {
                 self.phase = Phase::Cut { epoch: Some(epoch) };
                 self.set_state(InstanceState::CutUnconfirmed, "stop could not be recorded");

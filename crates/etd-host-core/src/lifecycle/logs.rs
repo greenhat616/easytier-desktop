@@ -54,7 +54,11 @@ impl LogBook {
     pub(crate) fn split_lines(bytes: &[u8]) -> impl Iterator<Item = String> + '_ {
         bytes
             .split(|b| *b == b'\n')
-            .map(|l| String::from_utf8_lossy(l).trim_end_matches('\r').to_string())
+            .map(|l| {
+                String::from_utf8_lossy(l)
+                    .trim_end_matches('\r')
+                    .to_string()
+            })
             .filter(|l| !l.is_empty())
     }
 }

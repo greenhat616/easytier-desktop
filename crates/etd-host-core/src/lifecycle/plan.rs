@@ -6,9 +6,9 @@ use crate::core_store::{CoreSelector, CoreUsage, StoreError, VerifiedCore};
 use etd_contract::{ErrorCode, ErrorDetail, HostMode, InstanceId, NetworkSpec, Revision};
 use etd_core_api::{CoreError, LaunchContext, LaunchPlan};
 use etd_sysfx::{
-    CoreRef, EffectIntent, EffectKind, EffectScope, Epoch, FenceSpec, GenerationPlan,
-    LaunchInputs, LedgerError, ManagementGuard, ObjectKey, Persistence, Privilege,
-    StoredGeneration, Undo, naming,
+    CoreRef, EffectIntent, EffectKind, EffectScope, Epoch, FenceSpec, GenerationPlan, LaunchInputs,
+    LedgerError, ManagementGuard, ObjectKey, Persistence, Privilege, StoredGeneration, Undo,
+    naming,
 };
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
@@ -24,6 +24,11 @@ pub(crate) enum PlanFailure {
     Replay(String),
     /// No loopback port could be reserved.
     Port(String),
+    /// A launch prerequisite of this host is missing (e.g. `/dev/net/tun`).
+    Prerequisite {
+        feature: String,
+        reason: String,
+    },
 }
 
 impl PlanFailure {
@@ -34,6 +39,7 @@ impl PlanFailure {
             PlanFailure::Ledger(e) => e.to_string(),
             PlanFailure::Replay(m) => format!("replay refused: {m}"),
             PlanFailure::Port(m) => format!("no management port: {m}"),
+            PlanFailure::Prerequisite { feature, reason } => format!("{feature}: {reason}"),
         }
     }
 
@@ -58,6 +64,10 @@ impl PlanFailure {
             PlanFailure::Core(_) => ErrorCode::CoreUnavailable,
             PlanFailure::Ledger(e) => return ledger_detail(e, instance),
             PlanFailure::Port(_) => ErrorCode::HostNotServing,
+            PlanFailure::Prerequisite { feature, .. } => {
+                d.features = vec![feature.clone()];
+                ErrorCode::FeatureRejected
+            }
         };
         d.set_code(code);
         d
@@ -100,7 +110,6 @@ pub(crate) fn error(code: ErrorCode, message: impl Into<String>, instance: &str)
 #[derive(Debug, Clone)]
 pub(crate) struct PlannedGeneration {
     pub generation: GenerationPlan,
-    pub launch: LaunchPlan,
 }
 
 pub(crate) fn privilege(mode: HostMode) -> Privilege {
@@ -200,12 +209,41 @@ pub(crate) fn generation_effects(
     Ok(effects)
 }
 
+/// Resolve and verify the kernel; its path is canonicalized so the process
+/// record, the marker sweep and replay all name the same file.
 async fn resolve_core(ctx: &Ctx, version: Option<String>) -> Result<VerifiedCore, PlanFailure> {
-    ctx.deps
+    let mut core = ctx
+        .deps
         .core_store
         .resolve(&CoreSelector { version })
         .await
-        .map_err(PlanFailure::Store)
+        .map_err(PlanFailure::Store)?;
+    let binary = core.binary.clone();
+    core.binary = tokio::task::spawn_blocking(move || std::fs::canonicalize(&binary))
+        .await
+        .map_err(|e| PlanFailure::Store(StoreError::Io(e.to_string())))?
+        .map_err(|e| {
+            PlanFailure::Store(StoreError::Io(format!(
+                "kernel {}: {e}",
+                core.binary.display()
+            )))
+        })?;
+    Ok(core)
+}
+
+/// A privileged Linux host needs the TUN device for a TUN instance.
+fn check_prerequisites(mode: HostMode, spec: &NetworkSpec) -> Result<(), PlanFailure> {
+    if cfg!(target_os = "linux")
+        && privilege(mode) == Privilege::System
+        && !spec.no_tun
+        && !std::path::Path::new("/dev/net/tun").exists()
+    {
+        return Err(PlanFailure::Prerequisite {
+            feature: "tun".into(),
+            reason: "/dev/net/tun does not exist on this host".into(),
+        });
+    }
+    Ok(())
 }
 
 /// Plan generation `epoch` of `instance` with `spec` under the current
@@ -218,7 +256,13 @@ pub(crate) async fn plan_generation(
     epoch: Epoch,
     fence_failed: bool,
 ) -> Result<PlannedGeneration, PlanFailure> {
-    let settings = ctx.deps.ledger.settings().await.map_err(PlanFailure::Ledger)?;
+    check_prerequisites(ctx.deps.mode, spec)?;
+    let settings = ctx
+        .deps
+        .ledger
+        .settings()
+        .await
+        .map_err(PlanFailure::Ledger)?;
     let core = resolve_core(ctx, settings.selected_core).await?;
     let guard = choose_guard(
         ctx.deps.mode,
@@ -259,7 +303,11 @@ pub(crate) async fn plan_generation(
         epoch,
         inputs,
     };
-    let launch = ctx.deps.core.plan_launch(&lctx).map_err(PlanFailure::Core)?;
+    let launch = ctx
+        .deps
+        .core
+        .plan_launch(&lctx)
+        .map_err(PlanFailure::Core)?;
     let effects = generation_effects(ctx, &lctx, &launch)?;
     Ok(PlannedGeneration {
         generation: GenerationPlan {
@@ -269,7 +317,6 @@ pub(crate) async fn plan_generation(
             inputs: lctx.inputs,
             effects,
         },
-        launch,
     })
 }
 
@@ -281,6 +328,7 @@ pub(crate) async fn replay(
     epoch: Epoch,
     stored: &StoredGeneration,
 ) -> Result<LaunchPlan, PlanFailure> {
+    check_prerequisites(ctx.deps.mode, &stored.inputs.spec)?;
     let want = &stored.inputs.core;
     let core = resolve_core(ctx, Some(want.version.clone())).await?;
     if core.sha256 != want.sha256 || core.binary != want.binary {
@@ -294,7 +342,11 @@ pub(crate) async fn replay(
         epoch,
         inputs: stored.inputs.clone(),
     };
-    let launch = ctx.deps.core.plan_launch(&lctx).map_err(PlanFailure::Core)?;
+    let launch = ctx
+        .deps
+        .core
+        .plan_launch(&lctx)
+        .map_err(PlanFailure::Core)?;
     let expected = generation_effects(ctx, &lctx, &launch)?;
     if !same_effects(&expected, stored) {
         return Err(PlanFailure::Replay(

@@ -6,7 +6,7 @@
 //! 1. The fence record is part of the generation, committed (planned)
 //!    before anything happens; [`install`] puts the persistent rule in place
 //!    and marks the record applied. Spawning is refused if this fails.
-//! 2-3. After the spawn, [`check`] runs on every readiness tick: the
+//! 2. (and 3.) After the spawn, [`check`] runs on every readiness tick: the
 //!    listener on the management address must be the process just spawned,
 //!    then both directions are probed against that live listener. Basic
 //!    readiness of a fenced instance waits for [`FenceCheck::Verified`];
@@ -22,8 +22,8 @@
 //!    `PortFence::remove` itself, and never reclaims a generation whose
 //!    process liveness is uncertain.
 use etd_sysfx::{
-    DirectionResult, Effect, EffectState, FenceError, FenceSpec, Ledger, ListenerCheck,
-    PortFence, SystemObserver,
+    DirectionResult, Effect, EffectState, FenceError, FenceSpec, Ledger, ListenerCheck, PortFence,
+    SystemObserver,
 };
 
 /// Step 1: install the rule recorded by `record` and mark it applied.
@@ -78,9 +78,10 @@ pub(crate) async fn check(
     match fence.verify(spec, pid).await {
         Ok(v) if v.passed() => FenceCheck::Verified,
         // A refusal on an empty port proves nothing: look again.
-        Ok(v) if v.listener == ListenerCheck::NotListening
-            || (v.host == DirectionResult::NoListener
-                && v.unprivileged == DirectionResult::NoListener) =>
+        Ok(v)
+            if v.listener == ListenerCheck::NotListening
+                || (v.host == DirectionResult::NoListener
+                    && v.unprivileged == DirectionResult::NoListener) =>
         {
             FenceCheck::Pending
         }

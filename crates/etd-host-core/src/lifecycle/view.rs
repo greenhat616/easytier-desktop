@@ -3,8 +3,8 @@
 //! and the conversion of reclaim reports into contract messages.
 use crate::api::{HostEvent, HostView};
 use etd_contract::v1::{
-    self, CandidateOrigin, InstanceReclaim, InstanceView, NoticeLevel, ReclaimStatus,
-    ResidueState, event,
+    self, CandidateOrigin, InstanceReclaim, InstanceView, NoticeLevel, ReclaimStatus, ResidueState,
+    event,
 };
 use etd_contract::{DesiredInstance, HostPhase, InstanceStatus, NetworkSpec};
 use etd_sysfx::{
@@ -203,7 +203,10 @@ fn set_desired(s: &mut etd_contract::HostSnapshot, instance: DesiredInstance) {
 /// The spec as clients may see it: the secret is never returned, only
 /// whether one is set.
 pub fn redact_spec(mut spec: NetworkSpec) -> NetworkSpec {
-    spec.network_secret_set = spec.network_secret.as_deref().is_some_and(|s| !s.is_empty());
+    spec.network_secret_set = spec
+        .network_secret
+        .as_deref()
+        .is_some_and(|s| !s.is_empty());
     spec.network_secret = None;
     spec
 }
@@ -297,9 +300,7 @@ fn generation_view(g: &GenerationReport, awaiting: bool) -> InstanceReclaim {
                         failures,
                         last_error,
                     } => (ResidueState::Failing, *failures, last_error.clone()),
-                    ResidueReason::Indeterminate(m) => {
-                        (ResidueState::Indeterminate, 0, m.clone())
-                    }
+                    ResidueReason::Indeterminate(m) => (ResidueState::Indeterminate, 0, m.clone()),
                     other => (ResidueState::Pending, 0, format!("{other:?}")),
                 };
                 v1::Residue {
@@ -401,7 +402,9 @@ pub fn reclaim_report(report: &ReclaimReport) -> v1::ReclaimReport {
 pub(crate) fn merge_generation(report: &mut v1::ReclaimReport, g: &GenerationReport, at: i64) {
     report.generated_unix_ms = at;
     let view = generation_view(g, false);
-    report.instances.retain(|r| r.instance_id != view.instance_id);
+    report
+        .instances
+        .retain(|r| r.instance_id != view.instance_id);
     if view.status() != ReclaimStatus::Clean {
         report.instances.push(view);
     }

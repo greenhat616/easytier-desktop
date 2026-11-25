@@ -352,8 +352,9 @@ impl ContractService {
                         .and_then(|v| v.spec.as_ref())
                         .and_then(|v| v.network_secret.clone());
                 }
-                spec.network_secret_set =
-                    spec.network_secret.as_ref().is_some_and(|s| !s.is_empty());
+                // This is an output-only redaction hint, never a durable
+                // launch input. H1 plans from the canonical unredacted spec.
+                spec.network_secret_set = false;
                 let state =
                     Desired::try_from(*state).map_err(|_| invalid("Invalid desired state"))?;
                 let state = if state == Desired::Unspecified {
@@ -364,6 +365,14 @@ impl ContractService {
                 let plan = self
                     .plan(instance, Some(spec.clone()), state == Desired::Running)
                     .await?;
+                if let Some(generation) = &plan.generation {
+                    // L1 requires exact equality of PutInstance and the
+                    // persisted generation inputs for deterministic replay.
+                    spec = generation.inputs.spec.clone();
+                    if spec.network_secret_set {
+                        return Err(host_closed());
+                    }
+                }
                 (
                     Change::PutInstance {
                         instance: Box::new(DesiredInstance {

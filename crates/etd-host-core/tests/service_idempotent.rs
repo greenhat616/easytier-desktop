@@ -475,3 +475,104 @@ async fn receipt_is_visible_only_to_original_caller_or_admin() {
         assert_eq!(actual, expected);
     }
 }
+
+#[tokio::test]
+async fn apply_with_secret_uses_h1_canonical_generation_spec() {
+    use etd_sysfx::Epoch;
+    let mut f = Fixture::new().await;
+    f.start_commands();
+    let body = ApplyRequest {
+        header: Some(MutationHeader {
+            request_id: "apply-secret-start".into(),
+            expected_revision: 1,
+        }),
+        instance_id: INSTANCE.into(),
+        spec: Some(NetworkSpec {
+            network_secret: Some("synthetic-fixture".into()),
+            network_secret_set: true,
+            ..Default::default()
+        }),
+        desired: Desired::Running as i32,
+    };
+    let receipt = f
+        .service
+        .apply(request(body, Role::Control))
+        .await
+        .unwrap()
+        .into_inner()
+        .receipt
+        .unwrap();
+    assert_eq!(receipt.revision, 2);
+    let persisted = f.ledger.desired().await.unwrap().1.remove(0).spec.unwrap();
+    assert!(!persisted.network_secret_set);
+    assert_eq!(
+        persisted.network_secret.as_deref(),
+        Some("synthetic-fixture")
+    );
+    let generation = f
+        .ledger
+        .generation(&INSTANCE.into(), Epoch(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(generation.inputs.spec, persisted);
+}
+
+#[tokio::test]
+async fn stopped_apply_then_set_desired_starts_from_exact_stored_spec() {
+    use etd_sysfx::Epoch;
+    let mut f = Fixture::new().await;
+    f.start_commands();
+    let body = ApplyRequest {
+        header: Some(MutationHeader {
+            request_id: "apply-secret-stopped".into(),
+            expected_revision: 1,
+        }),
+        instance_id: INSTANCE.into(),
+        spec: Some(NetworkSpec {
+            network_secret: Some("synthetic-fixture".into()),
+            network_secret_set: true,
+            ..Default::default()
+        }),
+        desired: Desired::Stopped as i32,
+    };
+    f.service.apply(request(body, Role::Control)).await.unwrap();
+    let persisted = f.ledger.desired().await.unwrap().1.remove(0).spec.unwrap();
+    assert!(!persisted.network_secret_set);
+    assert!(
+        f.ledger
+            .generation(&INSTANCE.into(), Epoch(1))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let stop = SetDesiredRequest {
+        header: Some(MutationHeader {
+            request_id: "start-stored-secret".into(),
+            expected_revision: 2,
+        }),
+        instance_id: INSTANCE.into(),
+        desired: Desired::Running as i32,
+    };
+    let receipt = f
+        .service
+        .set_desired(request(stop, Role::Control))
+        .await
+        .unwrap()
+        .into_inner()
+        .receipt
+        .unwrap();
+    assert_eq!(receipt.revision, 3);
+    let generation = f
+        .ledger
+        .generation(&INSTANCE.into(), Epoch(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(generation.inputs.spec_revision, 2);
+    assert_eq!(generation.inputs.spec, persisted);
+    assert_eq!(
+        generation.inputs.spec.network_secret.as_deref(),
+        Some("synthetic-fixture")
+    );
+}

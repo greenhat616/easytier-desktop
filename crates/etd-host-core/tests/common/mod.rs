@@ -126,8 +126,11 @@ impl Fixture {
                     } => {
                         plans.fetch_add(1, Ordering::SeqCst);
                         let (revision, desired) = ledger.desired().await.unwrap();
+                        // Real H1 requires output-only hints cleared before
+                        // planning, and clears them again for replay inputs.
+                        assert!(spec.as_ref().is_none_or(|spec| !spec.network_secret_set));
                         let generation = if start {
-                            let (spec, spec_revision) = if let Some(spec) = spec {
+                            let (mut spec, spec_revision) = if let Some(spec) = spec {
                                 (*spec, revision + 1)
                             } else {
                                 (
@@ -148,6 +151,7 @@ impl Fixture {
                                 &[],
                                 spec_revision,
                             );
+                            spec.network_secret_set = false;
                             plan.inputs.spec = spec;
                             Some(plan)
                         } else {

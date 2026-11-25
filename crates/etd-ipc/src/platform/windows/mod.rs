@@ -238,3 +238,27 @@ pub(super) async fn connect(
 fn win_error(error: windows::core::Error) -> io::Error {
     io::Error::from_raw_os_error(error.code().0 & 0xffff)
 }
+
+/// Expand 8.3 names reported by QueryFullProcessImageNameW (for example
+/// RUNNER~1 in a temp path). Expanding a name does not follow junctions.
+/// Require both the resulting spelling and the final filesystem path to match.
+pub(super) fn image_matches(image: &Path, host: &Path) -> io::Result<bool> {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+    use windows::Win32::Storage::FileSystem::GetLongPathNameW;
+    let mut wide = vec![0u16; 32768];
+    let len =
+        unsafe { GetLongPathNameW(&HSTRING::from(image.as_os_str()), Some(&mut wide)) } as usize;
+    if len == 0 || len >= wide.len() {
+        return Err(denied("could not expand host image path"));
+    }
+    wide.truncate(len);
+    let expanded = OsString::from_wide(&wide);
+    let expected = host.as_os_str().as_encoded_bytes();
+    let actual = expanded.as_encoded_bytes();
+    let prefix = br"\\?\";
+    Ok(actual
+        .strip_prefix(prefix)
+        .unwrap_or(actual)
+        .eq_ignore_ascii_case(expected.strip_prefix(prefix).unwrap_or(expected))
+        && image.canonicalize().map_err(denied)? == host)
+}

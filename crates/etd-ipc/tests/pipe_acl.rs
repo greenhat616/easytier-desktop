@@ -1,5 +1,7 @@
 #![cfg(windows)]
 mod common;
+#[path = "common/windows_account.rs"]
+mod windows_account;
 use common::*;
 use etd_ipc::{
     ListenerPolicy, OsUserId,
@@ -19,7 +21,7 @@ use windows::{
             FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_WRITE_DATA, READ_CONTROL, SYNCHRONIZE,
         },
     },
-    core::{PCWSTR, PWSTR, w},
+    core::PWSTR,
 };
 
 fn entries(f: &File) -> BTreeMap<String, u32> {
@@ -125,12 +127,16 @@ fn elevated() -> bool {
 #[tokio::test]
 async fn second_account_denied_allowed_and_revoked_on_real_pipe() {
     use etd_ipc::Listener;
-    use std::{
-        io::Write,
-        os::windows::io::{FromRawHandle, OwnedHandle},
-    };
-    if !elevated() {
-        let reason = "requires an elevated Windows token to log on LocalService";
+    use std::io::Write;
+    let reason =
+        if std::env::var_os("ETD_IPC_CI_ACCOUNTS").as_deref() != Some(std::ffi::OsStr::new("1")) {
+            Some("set ETD_IPC_CI_ACCOUNTS=1 to allow creating a temporary standard user")
+        } else if !elevated() {
+            Some("requires an elevated Windows token to create the temporary second account")
+        } else {
+            None
+        };
+    if let Some(reason) = reason {
         assert!(
             std::env::var_os("GITHUB_ACTIONS").is_none(),
             "{reason}: CI must exercise the real ACL"
@@ -140,19 +146,7 @@ async fn second_account_denied_allowed_and_revoked_on_real_pipe() {
     }
     let f = Fixture::new();
     let mut listener = f.listener();
-    let mut h = HANDLE::default();
-    let token = unsafe {
-        LogonUserW(
-            w!("LocalService"),
-            w!("NT AUTHORITY"),
-            PCWSTR::null(),
-            LOGON32_LOGON_SERVICE,
-            LOGON32_PROVIDER_DEFAULT,
-            &mut h,
-        )
-        .unwrap();
-        OwnedHandle::from_raw_handle(h.0)
-    };
+    let (token, second_user) = windows_account::logon();
     let open = || {
         unsafe {
             ImpersonateLoggedOnUser(HANDLE(token.as_raw_handle())).unwrap();
@@ -168,21 +162,20 @@ async fn second_account_denied_allowed_and_revoked_on_real_pipe() {
         opened
     };
     let policy = listener.policy_handle();
-    let service = OsUserId::WindowsSid("S-1-5-19".into());
     assert_eq!(
         open().unwrap_err().kind(),
         std::io::ErrorKind::PermissionDenied
     );
     policy
         .update(&ListenerPolicy {
-            allow_users: vec![service.clone()],
+            allow_users: vec![second_user.clone()],
             ..Default::default()
         })
         .unwrap();
     let mut allowed = open().unwrap();
     allowed.write_all(&[1]).unwrap();
     let (_stream, peer) = listener.accept().await.unwrap();
-    assert_eq!(peer.user, service);
+    assert_eq!(peer.user, second_user);
     policy.update(&ListenerPolicy::default()).unwrap();
     assert_eq!(
         open().unwrap_err().kind(),

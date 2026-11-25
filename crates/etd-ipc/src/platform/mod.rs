@@ -75,18 +75,15 @@ fn verify_image(directory: &Path, image: &Path) -> io::Result<PathBuf> {
     // Compare the kernel's image name directly. Resolving a peer-controlled
     // path could follow a symlink installed after the process was inspected.
     #[cfg(windows)]
-    let matches = {
-        use std::os::windows::ffi::OsStrExt;
-        let prefix: Vec<u16> = r"\\?\".encode_utf16().collect();
-        let expected: Vec<_> = host.as_os_str().encode_wide().collect();
-        let actual: Vec<_> = image.as_os_str().encode_wide().collect();
-        actual.strip_prefix(&prefix[..]).unwrap_or(&actual)
-            == expected.strip_prefix(&prefix[..]).unwrap_or(&expected)
-    };
+    let matches = native::image_matches(image, &host)?;
     #[cfg(unix)]
     let matches = image == host;
     if !matches || !host.is_file() || host.canonicalize().map_err(denied)? != host {
-        return Err(denied("unexpected host executable"));
+        return Err(denied(format!(
+            "unexpected host executable {} (expected {})",
+            image.display(),
+            host.display()
+        )));
     }
     Ok(host)
 }

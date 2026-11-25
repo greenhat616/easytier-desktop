@@ -14,13 +14,19 @@ use std::{
 async fn privileged_second_account_denied_then_granted_then_revoked() {
     assert!(Uid::effective().is_root());
     let user = User::from_name("nobody").unwrap().unwrap();
-    let f = Fixture::new();
-    fs::set_permissions(f.dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
-    let listener = f.listener();
+    // A per-user macOS TMPDIR can have a non-traversable ancestor.
+    let dir = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let socket = dir.path().join("host.sock");
+    let listener = etd_ipc::platform::LocalListener::bind(
+        &etd_ipc::Endpoint::UnixSocket(socket.clone()),
+        &ListenerPolicy::default(),
+    )
+    .unwrap();
     let probe = || {
         let status=Command::new("python3").arg("-c").arg(
             "import socket,sys\ns=socket.socket(socket.AF_UNIX)\ntry: s.connect(sys.argv[1])\nexcept PermissionError: sys.exit(77)"
-        ).arg(endpoint_arg(&f.ep)).uid(user.uid.as_raw()).gid(user.gid.as_raw()).status().unwrap();
+        ).arg(&socket).uid(user.uid.as_raw()).gid(user.gid.as_raw()).status().unwrap();
         status.code().unwrap()
     };
     assert_eq!(probe(), 77);

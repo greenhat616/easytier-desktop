@@ -287,12 +287,20 @@ async fn stops_and_cuts(edges: &mut Edges) {
     let mut h = world.start();
     h.wait_serving().await;
     h.apply("a", spec("a"), Desired::Running).await;
-    h.wait_state("a", S::Starting).await;
+    // Stop once the kernel runs (a stop committed before the spawn is
+    // caught by the pre-launch re-read instead: Starting -> Reclaiming).
+    h.until_still("a spawned", |h| {
+        h.state("a") == S::Starting && h.world.spawned().len() == 1
+    })
+    .await;
     h.set_desired("a", Desired::Stopped).await.unwrap();
     h.wait_state("a", S::Stopped).await;
     // Cut while starting.
     h.set_desired("a", Desired::Running).await.unwrap();
-    h.wait_state("a", S::Starting).await;
+    h.until_still("a spawned", |h| {
+        h.state("a") == S::Starting && h.world.spawned().len() == 2
+    })
+    .await;
     h.cut("a").await.unwrap();
     h.wait_state("a", S::CutUnconfirmed).await;
     h.set_desired("a", Desired::Running).await.unwrap();

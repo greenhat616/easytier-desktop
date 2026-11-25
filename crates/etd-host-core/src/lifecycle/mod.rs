@@ -52,6 +52,9 @@ pub struct LifecycleConfig {
     pub reclaim_retry: Duration,
     /// Kernel log lines kept per instance.
     pub log_lines: usize,
+    /// Session-form host: how long no client may hold a lease before the
+    /// host stops its instances and exits.
+    pub lease_grace: Duration,
 }
 
 impl Default for LifecycleConfig {
@@ -63,6 +66,7 @@ impl Default for LifecycleConfig {
             full_ready_timeout: Duration::from_secs(10),
             reclaim_retry: Duration::from_secs(2),
             log_lines: 1000,
+            lease_grace: Duration::from_secs(30),
         }
     }
 }
@@ -71,6 +75,25 @@ impl Default for LifecycleConfig {
 pub(crate) struct Ctx {
     pub deps: Arc<HostDeps>,
     pub config: LifecycleConfig,
+    /// Set while the self-check's kernel sweep has not succeeded: no
+    /// instance starts (the reason is shown while waiting).
+    pub hold: std::sync::Mutex<Option<String>>,
+}
+
+impl Ctx {
+    pub(crate) fn held(&self) -> Option<String> {
+        self.hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set_hold(&self, hold: Option<String>) {
+        *self
+            .hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hold;
+    }
 }
 
 /// Why [`Orchestrator::run`] returned.
@@ -103,7 +126,11 @@ impl Orchestrator {
         config: LifecycleConfig,
     ) -> Self {
         Self {
-            ctx: Arc::new(Ctx { deps, config }),
+            ctx: Arc::new(Ctx {
+                deps,
+                config,
+                hold: std::sync::Mutex::new(None),
+            }),
             port,
         }
     }
@@ -131,6 +158,8 @@ impl Orchestrator {
             host_logs: Arc::new(LogBook::new(self.ctx.config.log_lines)),
             phase: HostPhase::SelfCheck,
             tickets_due: None,
+            resweep_due: None,
+            lease_deadline: None,
             purge: None,
             ending: None,
             shutdown_replies: Vec::new(),
@@ -168,6 +197,10 @@ struct Actor {
     phase: HostPhase,
     /// Pending tickets are executed again at this time (ledger outage).
     tickets_due: Option<Instant>,
+    /// The self-check's kernel sweep is retried at this time.
+    resweep_due: Option<Instant>,
+    /// Session-form host: no lease since; the host winds down at this time.
+    lease_deadline: Option<Instant>,
     /// A PurgeAll ticket waits for every supervisor to end.
     purge: Option<String>,
     ending: Option<Ending>,
@@ -229,14 +262,14 @@ impl Actor {
             {
                 return self.finish(end).await;
             }
-            let ctx = self.ctx.clone();
-            let ticket_sleep = match self.tickets_due {
-                Some(at) => ctx
-                    .deps
-                    .clock
-                    .sleep(at.saturating_duration_since(ctx.deps.clock.now())),
+            let clock = self.ctx.deps.clock.clone();
+            let until = |at: Option<Instant>| match at {
+                Some(at) => clock.sleep(at.saturating_duration_since(clock.now())),
                 None => Box::pin(std::future::pending()),
             };
+            let ticket_sleep = until(self.tickets_due);
+            let resweep_sleep = until(self.resweep_due);
+            let lease_sleep = until(self.lease_deadline);
             tokio::select! {
                 biased;
                 report = self.reports_rx.recv() => {
@@ -256,6 +289,15 @@ impl Actor {
                 () = ticket_sleep => {
                     self.tickets_due = None;
                     self.execute_tickets().await;
+                }
+                () = resweep_sleep => {
+                    self.resweep_due = None;
+                    self.resweep().await;
+                }
+                () = lease_sleep => {
+                    self.lease_deadline = None;
+                    self.host_log("no client holds a lease: stopping instances and exiting".into());
+                    self.begin_ending(Ending::Lease);
                 }
             }
         }
@@ -285,8 +327,62 @@ impl Actor {
             let init = initial.remove(&id).unwrap_or(Initial::Idle);
             self.spawn_supervisor(id, Box::new(desired), init, None);
         }
+        if let Some(why) = outcome.hold_starts {
+            self.ctx.set_hold(Some(why));
+            self.resweep_due = Some(self.ctx.deps.clock.now() + self.ctx.config.reclaim_retry);
+        }
         self.set_phase(HostPhase::Serving);
+        let at = self.now_ms();
+        for notice in outcome.notices {
+            self.publisher.notice(at, notice);
+        }
+        self.presence_changed();
         self.execute_tickets().await;
+    }
+
+    /// The self-check's sweep failed: try it again; once it succeeds the
+    /// held starts go ahead.
+    async fn resweep(&mut self) {
+        match boot::resweep(&self.ctx).await {
+            Ok(()) => {
+                self.ctx.set_hold(None);
+                let at = self.now_ms();
+                self.publisher.notice(
+                    at,
+                    view::notice(
+                        etd_contract::v1::NoticeLevel::Info,
+                        "selfcheck.complete",
+                        "the kernel sweep succeeded; instances start",
+                        "",
+                    ),
+                );
+                for s in self.supervisors.values() {
+                    let _ = s.tx.send(SupCmd::ClaimsChanged);
+                }
+            }
+            Err(why) => {
+                self.host_log(format!("kernel sweep retry failed: {why}"));
+                self.resweep_due = Some(self.ctx.deps.clock.now() + self.ctx.config.reclaim_retry);
+            }
+        }
+    }
+
+    /// Session-form host lifetime: the grace period runs while no client
+    /// holds a lease; the service form ignores leases.
+    fn presence_changed(&mut self) {
+        let session = matches!(
+            self.ctx.deps.mode,
+            HostMode::ElevatedSession | HostMode::User
+        );
+        if !session || self.phase != HostPhase::Serving {
+            self.lease_deadline = None;
+            return;
+        }
+        if self.presence.borrow().lease_holders > 0 {
+            self.lease_deadline = None;
+        } else if self.lease_deadline.is_none() {
+            self.lease_deadline = Some(self.ctx.deps.clock.now() + self.ctx.config.lease_grace);
+        }
     }
 
     fn store_repair_index(&self, desired: &[DesiredInstance]) {
@@ -538,6 +634,7 @@ impl Actor {
             Command::Logs { request, reply } => self.on_logs(request, reply),
             Command::Clients(p) => {
                 self.presence.send_replace(p);
+                self.presence_changed();
             }
             Command::ReleaseLease { instances, reply } => {
                 self.on_release_lease(instances, reply);

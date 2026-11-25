@@ -28,7 +28,7 @@
 //!   a desired state is committed.
 use crate::api::{ClientPresence, LogStream, Reply};
 use crate::fence_seq::{self, FenceCheck};
-use crate::lifecycle::logs::LogBook;
+use crate::lifecycle::logs::{self, LineBuffer, LogBook};
 use crate::lifecycle::plan::{self, PlanFailure, error};
 use crate::lifecycle::{Ctx, machine, view};
 use crate::poller::{self, Poller};
@@ -39,12 +39,13 @@ use etd_contract::{
 };
 use etd_core_api::{CoreEventCursor, CoreEventKind, CoreSession, LaunchPlan, ReadinessCondition};
 use etd_proc::{
-    Exit, ExitCause, ProcessError, ProcessEvent, ProcessHandle, RestartDecision, RestartPolicy,
+    Exit, ExitCause, KillOutcome, ProcessError, ProcessEvent, ProcessHandle, RestartDecision,
+    RestartPolicy,
 };
 use etd_sysfx::{
     Credential, Effect, EffectKind, EffectState, Epoch, FenceSpec, GenerationOutcome,
     GenerationReport, LaunchInputs, LedgerError, ManagementGuard, ObjectKey, Observation,
-    Persistence, StoredGeneration,
+    Persistence, StoredGeneration, Undo,
 };
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -130,6 +131,8 @@ enum LaunchFail {
     Uncertain(String),
     /// A foreign object holds what this generation would create.
     Taken(String),
+    /// The committed desired state no longer wants this generation.
+    Superseded(String),
 }
 
 struct Live {
@@ -151,6 +154,9 @@ struct Live {
     /// Kernel records still `Planned` (enumerated until they appear).
     pending: Vec<Effect>,
     next_tick: Instant,
+    /// Partial output lines (a secret may span chunks).
+    stdout: LineBuffer,
+    stderr: LineBuffer,
 }
 
 enum Phase {
@@ -206,6 +212,9 @@ pub(crate) struct Supervisor {
     waiting: bool,
     shutdown: Option<oneshot::Sender<()>>,
     stopping_for_exit: bool,
+    /// Network secrets of the launched generations, redacted from every
+    /// kernel-derived text.
+    secrets: Vec<String>,
 }
 
 /// Wall-clock milliseconds of a monotonic instant.
@@ -256,6 +265,29 @@ fn is_fence_kind(kind: EffectKind) -> bool {
 
 fn is_host_kind(kind: EffectKind) -> bool {
     matches!(kind, EffectKind::Process | EffectKind::RuntimeDir) || is_fence_kind(kind)
+}
+
+/// A kernel record whose creation credential the host reads back after the
+/// spawn (lease and expiring records are record-only: never waited on).
+fn needs_read_back(e: &Effect) -> bool {
+    !is_host_kind(e.kind)
+        && e.state == EffectState::Planned
+        && !matches!(
+            e.persistence,
+            Persistence::Lease { .. } | Persistence::Expiring { .. }
+        )
+}
+
+/// Records with no creation credential to read back: routes via an
+/// interface (removed with it), upstream's own recovery record (replayed,
+/// never deleted by credential) and settings (restored only while the value
+/// is still ours).
+fn credential_less(e: &Effect) -> bool {
+    matches!(e.key, ObjectKey::RoutesVia { .. })
+        || matches!(
+            e.undo,
+            Undo::ReplayUpstreamRecovery | Undo::RestoreIfOurs { .. }
+        )
 }
 
 impl Supervisor {
@@ -315,6 +347,7 @@ impl Supervisor {
             waiting: false,
             shutdown: None,
             stopping_for_exit: false,
+            secrets: Vec::new(),
         };
         if let Some(state) = state {
             s.set_state(state, message);
@@ -366,12 +399,26 @@ impl Supervisor {
     }
 
     fn notice(&self, level: NoticeLevel, code: &str, message: impl Into<String>) {
+        let message = logs::redact(&message.into(), &self.secrets);
         self.report(Report::Notice(view::notice(
             level,
             code,
             message,
             self.id.as_str(),
         )));
+    }
+
+    /// Remember a launched generation's network secret for redaction (the
+    /// previous one too: its kernel may still be writing).
+    fn remember_secret(&mut self, spec: &etd_contract::NetworkSpec) {
+        if let Some(s) = spec.network_secret.as_ref().filter(|s| !s.is_empty())
+            && !self.secrets.contains(s)
+        {
+            self.secrets.push(s.clone());
+            if self.secrets.len() > 2 {
+                self.secrets.remove(0);
+            }
+        }
     }
 
     /// Move along an edge of the instance state machine and publish.
@@ -389,7 +436,7 @@ impl Supervisor {
             self.status.state_since_unix_ms = self.ctx.deps.clock.wall_now().as_millisecond();
         }
         self.status.set_state(to);
-        self.status.message = message.into();
+        self.status.message = logs::redact(&message.into(), &self.secrets);
         if !machine::is_live(to) {
             self.status.management = ManagementAccess::Unspecified as i32;
             if to != InstanceState::Backoff {
@@ -406,7 +453,7 @@ impl Supervisor {
         self.logs.push(LogLine {
             at_unix_ms: self.ctx.deps.clock.wall_now().as_millisecond(),
             source: source as i32,
-            text,
+            text: logs::redact(&text, &self.secrets),
             instance_id: self.id.to_string(),
             epoch: epoch.0,
         });
@@ -572,6 +619,14 @@ impl Supervisor {
     /// Start a generation: the committed one (`launch`) or a new one
     /// reserved with `begin_epoch`.
     async fn try_start(&mut self, launch: Option<Epoch>) -> Flow {
+        // The self-check could not account for every kernel: nothing starts.
+        if let Some(why) = self.ctx.held() {
+            self.waiting = true;
+            if self.status.state() != InstanceState::Waiting {
+                self.set_state(InstanceState::Waiting, why);
+            }
+            return Flow::Continue;
+        }
         let ledger = self.ctx.deps.ledger.clone();
         if let Some(epoch) = launch {
             match ledger.generation(&self.id, epoch).await {
@@ -715,6 +770,7 @@ impl Supervisor {
 
     async fn launch(&mut self, epoch: Epoch, stored: StoredGeneration) -> Flow {
         self.waiting = false;
+        self.remember_secret(&stored.inputs.spec);
         self.status.epoch = epoch.0;
         self.status.core_version = stored.inputs.core.version.clone();
         self.status.last_exit = self.status.last_exit.take();
@@ -765,11 +821,46 @@ impl Supervisor {
                         self.notice(NoticeLevel::Error, "start.refused", m.clone());
                         Then::Quarantine(m)
                     }
+                    LaunchFail::Superseded(m) => {
+                        self.notice(NoticeLevel::Info, "start.superseded", m);
+                        Then::Settle
+                    }
                 };
                 self.enter_reclaim(epoch, then, "launch failed");
                 Flow::Continue
             }
         }
+    }
+
+    /// Re-read the persisted desired state right before a launch side
+    /// effect: the instance must still be wanted RUNNING with exactly the
+    /// configuration (and spec revision) this generation was planned from.
+    async fn still_wanted(&mut self, stored: &StoredGeneration) -> Result<(), LaunchFail> {
+        let ledger = self.ctx.deps.ledger.clone();
+        let unavailable = |e: LedgerError| LaunchFail::Abnormal(format!("ledger unavailable: {e}"));
+        let (_, desired) = ledger.desired().await.map_err(unavailable)?;
+        let current = desired.into_iter().find(|d| d.instance_id == self.id.0);
+        let revision = match &current {
+            Some(_) => Some(ledger.spec_revision(&self.id).await.map_err(unavailable)?),
+            None => None,
+        };
+        let wanted = current.as_ref().is_some_and(|d| {
+            d.desired() == Desired::Running
+                && d.spec.as_ref() == Some(&stored.inputs.spec)
+                && revision == Some(stored.inputs.spec_revision)
+        });
+        if wanted {
+            return Ok(());
+        }
+        let why = match &current {
+            None => "the instance was removed".to_string(),
+            Some(d) if d.desired() != Desired::Running => "a stop was committed".to_string(),
+            Some(_) => "a new configuration was committed".to_string(),
+        };
+        self.desired = current.map(Box::new);
+        Err(LaunchFail::Superseded(format!(
+            "generation not started: {why} meanwhile"
+        )))
     }
 
     fn record_of(stored: &StoredGeneration, pred: impl Fn(EffectKind) -> bool) -> Option<Effect> {
@@ -781,7 +872,7 @@ impl Supervisor {
         epoch: Epoch,
         stored: &StoredGeneration,
     ) -> Result<Box<Live>, LaunchFail> {
-        let deps = &self.ctx.deps;
+        let deps = self.ctx.deps.clone();
         let inputs = stored.inputs.clone();
         let plan = plan::replay(&self.ctx, &self.id, epoch, stored)
             .await
@@ -813,6 +904,14 @@ impl Supervisor {
                 }
             }
         }
+
+        // No side effect for a generation the committed state no longer
+        // wants (a stop or a new configuration committed meanwhile).
+        self.still_wanted(stored).await?;
+        let pending = self
+            .flag_preexisting(stored)
+            .await
+            .map_err(LaunchFail::Abnormal)?;
 
         // Fence before anything listens.
         let fence = if inputs.guard == ManagementGuard::Fence {
@@ -884,6 +983,7 @@ impl Supervisor {
             .map_err(|e| LaunchFail::Abnormal(format!("ledger: {e}")))?;
 
         // Spawn, then record its identity at once.
+        self.still_wanted(stored).await?;
         let process_record = Self::record_of(stored, |k| k == EffectKind::Process)
             .ok_or_else(|| LaunchFail::Fatal("generation has no process record".into()))?;
         let mut handle = deps
@@ -925,21 +1025,7 @@ impl Supervisor {
         }
         let events = handle.take_events();
         let now = self.now();
-        // Every kernel object whose creation credential must be read back
-        // (lease and expiring records are record-only: never waited on).
-        let pending = stored
-            .effects
-            .iter()
-            .filter(|e| {
-                !is_host_kind(e.kind)
-                    && e.state == EffectState::Planned
-                    && !matches!(
-                        e.persistence,
-                        Persistence::Lease { .. } | Persistence::Expiring { .. }
-                    )
-            })
-            .cloned()
-            .collect();
+
         Ok(Box::new(Live {
             epoch,
             inputs,
@@ -958,6 +1044,8 @@ impl Supervisor {
             cursor: None,
             pending,
             next_tick: now,
+            stdout: LineBuffer::default(),
+            stderr: LineBuffer::default(),
         }))
     }
 
@@ -1123,7 +1211,10 @@ impl Supervisor {
                 (key, _) => deps.observer.observe(e.kind, key).await.ok().flatten(),
             };
             match obs {
-                Some(o) => {
+                // Applied means "we hold its creation credential": without
+                // one the record keeps waiting (a crash meanwhile leaves it a
+                // candidate, never deletable by name alone).
+                Some(o) if o.credential.is_some() || credential_less(&e) => {
                     if let Err(err) = deps
                         .ledger
                         .transition(&e.id, EffectState::Applied, Some(o))
@@ -1133,10 +1224,52 @@ impl Supervisor {
                         still.push(e);
                     }
                 }
-                None => still.push(e),
+                _ => still.push(e),
             }
         }
         live.pending = still;
+    }
+
+    /// Before the spawn: a kernel object that already exists under a key
+    /// this generation will read back is not ours. It is flagged as a
+    /// conflict for the administrator (never claimed, never deleted) and
+    /// left out of the read-back.
+    async fn flag_preexisting(&mut self, stored: &StoredGeneration) -> Result<Vec<Effect>, String> {
+        let deps = self.ctx.deps.clone();
+        let mut pending = Vec::new();
+        for e in stored.effects.iter().filter(|e| needs_read_back(e)) {
+            // Unnamed keys (system-assigned names) cannot exist yet.
+            if matches!(
+                e.key,
+                ObjectKey::Interface { name: None, .. } | ObjectKey::RoutesVia { interface: None }
+            ) || credential_less(e)
+            {
+                pending.push(e.clone());
+                continue;
+            }
+            match deps.observer.observe(e.kind, &e.key).await {
+                Ok(None) => pending.push(e.clone()),
+                Ok(Some(found)) => {
+                    let message = format!(
+                        "{} {} already exists before the kernel starts; left for an administrator",
+                        e.kind,
+                        view::key_text(&e.key)
+                    );
+                    deps.ledger
+                        .transition(&e.id, EffectState::Reclaiming, None)
+                        .await
+                        .map_err(|err| format!("ledger: {err}"))?;
+                    deps.ledger
+                        .transition(&e.id, EffectState::Conflict, Some(found))
+                        .await
+                        .map_err(|err| format!("ledger: {err}"))?;
+                    self.notice(NoticeLevel::Warning, "start.preexisting", message);
+                }
+                // Cannot look: read it back after the spawn as usual.
+                Err(_) => pending.push(e.clone()),
+            }
+        }
+        Ok(pending)
     }
 
     async fn condition_met(&mut self, condition: &ReadinessCondition, pid: u32) -> bool {
@@ -1180,6 +1313,31 @@ impl Supervisor {
 
     async fn attach(&mut self, live: &mut Live) {
         let deps = self.ctx.deps.clone();
+        // Unfenced (user host): the port was free when planned, but another
+        // process could have taken it since; only talk to our own kernel.
+        if live.inputs.guard == ManagementGuard::Unguarded {
+            match deps.observer.listener(live.plan.endpoint.0).await {
+                Ok(Some(l)) if l.pid == live.pid => {}
+                Ok(Some(l)) => {
+                    if live.attach_after == live.spawned {
+                        self.notice(
+                            NoticeLevel::Warning,
+                            "management.foreign_listener",
+                            format!(
+                                "management port {} is held by pid {}, not the kernel",
+                                live.plan.endpoint.0, l.pid
+                            ),
+                        );
+                    }
+                    live.attach_after = self.now() + poller::SUBSCRIBED_INTERVAL;
+                    return;
+                }
+                _ => {
+                    live.attach_after = self.now() + poller::SUBSCRIBED_INTERVAL;
+                    return;
+                }
+            }
+        }
         let descriptor = etd_core_api::CoreDescriptor {
             version: live.inputs.core.version.clone(),
             proto_revision: live.inputs.core.proto_revision.clone(),
@@ -1234,6 +1392,43 @@ impl Supervisor {
         }
     }
 
+    /// Kernel output: complete lines only, so a secret split across chunks
+    /// is redacted as a whole.
+    fn output(&mut self, live: &mut Live, source: v1::LogSource, bytes: &[u8]) {
+        let buffer = match source {
+            v1::LogSource::CoreStderr => &mut live.stderr,
+            _ => &mut live.stdout,
+        };
+        for line in buffer.push(bytes) {
+            self.log(source, live.epoch, line);
+        }
+    }
+
+    /// The rest of the output once the kernel is gone.
+    fn flush_output(&mut self, live: &mut Live) {
+        if let Some(rx) = live.events.as_mut() {
+            let mut queued = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                queued.push(ev);
+            }
+            for ev in queued {
+                match ev {
+                    ProcessEvent::Stdout(b) => self.output(live, v1::LogSource::CoreStdout, &b),
+                    ProcessEvent::Stderr(b) => self.output(live, v1::LogSource::CoreStderr, &b),
+                    _ => {}
+                }
+            }
+        }
+        for (source, rest) in [
+            (v1::LogSource::CoreStdout, live.stdout.finish()),
+            (v1::LogSource::CoreStderr, live.stderr.finish()),
+        ] {
+            if let Some(line) = rest {
+                self.log(source, live.epoch, line);
+            }
+        }
+    }
+
     async fn on_process(&mut self, event: Option<ProcessEvent>) -> Flow {
         let Phase::Live(live) = &self.phase else {
             return Flow::Continue;
@@ -1241,14 +1436,16 @@ impl Supervisor {
         let epoch = live.epoch;
         match event {
             Some(ProcessEvent::Stdout(bytes)) => {
-                for line in LogBook::split_lines(&bytes) {
-                    self.log(v1::LogSource::CoreStdout, epoch, line);
+                if let Phase::Live(mut live) = std::mem::replace(&mut self.phase, Phase::Idle) {
+                    self.output(&mut live, v1::LogSource::CoreStdout, &bytes);
+                    self.phase = Phase::Live(live);
                 }
                 Flow::Continue
             }
             Some(ProcessEvent::Stderr(bytes)) => {
-                for line in LogBook::split_lines(&bytes) {
-                    self.log(v1::LogSource::CoreStderr, epoch, line);
+                if let Phase::Live(mut live) = std::mem::replace(&mut self.phase, Phase::Idle) {
+                    self.output(&mut live, v1::LogSource::CoreStderr, &bytes);
+                    self.phase = Phase::Live(live);
                 }
                 Flow::Continue
             }
@@ -1261,18 +1458,38 @@ impl Supervisor {
             }
             Some(ProcessEvent::CleanupUncertain(reason)) => {
                 // Terminal, not an exit: no restart, quarantine.
-                self.phase = Phase::Idle;
+                if let Phase::Live(mut live) = std::mem::replace(&mut self.phase, Phase::Idle) {
+                    self.flush_output(&mut live);
+                }
                 self.quarantine_uncertain(epoch, reason).await;
                 Flow::Continue
             }
             Some(_) => Flow::Continue,
             None => {
+                // The event channel closed without a terminal event: wait
+                // for the exit only as long as a stop may take, then treat
+                // the tree as unconfirmed.
                 let Phase::Live(mut live) = std::mem::replace(&mut self.phase, Phase::Idle) else {
                     unreachable!()
                 };
                 live.events = None;
-                let exit = live.handle.wait().await;
-                self.exited(live, exit, None);
+                let clock = self.ctx.deps.clock.clone();
+                let grace = self.ctx.config.stop_grace;
+                let exit = tokio::select! {
+                    exit = live.handle.wait() => Some(exit),
+                    () = clock.sleep(grace) => None,
+                };
+                match exit {
+                    Some(exit) => self.exited(live, exit, None),
+                    None => {
+                        self.flush_output(&mut live);
+                        self.quarantine_uncertain(
+                            epoch,
+                            "the kernel's event channel closed without an exit".into(),
+                        )
+                        .await;
+                    }
+                }
                 Flow::Continue
             }
         }
@@ -1376,18 +1593,7 @@ impl Supervisor {
     /// The kernel of `live` is gone: publish, then reclaim its generation.
     fn exited(&mut self, mut live: Box<Live>, exit: Exit, then: Option<Then>) {
         // Output still queued behind the exit.
-        if let Some(rx) = live.events.as_mut() {
-            while let Ok(ev) = rx.try_recv() {
-                let (source, bytes) = match ev {
-                    ProcessEvent::Stdout(b) => (v1::LogSource::CoreStdout, b),
-                    ProcessEvent::Stderr(b) => (v1::LogSource::CoreStderr, b),
-                    _ => continue,
-                };
-                for line in LogBook::split_lines(&bytes) {
-                    self.log(source, live.epoch, line);
-                }
-            }
-        }
+        self.flush_output(&mut live);
         let then = match then {
             Some(t) => t,
             None if exit.abnormal() => self.abnormal_then(&exit),
@@ -1513,6 +1719,43 @@ impl Supervisor {
 
     // ----- reclaim ---------------------------------------------------------
 
+    /// Kill the kernels running from this generation's runtime directory
+    /// that no record knows. `Err`: one survives or cannot be looked for.
+    async fn kill_generation_orphans(&mut self, epoch: Epoch) -> Result<(), String> {
+        let dir = plan::runtime_dir(&self.ctx, &self.id, epoch);
+        let process = self.ctx.deps.process.clone();
+        let found = process
+            .find_marked(&crate::boot::kernel_marker(&self.ctx, dir))
+            .await
+            .map_err(|e| format!("process sweep failed: {e}"))?;
+        let recorded: Vec<(u32, String)> =
+            match self.ctx.deps.ledger.generation(&self.id, epoch).await {
+                Ok(Some(g)) => g
+                    .effects
+                    .iter()
+                    .filter_map(crate::reclaimers::recorded_identity)
+                    .map(|id| (id.pid, id.start_token))
+                    .collect(),
+                _ => Vec::new(),
+            };
+        for id in found {
+            if recorded.contains(&(id.pid, id.start_token.clone())) {
+                continue; // the reclaim engine handles recorded kernels
+            }
+            match process.kill_verified(&id).await {
+                Ok(KillOutcome::Killed | KillOutcome::Gone | KillOutcome::Reused) => {}
+                Ok(KillOutcome::Uncertain) => {
+                    return Err(format!(
+                        "kernel pid {} could not be killed with certainty",
+                        id.pid
+                    ));
+                }
+                Err(e) => return Err(format!("kernel pid {} not killed: {e}", id.pid)),
+            }
+        }
+        Ok(())
+    }
+
     async fn reclaim(&mut self, epoch: Epoch, then: Then, retry: bool) -> Flow {
         let engine = self.ctx.deps.reclaim.clone();
         let result = if retry {
@@ -1593,6 +1836,12 @@ impl Supervisor {
                 match &self.phase {
                     Phase::Quarantined { epoch } => {
                         let epoch = *epoch;
+                        // Kernels of this generation outside any record
+                        // (orphans) must go first.
+                        if let Err(why) = self.kill_generation_orphans(epoch).await {
+                            self.notice(NoticeLevel::Error, "reclaim.orphan", why);
+                            return Flow::Continue;
+                        }
                         self.set_state(InstanceState::Reclaiming, "retrying reclaim");
                         return self.reclaim(epoch, Then::Settle, true).await;
                     }

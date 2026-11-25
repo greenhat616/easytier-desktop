@@ -410,6 +410,7 @@ impl World {
             full_ready_timeout: Duration::from_secs(1),
             reclaim_retry: Duration::from_millis(500),
             log_lines: 100,
+            lease_grace: Duration::from_secs(30),
         };
         Self {
             scratch,

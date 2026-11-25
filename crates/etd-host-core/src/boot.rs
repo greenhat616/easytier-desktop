@@ -13,31 +13,43 @@
 //!    diagnose only. Unavailable: recovery without the ledger (exclusive
 //!    containers only), then diagnose-only serving; no instance starts.
 //! 3. Orphan kernels. Every open process record with a recorded identity
-//!    is checked: `Same` is killed (`kill_verified`), `Uncertain` puts the
-//!    record, and so its instance, in quarantine; nothing else is touched
-//!    for that instance. Then a marker sweep (our kernel store image, a
-//!    command line inside the run directory) kills kernels no record knows
-//!    (crash between spawn and recording the pid).
-//! 4. `ReclaimEngine::reclaim_all(Instances)`: every open generation in
-//!    rank order, one failing generation never stopping the others.
+//!    is checked: `Same` is killed (`kill_verified`), `Uncertain` (or a
+//!    failed kill) quarantines the record, persisted, and so its instance.
+//!    Then a marker sweep per runtime directory `run/<instance>/<epoch>/`
+//!    kills kernels no record knows (crash between spawn and recording the
+//!    pid); a kill that fails or is uncertain quarantines that instance,
+//!    and a final sweep of the whole run directory catches the rest.
+//! 4. `ReclaimEngine::reclaim_all(Instances)`: every open generation, the
+//!    process record first; one failing generation never stops the others.
 //! 5. The report is published; closed records are compacted.
 //! 6. Serving: one supervisor per desired instance, starting from what is
 //!    still open (quarantined or pending generations), then accepted
 //!    tickets are replayed.
 //!
+//! The self-check never passes over a failure (ruling msg#567): if the
+//! process records cannot be read, or a sweep fails or finds a kernel it
+//! cannot kill and cannot attribute, no privileged instance starts until a
+//! later sweep succeeds ([`resweep`]); an orphan attributed to an instance
+//! quarantines that instance. Where the quarantine cannot be persisted
+//! (its generation is already closed, or the ledger refuses the write) the
+//! instance stays quarantined in memory and is never reclaimed or started
+//! automatically; the next host start finds the same orphan again.
+//!
 //! Running it twice in a row writes nothing the second time: killed
 //! processes are gone, quarantined records are skipped, and the engine
 //! finds nothing open to reclaim.
-use crate::lifecycle::Ctx;
+use crate::lifecycle::{Ctx, view};
 use crate::reclaimers::{exact_identity, recorded_identity};
 use crate::supervisor::Initial;
-use etd_contract::{DesiredInstance, InstanceId, Revision};
+use etd_contract::v1::{self, NoticeLevel};
+use etd_contract::{DesiredInstance, HostMode, InstanceId, Revision};
 use etd_proc::{KillOutcome, Liveness, ProcessIdentity, ProcessMarker};
 use etd_sysfx::{
-    Effect, EffectKind, EffectState, GenerationOutcome, LedgerError, ReclaimReport, ReclaimScope,
-    ScopeFilter,
+    Effect, EffectKind, EffectState, Epoch, GenerationOutcome, LedgerError, ReclaimReport,
+    ReclaimScope, ScopeFilter,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// What the self-check leaves for the orchestrator.
@@ -49,6 +61,10 @@ pub(crate) struct BootOutcome {
     /// How each instance's supervisor starts; missing means idle.
     pub initial: BTreeMap<InstanceId, Initial>,
     pub report: Option<ReclaimReport>,
+    /// No privileged instance may start until a sweep succeeds.
+    pub hold_starts: Option<String>,
+    /// Published once serving.
+    pub notices: Vec<v1::Notice>,
     /// Host log lines.
     pub log: Vec<String>,
 }
@@ -61,18 +77,37 @@ impl BootOutcome {
             desired: Vec::new(),
             initial: BTreeMap::new(),
             report,
+            hold_starts: None,
+            notices: Vec::new(),
             log,
         }
     }
 }
 
 /// Our kernels: an image from the kernel store, a command line inside the
-/// run directory.
-pub(crate) fn kernel_marker(ctx: &Ctx) -> ProcessMarker {
+/// run directory (or one generation's runtime directory).
+pub(crate) fn kernel_marker(ctx: &Ctx, cmdline_root: PathBuf) -> ProcessMarker {
     ProcessMarker {
         exe_root: ctx.deps.dirs.core_store_dir.clone(),
-        cmdline_root: ctx.deps.dirs.run_dir.clone(),
+        cmdline_root,
     }
+}
+
+/// Outcome of a sweep for kernels no record knows.
+#[derive(Default)]
+pub(crate) struct Sweep {
+    /// Instances whose orphan could not be killed: (epoch, reason).
+    pub quarantine: BTreeMap<InstanceId, (Epoch, String)>,
+    /// The sweep itself failed, or an orphan nobody can be blamed for
+    /// survived: hold every privileged start.
+    pub failed: Option<String>,
+    pub log: Vec<String>,
+}
+
+/// Starts are held only on a privileged host (a user host's kernels run
+/// with the user's own rights).
+fn privileged(ctx: &Ctx) -> bool {
+    ctx.deps.mode != HostMode::User
 }
 
 pub(crate) async fn self_check(ctx: Arc<Ctx>) -> BootOutcome {
@@ -105,7 +140,8 @@ pub(crate) async fn self_check(ctx: Arc<Ctx>) -> BootOutcome {
             log.push(format!(
                 "self-check: ledger unavailable ({e}); recovering without it"
             ));
-            sweep_orphans(&ctx, &BTreeSet::new(), &mut log).await;
+            let sweep = sweep_orphans(&ctx, &BTreeSet::new()).await;
+            log.extend(sweep.log);
             let report = match deps.reclaim.recover_without_ledger().await {
                 Ok(r) => Some(r),
                 Err(e) => {
@@ -118,7 +154,9 @@ pub(crate) async fn self_check(ctx: Arc<Ctx>) -> BootOutcome {
     };
 
     // Step 3: orphan kernels.
-    let mut quarantined: BTreeMap<InstanceId, String> = BTreeMap::new();
+    let mut quarantined: BTreeMap<InstanceId, (Epoch, String)> = BTreeMap::new();
+    let mut notices = Vec::new();
+    let mut hold: Option<String> = None;
     let mut known: BTreeSet<(u32, String)> = BTreeSet::new();
     let process_filter = ScopeFilter {
         kinds: vec![EffectKind::Process],
@@ -127,34 +165,73 @@ pub(crate) async fn self_check(ctx: Arc<Ctx>) -> BootOutcome {
     match deps.ledger.open_effects(&process_filter).await {
         Ok(records) => {
             for e in records {
-                let Some(id) = recorded_identity(&e) else {
-                    continue;
-                };
-                known.insert((id.pid, id.start_token.clone()));
-                let Some((instance, _)) = e.scope.generation() else {
+                let Some((instance, epoch)) = e.scope.generation() else {
                     continue;
                 };
                 let instance = instance.clone();
                 if e.state == EffectState::Quarantined {
                     quarantined
                         .entry(instance)
-                        .or_insert_with(|| e.last_error.clone().unwrap_or_default());
+                        .or_insert_with(|| (epoch, e.last_error.clone().unwrap_or_default()));
                     continue;
                 }
+                let Some(id) = recorded_identity(&e) else {
+                    continue;
+                };
+                known.insert((id.pid, id.start_token.clone()));
                 if let Err(reason) = kill_recorded(&ctx, &e, &id).await {
                     log.push(format!(
                         "self-check: instance {instance} quarantined: {reason}"
                     ));
-                    quarantine_record(&ctx, &e, &reason).await;
-                    quarantined.insert(instance, reason);
+                    if let Err(err) = quarantine_record(&ctx, &e, &reason).await {
+                        log.push(format!(
+                            "self-check: quarantine of {instance} not recorded ({err}); \
+                             it is held in memory, nothing reclaimed or started"
+                        ));
+                    }
+                    notices.push(view::notice(
+                        NoticeLevel::Error,
+                        "selfcheck.quarantined",
+                        reason.clone(),
+                        instance.as_str(),
+                    ));
+                    quarantined.insert(instance, (epoch, reason));
                 }
             }
         }
-        Err(e) => log.push(format!("self-check: process records unreadable: {e}")),
+        Err(e) => {
+            let why = format!("process records unreadable: {e}");
+            log.push(format!("self-check: {why}"));
+            hold = Some(why);
+        }
     }
-    sweep_orphans(&ctx, &known, &mut log).await;
+    let sweep = sweep_orphans(&ctx, &known).await;
+    log.extend(sweep.log);
+    for (instance, (epoch, reason)) in sweep.quarantine {
+        notices.push(view::notice(
+            NoticeLevel::Error,
+            "selfcheck.quarantined",
+            reason.clone(),
+            instance.as_str(),
+        ));
+        persist_orphan_quarantine(&ctx, &instance, epoch, &reason, &mut log).await;
+        quarantined.entry(instance).or_insert((epoch, reason));
+    }
+    if let Some(why) = sweep.failed {
+        hold.get_or_insert(why);
+    }
+    let hold_starts = hold.filter(|_| privileged(&ctx));
+    if let Some(why) = &hold_starts {
+        notices.push(view::notice(
+            NoticeLevel::Error,
+            "selfcheck.incomplete",
+            format!("no instance starts until the kernel sweep succeeds: {why}"),
+            "",
+        ));
+    }
 
-    // Step 4: reclaim every open generation in rank order.
+    // Step 4: reclaim every open generation (the engine holds those whose
+    // kernel is not verified dead).
     let report = match deps.reclaim.reclaim_all(ReclaimScope::Instances).await {
         Ok(r) => Some(r),
         Err(e) => {
@@ -174,25 +251,31 @@ pub(crate) async fn self_check(ctx: Arc<Ctx>) -> BootOutcome {
     // a removal completes when its last generation closes.
     let (revision, desired) = deps.ledger.desired().await.unwrap_or((revision, desired));
     let mut initial = BTreeMap::new();
-    match deps.ledger.open_effects(&ScopeFilter::default()).await {
-        Ok(open) => {
-            for d in &desired {
-                let id = InstanceId(d.instance_id.clone());
-                let mine: Vec<Effect> = open
-                    .iter()
-                    .filter(|e| e.scope.generation().is_some_and(|(i, _)| *i == id))
-                    .cloned()
-                    .collect();
-                let mut init = initial_from_open(&mine, report.as_ref());
-                if let (Initial::Reclaim(epoch), Some(reason)) = (&init, quarantined.get(&id)) {
-                    init = Initial::Quarantined(*epoch, reason.clone());
-                }
-                if !matches!(init, Initial::Idle) {
-                    initial.insert(id, init);
-                }
-            }
+    let open = deps.ledger.open_effects(&ScopeFilter::default()).await;
+    if let Err(e) = &open {
+        log.push(format!("self-check: open records unreadable: {e}"));
+    }
+    for d in &desired {
+        let id = InstanceId(d.instance_id.clone());
+        let mine: Vec<Effect> = match &open {
+            Ok(open) => open
+                .iter()
+                .filter(|e| e.scope.generation().is_some_and(|(i, _)| *i == id))
+                .cloned()
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let mut init = initial_from_open(&mine, report.as_ref());
+        if let Some((epoch, reason)) = quarantined.get(&id) {
+            let epoch = match &init {
+                Initial::Reclaim(e) | Initial::Quarantined(e, _) => *e,
+                Initial::Idle => *epoch,
+            };
+            init = Initial::Quarantined(epoch, reason.clone());
         }
-        Err(e) => log.push(format!("self-check: open records unreadable: {e}")),
+        if !matches!(init, Initial::Idle) {
+            initial.insert(id, init);
+        }
     }
     BootOutcome {
         diagnostic: false,
@@ -200,6 +283,8 @@ pub(crate) async fn self_check(ctx: Arc<Ctx>) -> BootOutcome {
         desired,
         initial,
         report,
+        hold_starts,
+        notices,
         log,
     }
 }
@@ -243,7 +328,7 @@ pub(crate) fn initial_from_open(open: &[Effect], report: Option<&ReclaimReport>)
 }
 
 /// Kill a recorded kernel that is still alive. `Err`: its liveness cannot
-/// be established (quarantine).
+/// be established or the kill failed (quarantine).
 async fn kill_recorded(ctx: &Ctx, e: &Effect, id: &ProcessIdentity) -> Result<(), String> {
     let process = &ctx.deps.process;
     match process.liveness(id).await {
@@ -266,22 +351,68 @@ async fn kill_recorded(ctx: &Ctx, e: &Effect, id: &ProcessIdentity) -> Result<()
 
 /// Persist the quarantine, so neither the reclaim engine nor a later host
 /// run treats the generation as closable.
-async fn quarantine_record(ctx: &Ctx, e: &Effect, reason: &str) {
+pub(crate) async fn quarantine_record(
+    ctx: &Ctx,
+    e: &Effect,
+    reason: &str,
+) -> Result<(), LedgerError> {
     let ledger = &ctx.deps.ledger;
     if e.state != EffectState::Reclaiming {
-        let _ = ledger
+        ledger
             .transition(&e.id, EffectState::Reclaiming, None)
-            .await;
+            .await?;
     }
-    let _ = ledger.record_failure(&e.id, reason).await;
-    let _ = ledger
+    ledger.record_failure(&e.id, reason).await?;
+    ledger
         .transition(&e.id, EffectState::Quarantined, None)
-        .await;
+        .await
+}
+
+/// An unkillable orphan of `instance` / `epoch`: quarantine that
+/// generation's open process records; with none open (closed generation)
+/// the quarantine lives in memory only.
+async fn persist_orphan_quarantine(
+    ctx: &Ctx,
+    instance: &InstanceId,
+    epoch: Epoch,
+    reason: &str,
+    log: &mut Vec<String>,
+) {
+    let filter = ScopeFilter {
+        kinds: vec![EffectKind::Process],
+        ..ScopeFilter::epoch(instance.clone(), epoch)
+    };
+    let records = match ctx.deps.ledger.open_effects(&filter).await {
+        Ok(r) => r,
+        Err(e) => {
+            log.push(format!(
+                "self-check: quarantine of {instance} not recorded ({e}); held in memory"
+            ));
+            return;
+        }
+    };
+    if records.is_empty() {
+        log.push(format!(
+            "self-check: generation {} of {instance} is closed; its orphan keeps the instance quarantined in memory",
+            epoch.0
+        ));
+    }
+    for e in records
+        .iter()
+        .filter(|e| e.state != EffectState::Quarantined)
+    {
+        if let Err(err) = quarantine_record(ctx, e, reason).await {
+            log.push(format!(
+                "self-check: quarantine of {instance} not recorded ({err}); held in memory"
+            ));
+        }
+    }
 }
 
 /// Diagnose only: list, never kill.
 async fn list_orphans(ctx: &Ctx, log: &mut Vec<String>) {
-    match ctx.deps.process.find_marked(&kernel_marker(ctx)).await {
+    let marker = kernel_marker(ctx, ctx.deps.dirs.run_dir.clone());
+    match ctx.deps.process.find_marked(&marker).await {
         Ok(found) => {
             for id in found {
                 log.push(format!(
@@ -295,29 +426,136 @@ async fn list_orphans(ctx: &Ctx, log: &mut Vec<String>) {
     }
 }
 
-/// Kill our kernels that no open record knows.
-async fn sweep_orphans(ctx: &Ctx, known: &BTreeSet<(u32, String)>, log: &mut Vec<String>) {
+/// `run/<instance>/<epoch>/` directories present on disk.
+fn epoch_dirs(run: &std::path::Path) -> std::io::Result<Vec<(InstanceId, Epoch, PathBuf)>> {
+    let mut out = Vec::new();
+    let instances = match std::fs::read_dir(run) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e),
+    };
+    for inst in instances {
+        let inst = inst?;
+        if !inst.file_type()?.is_dir() {
+            continue;
+        }
+        let name = inst.file_name().to_string_lossy().into_owned();
+        for ep in std::fs::read_dir(inst.path())? {
+            let ep = ep?;
+            if let Ok(n) = ep.file_name().to_string_lossy().parse::<u64>()
+                && ep.file_type()?.is_dir()
+            {
+                out.push((InstanceId(name.clone()), Epoch(n), ep.path()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Kill our kernels that no open record knows: per generation directory
+/// first (an unkillable one quarantines its instance), then the whole run
+/// directory (an unkillable kernel there cannot be attributed).
+pub(crate) async fn sweep_orphans(ctx: &Ctx, known: &BTreeSet<(u32, String)>) -> Sweep {
+    let mut sweep = Sweep::default();
     let process = &ctx.deps.process;
-    match process.find_marked(&kernel_marker(ctx)).await {
-        Ok(found) => {
-            for id in found {
-                if known.contains(&(id.pid, id.start_token.clone())) {
-                    continue;
-                }
-                match process.kill_verified(&id).await {
-                    Ok(KillOutcome::Killed) => {
-                        log.push(format!(
-                            "self-check: killed unrecorded kernel pid {}",
-                            id.pid
-                        ));
-                    }
-                    Ok(_) => {}
+    let mut handled: BTreeSet<(u32, String)> = known.clone();
+    let run = ctx.deps.dirs.run_dir.clone();
+    let dirs = tokio::task::spawn_blocking(move || epoch_dirs(&run))
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))
+        .and_then(|r| r);
+    match dirs {
+        Ok(dirs) => {
+            for (instance, epoch, dir) in dirs {
+                match process.find_marked(&kernel_marker(ctx, dir)).await {
                     Err(e) => {
-                        log.push(format!("self-check: kernel pid {} not killed: {e}", id.pid))
+                        sweep
+                            .failed
+                            .get_or_insert(format!("process sweep failed: {e}"));
+                    }
+                    Ok(found) => {
+                        for id in found {
+                            if !handled.insert((id.pid, id.start_token.clone())) {
+                                continue;
+                            }
+                            if let Err(reason) = kill_orphan(ctx, &id, &mut sweep.log).await {
+                                sweep
+                                    .quarantine
+                                    .entry(instance.clone())
+                                    .or_insert((epoch, reason));
+                            }
+                        }
                     }
                 }
             }
         }
-        Err(e) => log.push(format!("self-check: process sweep failed: {e}")),
+        Err(e) => {
+            sweep
+                .failed
+                .get_or_insert(format!("run directory unreadable: {e}"));
+        }
+    }
+    let marker = kernel_marker(ctx, ctx.deps.dirs.run_dir.clone());
+    match process.find_marked(&marker).await {
+        Err(e) => {
+            sweep
+                .failed
+                .get_or_insert(format!("process sweep failed: {e}"));
+        }
+        Ok(found) => {
+            for id in found {
+                if !handled.insert((id.pid, id.start_token.clone())) {
+                    continue;
+                }
+                if let Err(reason) = kill_orphan(ctx, &id, &mut sweep.log).await {
+                    sweep.failed.get_or_insert(reason);
+                }
+            }
+        }
+    }
+    if let Some(why) = &sweep.failed {
+        sweep.log.push(format!("self-check: {why}"));
+    }
+    sweep
+}
+
+async fn kill_orphan(ctx: &Ctx, id: &ProcessIdentity, log: &mut Vec<String>) -> Result<(), String> {
+    match ctx.deps.process.kill_verified(id).await {
+        Ok(KillOutcome::Killed) => {
+            log.push(format!(
+                "self-check: killed unrecorded kernel pid {}",
+                id.pid
+            ));
+            Ok(())
+        }
+        Ok(KillOutcome::Gone | KillOutcome::Reused) => Ok(()),
+        Ok(KillOutcome::Uncertain) => Err(format!(
+            "unrecorded kernel pid {} could not be killed with certainty",
+            id.pid
+        )),
+        Err(e) => Err(format!("unrecorded kernel pid {} not killed: {e}", id.pid)),
+    }
+}
+
+/// Retry of a failed sweep while starts are held. `Ok`: starts may go on.
+pub(crate) async fn resweep(ctx: &Ctx) -> Result<(), String> {
+    let known: BTreeSet<(u32, String)> = ctx
+        .deps
+        .ledger
+        .open_effects(&ScopeFilter {
+            kinds: vec![EffectKind::Process],
+            ..ScopeFilter::default()
+        })
+        .await
+        .map_err(|e| format!("process records unreadable: {e}"))?
+        .iter()
+        .filter_map(recorded_identity)
+        .map(|id| (id.pid, id.start_token))
+        .collect();
+    let sweep = sweep_orphans(ctx, &known).await;
+    match sweep.failed {
+        Some(why) => Err(why),
+        None if sweep.quarantine.is_empty() => Ok(()),
+        None => Err("an orphan kernel could not be killed".into()),
     }
 }

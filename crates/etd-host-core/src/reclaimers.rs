@@ -66,6 +66,15 @@ impl ProcessReclaimer {
     }
 
     /// The root is gone; is the whole tree? `Err`: cannot be confirmed.
+    ///
+    /// Windows job object: the job kills the tree with its last handle.
+    /// Linux cgroup v2 and process group, macOS: a fresh, successful marker
+    /// sweep (our kernel image, a command line inside this generation's
+    /// runtime directory) that finds nothing. Rulings msg#557 / msg#567 and
+    /// etd-proc's `ProcessEngine::liveness` convention accept this for
+    /// cgroup and process group alike: upstream kernels spawn no children,
+    /// and the engine offers no call proving a cgroup empty. A failed sweep
+    /// or any survivor is indeterminate (quarantine).
     async fn tree_gone(&self, e: &Effect) -> Result<(), String> {
         if recorded_containment(e) == Some(Containment::JobObject) {
             // The job object kills the tree when its last handle closes.
@@ -144,7 +153,7 @@ pub(crate) async fn exact_identity(
         .map_err(|err| format!("marker lookup failed: {err}"))?;
     found
         .into_iter()
-        .find(|f| f.pid == id.pid && f.start_token == id.start_token)
+        .find(|f| f.pid == id.pid && f.start_token == id.start_token && f.exe == id.exe)
         .map(Some)
         .ok_or_else(|| format!("pid {} not found under its generation marker", id.pid))
 }

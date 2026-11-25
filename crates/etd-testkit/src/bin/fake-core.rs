@@ -1,3 +1,3 @@
-fn main() {
-    // Reserved for component tests; never part of product packaging.
-}
+//! Scriptable stand-in for easytier-core in process tests; never packaged.
+//! Owned by P1.
+fn main() {}

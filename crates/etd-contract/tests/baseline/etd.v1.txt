@@ -1,0 +1,437 @@
+enum .etd.v1.CandidateAction.CANDIDATE_ACTION_DELETE = 1
+enum .etd.v1.CandidateAction.CANDIDATE_ACTION_KEEP = 2
+enum .etd.v1.CandidateAction.CANDIDATE_ACTION_UNSPECIFIED = 0
+enum .etd.v1.CandidateOrigin.CANDIDATE_ORIGIN_LEDGER_LOST = 2
+enum .etd.v1.CandidateOrigin.CANDIDATE_ORIGIN_NO_CREDENTIAL = 1
+enum .etd.v1.CandidateOrigin.CANDIDATE_ORIGIN_PREFIX_MATCH = 3
+enum .etd.v1.CandidateOrigin.CANDIDATE_ORIGIN_UNSPECIFIED = 0
+enum .etd.v1.ClientKind.CLIENT_KIND_CLI = 2
+enum .etd.v1.ClientKind.CLIENT_KIND_DESKTOP = 1
+enum .etd.v1.ClientKind.CLIENT_KIND_UNSPECIFIED = 0
+enum .etd.v1.CoreSupport.CORE_SUPPORT_LIFECYCLE_ONLY = 2
+enum .etd.v1.CoreSupport.CORE_SUPPORT_PROFILED = 1
+enum .etd.v1.CoreSupport.CORE_SUPPORT_REJECTED = 3
+enum .etd.v1.CoreSupport.CORE_SUPPORT_UNSPECIFIED = 0
+enum .etd.v1.Desired.DESIRED_RUNNING = 2
+enum .etd.v1.Desired.DESIRED_STOPPED = 1
+enum .etd.v1.Desired.DESIRED_UNSPECIFIED = 0
+enum .etd.v1.ErrorCode.ERROR_CODE_CORE_UNAVAILABLE = 12
+enum .etd.v1.ErrorCode.ERROR_CODE_ELEVATION_REQUIRED = 4
+enum .etd.v1.ErrorCode.ERROR_CODE_FEATURE_REJECTED = 9
+enum .etd.v1.ErrorCode.ERROR_CODE_HOST_NOT_SERVING = 15
+enum .etd.v1.ErrorCode.ERROR_CODE_INSTANCE_BUSY = 14
+enum .etd.v1.ErrorCode.ERROR_CODE_INVALID_SPEC = 8
+enum .etd.v1.ErrorCode.ERROR_CODE_LEDGER_UNAVAILABLE = 13
+enum .etd.v1.ErrorCode.ERROR_CODE_MANAGEMENT_UNAVAILABLE = 16
+enum .etd.v1.ErrorCode.ERROR_CODE_PERMISSION_DENIED = 3
+enum .etd.v1.ErrorCode.ERROR_CODE_REQUEST_ID_REUSED = 6
+enum .etd.v1.ErrorCode.ERROR_CODE_REVISION_CONFLICT = 5
+enum .etd.v1.ErrorCode.ERROR_CODE_SINGLE_WRITER_TAKEN = 11
+enum .etd.v1.ErrorCode.ERROR_CODE_UNKNOWN_CANDIDATE = 17
+enum .etd.v1.ErrorCode.ERROR_CODE_UNKNOWN_INSTANCE = 7
+enum .etd.v1.ErrorCode.ERROR_CODE_UNMODELLED_EFFECTS = 10
+enum .etd.v1.ErrorCode.ERROR_CODE_UNSPECIFIED = 0
+enum .etd.v1.ErrorCode.ERROR_CODE_VERSION_METADATA = 2
+enum .etd.v1.ErrorCode.ERROR_CODE_VERSION_MISMATCH = 1
+enum .etd.v1.HostMode.HOST_MODE_ELEVATED_SESSION = 2
+enum .etd.v1.HostMode.HOST_MODE_SERVICE = 1
+enum .etd.v1.HostMode.HOST_MODE_UNSPECIFIED = 0
+enum .etd.v1.HostMode.HOST_MODE_USER = 3
+enum .etd.v1.HostPhase.HOST_PHASE_DIAGNOSTIC_ONLY = 3
+enum .etd.v1.HostPhase.HOST_PHASE_SELF_CHECK = 1
+enum .etd.v1.HostPhase.HOST_PHASE_SERVING = 2
+enum .etd.v1.HostPhase.HOST_PHASE_SHUTTING_DOWN = 4
+enum .etd.v1.HostPhase.HOST_PHASE_UNSPECIFIED = 0
+enum .etd.v1.InstanceState.INSTANCE_STATE_BACKOFF = 7
+enum .etd.v1.InstanceState.INSTANCE_STATE_CUT_UNCONFIRMED = 10
+enum .etd.v1.InstanceState.INSTANCE_STATE_GAVE_UP = 8
+enum .etd.v1.InstanceState.INSTANCE_STATE_QUARANTINED = 9
+enum .etd.v1.InstanceState.INSTANCE_STATE_READY_BASIC = 3
+enum .etd.v1.InstanceState.INSTANCE_STATE_READY_FULL = 4
+enum .etd.v1.InstanceState.INSTANCE_STATE_RECLAIMING = 6
+enum .etd.v1.InstanceState.INSTANCE_STATE_STARTING = 2
+enum .etd.v1.InstanceState.INSTANCE_STATE_STOPPED = 1
+enum .etd.v1.InstanceState.INSTANCE_STATE_STOPPING = 5
+enum .etd.v1.InstanceState.INSTANCE_STATE_UNSPECIFIED = 0
+enum .etd.v1.LeaseRelease.LEASE_RELEASE_KEEP_INSTANCES = 2
+enum .etd.v1.LeaseRelease.LEASE_RELEASE_STOP_INSTANCES = 1
+enum .etd.v1.LeaseRelease.LEASE_RELEASE_UNSPECIFIED = 0
+enum .etd.v1.LogSource.LOG_SOURCE_CORE_STDERR = 3
+enum .etd.v1.LogSource.LOG_SOURCE_CORE_STDOUT = 2
+enum .etd.v1.LogSource.LOG_SOURCE_HOST = 1
+enum .etd.v1.LogSource.LOG_SOURCE_UNSPECIFIED = 0
+enum .etd.v1.ManagementAccess.MANAGEMENT_ACCESS_AVAILABLE = 2
+enum .etd.v1.ManagementAccess.MANAGEMENT_ACCESS_DENY_ALL = 3
+enum .etd.v1.ManagementAccess.MANAGEMENT_ACCESS_LIFECYCLE_ONLY = 4
+enum .etd.v1.ManagementAccess.MANAGEMENT_ACCESS_PENDING = 1
+enum .etd.v1.ManagementAccess.MANAGEMENT_ACCESS_UNSPECIFIED = 0
+enum .etd.v1.NoticeLevel.NOTICE_LEVEL_ERROR = 3
+enum .etd.v1.NoticeLevel.NOTICE_LEVEL_INFO = 1
+enum .etd.v1.NoticeLevel.NOTICE_LEVEL_UNSPECIFIED = 0
+enum .etd.v1.NoticeLevel.NOTICE_LEVEL_WARNING = 2
+enum .etd.v1.QueryKind.QUERY_KIND_NODES = 1
+enum .etd.v1.QueryKind.QUERY_KIND_ROUTES = 2
+enum .etd.v1.QueryKind.QUERY_KIND_TRAFFIC = 3
+enum .etd.v1.QueryKind.QUERY_KIND_UNSPECIFIED = 0
+enum .etd.v1.ReclaimStatus.RECLAIM_STATUS_AWAITING_CONFIRMATION = 4
+enum .etd.v1.ReclaimStatus.RECLAIM_STATUS_CLEAN = 1
+enum .etd.v1.ReclaimStatus.RECLAIM_STATUS_IN_PROGRESS = 2
+enum .etd.v1.ReclaimStatus.RECLAIM_STATUS_QUARANTINED = 3
+enum .etd.v1.ReclaimStatus.RECLAIM_STATUS_UNSPECIFIED = 0
+enum .etd.v1.ResidueState.RESIDUE_STATE_FAILING = 2
+enum .etd.v1.ResidueState.RESIDUE_STATE_INDETERMINATE = 3
+enum .etd.v1.ResidueState.RESIDUE_STATE_PENDING = 1
+enum .etd.v1.ResidueState.RESIDUE_STATE_UNSPECIFIED = 0
+enum .etd.v1.Role.ROLE_ADMIN = 3
+enum .etd.v1.Role.ROLE_CONTROL = 2
+enum .etd.v1.Role.ROLE_UNSPECIFIED = 0
+enum .etd.v1.Role.ROLE_VIEWER = 1
+enum .etd.v1.TransportProtocol.TRANSPORT_PROTOCOL_TCP = 1
+enum .etd.v1.TransportProtocol.TRANSPORT_PROTOCOL_UDP = 2
+enum .etd.v1.TransportProtocol.TRANSPORT_PROTOCOL_UNSPECIFIED = 0
+extend .google.protobuf.MethodOptions required_role = 50000 .etd.v1.Role
+field .etd.v1.AllowEntry.display_name = 3 single String
+field .etd.v1.AllowEntry.principal = 1 single Message .etd.v1.OsPrincipal
+field .etd.v1.AllowEntry.role = 2 single Enum .etd.v1.Role
+field .etd.v1.ApplyRequest.desired = 4 single Enum .etd.v1.Desired
+field .etd.v1.ApplyRequest.header = 1 single Message .etd.v1.MutationHeader
+field .etd.v1.ApplyRequest.instance_id = 2 single String
+field .etd.v1.ApplyRequest.spec = 3 single Message .etd.v1.NetworkSpec
+field .etd.v1.ApplyResponse.receipt = 1 single Message .etd.v1.Receipt
+field .etd.v1.Candidate.candidate_id = 1 single String
+field .etd.v1.Candidate.detail = 7 single String
+field .etd.v1.Candidate.epoch = 6 single Uint64
+field .etd.v1.Candidate.identity = 3 single String
+field .etd.v1.Candidate.instance_id = 5 single String
+field .etd.v1.Candidate.kind = 2 single String
+field .etd.v1.Candidate.origin = 4 single Enum .etd.v1.CandidateOrigin
+field .etd.v1.CandidateDecision.action = 2 single Enum .etd.v1.CandidateAction
+field .etd.v1.CandidateDecision.candidate_id = 1 single String
+field .etd.v1.Conflict.effect_id = 5 single String
+field .etd.v1.Conflict.expected = 3 single String
+field .etd.v1.Conflict.found = 4 single String
+field .etd.v1.Conflict.identity = 2 single String
+field .etd.v1.Conflict.kind = 1 single String
+field .etd.v1.CoreEntry.proto_revision = 2 single String
+field .etd.v1.CoreEntry.sha256 = 3 single String
+field .etd.v1.CoreEntry.support = 4 single Enum .etd.v1.CoreSupport
+field .etd.v1.CoreEntry.version = 1 single String
+field .etd.v1.DesiredChanged.instance = 2 single Message .etd.v1.DesiredInstance
+field .etd.v1.DesiredChanged.request_id = 3 single String
+field .etd.v1.DesiredChanged.revision = 1 single Uint64
+field .etd.v1.DesiredChanged.ticket = 4 single String
+field .etd.v1.DesiredInstance.desired = 3 single Enum .etd.v1.Desired
+field .etd.v1.DesiredInstance.instance_id = 1 single String
+field .etd.v1.DesiredInstance.spec = 2 single Message .etd.v1.NetworkSpec
+field .etd.v1.ErrorDetail.code = 1 single Enum .etd.v1.ErrorCode
+field .etd.v1.ErrorDetail.current_revision = 3 single Uint64
+field .etd.v1.ErrorDetail.features = 4 repeated String
+field .etd.v1.ErrorDetail.host_major = 6 single Uint32
+field .etd.v1.ErrorDetail.host_minor = 7 single Uint32
+field .etd.v1.ErrorDetail.instance_id = 5 single String
+field .etd.v1.ErrorDetail.message = 2 single String
+field .etd.v1.Event.at_unix_ms = 2 single Int64
+field .etd.v1.Event.cursor = 1 single Message .etd.v1.EventCursor
+field .etd.v1.Event.desired_changed = 12 single Message .etd.v1.DesiredChanged oneof=payload
+field .etd.v1.Event.host_phase = 14 single Message .etd.v1.HostPhaseChanged oneof=payload
+field .etd.v1.Event.instance_exited = 15 single Message .etd.v1.InstanceExited oneof=payload
+field .etd.v1.Event.instance_removed = 11 single Message .etd.v1.InstanceRemoved oneof=payload
+field .etd.v1.Event.instance_status = 10 single Message .etd.v1.InstanceStatus oneof=payload
+field .etd.v1.Event.notice = 17 single Message .etd.v1.Notice oneof=payload
+field .etd.v1.Event.reclaim_report = 13 single Message .etd.v1.ReclaimReport oneof=payload
+field .etd.v1.Event.resync_required = 16 single Message .etd.v1.ResyncRequired oneof=payload
+field .etd.v1.EventCursor.seq = 2 single Uint64
+field .etd.v1.EventCursor.stream_id = 1 single String
+field .etd.v1.ExitInfo.abnormal = 3 single Bool
+field .etd.v1.ExitInfo.at_unix_ms = 4 single Int64
+field .etd.v1.ExitInfo.code = 1 optional Int32
+field .etd.v1.ExitInfo.signal = 2 optional Int32
+field .etd.v1.GetAllowListResponse.entries = 1 repeated Message .etd.v1.AllowEntry
+field .etd.v1.GetAllowListResponse.revision = 2 single Uint64
+field .etd.v1.GetReceiptRequest.request_id = 1 single String
+field .etd.v1.GetReceiptResponse.receipt = 1 single Message .etd.v1.Receipt
+field .etd.v1.Hello.build = 3 single String
+field .etd.v1.Hello.client_kind = 4 single Enum .etd.v1.ClientKind
+field .etd.v1.Hello.major = 1 single Uint32
+field .etd.v1.Hello.minor = 2 single Uint32
+field .etd.v1.HostPhaseChanged.phase = 1 single Enum .etd.v1.HostPhase
+field .etd.v1.HostSnapshot.cursor = 3 single Message .etd.v1.EventCursor
+field .etd.v1.HostSnapshot.default_core_version = 6 single String
+field .etd.v1.HostSnapshot.instances = 2 repeated Message .etd.v1.InstanceView
+field .etd.v1.HostSnapshot.phase = 4 single Enum .etd.v1.HostPhase
+field .etd.v1.HostSnapshot.reclaim = 5 single Message .etd.v1.ReclaimReport
+field .etd.v1.HostSnapshot.revision = 1 single Uint64
+field .etd.v1.InstanceExited.attempt = 4 single Uint32
+field .etd.v1.InstanceExited.epoch = 2 single Uint64
+field .etd.v1.InstanceExited.exit = 3 single Message .etd.v1.ExitInfo
+field .etd.v1.InstanceExited.gave_up = 6 single Bool
+field .etd.v1.InstanceExited.instance_id = 1 single String
+field .etd.v1.InstanceExited.restart_at_unix_ms = 5 single Int64
+field .etd.v1.InstanceReclaim.epoch = 2 single Uint64
+field .etd.v1.InstanceReclaim.instance_id = 1 single String
+field .etd.v1.InstanceReclaim.reason = 5 single String
+field .etd.v1.InstanceReclaim.residues = 4 repeated Message .etd.v1.Residue
+field .etd.v1.InstanceReclaim.status = 3 single Enum .etd.v1.ReclaimStatus
+field .etd.v1.InstanceRemoved.instance_id = 1 single String
+field .etd.v1.InstanceRemoved.revision = 2 single Uint64
+field .etd.v1.InstanceStatus.addresses = 10 repeated String
+field .etd.v1.InstanceStatus.core_version = 11 single String
+field .etd.v1.InstanceStatus.epoch = 3 single Uint64
+field .etd.v1.InstanceStatus.instance_id = 1 single String
+field .etd.v1.InstanceStatus.interface_name = 9 single String
+field .etd.v1.InstanceStatus.last_exit = 7 single Message .etd.v1.ExitInfo
+field .etd.v1.InstanceStatus.management = 4 single Enum .etd.v1.ManagementAccess
+field .etd.v1.InstanceStatus.message = 8 single String
+field .etd.v1.InstanceStatus.next_restart_unix_ms = 6 single Int64
+field .etd.v1.InstanceStatus.open_residues = 13 single Uint32
+field .etd.v1.InstanceStatus.restart_attempt = 5 single Uint32
+field .etd.v1.InstanceStatus.state = 2 single Enum .etd.v1.InstanceState
+field .etd.v1.InstanceStatus.state_since_unix_ms = 12 single Int64
+field .etd.v1.InstanceView.desired = 1 single Message .etd.v1.DesiredInstance
+field .etd.v1.InstanceView.status = 2 single Message .etd.v1.InstanceStatus
+field .etd.v1.ListCoresResponse.cores = 1 repeated Message .etd.v1.CoreEntry
+field .etd.v1.ListCoresResponse.default_version = 2 single String
+field .etd.v1.LogLine.at_unix_ms = 1 single Int64
+field .etd.v1.LogLine.epoch = 5 single Uint64
+field .etd.v1.LogLine.instance_id = 4 single String
+field .etd.v1.LogLine.source = 2 single Enum .etd.v1.LogSource
+field .etd.v1.LogLine.text = 3 single String
+field .etd.v1.MutationHeader.expected_revision = 2 single Uint64
+field .etd.v1.MutationHeader.request_id = 1 single String
+field .etd.v1.NetworkFlags.bind_device = 12 single Bool
+field .etd.v1.NetworkFlags.compression = 13 single String
+field .etd.v1.NetworkFlags.disable_encryption = 2 single Bool
+field .etd.v1.NetworkFlags.disable_ipv6 = 10 single Bool
+field .etd.v1.NetworkFlags.disable_p2p = 5 single Bool
+field .etd.v1.NetworkFlags.disable_udp_hole_punching = 6 single Bool
+field .etd.v1.NetworkFlags.enable_kcp_proxy = 3 single Bool
+field .etd.v1.NetworkFlags.enable_quic_proxy = 4 single Bool
+field .etd.v1.NetworkFlags.latency_first = 1 single Bool
+field .etd.v1.NetworkFlags.multi_thread = 8 single Bool
+field .etd.v1.NetworkFlags.private_mode = 9 single Bool
+field .etd.v1.NetworkFlags.relay_all_peer_rpc = 7 single Bool
+field .etd.v1.NetworkFlags.use_smoltcp = 11 single Bool
+field .etd.v1.NetworkSpec.dhcp = 7 single Bool oneof=ipv4
+field .etd.v1.NetworkSpec.display_name = 1 single String
+field .etd.v1.NetworkSpec.enable_exit_node = 13 single Bool
+field .etd.v1.NetworkSpec.exit_nodes = 12 repeated String
+field .etd.v1.NetworkSpec.flags = 20 single Message .etd.v1.NetworkFlags
+field .etd.v1.NetworkSpec.hostname = 5 single String
+field .etd.v1.NetworkSpec.ipv4_cidr = 6 single String oneof=ipv4
+field .etd.v1.NetworkSpec.listeners = 9 repeated String
+field .etd.v1.NetworkSpec.magic_dns = 18 single Bool
+field .etd.v1.NetworkSpec.mtu = 14 single Uint32
+field .etd.v1.NetworkSpec.network_name = 2 single String
+field .etd.v1.NetworkSpec.network_secret = 3 optional String
+field .etd.v1.NetworkSpec.network_secret_set = 4 single Bool
+field .etd.v1.NetworkSpec.no_listener = 10 single Bool
+field .etd.v1.NetworkSpec.no_tun = 15 single Bool
+field .etd.v1.NetworkSpec.peers = 8 repeated String
+field .etd.v1.NetworkSpec.port_forwards = 17 repeated Message .etd.v1.PortForward
+field .etd.v1.NetworkSpec.proxy_cidrs = 11 repeated String
+field .etd.v1.NetworkSpec.public_ipv6_provider = 19 single Bool
+field .etd.v1.NetworkSpec.socks5_port = 16 single Uint32
+field .etd.v1.Node.cost = 9 single Uint32
+field .etd.v1.Node.hostname = 2 single String
+field .etd.v1.Node.ipv4_cidr = 3 single String
+field .etd.v1.Node.ipv6_cidr = 13 single String
+field .etd.v1.Node.is_self = 10 single Bool
+field .etd.v1.Node.latency_us = 5 single Uint32
+field .etd.v1.Node.loss_rate = 6 single Double
+field .etd.v1.Node.nat_type = 7 single String
+field .etd.v1.Node.peer_id = 1 single Uint32
+field .etd.v1.Node.rx_bytes = 11 single Uint64
+field .etd.v1.Node.tunnels = 8 repeated String
+field .etd.v1.Node.tx_bytes = 12 single Uint64
+field .etd.v1.Node.version = 4 single String
+field .etd.v1.NodeList.nodes = 1 repeated Message .etd.v1.Node
+field .etd.v1.Notice.code = 2 single String
+field .etd.v1.Notice.instance_id = 4 single String
+field .etd.v1.Notice.level = 1 single Enum .etd.v1.NoticeLevel
+field .etd.v1.Notice.message = 3 single String
+field .etd.v1.OsPrincipal.unix_gid = 4 single Uint32 oneof=id
+field .etd.v1.OsPrincipal.unix_uid = 3 single Uint32 oneof=id
+field .etd.v1.OsPrincipal.windows_group_sid = 2 single String oneof=id
+field .etd.v1.OsPrincipal.windows_user_sid = 1 single String oneof=id
+field .etd.v1.PeerTraffic.peer_id = 1 single Uint32
+field .etd.v1.PeerTraffic.rx_bytes = 2 single Uint64
+field .etd.v1.PeerTraffic.tx_bytes = 3 single Uint64
+field .etd.v1.PortForward.bind = 2 single String
+field .etd.v1.PortForward.destination = 3 single String
+field .etd.v1.PortForward.protocol = 1 single Enum .etd.v1.TransportProtocol
+field .etd.v1.PurgeAllDataRequest.confirm = 2 single Bool
+field .etd.v1.PurgeAllDataRequest.header = 1 single Message .etd.v1.MutationHeader
+field .etd.v1.PurgeAllDataResponse.receipt = 1 single Message .etd.v1.Receipt
+field .etd.v1.QueryRequest.instance_id = 1 single String
+field .etd.v1.QueryRequest.kind = 2 single Enum .etd.v1.QueryKind
+field .etd.v1.QueryResponse.at_unix_ms = 4 single Int64
+field .etd.v1.QueryResponse.nodes = 1 single Message .etd.v1.NodeList oneof=result
+field .etd.v1.QueryResponse.routes = 2 single Message .etd.v1.RouteList oneof=result
+field .etd.v1.QueryResponse.traffic = 3 single Message .etd.v1.TrafficStats oneof=result
+field .etd.v1.Receipt.accepted_unix_ms = 4 single Int64
+field .etd.v1.Receipt.request_id = 1 single String
+field .etd.v1.Receipt.revision = 2 single Uint64
+field .etd.v1.Receipt.ticket = 3 single String
+field .etd.v1.ReclaimReport.candidates = 3 repeated Message .etd.v1.Candidate
+field .etd.v1.ReclaimReport.conflicts = 4 repeated Message .etd.v1.Conflict
+field .etd.v1.ReclaimReport.generated_unix_ms = 1 single Int64
+field .etd.v1.ReclaimReport.instances = 2 repeated Message .etd.v1.InstanceReclaim
+field .etd.v1.ReclaimReport.notes = 5 repeated Message .etd.v1.Notice
+field .etd.v1.ReleaseLeaseRequest.instances = 1 single Enum .etd.v1.LeaseRelease
+field .etd.v1.ReleaseLeaseResponse.host_exiting = 1 single Bool
+field .etd.v1.RemoveInstanceRequest.header = 1 single Message .etd.v1.MutationHeader
+field .etd.v1.RemoveInstanceRequest.instance_id = 2 single String
+field .etd.v1.RemoveInstanceResponse.receipt = 1 single Message .etd.v1.Receipt
+field .etd.v1.Residue.effect_id = 1 single String
+field .etd.v1.Residue.failures = 4 single Uint32
+field .etd.v1.Residue.identity = 3 single String
+field .etd.v1.Residue.kind = 2 single String
+field .etd.v1.Residue.last_error = 5 single String
+field .etd.v1.Residue.state = 6 single Enum .etd.v1.ResidueState
+field .etd.v1.ResolveCandidatesRequest.decisions = 2 repeated Message .etd.v1.CandidateDecision
+field .etd.v1.ResolveCandidatesRequest.header = 1 single Message .etd.v1.MutationHeader
+field .etd.v1.ResolveCandidatesResponse.receipt = 1 single Message .etd.v1.Receipt
+field .etd.v1.ResyncRequired.reason = 1 single String
+field .etd.v1.RetryReclaimRequest.header = 1 single Message .etd.v1.MutationHeader
+field .etd.v1.RetryReclaimRequest.instance_id = 2 single String
+field .etd.v1.RetryReclaimResponse.receipt = 1 single Message .etd.v1.Receipt
+field .etd.v1.Route.cost = 6 single Uint32
+field .etd.v1.Route.hostname = 2 single String
+field .etd.v1.Route.ipv4_cidr = 3 single String
+field .etd.v1.Route.next_hop_peer_id = 5 single Uint32
+field .etd.v1.Route.path_latency_us = 7 single Uint32
+field .etd.v1.Route.peer_id = 1 single Uint32
+field .etd.v1.Route.proxy_cidrs = 4 repeated String
+field .etd.v1.RouteList.routes = 1 repeated Message .etd.v1.Route
+field .etd.v1.SelectCoreRequest.header = 1 single Message .etd.v1.MutationHeader
+field .etd.v1.SelectCoreRequest.version = 2 single String
+field .etd.v1.SelectCoreResponse.receipt = 1 single Message .etd.v1.Receipt
+field .etd.v1.SetAllowListRequest.entries = 2 repeated Message .etd.v1.AllowEntry
+field .etd.v1.SetAllowListRequest.header = 1 single Message .etd.v1.MutationHeader
+field .etd.v1.SetAllowListResponse.receipt = 1 single Message .etd.v1.Receipt
+field .etd.v1.SetDesiredRequest.desired = 3 single Enum .etd.v1.Desired
+field .etd.v1.SetDesiredRequest.header = 1 single Message .etd.v1.MutationHeader
+field .etd.v1.SetDesiredRequest.instance_id = 2 single String
+field .etd.v1.SetDesiredResponse.receipt = 1 single Message .etd.v1.Receipt
+field .etd.v1.StreamLogsRequest.follow = 3 single Bool
+field .etd.v1.StreamLogsRequest.instance_id = 1 single String
+field .etd.v1.StreamLogsRequest.tail_lines = 2 single Uint32
+field .etd.v1.SubscribeRequest.after = 1 single Message .etd.v1.EventCursor
+field .etd.v1.TrafficStats.peers = 5 repeated Message .etd.v1.PeerTraffic
+field .etd.v1.TrafficStats.rx_bytes = 1 single Uint64
+field .etd.v1.TrafficStats.rx_packets = 3 single Uint64
+field .etd.v1.TrafficStats.tx_bytes = 2 single Uint64
+field .etd.v1.TrafficStats.tx_packets = 4 single Uint64
+field .etd.v1.Welcome.capabilities = 3 repeated String
+field .etd.v1.Welcome.host_build = 5 single String
+field .etd.v1.Welcome.host_mode = 6 single Enum .etd.v1.HostMode
+field .etd.v1.Welcome.major = 1 single Uint32
+field .etd.v1.Welcome.minor = 2 single Uint32
+field .etd.v1.Welcome.phase = 7 single Enum .etd.v1.HostPhase
+field .etd.v1.Welcome.role = 4 single Enum .etd.v1.Role
+field .etd.v1.Welcome.stream_id = 8 single String
+file etd/v1/host.proto
+file etd/v1/options.proto
+message .etd.v1.AllowEntry
+message .etd.v1.ApplyRequest
+message .etd.v1.ApplyResponse
+message .etd.v1.Candidate
+message .etd.v1.CandidateDecision
+message .etd.v1.Conflict
+message .etd.v1.CoreEntry
+message .etd.v1.DesiredChanged
+message .etd.v1.DesiredInstance
+message .etd.v1.ErrorDetail
+message .etd.v1.Event
+message .etd.v1.EventCursor
+message .etd.v1.ExitInfo
+message .etd.v1.GetAllowListRequest
+message .etd.v1.GetAllowListResponse
+message .etd.v1.GetReceiptRequest
+message .etd.v1.GetReceiptResponse
+message .etd.v1.GetReclaimReportRequest
+message .etd.v1.Hello
+message .etd.v1.HostPhaseChanged
+message .etd.v1.HostSnapshot
+message .etd.v1.InstanceExited
+message .etd.v1.InstanceReclaim
+message .etd.v1.InstanceRemoved
+message .etd.v1.InstanceStatus
+message .etd.v1.InstanceView
+message .etd.v1.ListCoresRequest
+message .etd.v1.ListCoresResponse
+message .etd.v1.LogLine
+message .etd.v1.MutationHeader
+message .etd.v1.NetworkFlags
+message .etd.v1.NetworkSpec
+message .etd.v1.Node
+message .etd.v1.NodeList
+message .etd.v1.Notice
+message .etd.v1.OsPrincipal
+message .etd.v1.PeerTraffic
+message .etd.v1.PortForward
+message .etd.v1.PurgeAllDataRequest
+message .etd.v1.PurgeAllDataResponse
+message .etd.v1.QueryRequest
+message .etd.v1.QueryResponse
+message .etd.v1.Receipt
+message .etd.v1.ReclaimReport
+message .etd.v1.ReleaseLeaseRequest
+message .etd.v1.ReleaseLeaseResponse
+message .etd.v1.RemoveInstanceRequest
+message .etd.v1.RemoveInstanceResponse
+message .etd.v1.Residue
+message .etd.v1.ResolveCandidatesRequest
+message .etd.v1.ResolveCandidatesResponse
+message .etd.v1.ResyncRequired
+message .etd.v1.RetryReclaimRequest
+message .etd.v1.RetryReclaimResponse
+message .etd.v1.Route
+message .etd.v1.RouteList
+message .etd.v1.SelectCoreRequest
+message .etd.v1.SelectCoreResponse
+message .etd.v1.SetAllowListRequest
+message .etd.v1.SetAllowListResponse
+message .etd.v1.SetDesiredRequest
+message .etd.v1.SetDesiredResponse
+message .etd.v1.SnapshotRequest
+message .etd.v1.StreamLogsRequest
+message .etd.v1.SubscribeRequest
+message .etd.v1.TrafficStats
+message .etd.v1.Welcome
+role /etd.v1.HostService/Apply = Some(Control)
+role /etd.v1.HostService/GetAllowList = Some(Admin)
+role /etd.v1.HostService/GetReceipt = Some(Viewer)
+role /etd.v1.HostService/GetReclaimReport = Some(Viewer)
+role /etd.v1.HostService/Handshake = Some(Viewer)
+role /etd.v1.HostService/ListCores = Some(Viewer)
+role /etd.v1.HostService/PurgeAllData = Some(Admin)
+role /etd.v1.HostService/Query = Some(Viewer)
+role /etd.v1.HostService/ReleaseLease = Some(Control)
+role /etd.v1.HostService/RemoveInstance = Some(Control)
+role /etd.v1.HostService/ResolveCandidates = Some(Admin)
+role /etd.v1.HostService/RetryReclaim = Some(Control)
+role /etd.v1.HostService/SelectCore = Some(Admin)
+role /etd.v1.HostService/SetAllowList = Some(Admin)
+role /etd.v1.HostService/SetDesired = Some(Control)
+role /etd.v1.HostService/Snapshot = Some(Viewer)
+role /etd.v1.HostService/StreamLogs = Some(Viewer)
+role /etd.v1.HostService/Subscribe = Some(Viewer)
+rpc .etd.v1.HostService.Apply(.etd.v1.ApplyRequest) returns (.etd.v1.ApplyResponse)
+rpc .etd.v1.HostService.GetAllowList(.etd.v1.GetAllowListRequest) returns (.etd.v1.GetAllowListResponse)
+rpc .etd.v1.HostService.GetReceipt(.etd.v1.GetReceiptRequest) returns (.etd.v1.GetReceiptResponse)
+rpc .etd.v1.HostService.GetReclaimReport(.etd.v1.GetReclaimReportRequest) returns (.etd.v1.ReclaimReport)
+rpc .etd.v1.HostService.Handshake(.etd.v1.Hello) returns (.etd.v1.Welcome)
+rpc .etd.v1.HostService.ListCores(.etd.v1.ListCoresRequest) returns (.etd.v1.ListCoresResponse)
+rpc .etd.v1.HostService.PurgeAllData(.etd.v1.PurgeAllDataRequest) returns (.etd.v1.PurgeAllDataResponse)
+rpc .etd.v1.HostService.Query(.etd.v1.QueryRequest) returns (.etd.v1.QueryResponse)
+rpc .etd.v1.HostService.ReleaseLease(.etd.v1.ReleaseLeaseRequest) returns (.etd.v1.ReleaseLeaseResponse)
+rpc .etd.v1.HostService.RemoveInstance(.etd.v1.RemoveInstanceRequest) returns (.etd.v1.RemoveInstanceResponse)
+rpc .etd.v1.HostService.ResolveCandidates(.etd.v1.ResolveCandidatesRequest) returns (.etd.v1.ResolveCandidatesResponse)
+rpc .etd.v1.HostService.RetryReclaim(.etd.v1.RetryReclaimRequest) returns (.etd.v1.RetryReclaimResponse)
+rpc .etd.v1.HostService.SelectCore(.etd.v1.SelectCoreRequest) returns (.etd.v1.SelectCoreResponse)
+rpc .etd.v1.HostService.SetAllowList(.etd.v1.SetAllowListRequest) returns (.etd.v1.SetAllowListResponse)
+rpc .etd.v1.HostService.SetDesired(.etd.v1.SetDesiredRequest) returns (.etd.v1.SetDesiredResponse)
+rpc .etd.v1.HostService.Snapshot(.etd.v1.SnapshotRequest) returns (.etd.v1.HostSnapshot)
+rpc .etd.v1.HostService.StreamLogs(.etd.v1.StreamLogsRequest) returns (stream .etd.v1.LogLine)
+rpc .etd.v1.HostService.Subscribe(.etd.v1.SubscribeRequest) returns (stream .etd.v1.Event)

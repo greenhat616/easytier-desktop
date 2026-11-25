@@ -36,30 +36,69 @@ etd-sysfx = { path = "crates/etd-sysfx" }
 etd-sysfx-os = { path = "crates/etd-sysfx-os" }
 etd-core-api = { path = "crates/etd-core-api" }
 etd-core-easytier = { path = "crates/etd-core-easytier" }
+etd-testkit = { path = "crates/etd-testkit" }
 
 anyhow = "1.0.105"
+assert_cmd = "2.2.2"
 async-channel = "2.5.0"
 async-trait = "0.1.92"
+backon = { version = "1.6.0", default-features = false }
+bytes = "1.12.2"
 cargo_metadata = "0.23.1"
+clap = { version = "4.6.10", default-features = false }
+directories = "6.0.0"
+encoding_rs = "0.8.44"
 futures-util = { version = "0.3.34", default-features = false }
 gpui-kit = { version = "=0.11.0", default-features = false }
+hmac = "0.13.0"
+hyper-util = { version = "0.1.21", default-features = false }
 insta = "1.49.0"
 jiff = { version = "1.0.3", default-features = false }
+libc = "0.2.191"
 mockall = "0.15.0"
 muda = { version = "0.21.2", default-features = false }
+nftables = "0.6.3"
+nix = { version = "0.32.0", default-features = false }
+predicates = "3.1.4"
 processkit = { version = "=3.3.4", default-features = false }
 proptest = "1.12.0"
 prost = "=0.14.6"
 prost-build = "=0.14.6"
+prost-types = "=0.14.6"
+rand = "0.10.4"
+rtnetlink = "0.24.0"
 rusqlite = { version = "0.43.0", default-features = false }
+serde = { version = "1.0.229", default-features = false }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+sysinfo = { version = "0.40.4", default-features = false }
+system-configuration = "0.8.0"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", default-features = false }
+tokio-stream = { version = "0.1.19", default-features = false }
+tokio-util = { version = "0.7.20", default-features = false }
+toml = "1.2.3"
 tonic = { version = "=0.14.9", default-features = false }
 tonic-prost = "=0.14.9"
 tonic-prost-build = "=0.14.9"
+tower = { version = "0.5.3", default-features = false }
+tracing = { version = "0.1.44", default-features = false }
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", default-features = false }
 tray-icon = { version = "0.26.1", default-features = false }
+uuid = { version = "1.29.3", default-features = false }
+windows = { version = "0.62.2", default-features = false }
+windows-service = "0.8.1"
+zbus = { version = "6.5.0", default-features = false }
+zeroize = "1.9.2"
 
 # EasyTier prototype pin (keep upstream types inside etd-core-easytier).
 easytier-proto = { git = "https://github.com/EasyTier/EasyTier.git", rev = "c97f36b8d40f3bde7a95cc9ec99fe95fe35a6ff0", default-features = false }
 easytier-core = { git = "https://github.com/EasyTier/EasyTier.git", rev = "c97f36b8d40f3bde7a95cc9ec99fe95fe35a6ff0", default-features = false }
+
+[workspace.lints.cargo]
+# F0 declares every doc#4 dependency up front so later packages never edit a
+# manifest; most are unused until their owning package lands. Revisit (X1)
+# once wave 1 has merged.
+unused_dependencies = "allow"

@@ -1,8 +1,8 @@
-# EasyTier Desktop（项目骨架）
+# EasyTier Desktop（接口冻结 freeze-v1）
 
-使用 Rust 1.100.0、edition 2024、Cargo resolver 3；当前仅包含契约、抽象接口、
-适配器占位、开发检查以及 GPUI 空窗口。**不包含业务逻辑，不会启动内核、
-安装服务、修改系统网络或回收系统对象。**
+使用 Rust 1.100.0、edition 2024、Cargo resolver 3。当前包含完整的契约、各层 trait
+与模型（已冻结）、按工作包归属拆好的空实现文件、开发检查以及 GPUI 空窗口。
+**不包含业务逻辑，不会启动内核、安装服务、修改系统网络或回收系统对象。**
 
 ## 目录和职责
 
@@ -25,8 +25,23 @@
 | xtask | 工作区依赖边界检查 |
 
 消息由 etd-contract 使用 prost 生成；etd-client 和 etd-host-core 使用 tonic
-分别生成 client/server stubs，通过 extern_path 复用同一个消息类型。以后再逐步
-扩充 protobuf 契约（现仅握手、快照）；其他领域模型是暂定的 Rust 签名。
+分别生成 client/server stubs（各自的 `stub` 模块），通过 extern_path 复用同一个
+消息类型。契约 `etd.v1` 已包含架构 v7 列出的全部方法，每个方法用
+`(etd.v1.required_role)` 自定义选项标注所需角色，`etd_contract::required_role`
+从描述符读出同一张表。
+
+## 接口冻结与文件归属
+
+冻结接口（改动走变更请求）：`crates/etd-contract/**`、`buf.yaml`、根及各 crate 的
+`Cargo.toml` 与 `lib.rs`、各 trait 与模型文件、`etd-testkit/src/lib.rs` 与
+`fakes/mod.rs`。每个实现文件开头写明归属的工作包（见 doc#7 归属表）。加字段、
+加枚举变体（枚举一律 `#[non_exhaustive]`，少数安全相关的判定枚举除外）、加默认
+实现的方法算兼容改动；签名改动算破坏。
+
+契约描述符基线在 `crates/etd-contract/tests/baseline/etd.v1.txt`；兼容的新增
+用 `ETD_UPDATE_BASELINE=1 cargo nextest run -p etd-contract` 重新生成并随改动评审。
+各 crate 的依赖已按 doc#4 一次加齐，未使用的依赖由 `[workspace.lints.cargo]`
+暂时放行，第 1 波合并后再收紧。
 
 ## 本地检查
 
@@ -46,8 +61,9 @@ cargo run -p etd-ui
 ```
 
 若已安装 cargo-nextest，可用 `cargo nextest run --workspace --locked`，
-另运行 `cargo test --doc --workspace --locked`。依赖审计用 `cargo deny check`；
-buf 配置已准备，安装后可运行 `buf lint`。这些是额外工具，不由本仓库自动安装。
+另运行 `cargo test --doc --workspace --locked`。依赖审计用 `cargo deny --locked check`；
+契约检查用 `buf lint` 和 `buf breaking --against '.git#tag=freeze-v1'`。
+这些是额外工具，不由本仓库自动安装。
 
 ## 依赖边界
 

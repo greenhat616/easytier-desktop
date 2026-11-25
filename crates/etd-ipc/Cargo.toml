@@ -8,4 +8,41 @@ publish.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "net"] }
+bytes = { workspace = true }
+futures-util = { workspace = true, features = ["std"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
+tokio-stream = { workspace = true, features = ["net"] }
+tonic = { workspace = true, features = ["channel", "server"] }
+tower = { workspace = true, features = ["util"] }
+tracing = { workspace = true, features = ["std"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+nix = { workspace = true, features = ["fs", "process", "socket", "user"] }
+
+[dev-dependencies]
+etd-contract = { workspace = true }
+etd-testkit = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tonic-prost = { workspace = true }
+
+[lints]
+workspace = true

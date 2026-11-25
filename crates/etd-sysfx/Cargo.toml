@@ -10,6 +10,24 @@ publish.workspace = true
 etd-contract = { workspace = true }
 async-trait = { workspace = true }
 futures-util = { workspace = true, features = ["std"] }
-thiserror = { workspace = true }
+hmac = { workspace = true }
+jiff = { workspace = true, features = ["std", "serde"] }
+rand = { workspace = true }
 rusqlite = { workspace = true, features = ["bundled"] }
-jiff = { workspace = true, features = ["std"] }
+serde = { workspace = true, features = ["std", "derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tracing = { workspace = true, features = ["std"] }
+uuid = { workspace = true, features = ["std", "v4", "v5", "serde"] }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+etd-testkit = { workspace = true }
+proptest = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

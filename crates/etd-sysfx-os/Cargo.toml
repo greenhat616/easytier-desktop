@@ -7,6 +7,65 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+etd-contract = { workspace = true }
 etd-sysfx = { workspace = true }
 async-trait = { workspace = true }
 futures-util = { workspace = true, features = ["std"] }
+jiff = { workspace = true, features = ["std", "serde"] }
+serde = { workspace = true, features = ["std", "derive"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "net", "process", "rt", "sync", "time"] }
+tracing = { workspace = true, features = ["std"] }
+uuid = { workspace = true, features = ["std", "v5"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+    "Win32_NetworkManagement_WindowsFirewall",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Kernel",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_Rpc",
+    "Win32_System_Services",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+] }
+windows-service = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+nix = { workspace = true, features = ["fs", "hostname", "ioctl", "net", "process", "signal", "user"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nftables = { workspace = true }
+rtnetlink = { workspace = true }
+zbus = { workspace = true, features = ["tokio", "proxy"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+system-configuration = { workspace = true }
+
+[dev-dependencies]
+etd-testkit = { workspace = true }
+proptest = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

@@ -10,10 +10,26 @@ publish.workspace = true
 etd-contract = { workspace = true }
 etd-ipc = { workspace = true }
 async-trait = { workspace = true }
+backon = { workspace = true, features = ["std", "tokio-sleep"] }
 futures-util = { workspace = true, features = ["std"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tokio-stream = { workspace = true, features = ["sync"] }
+tokio-util = { workspace = true }
 tonic = { workspace = true, features = ["channel", "codegen"] }
 tonic-prost = { workspace = true }
-thiserror = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tracing = { workspace = true, features = ["std"] }
+uuid = { workspace = true, features = ["std", "v4"] }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
+
+[dev-dependencies]
+etd-testkit = { workspace = true }
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

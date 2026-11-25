@@ -11,4 +11,8 @@ etd-contract = { workspace = true }
 etd-proc = { workspace = true }
 etd-sysfx = { workspace = true }
 async-trait = { workspace = true }
+futures-util = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
+
+[lints]
+workspace = true

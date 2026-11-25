@@ -1,13 +1,41 @@
+//! Frozen interface (F0): how the UI finds or starts a host.
 use async_trait::async_trait;
 use etd_contract::HostMode;
-use etd_ipc::Endpoint;
+use etd_ipc::{Endpoint, ServerExpectation};
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
 pub enum LaunchError {
-    #[error("host launch not implemented")]
-    NotImplemented,
+    #[error("no host service is installed")]
+    NotInstalled,
+    #[error("the user declined or cancelled elevation")]
+    ElevationDenied,
+    #[error("host form {0:?} is not supported on this platform or build")]
+    Unsupported(HostMode),
+    #[error("failed to start the host: {0}")]
+    Spawn(String),
+    #[error("the host did not come up in time")]
+    Timeout,
+    #[error("launcher I/O error: {0}")]
+    Io(String),
 }
+
+/// A host a client can connect to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostTarget {
+    pub mode: HostMode,
+    pub endpoint: Endpoint,
+    /// What the connector must verify about the server process.
+    pub expectation: ServerExpectation,
+}
+
+/// Decides which host form to use and, when needed, starts it (user host as
+/// a child process, elevated session) or triggers installation.
 #[async_trait]
 pub trait HostLauncher: Send + Sync {
-    async fn ensure(&self, want: HostMode) -> Result<Endpoint, LaunchError>;
+    /// A host that is already reachable or installed, without starting
+    /// anything or prompting.
+    async fn probe(&self) -> Result<Option<HostTarget>, LaunchError>;
+    /// Find or start a host of the wanted form.
+    async fn ensure(&self, want: HostMode) -> Result<HostTarget, LaunchError>;
 }

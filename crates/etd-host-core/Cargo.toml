@@ -6,15 +6,36 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# Trait crates only (architecture boundary 3, enforced by xtask).
 [dependencies]
 etd-contract = { workspace = true }
+etd-core-api = { workspace = true }
 etd-ipc = { workspace = true }
 etd-proc = { workspace = true }
 etd-sysfx = { workspace = true }
-etd-core-api = { workspace = true }
-tonic = { workspace = true, features = ["server", "codegen"] }
-tonic-prost = { workspace = true }
+async-trait = { workspace = true }
+futures-util = { workspace = true, features = ["std"] }
+jiff = { workspace = true, features = ["std", "serde"] }
+prost = { workspace = true }
+serde = { workspace = true, features = ["std", "derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio-stream = { workspace = true, features = ["sync"] }
+tokio-util = { workspace = true }
+tonic = { workspace = true, features = ["codegen", "router", "server"] }
+tonic-prost = { workspace = true }
+tracing = { workspace = true, features = ["std"] }
+uuid = { workspace = true, features = ["std", "v4"] }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
+
+[dev-dependencies]
+etd-testkit = { workspace = true }
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

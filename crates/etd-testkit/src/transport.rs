@@ -1,3 +1,4 @@
+//! In-memory duplex transport for component tests. Owned by I1.
 use etd_ipc::BoxConn;
 pub fn duplex(capacity: usize) -> (BoxConn, BoxConn) {
     let (left, right) = tokio::io::duplex(capacity);

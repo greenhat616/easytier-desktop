@@ -1,58 +1,529 @@
-use etd_contract::{DesiredInstance, RequestId};
+//! Frozen side-effect model (F0).
+//!
+//! Every system object the kernel or the host creates is recorded *before*
+//! the action that creates it ("record first, act second"), so the ledger can
+//! only ever hold more than the system, never less. A record carries its
+//! scope (instance + epoch, or product), a natural key, how to undo it, how
+//! long it survives, and, once observed, the creation credential that
+//! authorises deletion. Names locate objects; only credentials (or an
+//! exclusive container) authorise deleting them.
+use etd_contract::InstanceId;
+use serde::{Deserialize, Serialize};
+use std::{fmt, path::PathBuf, str::FromStr};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Ledger-assigned record id (opaque, unique, sortable by creation).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct EffectId(pub String);
-#[derive(Debug, Clone, PartialEq, Eq)]
+
+/// Generation of an instance. Every start of an instance uses a new epoch;
+/// a new epoch may not start while an older one has open records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Epoch(pub u64);
+
+/// Opaque boot identifier (Linux boot_id, macOS kern.bootsessionuuid,
+/// Windows boot-time derived). Changes on every reboot.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BootId(pub String);
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EffectKind {
-    Interface,
-    Route,
-    Firewall,
-    Dns,
-    File,
-    Fence,
+
+/// Secret per-installation key from which interface names are derived.
+/// Kept out of logs.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InstallKey(pub [u8; 32]);
+
+impl fmt::Debug for InstallKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("InstallKey(..)")
+    }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+
+/// Owner of a record.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum EffectScope {
+    /// Belongs to one generation of one instance; reclaimed when that
+    /// generation ends.
+    Instance { instance: InstanceId, epoch: Epoch },
+    /// Belongs to the product (driver, service registration, program
+    /// firewall rules); only `uninstall` / `reclaim --all --purge` remove it.
+    Product,
+}
+
+/// Concrete object type. One [`crate::Reclaimer`] handles one kind. The
+/// string form ([`EffectKind::as_str`]) is what the ledger stores and the
+/// reclaim report shows; it never changes for an existing kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum EffectKind {
+    /// The kernel process itself (closed last, after it is verified dead).
+    Process,
+    /// `run/<instance>/<epoch>/`, holding the generated configuration.
+    RuntimeDir,
+    /// Routes pointing at the instance's interface (verify none remain).
+    Route,
+    /// UPnP / NAT-PMP mapping on the router: recorded, expires on its own.
+    UpnpMapping,
+    /// Management-port fence: WFP filter in the product sublayer.
+    WinFenceFilter,
+    /// Management-port fence: rule in the product nftables table.
+    LinuxFenceRule,
+    /// Management-port fence: rule in the product PF anchor.
+    MacFenceRule,
+    /// wintun adapter (name derived from the install key, GUID = UUIDv5).
+    WinTunAdapter,
+    /// One of the eight per-interface firewall rules.
+    WinFirewallRule,
+    /// One of the two per-program firewall rules (product scope).
+    WinProgramFirewallRule,
+    /// Tcpip / Tcpip6 / NetBT interface values under the adapter GUID.
+    WinRegistryValue,
+    /// NRPT rule written by Magic DNS (shared with other EasyTier installs).
+    WinNrptRule,
+    /// Linux TUN interface.
+    LinuxTun,
+    /// systemd-resolved per-link DNS configuration.
+    LinuxResolvedLink,
+    /// macOS utun interface (name assigned by the system, read back).
+    MacUtun,
+    /// wintun / WinDivert driver (product scope).
+    Driver,
+    /// Host service registration (product scope).
+    ServiceRegistration,
+}
+
+impl EffectKind {
+    pub const ALL: &'static [EffectKind] = &[
+        EffectKind::Process,
+        EffectKind::RuntimeDir,
+        EffectKind::Route,
+        EffectKind::UpnpMapping,
+        EffectKind::WinFenceFilter,
+        EffectKind::LinuxFenceRule,
+        EffectKind::MacFenceRule,
+        EffectKind::WinTunAdapter,
+        EffectKind::WinFirewallRule,
+        EffectKind::WinProgramFirewallRule,
+        EffectKind::WinRegistryValue,
+        EffectKind::WinNrptRule,
+        EffectKind::LinuxTun,
+        EffectKind::LinuxResolvedLink,
+        EffectKind::MacUtun,
+        EffectKind::Driver,
+        EffectKind::ServiceRegistration,
+    ];
+
+    /// Stable storage / report name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EffectKind::Process => "process",
+            EffectKind::RuntimeDir => "run_dir",
+            EffectKind::Route => "route",
+            EffectKind::UpnpMapping => "upnp_mapping",
+            EffectKind::WinFenceFilter => "win.fence_filter",
+            EffectKind::LinuxFenceRule => "linux.fence_rule",
+            EffectKind::MacFenceRule => "macos.fence_rule",
+            EffectKind::WinTunAdapter => "win.tun",
+            EffectKind::WinFirewallRule => "win.firewall_rule",
+            EffectKind::WinProgramFirewallRule => "win.program_firewall_rule",
+            EffectKind::WinRegistryValue => "win.registry_value",
+            EffectKind::WinNrptRule => "win.nrpt_rule",
+            EffectKind::LinuxTun => "linux.tun",
+            EffectKind::LinuxResolvedLink => "linux.resolved_link",
+            EffectKind::MacUtun => "macos.utun",
+            EffectKind::Driver => "driver",
+            EffectKind::ServiceRegistration => "service_registration",
+        }
+    }
+
+    /// Default reclaim rank (see [`crate::rank`]).
+    pub fn default_rank(self) -> u8 {
+        use crate::rank;
+        match self {
+            EffectKind::WinFirewallRule
+            | EffectKind::WinProgramFirewallRule
+            | EffectKind::WinNrptRule
+            | EffectKind::LinuxResolvedLink
+            | EffectKind::UpnpMapping => rank::DNS_AND_FIREWALL,
+            EffectKind::WinRegistryValue => rank::REGISTRY,
+            EffectKind::WinTunAdapter | EffectKind::LinuxTun | EffectKind::MacUtun => {
+                rank::INTERFACE
+            }
+            EffectKind::Route => rank::ROUTES,
+            EffectKind::RuntimeDir => rank::RUNTIME_DIR,
+            EffectKind::Process => rank::PROCESS,
+            EffectKind::WinFenceFilter | EffectKind::LinuxFenceRule | EffectKind::MacFenceRule => {
+                rank::FENCE
+            }
+            EffectKind::Driver | EffectKind::ServiceRegistration => rank::PRODUCT,
+        }
+    }
+}
+
+impl fmt::Display for EffectKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Unknown kind name (e.g. a ledger written by a newer version).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown effect kind {0:?}")]
+pub struct UnknownEffectKind(pub String);
+
+impl FromStr for EffectKind {
+    type Err = UnknownEffectKind;
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        EffectKind::ALL
+            .iter()
+            .copied()
+            .find(|kind| kind.as_str() == name)
+            .ok_or_else(|| UnknownEffectKind(name.to_owned()))
+    }
+}
+
+/// Natural key: enough to find the object with no in-memory state. Names are
+/// visible to others and only locate; see [`Credential`] for deletion.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ObjectKey {
+    /// Kernel process, by its persisted identity and the epoch directory its
+    /// command line references.
+    Process {
+        pid: u32,
+        start_token: String,
+        exe: PathBuf,
+        cmdline_marker: PathBuf,
+    },
+    /// File or directory.
+    Path { path: PathBuf },
+    /// Network interface. `name` is `None` until known (macOS utun);
+    /// `guid` is the Windows adapter GUID derived from the name.
+    Interface {
+        name: Option<String>,
+        guid: Option<String>,
+    },
+    /// Routes whose next hop is the named interface.
+    RoutesVia { interface: String },
+    /// Named rule (firewall, NRPT): exact rule name, optional group.
+    Rule { name: String, group: Option<String> },
+    /// Registry value or key (`value: None` = the key itself).
+    Registry { key: String, value: Option<String> },
+    /// Rule inside a product-exclusive container (WFP sublayer, nftables
+    /// table, PF anchor) guarding one loopback port.
+    Fence {
+        container: String,
+        rule: String,
+        port: u16,
+    },
+    /// systemd-resolved link configuration.
+    ResolvedLink { interface: String },
+    /// Router port mapping.
+    PortMapping {
+        protocol: String,
+        external_port: u16,
+        description: String,
+    },
+    /// Driver or service, by its registered name.
+    Service { name: String },
+}
+
+/// Creation credential, read back from the system once the object exists.
+/// A reclaimer deletes only when the object it finds matches the recorded
+/// credential, or when the object sits in an exclusive container.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Credential {
+    /// Windows adapter LUID and device instance id.
+    WinAdapter {
+        luid: u64,
+        device_instance_id: String,
+    },
+    /// Unix interface index, valid only within `boot`.
+    UnixInterface { index: u32, boot: BootId },
+    /// File identity (inode / file index plus device / volume).
+    File { file_id: u64, device: u64 },
+    /// Process identity (pid + start token).
+    Process { pid: u32, start_token: String },
+    /// Lives in a container only the host can write; deletable by key.
+    ExclusiveContainer { container: String },
+    /// Opaque platform-specific identity (e.g. firewall rule GUID).
+    Opaque { value: String },
+}
+
+/// What was seen when looking at the system.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Observation {
+    pub credential: Option<Credential>,
+    /// Concrete key as found (e.g. the utun name once assigned).
+    pub key: Option<ObjectKey>,
+    pub observed_at: jiff::Timestamp,
+    /// Human-readable detail for reports.
+    pub detail: Option<String>,
+}
+
+/// A setting value, for "restore if still ours".
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SettingValue {
+    Absent,
+    String(String),
+    MultiString(Vec<String>),
+    U32(u32),
+    U64(u64),
+    Bytes(Vec<u8>),
+}
+
+/// How to undo. Both forms are idempotent.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Undo {
+    /// Objects we (or the kernel on our behalf) created: make sure it no
+    /// longer exists.
+    EnsureAbsent,
+    /// Settings we changed: if the current value is still `ours`, put back
+    /// `original`; if someone else changed it since, leave it.
+    RestoreIfOurs {
+        ours: SettingValue,
+        original: SettingValue,
+    },
+}
+
+/// How long the object survives on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Persistence {
+    /// Expected to vanish with the process; still probed after a crash.
+    WithProcess,
+    /// Vanishes on reboot: closed without probing when the boot id changed.
+    UntilReboot,
+    /// Stays until removed.
+    Persistent,
+    /// Expires by itself (router lease) at the given time.
+    Expiring { until: jiff::Timestamp },
+}
+
+/// Ledger record state. See the record state machine in doc#2 v7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum EffectState {
+    /// Committed before the action; the object may or may not exist.
     Planned,
+    /// Observed, credential recorded.
     Applied,
+    /// Probe, delete, verify in progress.
     Reclaiming,
+    /// Verified gone (or restored). Closed; removed at compaction.
     Reclaimed,
+    /// Five consecutive reclaim failures. Open.
     Quarantined,
+    /// Object present without a matching credential and outside an
+    /// exclusive container: never deleted automatically. Open until an
+    /// administrator decides.
     Candidate,
 }
-#[derive(Debug, Clone)]
-pub struct Observation {
-    pub identity: String,
+
+impl EffectState {
+    /// Closed records no longer hold their epoch open.
+    pub fn is_closed(self) -> bool {
+        matches!(self, EffectState::Reclaimed)
+    }
 }
-#[derive(Debug, Clone)]
+
+/// What a planner wants recorded before acting. The ledger turns it into an
+/// [`Effect`] (id, state `Planned`, boot id, timestamp).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectIntent {
+    pub scope: EffectScope,
+    pub kind: EffectKind,
+    pub key: ObjectKey,
+    pub undo: Undo,
+    pub persistence: Persistence,
+}
+
+/// A ledger record.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Effect {
     pub id: EffectId,
+    pub scope: EffectScope,
     pub kind: EffectKind,
+    pub key: ObjectKey,
+    pub undo: Undo,
+    pub persistence: Persistence,
     pub state: EffectState,
+    /// Boot id when the record was written.
     pub boot: BootId,
+    /// Latest observation; carries the creation credential once applied.
     pub observation: Option<Observation>,
+    /// Consecutive reclaim failures (quarantine at
+    /// [`crate::QUARANTINE_AFTER`]).
+    pub failures: u32,
+    pub last_error: Option<String>,
     pub recorded_at: jiff::Timestamp,
 }
-#[derive(Debug, Clone)]
-pub struct ChangeSet {
-    pub request_id: RequestId,
-    pub desired: Vec<DesiredInstance>,
-    pub effects: Vec<Effect>,
+
+/// Selects open records. Empty vectors mean "any".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScopeFilter {
+    pub instance: Option<InstanceId>,
+    pub epoch: Option<Epoch>,
+    /// Include product-scope records.
+    pub product: bool,
+    pub kinds: Vec<EffectKind>,
+    pub states: Vec<EffectState>,
 }
-#[derive(Debug, Clone, Default)]
-pub struct ScopeFilter;
-#[derive(Debug, Clone)]
+
+impl ScopeFilter {
+    /// Every open record, instance and product scope.
+    pub fn all() -> Self {
+        Self {
+            product: true,
+            ..Self::default()
+        }
+    }
+    /// Open records of one instance, every epoch.
+    pub fn instance(instance: InstanceId) -> Self {
+        Self {
+            instance: Some(instance),
+            ..Self::default()
+        }
+    }
+    /// Open records of one generation.
+    pub fn epoch(instance: InstanceId, epoch: Epoch) -> Self {
+        Self {
+            instance: Some(instance),
+            epoch: Some(epoch),
+            ..Self::default()
+        }
+    }
+}
+
+/// An object found by a [`crate::Sweeper`] outside the ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FoundObject {
     pub kind: EffectKind,
+    pub key: ObjectKey,
     pub observation: Observation,
+    pub origin: FoundBy,
 }
-#[derive(Debug, Clone)]
+
+/// How a swept object was found; decides what may happen to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FoundBy {
+    /// Inside a product-exclusive container: may be removed.
+    ExclusiveContainer,
+    /// Name re-derived for a known instance from the repair index: candidate.
+    DerivedName { instance: InstanceId },
+    /// Product prefix only: candidate, report only.
+    PrefixOnly,
+}
+
+/// Result of probing for a recorded object. Deliberately exhaustive.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Probe {
     Present(Observation),
     Absent,
-    Indeterminate,
+    /// Could not tell (access error, API failure); never treated as absent.
+    Indeterminate(String),
 }
-#[derive(Debug, Clone)]
-pub struct Reclaimed;
+
+/// Successful reclaim outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Reclaimed {
+    Removed,
+    AlreadyAbsent,
+    /// Setting restored to its original value.
+    Restored,
+    /// Setting changed by someone else since; left alone.
+    LeftModified,
+}
+
+/// Why a record holds its epoch open in a report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResidueReason {
+    /// Still being retried.
+    Pending,
+    Failing {
+        failures: u32,
+        last_error: String,
+    },
+    Indeterminate(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Residue {
+    pub effect: EffectId,
+    pub kind: EffectKind,
+    pub key: ObjectKey,
+    pub reason: ResidueReason,
+}
+
+/// Where a candidate came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CandidateSource {
+    /// Planned record, object present, no credential read back.
+    PlannedRecord { effect: EffectId },
+    /// Swept object (repair index or prefix).
+    Swept(FoundBy),
+}
+
+/// Never deleted automatically; an administrator decides item by item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    /// Stable id for the decision round trip.
+    pub id: String,
+    pub kind: EffectKind,
+    pub key: ObjectKey,
+    pub scope: Option<EffectScope>,
+    pub observation: Option<Observation>,
+    pub source: CandidateSource,
+}
+
+/// Same key as our record, different identity: not ours any more; never
+/// deleted, reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conflict {
+    pub effect: EffectId,
+    pub kind: EffectKind,
+    pub key: ObjectKey,
+    pub expected: Option<Credential>,
+    pub found: Option<Credential>,
+}
+
+/// Per-generation outcome of a reclaim run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GenerationOutcome {
+    /// Every record closed: the next epoch may start.
+    Closed,
+    /// Some records remain and will be retried.
+    Pending,
+    /// Quarantined: five failures, uncertain liveness or open candidates.
+    Quarantined(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationReport {
+    pub instance: InstanceId,
+    pub epoch: Epoch,
+    pub outcome: GenerationOutcome,
+    pub residues: Vec<Residue>,
+}
+
+/// Output of a reclaim run (instance stop/crash, self-check, retry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReclaimReport {
+    pub generated_at: jiff::Timestamp,
+    pub generations: Vec<GenerationReport>,
+    pub candidates: Vec<Candidate>,
+    pub conflicts: Vec<Conflict>,
+    /// Free-text notes, e.g. shared Magic DNS left in place.
+    pub notes: Vec<String>,
+}

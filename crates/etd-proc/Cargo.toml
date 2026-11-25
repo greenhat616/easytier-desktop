@@ -8,7 +8,36 @@ publish.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
 futures-util = { workspace = true, features = ["std"] }
+jiff = { workspace = true, features = ["std"] }
+processkit = { workspace = true, features = ["process-control", "stats", "tracing"] }
+sysinfo = { workspace = true, features = ["system"] }
 thiserror = { workspace = true }
-processkit = { workspace = true, features = ["process-control"] }
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "sync", "time"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true, features = ["std"] }
+
+[target.'cfg(windows)'.dependencies]
+encoding_rs = { workspace = true }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+nix = { workspace = true, features = ["process", "signal", "user"] }
+
+[dev-dependencies]
+etd-testkit = { workspace = true }
+proptest = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

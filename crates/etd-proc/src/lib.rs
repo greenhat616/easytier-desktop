@@ -1,8 +1,16 @@
-//! Process lifecycle abstractions and ProcessKit adapter.
+//! Process lifecycle abstractions and the ProcessKit adapter.
+//!
+//! Frozen interfaces (F0): `engine`, `model`, `restart`. The rest is owned by
+//! P1.
 mod engine;
 mod model;
-pub mod processkit_engine;
-pub mod restart;
+mod restart;
 pub use engine::*;
 pub use model::*;
 pub use restart::*;
+
+pub mod backoff;
+pub mod console_ctrl;
+pub mod identity;
+pub mod parent_death;
+pub mod processkit_engine;

@@ -6,8 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# Runtime dependency is prost only (architecture boundary, xtask rule).
 [dependencies]
-prost = { workspace = true }
+prost = { workspace = true, features = ["std", "derive"] }
 
 [build-dependencies]
 prost-build = { workspace = true }
+
+[dev-dependencies]
+prost-types = { workspace = true }
+
+[lints]
+workspace = true

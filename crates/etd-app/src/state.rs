@@ -1,22 +1,12 @@
-use etd_contract::{HostMode, HostSnapshot};
+//! State store fed by snapshots and the event stream. Owned by A1.
+use etd_contract::HostSnapshot;
 
 #[derive(Debug, Default, Clone)]
 pub struct StateStore {
     pub snapshot: Option<HostSnapshot>,
 }
-#[derive(Debug, Clone)]
-pub enum UserCommand {
-    Refresh,
-    Connect(HostMode),
-    Exit,
-}
-pub struct AppBridge {
-    pub commands: async_channel::Sender<UserCommand>,
-    pub states: async_channel::Receiver<StateStore>,
-}
-pub struct ExitGate;
 
-/// UI-independent dependencies for a future background application runtime.
+/// UI-independent dependencies of the background application runtime.
 pub struct AppServices {
     pub host: std::sync::Arc<dyn etd_client::HostClient>,
     pub launcher: std::sync::Arc<dyn crate::HostLauncher>,

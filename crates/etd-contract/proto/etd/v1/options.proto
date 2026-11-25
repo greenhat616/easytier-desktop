@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package etd.v1;
+
+import "google/protobuf/descriptor.proto";
+
+// Caller role, derived by the host from the peer's OS credentials and the
+// allow list. Roles are ordered: ADMIN may call everything CONTROL may call,
+// and CONTROL everything VIEWER may call.
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  // Read-only: state, nodes, routes, logs, reclaim report.
+  ROLE_VIEWER = 1;
+  // Control: apply configuration, start/stop instances, retry cleanup.
+  ROLE_CONTROL = 2;
+  // Administration: allow list, kernel selection, purge, candidate
+  // confirmation. On Windows this additionally requires an elevated token.
+  ROLE_ADMIN = 3;
+}
+
+extend google.protobuf.MethodOptions {
+  // The minimum role a caller needs for this method. Every method of every
+  // service in this package must carry it; the host interceptor rejects calls
+  // whose method has no entry.
+  Role required_role = 50000;
+}

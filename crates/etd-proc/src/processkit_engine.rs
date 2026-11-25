@@ -42,7 +42,6 @@ enum RegistryEntry {
     // Keep the actual containment alive until a later verified cleanup.
     // Across host restart the durable generation ledger owns quarantine.
     Quarantined(Arc<processkit::ProcessGroup>),
-    Confirmed,
 }
 type Registry = Mutex<HashMap<ProcessIdentity, RegistryEntry>>;
 fn registry() -> &'static Registry {
@@ -81,7 +80,7 @@ async fn retry_quarantine(
     let mut registry = registry().lock().unwrap();
     if matches!(registry.get(&id), Some(RegistryEntry::Quarantined(current)) if Arc::ptr_eq(current, &group))
     {
-        registry.insert(id, RegistryEntry::Confirmed);
+        registry.remove(&id);
     }
     Ok(KillOutcome::Gone)
 }
@@ -275,8 +274,12 @@ fn candidate_matches(
     ) {
         return Ok(false);
     }
+    let owner = process.user_id().map(|user| user == own);
+    #[cfg(windows)]
+    let owner =
+        owner.or_else(|| identity::query_access_denied(process.pid().as_u32()).then_some(false));
     match_criteria(
-        process.user_id().map(|user| user == own),
+        owner,
         process.exe().and_then(|exe| {
             let exe = identity::normalized(exe).ok()?;
             let root = identity::normalized(&marker.exe_root).ok()?;
@@ -689,7 +692,6 @@ impl ProcessEngine for ProcessKitEngine {
     async fn liveness(&self, id: &ProcessIdentity) -> Liveness {
         match registry_entry(id) {
             Some(RegistryEntry::Quarantined(_)) => return Liveness::Uncertain,
-            Some(RegistryEntry::Confirmed) => return Liveness::Gone,
             _ => {}
         }
         let query = id.clone();
@@ -698,7 +700,6 @@ impl ProcessEngine for ProcessKitEngine {
             .unwrap_or(Liveness::Uncertain);
         let live = match registry_entry(id) {
             Some(RegistryEntry::Quarantined(_)) => return Liveness::Uncertain,
-            Some(RegistryEntry::Confirmed) => return Liveness::Gone,
             Some(RegistryEntry::Live(live)) => live.upgrade(),
             _ => None,
         };
@@ -717,7 +718,6 @@ impl ProcessEngine for ProcessKitEngine {
             Some(RegistryEntry::Quarantined(group)) => {
                 return retry_quarantine(id.clone(), group).await;
             }
-            Some(RegistryEntry::Confirmed) => return Ok(KillOutcome::Gone),
             Some(RegistryEntry::Live(live)) => live.upgrade(),
             None => None,
         };
@@ -1207,7 +1207,13 @@ mod audit_tests {
         assert_eq!(engine.liveness(&id).await, Liveness::Uncertain);
         assert_eq!(engine.kill_verified(&id).await.unwrap(), KillOutcome::Gone);
         assert_eq!(engine.liveness(&id).await, Liveness::Gone);
-        assert_eq!(engine.kill_verified(&id).await.unwrap(), KillOutcome::Gone);
+        // Confirmation is delivered to H1 for durable closure; the old
+        // process-local tombstone is not retained indefinitely.
+        assert!(registry_entry(&id).is_none());
+        assert_eq!(
+            engine.kill_verified(&id).await.unwrap(),
+            KillOutcome::Uncertain
+        );
         assert!(weak.upgrade().is_none());
         registry().lock().unwrap().remove(&id);
     }

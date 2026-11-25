@@ -66,6 +66,25 @@ fn windows_minimal(pid: u32, name: &str, system_or_unknown: bool) -> bool {
         .any(|known| name.eq_ignore_ascii_case(known))
 }
 
+#[cfg(windows)]
+pub(crate) fn query_access_denied(pid: u32) -> bool {
+    use windows::Win32::{
+        Foundation::{CloseHandle, ERROR_ACCESS_DENIED},
+        System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+    // SAFETY: query-only access, no synchronization/termination privileges.
+    // A child spawned under this host's token is queryable; a denied query
+    // is evidence of a different security context, unlike missing metadata.
+    match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(handle) => {
+            // SAFETY: unique handle from OpenProcess, closed once.
+            let _ = unsafe { CloseHandle(handle) };
+            false
+        }
+        Err(error) => error.code() == ERROR_ACCESS_DENIED.to_hresult(),
+    }
+}
+
 pub(crate) fn minimal_process(process: &sysinfo::Process) -> bool {
     // Never exclude a candidate with actual executable/argv observation just
     // because of its name (a normal program can have a similar basename).
@@ -128,56 +147,6 @@ pub(crate) fn processkit_cgroup(path: &Path) -> Option<PathBuf> {
         }
     }
     domain
-}
-
-#[cfg(test)]
-mod minimal_snapshot_tests {
-    use super::*;
-
-    #[test]
-    fn linux_kernel_threads_do_not_become_unobservable_core_candidates() {
-        assert!(linux_minimal(9, Some(2), Some(0x0020_0000)));
-        assert!(linux_minimal(2, Some(0), None));
-        assert!(linux_minimal(10, Some(2), None));
-        // A PID namespace's PID 2 need not actually be a kernel thread.
-        assert!(!linux_minimal(2, Some(1), Some(0)));
-        assert!(!linux_minimal(99, Some(1), None));
-    }
-
-    #[test]
-    fn macos_kernel_task_is_not_a_user_process() {
-        assert!(macos_minimal(0));
-        assert!(!macos_minimal(1));
-        assert!(!macos_minimal(99));
-    }
-
-    #[test]
-    fn windows_system_minimal_and_pico_snapshots_are_excluded() {
-        for name in [
-            "System",
-            "Registry",
-            "Memory Compression",
-            "Secure System",
-            "VmmemWSL",
-            "Pico Process",
-        ] {
-            assert!(windows_minimal(14, name, true));
-            assert!(!windows_minimal(14, name, false));
-        }
-        assert!(windows_minimal(4, "System", true));
-        assert!(!windows_minimal(99, "System.exe", true));
-        assert!(!windows_minimal(99, "easytier-core.exe", true));
-    }
-
-    #[test]
-    fn cgroup_membership_uses_processkit_subtree_not_ui_pgid() {
-        let path = Path::new("/user.slice/processkit-12-abcd-1/nested");
-        assert_eq!(
-            processkit_cgroup(path).unwrap(),
-            Path::new("/user.slice/processkit-12-abcd-1")
-        );
-        assert!(processkit_cgroup(Path::new("/user.slice/app.scope")).is_none());
-    }
 }
 
 /// Require a path component boundary; a substring, a sibling with a common
@@ -361,5 +330,62 @@ impl Pin {
         };
         // SAFETY: one initialized pollfd, non-blocking poll.
         (unsafe { libc::poll(&mut fd, 1, 0) }) > 0 && fd.revents & libc::POLLIN != 0
+    }
+}
+
+#[cfg(test)]
+mod minimal_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn linux_kernel_threads_do_not_become_unobservable_core_candidates() {
+        assert!(linux_minimal(9, Some(2), Some(0x0020_0000)));
+        assert!(linux_minimal(2, Some(0), None));
+        assert!(linux_minimal(10, Some(2), None));
+        // A PID namespace's PID 2 need not actually be a kernel thread.
+        assert!(!linux_minimal(2, Some(1), Some(0)));
+        assert!(!linux_minimal(99, Some(1), None));
+    }
+
+    #[test]
+    fn macos_kernel_task_is_not_a_user_process() {
+        assert!(macos_minimal(0));
+        assert!(!macos_minimal(1));
+        assert!(!macos_minimal(99));
+    }
+
+    #[test]
+    fn windows_system_minimal_and_pico_snapshots_are_excluded() {
+        for name in [
+            "System",
+            "Registry",
+            "Memory Compression",
+            "Secure System",
+            "VmmemWSL",
+            "Pico Process",
+        ] {
+            assert!(windows_minimal(14, name, true));
+            assert!(!windows_minimal(14, name, false));
+        }
+        assert!(windows_minimal(4, "System", true));
+        assert!(!windows_minimal(99, "System.exe", true));
+        assert!(!windows_minimal(99, "easytier-core.exe", true));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn query_denial_is_not_inferred_from_own_process_or_absent_pid() {
+        assert!(!query_access_denied(std::process::id()));
+        assert!(!query_access_denied(2_000_000_000));
+    }
+
+    #[test]
+    fn cgroup_membership_uses_processkit_subtree_not_ui_pgid() {
+        let path = Path::new("/user.slice/processkit-12-abcd-1/nested");
+        assert_eq!(
+            processkit_cgroup(path).unwrap(),
+            Path::new("/user.slice/processkit-12-abcd-1")
+        );
+        assert!(processkit_cgroup(Path::new("/user.slice/app.scope")).is_none());
     }
 }

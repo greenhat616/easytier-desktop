@@ -235,7 +235,7 @@ async fn purge_waits_for_generations_that_may_use_shared_records() {
         report
             .notes
             .iter()
-            .filter(|n| n.contains("waiting"))
+            .filter(|n| n.contains("generations that may use it"))
             .count(),
         2
     );

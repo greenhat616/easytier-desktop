@@ -1,6 +1,7 @@
-//! R1 acceptance: reclaim order is DNS and firewall -> registry -> interface
-//! -> routes -> runtime directory -> process record -> fence, and the fence
-//! waits for the kernel process record.
+//! R1 acceptance: the kernel process record goes first (ruling msg#567: a
+//! kernel that may be alive owns every object of its generation), then DNS
+//! and firewall -> registry -> interface -> routes -> runtime directory ->
+//! fence; nothing else is touched until the process record is closed.
 mod reclaim_support;
 
 use etd_contract::InstanceId;
@@ -22,13 +23,13 @@ async fn ranks_are_reclaimed_in_dependency_order() {
     assert_eq!(
         w.sys.reclaim_order(),
         vec![
+            Process,
             WinFirewallRule,
             WinFirewallRule,
             WinRegistryValue,
             WinTunAdapter,
             Route,
             RuntimeDir,
-            Process,
             WinFenceFilter
         ]
     );
@@ -51,9 +52,22 @@ async fn fence_stays_until_the_process_record_closes() {
         .await
         .unwrap();
     assert_eq!(report.outcome, GenerationOutcome::Pending);
-    assert!(!w.sys.reclaim_order().contains(&EffectKind::WinFenceFilter));
-    let left: Vec<_> = w.sys.ours().iter().map(|o| o.kind).collect();
-    assert_eq!(left, vec![EffectKind::Process, EffectKind::WinFenceFilter]);
+    // Only the kernel was attempted; every other record waits for it.
+    assert_eq!(w.sys.reclaim_order(), vec![EffectKind::Process]);
+    let before = w.sys.ours().len();
+    assert!(
+        w.sys
+            .ours()
+            .iter()
+            .any(|o| o.kind == EffectKind::WinFenceFilter)
+    );
+    assert!(
+        w.sys
+            .ours()
+            .iter()
+            .any(|o| o.kind == EffectKind::WinTunAdapter)
+    );
+    assert!(before > 2);
 
     w.sys.clear_faults();
     let report = engine
@@ -82,8 +96,8 @@ async fn a_failing_rank_holds_back_higher_ranks() {
     use EffectKind::*;
     assert_eq!(
         w.sys.reclaim_order(),
-        vec![WinFirewallRule, WinFirewallRule, WinRegistryValue]
+        vec![Process, WinFirewallRule, WinFirewallRule, WinRegistryValue]
     );
-    // Registry, interface, route, runtime dir, process, fence remain.
-    assert_eq!(report.residues.len(), 6);
+    // Registry, interface, route, runtime dir, fence remain.
+    assert_eq!(report.residues.len(), 5);
 }

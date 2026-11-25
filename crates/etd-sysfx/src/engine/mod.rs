@@ -14,11 +14,12 @@
 //!   automatically.
 //! - Settings (`Undo::RestoreIfOurs`) are handed to the reclaimer, which
 //!   restores only while the current value is still ours.
-//! - Within a generation, records are handled rank by rank (lowest first).
-//!   A rank whose records are still ours and not gone (failing, quarantined,
-//!   indeterminate) stops the higher ranks; fences additionally wait until
-//!   every process record of the generation is closed (kernel verified
-//!   dead).
+//! - Within a generation the kernel process records go first; until every
+//!   one of them is closed (kernel verified dead) no other record of the
+//!   generation is touched (rulings msg#557 / msg#567). Then records are
+//!   handled rank by rank (lowest first); a rank whose records are still
+//!   ours and not gone (failing, quarantined, indeterminate) stops the
+//!   higher ranks, fences last.
 //! - Swept objects (outside the ledger) are removed only when they sit in an
 //!   exclusive container; everything else, including whatever the repair
 //!   index re-derives, is listed as a candidate.
@@ -136,7 +137,35 @@ impl ReclaimEngineImpl {
             .partition(|e| record::record_only(e.persistence));
         ctx.process_closed_at = None;
         records.sort_by(|a, b| (ctx.rank(a.kind), &a.id).cmp(&(ctx.rank(b.kind), &b.id)));
-        let mut process_open = false;
+        // The kernel goes first (ruling msg#567): while it may still be
+        // alive it owns, and would fight or recreate, every object of its
+        // generation. Process records are reclaimed before any other rank;
+        // unless every one of them closes (probe absent, or killed and
+        // verified gone), no other record of the group is touched.
+        let (processes, records): (Vec<Effect>, Vec<Effect>) = records
+            .into_iter()
+            .partition(|e| e.kind == EffectKind::Process);
+        let mut held: Option<String> = None;
+        for e in &processes {
+            match ctx.step(e).await? {
+                RecordOutcome::Closed => ctx.process_closed_at = Some(jiff::Timestamp::now()),
+                outcome => {
+                    held.get_or_insert(format!("process record {} is {outcome:?}", e.id.0));
+                }
+            }
+        }
+        if let Some(why) = held {
+            for e in &records {
+                ctx.notes.push(format!(
+                    "{}: waiting for the kernel process to be verified dead ({why})",
+                    report::pending_note(e)
+                ));
+            }
+            for e in &record_only {
+                ctx.step(e).await?;
+            }
+            return Ok(());
+        }
         let mut blocked = false;
         let mut i = 0;
         while i < records.len() {
@@ -146,19 +175,13 @@ impl ReclaimEngineImpl {
                 .position(|e| ctx.rank(e.kind) != rank)
                 .map_or(records.len(), |n| i + n);
             // Higher ranks wait; their records stay open and show up as
-            // residues.
-            if blocked || (rank >= crate::rank::FENCE && process_open) {
+            // residues. (Fences need the process records closed, which the
+            // process-first pass above already guarantees.)
+            if blocked {
                 break;
             }
             for e in &records[i..end] {
                 let outcome = ctx.step(e).await?;
-                if e.kind == EffectKind::Process {
-                    if outcome == RecordOutcome::Closed {
-                        ctx.process_closed_at = Some(jiff::Timestamp::now());
-                    } else {
-                        process_open = true;
-                    }
-                }
                 if outcome.blocks() {
                     blocked = true;
                 }

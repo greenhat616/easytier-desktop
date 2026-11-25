@@ -1,6 +1,20 @@
 //! Frozen kernel-store interface (F0). The manifest-backed implementation
 //! (manifest with version, SHA-256 and proto revision; hash checked before
 //! every use) is `core_store/manifest.rs` (H2).
+//!
+//! Layout: one directory per binary, named by its SHA-256 (lower-case hex),
+//! under `HostDirs::core_store_dir`; a binary is never replaced in place.
+//! The kernel path (which the program firewall rule names contain) is
+//! therefore unique per hash, and `EffectScope::CoreBinary` records of
+//! different binaries never share a key.
+//!
+//! Removing a kernel (v7: changing kernel versions is a one-time elevated
+//! `etd-host` subcommand) requires the service to be stopped: the
+//! maintenance subcommand takes the machine-wide singleton lock (so it is
+//! the only ledger writer and no generation can start meanwhile), runs
+//! `ReclaimEngine::reclaim_core`, deletes the binary via
+//! [`CoreStore::remove`], releases the lock; the service is then started
+//! again. There is no contract call for it.
 use etd_contract::v1::CoreEntry;
 use etd_core_api::{AdapterProfile, CoreDescriptor};
 use std::path::PathBuf;
@@ -62,10 +76,12 @@ pub trait CoreStore: Send + Sync {
     async fn resolve(&self, want: &CoreSelector) -> Result<VerifiedCore, StoreError>;
     /// Every kernel in the store with its support level, for ListCores.
     async fn list(&self) -> Result<Vec<CoreEntry>, StoreError>;
-    /// Remove a kernel from the store (host maintenance subcommand, not a
-    /// contract call). The caller first runs
+    /// Remove a kernel from the store (maintenance subcommand under the
+    /// singleton lock, see the module docs). The caller first runs
     /// `ReclaimEngine::reclaim_core(sha256)`, which removes the binary's
     /// program firewall rules and refuses while an open generation uses it;
-    /// only after that succeeds is the binary deleted.
+    /// the binary is deleted only if that report shows no pending
+    /// core-binary record. A selected default that is removed falls back to
+    /// no selection.
     async fn remove(&self, version: &str) -> Result<(), StoreError>;
 }

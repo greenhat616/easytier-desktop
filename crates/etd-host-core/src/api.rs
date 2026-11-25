@@ -28,6 +28,9 @@
 //!   deferred, and H1 starts it with `begin_epoch` once that generation is
 //!   reclaimed. Two instances that both want to run with the same claim are
 //!   rejected by the ledger (`ExclusiveTaken`).
+//! - Diagnose-only mode (ledger schema newer or unreadable): the startup
+//!   self-check lists orphan kernel processes but does not kill them, no
+//!   reclaim deletes anything, and no instance starts.
 //! - Before spawning any generation H1 checks with
 //!   `SystemObserver::interface` that the derived interface name is free;
 //!   if a foreign object holds it (e.g. a conflict an administrator chose to
@@ -80,6 +83,14 @@ pub enum Command {
     /// whether desired state will be running after the mutation. Rejections
     /// (feature classes, guard, kernel) come back as `ErrorDetail`; nothing
     /// commits then.
+    ///
+    /// H1 is the only planner and processes commands in order, so a Plan
+    /// that arrives while H1 is itself starting the instance (supervised
+    /// `begin_epoch`) returns `generation: None`. If a commit still fails
+    /// with `EpochNotNext` / `EpochOpen` (or `ExclusiveTaken` for the
+    /// generation), H2 plans again and retries; these ledger errors never
+    /// reach clients. A deferred start shows as `INSTANCE_STATE_WAITING`
+    /// with a notice naming the instance that holds the resource.
     Plan {
         instance: InstanceId,
         spec: Option<Box<NetworkSpec>>,
@@ -226,7 +237,8 @@ pub struct HostDirs {
     pub state_dir: PathBuf,
     /// Root of `run/<instance>/<epoch>/`.
     pub run_dir: PathBuf,
-    /// Protected kernel store.
+    /// Protected kernel store: one directory per binary, named by its
+    /// SHA-256 (see `core_store`).
     pub core_store_dir: PathBuf,
 }
 

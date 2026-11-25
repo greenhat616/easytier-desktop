@@ -53,6 +53,7 @@ enum .etd.v1.InstanceState.INSTANCE_STATE_STARTING = 2
 enum .etd.v1.InstanceState.INSTANCE_STATE_STOPPED = 1
 enum .etd.v1.InstanceState.INSTANCE_STATE_STOPPING = 5
 enum .etd.v1.InstanceState.INSTANCE_STATE_UNSPECIFIED = 0
+enum .etd.v1.InstanceState.INSTANCE_STATE_WAITING = 11
 enum .etd.v1.LeaseRelease.LEASE_RELEASE_KEEP_INSTANCES = 2
 enum .etd.v1.LeaseRelease.LEASE_RELEASE_STOP_INSTANCES = 1
 enum .etd.v1.LeaseRelease.LEASE_RELEASE_UNSPECIFIED = 0

@@ -305,6 +305,11 @@ enum InstanceState {
   // The kernel was killed but the stop intent could not be persisted; the
   // instance may come back after a host restart. Retry with SetDesired.
   INSTANCE_STATE_CUT_UNCONFIRMED = 10;
+  // Desired state is running but the start is deferred: another instance
+  // still holds a single-writer resource this configuration needs (e.g.
+  // Windows Magic DNS) through its running or not yet reclaimed generation.
+  // A notice names that instance; the start follows automatically.
+  INSTANCE_STATE_WAITING = 11;
 }
 
 enum ManagementAccess {

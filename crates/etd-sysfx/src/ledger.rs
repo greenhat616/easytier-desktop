@@ -27,19 +27,37 @@
 //! against current state. A changed kernel, spec or setting means a new
 //! generation.
 //!
-//! Single-writer claims (e.g. Windows Magic DNS). An instance *holds* its
-//! claims while its desired state is running **or** while any of its
-//! generations is still open (not yet reclaimed): a committed stop does not
-//! mean the kernel has stopped. Checked inside the transaction, against
-//! committed state:
-//! - two instances whose desired state is running may not share a claim
-//!   ([`LedgerError::ExclusiveTaken`]);
+//! Single-writer claims (e.g. Windows Magic DNS) come from two sources,
+//! stored separately ([`ClaimSource`]):
+//! - *desired claims*: those of the instance's current configuration
+//!   (`Change::PutInstance::claims`), held while its desired state is
+//!   running; replaced when the configuration is replaced;
+//! - *generation claims*: the immutable set recorded with each generation
+//!   ([`GenerationPlan::claims`]), held until that generation is closed,
+//!   whatever happens to the configuration meanwhile. A committed stop or a
+//!   replaced configuration does not mean the old kernel has stopped.
+//!
+//! Checked inside the transaction, against committed state:
+//! - two instances whose desired state is running may not share a desired
+//!   claim ([`LedgerError::ExclusiveTaken`]);
 //! - a generation (in [`Ledger::commit`] or [`Ledger::begin_epoch`]) may not
-//!   start while another instance holding the same claim has an open
-//!   generation ([`LedgerError::ExclusiveTaken`]). In that case the
-//!   mutation is committed with no generation (desired running, start
-//!   deferred) and the orchestrator starts it with `begin_epoch` once the
-//!   other generation is reclaimed.
+//!   start if another instance holds any of its claims, from either source
+//!   ([`LedgerError::ExclusiveTaken`]). The orchestrator avoids this by
+//!   planning no generation: the mutation commits with desired running and
+//!   the start deferred, and it starts the instance with `begin_epoch` once
+//!   the other generation is reclaimed.
+//!
+//! Required conformance cases (L1, `etd-testkit` `conformance::ledger`),
+//! besides the obvious ones:
+//! - instance A (claim X) running; A's configuration is replaced by one
+//!   without X while A's old generation is still open (reclaiming): A still
+//!   holds X through that generation; a generation of B claiming X is
+//!   refused until A's old generation closes, then accepted;
+//! - the same with a committed stop of A instead of a replacement;
+//! - epoch high-water survives `compact`; `generation()` of a compacted
+//!   generation returns `None`;
+//! - same request id + digest returns the original receipt after state has
+//!   moved on; a different digest is `RequestReused`.
 //!
 //! Idempotency comes first. [`Ledger::request_status`] is consulted before
 //! any state-dependent planning: a known request id with the same digest
@@ -105,6 +123,9 @@ pub struct GenerationPlan {
     pub epoch: Epoch,
     /// Persisted; replay uses these, not current state.
     pub inputs: LaunchInputs,
+    /// Single-writer claims of this generation (`LaunchPlan::exclusive` at
+    /// plan time). Immutable; held until the generation closes.
+    pub claims: Vec<String>,
     /// Every effect of the generation: the kernel's predicted effects
     /// (`LaunchPlan::effects`) plus the host's own (process record, runtime
     /// directory, fence). Each intent's scope must be this generation, or a
@@ -136,10 +157,30 @@ pub struct HostSettings {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredGeneration {
     pub inputs: LaunchInputs,
+    pub claims: Vec<String>,
     /// Every record of the generation, open or closed (until compaction).
     pub effects: Vec<Effect>,
     /// True once every record is closed.
     pub closed: bool,
+}
+
+/// Where a held claim comes from (see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ClaimSource {
+    /// The current configuration of an instance whose desired state is
+    /// running.
+    Desired,
+    /// An open generation of the instance.
+    Generation(Epoch),
+}
+
+/// One held single-writer claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimHold {
+    pub resource: String,
+    pub instance: InstanceId,
+    pub source: ClaimSource,
 }
 
 /// Result of looking a request up before planning.
@@ -161,9 +202,12 @@ pub struct Ticket {
     pub changes: Vec<Change>,
     /// Generations reserved by this ticket (instance, epoch). Tickets are
     /// replayed after the startup self-check; a generation the self-check
-    /// already closed (committed but never spawned) is not launched: the
-    /// orchestrator marks the ticket done and reconciles from desired state
-    /// with a new generation.
+    /// already closed (committed but never spawned), or that was compacted,
+    /// is not launched: the orchestrator marks the ticket done and
+    /// reconciles from desired state with a new generation. A ticket whose
+    /// effect has been superseded by later committed desired state (e.g. a
+    /// start followed by a receipted stop) is marked done without acting:
+    /// replay never revives a receipted stop or an older configuration.
     pub generations: Vec<(InstanceId, Epoch)>,
     pub done: bool,
 }
@@ -247,8 +291,9 @@ pub trait Ledger: Send + Sync {
     /// Desired state; the only input for starting instances after boot.
     async fn desired(&self) -> Result<(Revision, Vec<DesiredInstance>), LedgerError>;
     async fn settings(&self) -> Result<HostSettings, LedgerError>;
-    /// Single-writer claims of every instance, as last committed.
-    async fn claims(&self) -> Result<Vec<(InstanceId, Vec<String>)>, LedgerError>;
+    /// Every claim currently held, from both sources, as committed. The
+    /// planner uses it to decide whether a start must be deferred.
+    async fn claims(&self) -> Result<Vec<ClaimHold>, LedgerError>;
 
     /// The epoch the next generation of `instance` must use
     /// (`high-water + 1`; `Epoch(1)` for a new instance). Read-only.
@@ -262,7 +307,8 @@ pub trait Ledger: Send + Sync {
     async fn begin_epoch(&self, plan: GenerationPlan) -> Result<Vec<Effect>, LedgerError>;
 
     /// A committed generation with its persisted inputs, for replay.
-    /// `None` if it was never committed (or was compacted after closing).
+    /// `None` if it was never committed or was closed and then compacted:
+    /// callers treat `None` for an epoch below `next_epoch` as closed.
     async fn generation(
         &self,
         instance: &InstanceId,

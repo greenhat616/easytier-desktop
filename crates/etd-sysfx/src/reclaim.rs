@@ -135,11 +135,17 @@ pub trait ReclaimEngine: Send + Sync {
     /// Ledger written by a newer version or unreadable
     /// ([`LedgerError::SchemaTooNew`] / [`LedgerError::Unreadable`]):
     /// read-only diagnosis. Never deletes or changes anything, not even in
-    /// exclusive containers; lists candidates only.
+    /// exclusive containers; lists candidates only. In this mode the
+    /// startup self-check also leaves orphan kernel processes alone (it
+    /// lists them, never kills them) and starts no instance.
     async fn diagnose(&self) -> Result<ReclaimReport, ReclaimError>;
     /// Before a kernel leaves the store: reclaim every core-binary-scope
     /// record of that binary (program firewall rules). Fails with
     /// [`LedgerError::EpochOpen`] while an open generation still uses it.
+    /// Runs only in the maintenance subcommand that holds the singleton lock
+    /// (service stopped; see `CoreStore::remove`). The binary may be deleted
+    /// only if the returned report shows no pending (quarantined,
+    /// candidate or conflict) core-binary record for it.
     async fn reclaim_core(&self, sha256: &str) -> Result<ReclaimReport, LedgerError>;
     /// The latest report (for snapshots and GetReclaimReport).
     async fn report(&self) -> Result<ReclaimReport, LedgerError>;

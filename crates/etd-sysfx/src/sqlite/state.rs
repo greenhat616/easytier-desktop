@@ -264,7 +264,8 @@ impl LedgerState {
                 for instance in ids {
                     self.remove_instance(&instance)?;
                 }
-                self.settings = HostSettings::default();
+                // The allow-list is host security configuration, not user data.
+                self.settings.selected_core = None;
                 self.requests.clear();
                 self.compact_closed_effects();
             }

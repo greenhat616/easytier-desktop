@@ -230,7 +230,6 @@ impl ContractService {
                         Mutation::AllowList(entries) => {
                             self.inner.authorizer.replace(entries.clone())
                         }
-                        Mutation::Purge(true) => self.inner.authorizer.replace(Vec::new()),
                         _ => {}
                     }
                     // Durable tickets are also replayed by H1 after restart.

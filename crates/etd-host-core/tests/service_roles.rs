@@ -293,3 +293,41 @@ async fn user_host_owner_admin_is_unprivileged_and_allow_list_unavailable() {
         ErrorCode::FeatureRejected
     );
 }
+
+#[tokio::test]
+async fn purge_keeps_allow_list_and_elevated_admin_still_connects() {
+    use etd_sysfx::Ledger;
+    let f = Fixture::new().await;
+    let expected = f.ledger.settings().await.unwrap().allow_list;
+    f.service
+        .purge_all_data(request(
+            PurgeAllDataRequest {
+                header: Some(MutationHeader {
+                    expected_revision: 1,
+                    request_id: "purge".into(),
+                }),
+                confirm: true,
+            },
+            Role::Admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(f.ledger.settings().await.unwrap().allow_list, expected);
+    let hello = Hello {
+        major: VERSION_MAJOR,
+        minor: VERSION_MINOR,
+        ..Default::default()
+    };
+    assert_eq!(
+        f.service
+            .handshake(request(hello, Role::Admin))
+            .await
+            .unwrap()
+            .into_inner()
+            .role(),
+        Role::Admin
+    );
+    // Restart/reload covers persisted list, not merely the running snapshot.
+    f.auth.load(f.ledger.as_ref()).await.unwrap();
+    assert_eq!(f.auth.role_of(&peer(Role::Admin)), Some(Role::Admin));
+}

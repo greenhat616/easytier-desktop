@@ -41,7 +41,12 @@ impl ReclaimEngine for ReclaimEngineImpl {
     async fn resolve(&self, _: &[CandidateDecision]) -> Result<ReclaimReport, LedgerError> {
         Err(not_implemented())
     }
-    async fn sweep_without_ledger(&self) -> Result<ReclaimReport, ReclaimError> {
+    async fn recover_without_ledger(&self) -> Result<ReclaimReport, ReclaimError> {
+        Err(ReclaimError::Indeterminate(
+            "reclaim engine not implemented".into(),
+        ))
+    }
+    async fn diagnose(&self) -> Result<ReclaimReport, ReclaimError> {
         Err(ReclaimError::Indeterminate(
             "reclaim engine not implemented".into(),
         ))

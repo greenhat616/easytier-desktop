@@ -52,7 +52,7 @@ pub trait SystemObserver: Send + Sync {
     /// `proc_pidinfo` file-descriptor enumeration, unit number -> `utunN`):
     /// basic readiness of such an instance waits for one of them to carry an
     /// address, and the host records the name it finds as the concrete key
-    /// of the generation's interface record. Platforms where the host fixes
+    /// of the generation's interface record and of its `RoutesVia` record. Platforms where the host fixes
     /// the name may return what [`SystemObserver::interface`] finds.
     async fn interfaces_owned_by(&self, pid: u32) -> Result<Vec<InterfaceInfo>, ObserveError>;
     /// Full independent enumeration of one class of system objects, ours or
@@ -74,11 +74,17 @@ pub enum SystemClass {
     Processes,
 }
 
-/// One enumerated object: a key plus a canonical description that changes
-/// whenever the object's content changes.
+/// One enumerated object. A diff compares all three: same key with a
+/// different identity is a replaced object, same identity with a different
+/// description is a modified one.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SystemEntry {
     pub class: SystemClass,
     pub key: ObjectKey,
+    /// Creation identity (LUID and device instance id, interface index and
+    /// boot id, file id, rule GUID, pid and start token, ...); `None` only
+    /// where the object type has none.
+    pub identity: Option<Credential>,
+    /// Canonical content description; changes whenever the content does.
     pub description: String,
 }

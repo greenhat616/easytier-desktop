@@ -1,6 +1,7 @@
 //! Frozen kernel-adapter model (F0). No EasyTier type appears here.
 use etd_contract::InstanceId;
 use etd_proc::Command;
+pub use etd_sysfx::{CoreRef, LaunchInputs, ManagementGuard, Privilege};
 use etd_sysfx::{EffectIntent, Epoch, ObjectKey};
 use std::{net::SocketAddr, path::PathBuf, time::Duration, time::SystemTime};
 
@@ -24,47 +25,16 @@ pub struct AdapterProfile {
     pub deny_all_verified: bool,
 }
 
-/// Privilege of the host the kernel will run under.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Privilege {
-    /// SYSTEM / root (service or elevated session).
-    System,
-    /// Current user (user host): no TUN, no fence.
-    User,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeDirs {
-    /// `run/<instance>/<epoch>/`, writable only by the host.
-    pub generation: PathBuf,
-}
-
-/// Everything `plan_launch` needs besides the spec. The host chooses the
-/// interface name, the management address and the binary; the spec cannot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Everything `plan_launch` consumes: the generation and its persisted
+/// inputs. The host chooses the interface name, management address, guard
+/// and kernel; the spec cannot. Built from `GenerationPlan` on replay.
+#[derive(Debug, Clone, PartialEq)]
 pub struct LaunchContext {
     pub instance: InstanceId,
     /// Reserved epoch (`Ledger::next_epoch`); it appears in the runtime
     /// directory and in every planned record.
     pub epoch: Epoch,
-    pub dirs: RuntimeDirs,
-    /// Derived from the install key and instance id (`etd-` + 8 hex).
-    pub interface_name: String,
-    /// Loopback management (RPC portal) address forced on the kernel.
-    pub management: SocketAddr,
-    pub privilege: Privilege,
-    /// How the host will protect the management port for this launch. The
-    /// host asks for `Fence` when a fence is available on a privileged host;
-    /// when fencing is unavailable or failed it re-plans the next
-    /// generation with `DenyAll` (v7 fence step 4), which the driver accepts
-    /// only if the profile's deny-all configuration is verified
-    /// ([`CoreError::GuardUnavailable`] otherwise). User hosts ask for
-    /// `Unguarded`, or `LifecycleOnly` for a kernel without a profile.
-    pub management_guard: ManagementGuard,
-    pub core: CoreDescriptor,
-    /// Binary inside the protected kernel store.
-    pub binary: PathBuf,
+    pub inputs: LaunchInputs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,21 +77,6 @@ pub struct Readiness {
     /// The process must stay alive at least this long.
     pub minimum_uptime: Duration,
     pub condition: ReadinessCondition,
-}
-
-/// How the management port is protected for this launch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ManagementGuard {
-    /// Privileged host: a verified fence is required before any RPC.
-    Fence,
-    /// Fence unavailable and the profile's deny-all configuration is
-    /// verified: kernel whitelist closes the port; lifecycle only.
-    DenyAll,
-    /// User host: the kernel runs as the user; no fence.
-    Unguarded,
-    /// No adapter profile (user host only): no RPC at all.
-    LifecycleOnly,
 }
 
 /// Classification of one configured feature by its side effects.

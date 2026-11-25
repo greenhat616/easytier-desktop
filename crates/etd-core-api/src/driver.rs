@@ -2,7 +2,7 @@
 //! etd-core-easytier.
 use crate::*;
 use async_trait::async_trait;
-use etd_contract::{NetworkSpec, QueryKind, QueryResponse};
+use etd_contract::{QueryKind, QueryResponse};
 use std::{path::Path, time::Instant};
 
 #[async_trait]
@@ -16,8 +16,11 @@ pub trait CoreDriver: Send + Sync {
     /// this kernel version will cause with this configuration. Returns
     /// `Err(UnmodelledEffects)` for features whose write set is unknown or
     /// decided at run time, `Err(FeatureRejected)` for disabled features.
-    fn plan_launch(&self, spec: &NetworkSpec, ctx: &LaunchContext)
-    -> Result<LaunchPlan, CoreError>;
+    ///
+    /// Deterministic in `ctx` alone (which includes the spec): the host
+    /// replays a committed generation by calling it again with the persisted
+    /// inputs and requires the same effects.
+    fn plan_launch(&self, ctx: &LaunchContext) -> Result<LaunchPlan, CoreError>;
     /// Open a management session; RPC method numbers come from the profile
     /// of `core`, never guessed.
     async fn attach(

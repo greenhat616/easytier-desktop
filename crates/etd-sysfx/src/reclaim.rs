@@ -127,10 +127,16 @@ pub trait ReclaimEngine: Send + Sync {
         &self,
         decisions: &[etd_contract::CandidateDecision],
     ) -> Result<ReclaimReport, LedgerError>;
-    /// Ledger unusable (cannot open, unknown schema): clean exclusive
-    /// containers only and list everything else as candidates, using the
-    /// repair index if present.
-    async fn sweep_without_ledger(&self) -> Result<ReclaimReport, ReclaimError>;
+    /// Ledger unavailable, corrupt or lost (cannot be opened or written,
+    /// but not newer than this version): clean exclusive containers only and
+    /// list everything else as candidates, using the repair index if
+    /// present.
+    async fn recover_without_ledger(&self) -> Result<ReclaimReport, ReclaimError>;
+    /// Ledger written by a newer version or unreadable
+    /// ([`LedgerError::SchemaTooNew`] / [`LedgerError::Unreadable`]):
+    /// read-only diagnosis. Never deletes or changes anything, not even in
+    /// exclusive containers; lists candidates only.
+    async fn diagnose(&self) -> Result<ReclaimReport, ReclaimError>;
     /// The latest report (for snapshots and GetReclaimReport).
     async fn report(&self) -> Result<ReclaimReport, LedgerError>;
 }

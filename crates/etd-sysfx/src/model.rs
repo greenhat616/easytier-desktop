@@ -223,9 +223,10 @@ pub enum ObjectKey {
         guid: Option<String>,
     },
     /// Routes whose next hop is the named interface.
-    /// `None` while the interface name is not known yet (macOS utun): the
-    /// interface of the same generation, taken from that record's
-    /// observation.
+    /// `None` while the interface name is not known yet (macOS utun). When
+    /// the host reads the name back it transitions this record too, writing
+    /// `RoutesVia { interface: Some(name) }` as its observed key, so the
+    /// route reclaimer needs no other record.
     RoutesVia { interface: Option<String> },
     /// Named rule (firewall, NRPT): exact rule name, optional group.
     Rule { name: String, group: Option<String> },
@@ -241,10 +242,12 @@ pub enum ObjectKey {
     /// systemd-resolved link configuration.
     ResolvedLink { interface: String },
     /// Router port mapping.
-    /// The external port is assigned by the router and observed later.
+    /// Planned with `external_port: None`; the router-assigned port is
+    /// recorded later as the observed key (`Some(port)`).
     PortMapping {
         protocol: String,
         internal_port: u16,
+        external_port: Option<u16>,
         description: String,
     },
     /// Driver or service, by its registered name.
@@ -321,6 +324,8 @@ pub enum Undo {
 #[non_exhaustive]
 pub enum Persistence {
     /// Expected to vanish with the process; still probed after a crash.
+    /// Whether the wintun adapter belongs here depends on spike S2: if S2
+    /// shows it survives a kill, E1 classifies it as `Persistent`.
     WithProcess,
     /// Vanishes on reboot: closed without probing when the boot id changed.
     UntilReboot,
@@ -411,6 +416,8 @@ pub struct ScopeFilter {
     pub epoch: Option<Epoch>,
     /// Include product-scope records.
     pub product: bool,
+    /// Include core-binary-scope records.
+    pub core_binary: bool,
     pub kinds: Vec<EffectKind>,
     pub states: Vec<EffectState>,
 }
@@ -420,6 +427,7 @@ impl ScopeFilter {
     pub fn all() -> Self {
         Self {
             product: true,
+            core_binary: true,
             ..Self::default()
         }
     }
@@ -546,7 +554,8 @@ pub enum GenerationOutcome {
     Closed,
     /// Some records remain and will be retried.
     Pending,
-    /// Quarantined: five failures, uncertain liveness or open candidates.
+    /// Quarantined: five failures, uncertain liveness, open candidates or
+    /// open conflicts.
     Quarantined(String),
 }
 

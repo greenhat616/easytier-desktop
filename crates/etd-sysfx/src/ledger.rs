@@ -20,6 +20,31 @@
 //! the instance still has open records ([`LedgerError::EpochOpen`]).
 //! Concurrent planners cannot both succeed: the single writer serialises
 //! commits, and the loser gets a revision conflict or `EpochNotNext`.
+//!
+//! Replay. A generation is persisted with its [`LaunchInputs`]; the
+//! orchestrator launches it from those stored inputs (re-running the pure
+//! `plan_launch` and requiring the same effects), never by re-planning
+//! against current state. A changed kernel, spec or setting means a new
+//! generation.
+//!
+//! Single-writer claims (e.g. Windows Magic DNS). An instance *holds* its
+//! claims while its desired state is running **or** while any of its
+//! generations is still open (not yet reclaimed): a committed stop does not
+//! mean the kernel has stopped. Checked inside the transaction, against
+//! committed state:
+//! - two instances whose desired state is running may not share a claim
+//!   ([`LedgerError::ExclusiveTaken`]);
+//! - a generation (in [`Ledger::commit`] or [`Ledger::begin_epoch`]) may not
+//!   start while another instance holding the same claim has an open
+//!   generation ([`LedgerError::ExclusiveTaken`]). In that case the
+//!   mutation is committed with no generation (desired running, start
+//!   deferred) and the orchestrator starts it with `begin_epoch` once the
+//!   other generation is reclaimed.
+//!
+//! Idempotency comes first. [`Ledger::request_status`] is consulted before
+//! any state-dependent planning: a known request id with the same digest
+//! returns the original receipt even if the state has moved on (e.g. a
+//! RetryStart that already ran); with a different digest it is rejected.
 use crate::*;
 use async_trait::async_trait;
 use etd_contract::{
@@ -71,12 +96,15 @@ pub enum Change {
     PurgeAll,
 }
 
-/// The planned effects of one new generation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One new generation: its reserved epoch, the inputs its plan consumed,
+/// and its planned effects. Immutable once committed.
+#[derive(Debug, Clone, PartialEq)]
 pub struct GenerationPlan {
     pub instance: InstanceId,
     /// Must equal [`Ledger::next_epoch`] for `instance`.
     pub epoch: Epoch,
+    /// Persisted; replay uses these, not current state.
+    pub inputs: LaunchInputs,
     /// Every effect of the generation: the kernel's predicted effects
     /// (`LaunchPlan::effects`) plus the host's own (process record, runtime
     /// directory, fence). Each intent's scope must be this generation, or a
@@ -89,9 +117,7 @@ pub struct GenerationPlan {
 /// changes, new revision, operation ticket, and the reserved epoch and
 /// planned effects of every generation the mutation starts.
 ///
-/// Single-writer check, inside the transaction: after applying `changes`,
-/// no claim may be held by two instances whose desired state is running
-/// ([`LedgerError::ExclusiveTaken`]).
+/// Single-writer and generation checks: see the module docs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChangeSet {
     pub request: RequestRecord,
@@ -106,12 +132,38 @@ pub struct HostSettings {
     pub selected_core: Option<String>,
 }
 
+/// A committed generation as stored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredGeneration {
+    pub inputs: LaunchInputs,
+    /// Every record of the generation, open or closed (until compaction).
+    pub effects: Vec<Effect>,
+    /// True once every record is closed.
+    pub closed: bool,
+}
+
+/// Result of looking a request up before planning.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum RequestStatus {
+    /// Unknown request id: plan and commit it.
+    New,
+    /// Same id, same digest: answer with the original receipt; do not plan.
+    Done(Receipt),
+    /// Same id, different digest: reject.
+    Reused,
+}
+
 /// An accepted operation awaiting execution by the orchestrator.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ticket {
     pub receipt: Receipt,
     pub changes: Vec<Change>,
-    /// Generations reserved by this ticket (instance, epoch).
+    /// Generations reserved by this ticket (instance, epoch). Tickets are
+    /// replayed after the startup self-check; a generation the self-check
+    /// already closed (committed but never spawned) is not launched: the
+    /// orchestrator marks the ticket done and reconciles from desired state
+    /// with a new generation.
     pub generations: Vec<(InstanceId, Epoch)>,
     pub done: bool,
 }
@@ -160,7 +212,10 @@ pub enum LedgerError {
     InvalidTransition { from: EffectState, to: EffectState },
     #[error("ledger storage unavailable: {0:?}")]
     Unavailable(StorageFault),
-    /// Written by a newer version; the host may only diagnose.
+    /// Written by a newer version (or unreadable): the host enters
+    /// diagnose-only mode (`ReclaimEngine::diagnose`, no deletion at all),
+    /// unlike [`LedgerError::Unavailable`], which permits recovery of
+    /// exclusive containers.
     #[error("ledger schema {found} is newer than supported {supported}")]
     SchemaTooNew { found: u32, supported: u32 },
     /// Stored data this version cannot interpret (e.g. unknown effect kind).
@@ -179,7 +234,10 @@ pub trait Ledger: Send + Sync {
     /// described on [`ChangeSet`] and in the module docs.
     async fn commit(&self, expected: Revision, change: ChangeSet) -> Result<Receipt, LedgerError>;
 
-    /// Receipt of an earlier commit, by request id.
+    /// Idempotency lookup by request id and digest, done before planning.
+    async fn request_status(&self, request: &RequestRecord) -> Result<RequestStatus, LedgerError>;
+
+    /// Receipt of an earlier commit, by request id (GetReceipt).
     async fn receipt(&self, request: &RequestId) -> Result<Option<Receipt>, LedgerError>;
 
     /// Accepted operations not yet marked done (for replay after restart).
@@ -196,24 +254,20 @@ pub trait Ledger: Send + Sync {
     /// (`high-water + 1`; `Epoch(1)` for a new instance). Read-only.
     async fn next_epoch(&self, instance: &InstanceId) -> Result<Epoch, LedgerError>;
 
-    /// Supervisor-initiated generation (no client request): reserve `epoch`
-    /// and record its planned effects in one transaction, before anything is
-    /// spawned. Same checks as a generation inside [`Ledger::commit`].
-    async fn begin_epoch(
-        &self,
-        instance: &InstanceId,
-        epoch: Epoch,
-        effects: Vec<EffectIntent>,
-    ) -> Result<Vec<Effect>, LedgerError>;
+    /// Supervisor-initiated generation (no client request: restart after a
+    /// crash and reclaim, deferred single-writer start, deny-all re-plan):
+    /// reserve `plan.epoch` and persist its inputs and planned effects in one
+    /// transaction, before anything is spawned. Same checks as a generation
+    /// inside [`Ledger::commit`].
+    async fn begin_epoch(&self, plan: GenerationPlan) -> Result<Vec<Effect>, LedgerError>;
 
-    /// Open records of a generation as committed, e.g. to read back the
-    /// effects a commit planned. Equivalent to `open_effects` with
-    /// [`ScopeFilter::epoch`].
+    /// A committed generation with its persisted inputs, for replay.
+    /// `None` if it was never committed (or was compacted after closing).
     async fn generation(
         &self,
         instance: &InstanceId,
         epoch: Epoch,
-    ) -> Result<Vec<Effect>, LedgerError>;
+    ) -> Result<Option<StoredGeneration>, LedgerError>;
 
     /// Record one more planned effect of an existing open generation (or a
     /// product / core-binary effect). Must be called before the action that

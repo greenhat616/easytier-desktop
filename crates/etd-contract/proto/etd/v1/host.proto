@@ -145,8 +145,10 @@ enum HostPhase {
   // Startup self-check; control requests are refused with HOST_NOT_SERVING.
   HOST_PHASE_SELF_CHECK = 1;
   HOST_PHASE_SERVING = 2;
-  // Ledger cannot be opened or has an unknown schema: diagnose and list
-  // candidates only; no instance is started.
+  // Ledger unusable; no instance is started. Unavailable or corrupt ledger:
+  // exclusive containers are cleaned and everything else listed as
+  // candidates. Ledger written by a newer version: read-only diagnosis, no
+  // deletion at all.
   HOST_PHASE_DIAGNOSTIC_ONLY = 3;
   HOST_PHASE_SHUTTING_DOWN = 4;
 }
@@ -297,8 +299,8 @@ enum InstanceState {
   // Circuit breaker: fifth abnormal exit within five minutes. Desired state
   // is still running; RetryStart restarts.
   INSTANCE_STATE_GAVE_UP = 8;
-  // Reclaim failed five times, a candidate awaits confirmation, or process
-  // liveness is uncertain. The epoch stays open; no new epoch starts.
+  // Reclaim failed five times, a candidate or conflict awaits an
+  // administrator, or process liveness is uncertain. The epoch stays open; no new epoch starts.
   INSTANCE_STATE_QUARANTINED = 9;
   // The kernel was killed but the stop intent could not be persisted; the
   // instance may come back after a host restart. Retry with SetDesired.
@@ -589,7 +591,8 @@ enum ReclaimStatus {
   RECLAIM_STATUS_UNSPECIFIED = 0;
   RECLAIM_STATUS_CLEAN = 1;
   RECLAIM_STATUS_IN_PROGRESS = 2;
-  // Five consecutive failures or uncertain process liveness.
+  // Five consecutive failures, uncertain process liveness, or an open
+  // conflict.
   RECLAIM_STATUS_QUARANTINED = 3;
   // Candidates await item-by-item confirmation.
   RECLAIM_STATUS_AWAITING_CONFIRMATION = 4;

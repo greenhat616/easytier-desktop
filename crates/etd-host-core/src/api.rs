@@ -4,16 +4,35 @@
 //! `negotiate`, `events`, `core_store`).
 //!
 //! Division of work:
-//! - H2 authenticates and authorises, asks H1 to plan ([`Command::Plan`]),
-//!   commits the mutation together with the returned generation plan in one
-//!   ledger transaction (`ChangeSet::generations`; single-writer claims are
-//!   checked by the ledger inside that transaction against committed state)
-//!   and answers with the receipt; then it tells H1 with
-//!   [`Command::Committed`]. H1 executes accepted tickets
-//!   (`Ledger::pending_tickets`), spawns committed generations (re-running
-//!   the pure `plan_launch` with the same inputs and checking the result
-//!   against `Ledger::generation`), and reconciles actual toward desired
-//!   state. Supervised restarts use `Ledger::begin_epoch` directly.
+//! - H2 authenticates and authorises, then looks the request up first
+//!   (`Ledger::request_status`, by request id and digest): a known request
+//!   with the same content gets its original receipt without any planning,
+//!   even if state has moved on; same id with different content is
+//!   rejected. Only a new request is planned.
+//! - H2 asks H1 to plan ([`Command::Plan`]) and commits the mutation
+//!   together with the returned generation plan in one ledger transaction
+//!   (`ChangeSet::generations`), answers with the receipt, then tells H1
+//!   with [`Command::Committed`].
+//! - H1 executes accepted tickets (`Ledger::pending_tickets`) after the
+//!   startup self-check, and launches committed generations from their
+//!   persisted inputs (`Ledger::generation`: re-run the pure `plan_launch`
+//!   on the stored `LaunchInputs`, require the stored effects, re-verify the
+//!   kernel hash). A generation the self-check already closed is not
+//!   launched; the ticket is marked done and desired state reconciled with a
+//!   new generation. Supervised starts (restart after reclaim, deferred
+//!   single-writer start, deny-all re-plan) use `Ledger::begin_epoch`.
+//! - Single-writer claims are held while desired state is running or any
+//!   generation is still open (see `etd_sysfx::ledger`). If another
+//!   instance holding the claim still has an open generation, H1 plans no
+//!   generation: the mutation commits with desired running and the start
+//!   deferred, and H1 starts it with `begin_epoch` once that generation is
+//!   reclaimed. Two instances that both want to run with the same claim are
+//!   rejected by the ledger (`ExclusiveTaken`).
+//! - Before spawning any generation H1 checks with
+//!   `SystemObserver::interface` that the derived interface name is free;
+//!   if a foreign object holds it (e.g. a conflict an administrator chose to
+//!   KEEP), the start is refused and the instance quarantined. This is a
+//!   required H1 test.
 //! - A stale plan cannot commit: the commit carries the revision the plan
 //!   was made against, and the ledger checks the epoch.
 //! - H1 publishes every state change as a [`HostEvent`] with a gap-free
@@ -106,10 +125,11 @@ pub struct Planned {
     /// Single-writer claims of the configuration, for `Change::PutInstance`.
     pub claims: Vec<String>,
     /// The generation the mutation starts, to commit in the same
-    /// transaction: present when `start` and the instance has no live or
-    /// open generation; `None` when the start must wait (the running
-    /// generation is stopped and reclaimed first, then the supervisor uses
-    /// `Ledger::begin_epoch`).
+    /// transaction (its `inputs` are persisted for replay): present when
+    /// `start`, the instance has no live or open generation, and no other
+    /// instance holding one of `claims` has an open generation. `None` when
+    /// the start must wait (own generation still running or reclaiming, or a
+    /// claim still held); the supervisor then uses `Ledger::begin_epoch`.
     pub generation: Option<GenerationPlan>,
     /// Ledger revision the plan was computed against; H2 commits with this
     /// expected revision.

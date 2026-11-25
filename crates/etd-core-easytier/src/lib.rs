@@ -2,7 +2,6 @@
 //!
 //! This file (F0) only wires the frozen [`CoreDriver`] to the package files:
 //! `identify` and `plan/`, `profiles/` (E1), `session/` (E2).
-use etd_contract::NetworkSpec;
 use etd_core_api::*;
 use std::path::Path;
 
@@ -28,12 +27,8 @@ impl CoreDriver for EasyTierDriver {
     fn profile(&self, core: &CoreDescriptor) -> Option<AdapterProfile> {
         profiles::profile_for(core)
     }
-    fn plan_launch(
-        &self,
-        spec: &NetworkSpec,
-        ctx: &LaunchContext,
-    ) -> Result<LaunchPlan, CoreError> {
-        plan::plan_launch(spec, ctx)
+    fn plan_launch(&self, ctx: &LaunchContext) -> Result<LaunchPlan, CoreError> {
+        plan::plan_launch(ctx)
     }
     async fn attach(
         &self,

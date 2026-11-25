@@ -2,14 +2,11 @@
 //! before spawn. Every entry cites the upstream code that creates it; the
 //! host adds its own records (process, runtime directory, fence).
 //!
-//! Deliberately not recorded (see the E1 report):
-//! - Linux `mknod /dev/net/tun` (`virtual_nic.rs` `ensure_tun_device_node`):
-//!   only when the node is missing; recording it would make every start
-//!   report the system's own node as a candidate.
-//! - Windows `NetworkList\Profiles\*\Category` (`virtual_nic.rs`
-//!   `reg_change_catrgory_in_profile`): written only into a profile Windows
-//!   already created under the interface's name; its key is not known
-//!   before launch.
+//! Not an effect of ours: Linux `mknod /dev/net/tun` (`virtual_nic.rs`
+//! `ensure_tun_device_node`) happens only when the node is missing. A
+//! privileged Linux TUN launch requires the node to exist: H1 checks
+//! `/dev/net/tun` before planning and refuses the start otherwise (the plan
+//! inputs cannot carry the fact; the plan stays pure). It is never deleted.
 use super::{Platform, classify::magic_dns_active, spec::Settings};
 use etd_core_api::LaunchContext;
 use etd_sysfx::{
@@ -29,10 +26,6 @@ const NETBT: &str = r"HKLM\SYSTEM\CurrentControlSet\Services\NetBT\Parameters\In
 
 /// Magic DNS (`dns_server/system_config/windows.rs`).
 pub const MAGIC_DNS_RECOVERY_KEY: &str = r"HKLM\SOFTWARE\EasyTier\MagicDNS";
-pub const MAGIC_DNS_NRPT_COMMENT: &str = "EasyTier Magic DNS";
-/// Default zone without its trailing dot (`DEFAULT_ET_DNS_ZONE`); the spec
-/// cannot change it.
-pub const MAGIC_DNS_ZONE: &str = "et.net";
 
 /// UPnP / NAT-PMP mapping description and lease (`common/upnp.rs`).
 pub const UPNP_DESCRIPTION: &str = "EasyTier udp hole punch";
@@ -87,6 +80,11 @@ pub fn interface_rule_names(interface_name: &str) -> Vec<String> {
 
 /// The two per-program rule names (`do_add_self_to_firewall_allowlist`):
 /// `EasyTier <current_exe without \\?\> (<direction>)`.
+///
+/// Upstream uses the kernel's `current_exe()`, which is the canonical path
+/// the process engine launched. `LaunchInputs.core.binary` must therefore
+/// already be canonical (H1 canonicalizes it before planning); the plan is
+/// pure and cannot resolve links itself.
 pub fn program_rule_names(binary: &std::path::Path) -> Vec<String> {
     let exe = binary.to_string_lossy().replace(r"\\?\", "");
     ["Inbound", "Outbound"]
@@ -266,46 +264,34 @@ impl Builder<'_> {
             "NetbiosOptions",
             SettingValue::U32(2),
         );
+        // `NicCtx::run` -> `reg_change_catrgory_in_profile`: sets Category=1
+        // on the NetworkList profile named after the interface. The profile
+        // only exists because our adapter appeared; the reclaimer deletes it
+        // by the profile GUID read back as credential, never by name.
+        self.absent(
+            EffectKind::WinNetworkProfile,
+            ObjectKey::NetworkProfile {
+                profile_name: name.clone(),
+            },
+            Persistence::Persistent,
+        );
 
         if magic_dns_active(settings) {
-            // Two NRPT rules under DnsPolicyConfig\{random id}: the zone and
-            // its subdomains. Located by namespace and comment.
-            for namespace in [MAGIC_DNS_ZONE.to_owned(), format!(".{MAGIC_DNS_ZONE}")] {
-                self.absent(
-                    EffectKind::WinNrptRule,
-                    ObjectKey::Rule {
-                        name: namespace,
-                        group: Some(MAGIC_DNS_NRPT_COMMENT.into()),
-                    },
-                    Persistence::Persistent,
-                );
-            }
-            // Upstream's ownership record (every rule id it wrote, including
-            // zones other EasyTier processes publish at run time) and the
-            // saved original search lists; shared with other installs.
-            self.absent(
-                EffectKind::WinRegistryValue,
+            // One record for the whole machine-wide Magic DNS: the NRPT rules
+            // (`DnsPolicyConfig\{random id}`, one pair per zone, including
+            // zones learned from peers or other EasyTier processes at run
+            // time) and the adapter SearchList values are all listed in
+            // upstream's own recovery record, which `clean()` replays
+            // (`dns_server/system_config/windows.rs` `WindowsDNSRecovery`).
+            self.instance(
+                EffectKind::WinMagicDnsRecovery,
                 ObjectKey::Registry {
                     key: MAGIC_DNS_RECOVERY_KEY.into(),
-                    value: Some("NRPTRuleIDs".into()),
-                },
-                Persistence::Persistent,
-            );
-            self.absent(
-                EffectKind::WinRegistryValue,
-                ObjectKey::Registry {
-                    key: format!(r"{MAGIC_DNS_RECOVERY_KEY}\SearchLists\{guid}"),
                     value: None,
                 },
+                Undo::ReplayUpstreamRecovery,
                 Persistence::Persistent,
             );
-            for prefix in [TCPIP, TCPIP6] {
-                self.registry_value(
-                    format!("{prefix}{guid}"),
-                    "SearchList",
-                    SettingValue::String(MAGIC_DNS_ZONE.into()),
-                );
-            }
         }
     }
 

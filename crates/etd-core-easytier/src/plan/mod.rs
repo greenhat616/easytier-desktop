@@ -216,14 +216,16 @@ fn readiness(
 }
 
 /// A TCP socket the kernel binds once its network instance runs: the first
-/// tcp listener, else the SOCKS5 portal, else nothing (the caller falls
+/// tcp listener with a fixed port, else the SOCKS5 portal, else nothing (the caller falls
 /// back to the management portal).
 fn readiness_listener(settings: &spec::Settings) -> Option<SocketAddr> {
     settings
         .listeners
         .iter()
-        .find(|l| l.scheme == "tcp")
-        .and_then(|l| l.socket)
+        .filter(|l| l.scheme == "tcp")
+        .filter_map(|l| l.socket)
+        // Port 0 is assigned at run time: nothing to watch for.
+        .find(|socket| socket.port() != 0)
         .or_else(|| {
             settings
                 .socks5_port

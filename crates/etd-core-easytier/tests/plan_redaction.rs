@@ -72,6 +72,15 @@ fn secret_only_in_the_file() {
 }
 
 #[test]
+fn settings_debug_is_redacted() {
+    let settings = etd_core_easytier::plan::spec::Settings::from_spec(&full()).unwrap();
+    assert_eq!(settings.network_secret.as_deref(), Some(SECRET));
+    let debug = format!("{settings:?}{settings:#?}");
+    assert!(!debug.contains(SECRET));
+    assert!(debug.contains("<redacted>"));
+}
+
+#[test]
 fn errors_do_not_carry_the_secret() {
     let mut spec = full();
     spec.peers.push("bogus".into());

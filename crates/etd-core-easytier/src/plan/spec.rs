@@ -14,23 +14,12 @@ use etd_core_api::CoreError;
 use serde::Serialize;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-/// Listener port the kernel uses for tcp/udp by default
-/// (`easytier-core/src/connectivity/protocol/mod.rs`).
-pub const DEFAULT_LISTENER_PORT: u16 = 11010;
-
-/// Default listeners when the spec names none and `no_listener` is unset:
-/// what `easytier-core` expands `--listeners 11010` to
-/// (`Cli::gen_listeners`, port offsets from `protocol_port_offset`), minus
-/// `faketcp`, whose packet capture (WinDivert driver / raw netfilter) is not
-/// modelled.
-pub const DEFAULT_LISTENERS: &[&str] = &[
-    "tcp://0.0.0.0:11010",
-    "udp://0.0.0.0:11010",
-    "wg://0.0.0.0:11011",
-    "quic://0.0.0.0:11012",
-    "ws://0.0.0.0:11011",
-    "wss://0.0.0.0:11012",
-];
+/// Listener port upstream's CLI expands by default (tcp/udp 11010, then
+/// +1..+3 per scheme). Not applied here: an empty listener list means no
+/// listeners, so the instance only dials out and hole-punches, because the
+/// default set collides between instances and with an official install.
+/// The UI offers that set as a suggestion (ruling msg#477).
+pub const SUGGESTED_LISTENER_PORT: u16 = 11010;
 
 /// Schemes the kernel can listen on or dial directly (`IpScheme`).
 const IP_SCHEMES: &[&str] = &["tcp", "udp", "wg", "quic", "ws", "wss", "faketcp"];
@@ -132,7 +121,8 @@ pub enum Ipv4Mode {
 }
 
 /// Everything the adapter takes from a spec, validated and normalised.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Debug` redacts the secret.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Settings {
     pub network_name: String,
     /// Empty and absent both mean "no secret" (credential mode upstream).
@@ -140,7 +130,7 @@ pub struct Settings {
     pub hostname: Option<String>,
     pub ipv4: Ipv4Mode,
     pub peers: Vec<Endpoint>,
-    /// Effective listeners (defaults applied).
+    /// Listeners; empty means none.
     pub listeners: Vec<Endpoint>,
     pub proxy_cidrs: Vec<Ipv4Net>,
     pub exit_nodes: Vec<IpAddr>,
@@ -175,22 +165,14 @@ impl Settings {
             .iter()
             .map(|uri| Endpoint::parse("peers", uri, false))
             .collect::<Result<Vec<_>, _>>()?;
-        let listeners = if spec.no_listener {
-            if !spec.listeners.is_empty() {
-                return Err(invalid("listeners given with no_listener set".into()));
-            }
-            Vec::new()
-        } else if spec.listeners.is_empty() {
-            DEFAULT_LISTENERS
-                .iter()
-                .map(|uri| Endpoint::parse("listeners", uri, true))
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            spec.listeners
-                .iter()
-                .map(|uri| Endpoint::parse("listeners", uri, true))
-                .collect::<Result<Vec<_>, _>>()?
-        };
+        if spec.no_listener && !spec.listeners.is_empty() {
+            return Err(invalid("listeners given with no_listener set".into()));
+        }
+        let listeners = spec
+            .listeners
+            .iter()
+            .map(|uri| Endpoint::parse("listeners", uri, true))
+            .collect::<Result<Vec<_>, _>>()?;
         let proxy_cidrs = spec
             .proxy_cidrs
             .iter()
@@ -261,6 +243,33 @@ impl Settings {
             .iter()
             .chain(&self.peers)
             .any(|endpoint| endpoint.scheme == scheme)
+    }
+}
+
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Settings")
+            .field("network_name", &self.network_name)
+            .field(
+                "network_secret",
+                &self.network_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("hostname", &self.hostname)
+            .field("ipv4", &self.ipv4)
+            .field("peers", &self.peers)
+            .field("listeners", &self.listeners)
+            .field("proxy_cidrs", &self.proxy_cidrs)
+            .field("exit_nodes", &self.exit_nodes)
+            .field("enable_exit_node", &self.enable_exit_node)
+            .field("mtu", &self.mtu)
+            .field("no_tun", &self.no_tun)
+            .field("socks5_port", &self.socks5_port)
+            .field("port_forwards", &self.port_forwards)
+            .field("magic_dns", &self.magic_dns)
+            .field("public_ipv6_provider", &self.public_ipv6_provider)
+            .field("flags", &self.flags)
+            .field("compression", &self.compression)
+            .finish()
     }
 }
 

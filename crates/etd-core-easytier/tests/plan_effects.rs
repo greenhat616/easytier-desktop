@@ -163,6 +163,7 @@ fn windows_full_set() {
     expected.extend([EffectKind::WinProgramFirewallRule; 2]);
     expected.extend([EffectKind::WinFirewallRule; 8]);
     expected.extend([EffectKind::WinRegistryValue; 7]);
+    expected.push(EffectKind::WinNetworkProfile);
     expected.push(EffectKind::UpnpMapping);
     expected.sort();
     assert_eq!(kinds(&plan), expected);
@@ -195,50 +196,42 @@ fn windows_full_set() {
 }
 
 #[test]
-fn windows_magic_dns_records() {
-    let guid = effects::adapter_guid(&interface_name());
+fn windows_magic_dns_is_one_recovery_record() {
     let plan = plan_for(&ctx(magic_dns()), Platform::Windows).unwrap();
-    let nrpt: Vec<_> = of(&plan, EffectKind::WinNrptRule)
-        .iter()
-        .map(|e| rule_name(e))
-        .collect();
+    let recovery = of(&plan, EffectKind::WinMagicDnsRecovery);
+    assert_eq!(recovery.len(), 1);
     assert_eq!(
-        nrpt,
-        vec![
-            ("et.net", Some("EasyTier Magic DNS")),
-            (".et.net", Some("EasyTier Magic DNS"))
-        ]
+        recovery[0].key,
+        ObjectKey::Registry {
+            key: r"HKLM\SOFTWARE\EasyTier\MagicDNS".into(),
+            value: None,
+        }
     );
-    let registry: Vec<_> = of(&plan, EffectKind::WinRegistryValue)
-        .into_iter()
-        .map(|e| e.key.clone())
-        .collect();
-    assert!(registry.contains(&ObjectKey::Registry {
-        key: r"HKLM\SOFTWARE\EasyTier\MagicDNS".into(),
-        value: Some("NRPTRuleIDs".into()),
-    }));
-    assert!(registry.contains(&ObjectKey::Registry {
-        key: format!(r"HKLM\SOFTWARE\EasyTier\MagicDNS\SearchLists\{guid}"),
-        value: None,
-    }));
-    let search: Vec<_> = of(&plan, EffectKind::WinRegistryValue)
-        .into_iter()
-        .filter(
-            |e| matches!(&e.key, ObjectKey::Registry { value: Some(v), .. } if v == "SearchList"),
-        )
-        .collect();
-    assert_eq!(search.len(), 2);
-    for value in search {
-        assert_eq!(
-            value.undo,
-            Undo::RestoreIfOurs {
-                ours: SettingValue::String("et.net".into()),
-                original: SettingValue::Absent
-            }
-        );
-    }
+    assert_eq!(recovery[0].undo, Undo::ReplayUpstreamRecovery);
+    assert_eq!(recovery[0].persistence, Persistence::Persistent);
+    assert_eq!(recovery[0].scope, instance_scope());
+    // No fixed NRPT pair or SearchList guesses: upstream's record lists
+    // every rule (run-time zones included) and the saved search lists.
+    assert!(of(&plan, EffectKind::WinNrptRule).is_empty());
+    assert_eq!(of(&plan, EffectKind::WinRegistryValue).len(), 7);
     assert_eq!(plan.exclusive, vec!["windows.magic_dns".to_owned()]);
-    assert_eq!(kinds(&plan).len(), 22 + 6);
+    assert_eq!(kinds(&plan).len(), 23 + 1);
+}
+
+#[test]
+fn windows_network_profile_is_located_by_name() {
+    let plan = plan_for(&ctx(basic()), Platform::Windows).unwrap();
+    let profile = of(&plan, EffectKind::WinNetworkProfile);
+    assert_eq!(profile.len(), 1);
+    assert_eq!(
+        profile[0].key,
+        ObjectKey::NetworkProfile {
+            profile_name: interface_name()
+        }
+    );
+    assert_eq!(profile[0].undo, Undo::EnsureAbsent);
+    assert_eq!(profile[0].persistence, Persistence::Persistent);
+    assert_eq!(profile[0].scope, instance_scope());
 }
 
 #[test]

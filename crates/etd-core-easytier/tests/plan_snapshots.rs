@@ -121,15 +121,9 @@ fn basic_windows() {
     );
     assert_eq!(loaded.get_hostname(), "laptop");
     assert_eq!(loaded.get_peers().len(), 1);
-    // Default listeners: upstream's 11010 expansion without faketcp.
-    let listeners: Vec<String> = loaded
-        .get_listeners()
-        .unwrap()
-        .iter()
-        .map(ToString::to_string)
-        .collect();
-    assert_eq!(listeners.len(), 6);
-    assert!(listeners.iter().all(|l| !l.starts_with("faketcp")));
+    // No listeners named: none at all (ruling msg#477), never the
+    // colliding 11010 set.
+    assert_eq!(loaded.get_listeners(), Some(Vec::new()));
 }
 
 #[test]
@@ -203,4 +197,180 @@ fn deterministic_for_replay() {
             assert_eq!(plan_for(&ctx, platform), plan_for(&ctx, platform));
         }
     }
+}
+
+/// Upstream's top-level `Config` has no `deny_unknown_fields`: a misspelt
+/// key would be ignored silently, so every key written is read back.
+#[test]
+fn every_written_key_reads_back() {
+    use etd_contract::v1::{TransportProtocol, network_spec::Ipv4};
+    const KEYS: &[&str] = &[
+        "instance_name",
+        "instance_id",
+        "hostname",
+        "ipv4",
+        "dhcp",
+        "ipv6_public_addr_provider",
+        "listeners",
+        "exit_nodes",
+        "socks5_proxy",
+        "network_identity",
+        "peer",
+        "proxy_network",
+        "port_forward",
+        "flags",
+    ];
+    const FLAG_KEYS: &[&str] = &[
+        "dev_name",
+        "mtu",
+        "no_tun",
+        "latency_first",
+        "enable_encryption",
+        "enable_ipv6",
+        "enable_exit_node",
+        "use_smoltcp",
+        "disable_p2p",
+        "relay_all_peer_rpc",
+        "disable_udp_hole_punching",
+        "multi_thread",
+        "bind_device",
+        "enable_kcp_proxy",
+        "enable_quic_proxy",
+        "accept_dns",
+        "private_mode",
+        "data_compress_algo",
+    ];
+    let mut seen = std::collections::BTreeSet::new();
+    let mut seen_flags = std::collections::BTreeSet::new();
+    let mut with_provider = dhcp();
+    with_provider.public_ipv6_provider = true;
+    for (spec, platform) in [
+        (full(), Platform::Linux),
+        (with_provider, Platform::Windows),
+        (no_tun(), Platform::MacOs),
+    ] {
+        let ctx = ctx(spec.clone());
+        let plan = plan(&ctx, platform);
+        let text = toml_of(&plan);
+        let table: toml::Table = toml::from_str(&text).unwrap();
+        let loaded = TomlConfigLoader::new_from_str(&text).unwrap();
+        for key in table.keys() {
+            assert!(KEYS.contains(&key.as_str()), "unexpected key {key}");
+            seen.insert(key.clone());
+        }
+        for key in table["flags"].as_table().unwrap().keys() {
+            assert!(FLAG_KEYS.contains(&key.as_str()), "unexpected flag {key}");
+            seen_flags.insert(key.clone());
+        }
+        assert_eq!(loaded.get_inst_name(), format!("etd-{INSTANCE}"));
+        assert_eq!(loaded.get_id().to_string(), INSTANCE);
+        assert_eq!(loaded.get_hostname(), spec.hostname);
+        match &spec.ipv4 {
+            Some(Ipv4::Ipv4Cidr(cidr)) => {
+                assert_eq!(loaded.get_ipv4().unwrap().to_string(), *cidr);
+                assert!(!loaded.get_dhcp_config().enabled());
+            }
+            Some(Ipv4::Dhcp(true)) => {
+                assert!(loaded.get_ipv4().is_none());
+                assert!(loaded.get_dhcp_config().enabled());
+            }
+            _ => assert!(loaded.get_ipv4().is_none()),
+        }
+        assert_eq!(
+            loaded.get_ipv6_public_addr_provider(),
+            spec.public_ipv6_provider
+        );
+        let listeners: Vec<String> = loaded
+            .get_listeners()
+            .unwrap()
+            .iter()
+            .map(|u| u.to_string().trim_end_matches('/').to_owned())
+            .collect();
+        let expected: Vec<String> = spec
+            .listeners
+            .iter()
+            .map(|l| l.trim_end_matches('/').to_owned())
+            .collect();
+        assert_eq!(listeners, expected);
+        let exits: Vec<String> = loaded
+            .get_exit_nodes()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(exits, spec.exit_nodes);
+        assert_eq!(
+            loaded.get_socks5_portal().and_then(|u| u.port()),
+            (spec.socks5_port != 0).then_some(spec.socks5_port as u16)
+        );
+        let peers: Vec<String> = loaded
+            .get_peers()
+            .iter()
+            .map(|p| p.uri.to_string())
+            .collect();
+        assert_eq!(peers.len(), spec.peers.len());
+        for (got, want) in peers.iter().zip(&spec.peers) {
+            // `url` drops a scheme's default port.
+            let want = want.replace("wss://relay.example.org:443/", "wss://relay.example.org/");
+            assert!(
+                got.starts_with(want.as_str().trim_end_matches('/')),
+                "{got} vs {want}"
+            );
+        }
+        let proxies: Vec<String> = loaded
+            .get_proxy_cidrs()
+            .iter()
+            .map(|p| p.cidr.to_string())
+            .collect();
+        assert_eq!(proxies, spec.proxy_cidrs);
+        let forwards: Vec<(String, String, String)> = loaded
+            .get_port_forwards()
+            .iter()
+            .map(|f| {
+                (
+                    f.bind_addr.to_string(),
+                    f.dst_addr.to_string(),
+                    f.proto.clone(),
+                )
+            })
+            .collect();
+        let want: Vec<(String, String, String)> = spec
+            .port_forwards
+            .iter()
+            .map(|f| {
+                let proto = if f.protocol == TransportProtocol::Tcp as i32 {
+                    "tcp"
+                } else {
+                    "udp"
+                };
+                (f.bind.clone(), f.destination.clone(), proto.to_owned())
+            })
+            .collect();
+        assert_eq!(forwards, want);
+        let flags = loaded.get_flags();
+        let sf = spec.flags.clone().unwrap_or_default();
+        assert_eq!(flags.no_tun, spec.no_tun);
+        assert_eq!(flags.latency_first, sf.latency_first);
+        assert_eq!(flags.enable_encryption, !sf.disable_encryption);
+        assert_eq!(flags.enable_ipv6, !sf.disable_ipv6);
+        assert_eq!(flags.enable_exit_node, spec.enable_exit_node);
+        assert_eq!(flags.use_smoltcp, sf.use_smoltcp);
+        assert_eq!(flags.disable_p2p, sf.disable_p2p);
+        assert_eq!(flags.relay_all_peer_rpc, sf.relay_all_peer_rpc);
+        assert_eq!(
+            flags.disable_udp_hole_punching,
+            sf.disable_udp_hole_punching
+        );
+        assert_eq!(flags.multi_thread, sf.multi_thread);
+        assert_eq!(flags.bind_device, sf.bind_device);
+        assert_eq!(flags.enable_kcp_proxy, sf.enable_kcp_proxy);
+        assert_eq!(flags.enable_quic_proxy, sf.enable_quic_proxy);
+        assert_eq!(flags.accept_dns, spec.magic_dns);
+        assert_eq!(flags.private_mode, sf.private_mode);
+        if spec.mtu != 0 {
+            assert_eq!(flags.mtu, spec.mtu);
+        }
+    }
+    // The three fixtures together write every key.
+    assert_eq!(seen.len(), KEYS.len(), "{seen:?}");
+    assert_eq!(seen_flags.len(), FLAG_KEYS.len(), "{seen_flags:?}");
 }

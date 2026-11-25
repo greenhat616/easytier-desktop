@@ -391,3 +391,183 @@ pub async fn concurrent_revision(ledger: &dyn Ledger) {
         1
     );
 }
+
+/// Core and product intents are recorded once while open, but cannot keep
+/// an instance generation open after its own records have closed.
+pub async fn shared_effects(ledger: &dyn Ledger) {
+    let mut a = plan("a", 1, &[]);
+    let mut b = plan("b", 1, &[]);
+    let product = EffectIntent {
+        scope: EffectScope::Product,
+        kind: EffectKind::Driver,
+        key: ObjectKey::Service {
+            name: "driver".into(),
+        },
+        undo: Undo::EnsureAbsent,
+        persistence: Persistence::Persistent,
+    };
+    a.effects.push(product.clone());
+    b.effects.push(product);
+    commit(
+        ledger,
+        0,
+        changes(
+            "a",
+            1,
+            vec![
+                put("a", Desired::Running, &[]),
+                put("b", Desired::Running, &[]),
+            ],
+            vec![a, b],
+        ),
+    )
+    .await;
+    let product_filter = ScopeFilter {
+        product: true,
+        kinds: vec![EffectKind::Driver],
+        ..Default::default()
+    };
+    let products = ledger.open_effects(&product_filter).await.unwrap();
+    assert_eq!(products.len(), 1);
+    for name in ["a", "b"] {
+        let id = InstanceId::from(name);
+        let generation = ledger.generation(&id, Epoch(1)).await.unwrap().unwrap();
+        assert_eq!(generation.effects.len(), 2);
+        assert!(generation.effects.iter().any(|e| e.id == products[0].id));
+        let effect = ledger
+            .open_effects(&ScopeFilter::instance(id.clone()))
+            .await
+            .unwrap()
+            .remove(0);
+        ledger
+            .transition(&effect.id, EffectState::Reclaimed, None)
+            .await
+            .unwrap();
+        assert!(
+            ledger
+                .generation(&id, Epoch(1))
+                .await
+                .unwrap()
+                .unwrap()
+                .closed
+        );
+    }
+    assert_eq!(ledger.compact().await.unwrap(), 2);
+    assert_eq!(
+        ledger.open_effects(&product_filter).await.unwrap(),
+        products
+    );
+}
+
+pub async fn remove_while_reclaiming(ledger: &dyn Ledger) {
+    let id = InstanceId::from("a");
+    let mut generation = plan("a", 1, &["X"]);
+    let mut second = generation.effects[0].clone();
+    second.key = ObjectKey::Path {
+        path: "second".into(),
+    };
+    generation.effects.push(second);
+    commit(
+        ledger,
+        0,
+        changes(
+            "start",
+            1,
+            vec![put("a", Desired::Running, &["X"])],
+            vec![generation],
+        ),
+    )
+    .await;
+    let records = ledger
+        .open_effects(&ScopeFilter::instance(id.clone()))
+        .await
+        .unwrap();
+    ledger
+        .transition(&records[0].id, EffectState::Reclaiming, None)
+        .await
+        .unwrap();
+    let remove = changes(
+        "remove",
+        2,
+        vec![Change::RemoveInstance(id.clone())],
+        vec![],
+    );
+    let receipt = ledger.commit(1, remove.clone()).await.unwrap();
+    assert_eq!(
+        ledger.desired().await.unwrap().1[0].desired(),
+        Desired::Stopped
+    );
+    assert_eq!(
+        ledger.claims().await.unwrap(),
+        vec![ClaimHold {
+            resource: "X".into(),
+            instance: id.clone(),
+            source: ClaimSource::Generation(Epoch(1))
+        }]
+    );
+    let revive = changes(
+        "revive",
+        3,
+        vec![put("a", Desired::Running, &["X"])],
+        vec![],
+    );
+    assert!(matches!(
+        ledger.commit(2, revive.clone()).await,
+        Err(LedgerError::EpochOpen { .. })
+    ));
+    assert!(matches!(
+        ledger
+            .commit(
+                2,
+                changes(
+                    "set",
+                    4,
+                    vec![Change::SetDesired {
+                        instance: id.clone(),
+                        desired: Desired::Running
+                    }],
+                    vec![]
+                )
+            )
+            .await,
+        Err(LedgerError::EpochOpen { .. })
+    ));
+    assert!(matches!(
+        ledger.begin_epoch(plan("a", 2, &["X"])).await,
+        Err(LedgerError::EpochOpen { .. })
+    ));
+    ledger
+        .transition(&records[0].id, EffectState::Reclaimed, None)
+        .await
+        .unwrap();
+    assert_eq!(ledger.desired().await.unwrap().1.len(), 1);
+    ledger
+        .transition(&records[1].id, EffectState::Reclaimed, None)
+        .await
+        .unwrap();
+    assert_eq!(ledger.desired().await.unwrap(), (3, vec![]));
+    assert!(ledger.claims().await.unwrap().is_empty());
+    assert_eq!(ledger.next_epoch(&id).await.unwrap(), Epoch(2));
+    assert_eq!(ledger.commit(1, remove).await.unwrap(), receipt);
+    assert_eq!(
+        ledger.commit(2, revive).await,
+        Err(LedgerError::Conflict { current: 3 })
+    );
+    assert!(matches!(
+        ledger
+            .commit(
+                3,
+                changes(
+                    "set",
+                    4,
+                    vec![Change::SetDesired {
+                        instance: id,
+                        desired: Desired::Running
+                    }],
+                    vec![]
+                )
+            )
+            .await,
+        Err(LedgerError::UnknownInstance(_))
+    ));
+}

@@ -2,13 +2,14 @@
 //! copy and publish it only after the backing transaction succeeds.
 use crate::*;
 use etd_contract::{Desired, DesiredInstance, InstanceId, Receipt, RequestId, Revision};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Default)]
 #[doc(hidden)]
 pub struct LedgerState {
     pub(super) revision: Revision,
     pub(super) instances: BTreeMap<InstanceId, (DesiredInstance, Vec<String>)>,
+    pub(super) removal_pending: BTreeSet<InstanceId>,
     pub(super) settings: HostSettings,
     pub(super) requests: BTreeMap<RequestId, (RequestRecord, Ticket)>,
     pub(super) high_water: BTreeMap<InstanceId, Epoch>,
@@ -126,6 +127,30 @@ impl LedgerState {
         Ok(())
     }
 
+    fn reject_pending_removal(&self, instance: &InstanceId) -> Result<(), LedgerError> {
+        if self.removal_pending.contains(instance) {
+            // The open epoch is exactly the reason removal is still pending.
+            self.ensure_closed(instance)?;
+            return Err(invalid("inconsistent removal-pending instance"));
+        }
+        Ok(())
+    }
+
+    fn remove_instance(&mut self, instance: &InstanceId) -> Result<(), LedgerError> {
+        let (stored, _) = self
+            .instances
+            .get_mut(instance)
+            .ok_or_else(|| LedgerError::UnknownInstance(instance.clone()))?;
+        stored.desired = Desired::Stopped as i32;
+        if self.ensure_closed(instance).is_ok() {
+            self.instances.remove(instance);
+            self.removal_pending.remove(instance);
+        } else {
+            self.removal_pending.insert(instance.clone());
+        }
+        Ok(())
+    }
+
     fn check_claims(
         &self,
         instance: &InstanceId,
@@ -149,6 +174,7 @@ impl LedgerState {
     fn apply_change(&mut self, change: &Change) -> Result<(), LedgerError> {
         match change {
             Change::PutInstance { instance, claims } => {
+                self.reject_pending_removal(&InstanceId(instance.instance_id.clone()))?;
                 let mut claims = claims.clone();
                 claims.sort();
                 claims.dedup();
@@ -158,6 +184,7 @@ impl LedgerState {
                 );
             }
             Change::SetDesired { instance, desired } => {
+                self.reject_pending_removal(instance)?;
                 let (stored, _) = self
                     .instances
                     .get_mut(instance)
@@ -165,12 +192,12 @@ impl LedgerState {
                 stored.desired = *desired as i32;
             }
             Change::RemoveInstance(instance) => {
-                self.ensure_closed(instance)?;
-                self.instances
-                    .remove(instance)
-                    .ok_or_else(|| LedgerError::UnknownInstance(instance.clone()))?;
+                self.remove_instance(instance)?;
             }
             Change::RetryReclaim(instance) | Change::RetryStart(instance) => {
+                if matches!(change, Change::RetryStart(_)) {
+                    self.reject_pending_removal(instance)?;
+                }
                 if !self.instances.contains_key(instance) {
                     return Err(LedgerError::UnknownInstance(instance.clone()));
                 }
@@ -181,8 +208,9 @@ impl LedgerState {
             Change::PurgeAll => {
                 // Stop intent is durable before the orchestrator performs
                 // reclaim. Do not discard open ownership records.
-                for (instance, _) in self.instances.values_mut() {
-                    instance.desired = Desired::Stopped as i32;
+                let ids: Vec<_> = self.instances.keys().cloned().collect();
+                for instance in ids {
+                    self.remove_instance(&instance)?;
                 }
                 self.settings = HostSettings::default();
             }
@@ -417,6 +445,21 @@ impl LedgerState {
         e.state = to;
         if obs.is_some() {
             e.observation = obs;
+        }
+        if to == Reclaimed
+            && let Some((instance, _)) = e.scope.generation()
+        {
+            let instance = instance.clone();
+            if self.removal_pending.contains(&instance) && self.ensure_closed(&instance).is_ok() {
+                // Config removal is itself a desired-state change. Advance
+                // revision so a pre-removal planner cannot revive it.
+                self.revision = self
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("revision exhausted"))?;
+                self.instances.remove(&instance);
+                self.removal_pending.remove(&instance);
+            }
         }
         Ok(())
     }

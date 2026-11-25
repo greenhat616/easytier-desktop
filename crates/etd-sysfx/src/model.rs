@@ -104,6 +104,16 @@ pub enum EffectKind {
     Driver,
     /// Host service registration (product scope).
     ServiceRegistration,
+    /// Windows Magic DNS as a whole: upstream's ownership record under
+    /// `HKLM\SOFTWARE\EasyTier\MagicDNS` (NRPT rule ids, saved search
+    /// lists), which covers zones learned at run time. Undone by
+    /// [`Undo::ReplayUpstreamRecovery`], only while no other EasyTier process
+    /// runs (shared with other installs).
+    WinMagicDnsRecovery,
+    /// Windows network-list profile created for the instance's adapter
+    /// (upstream sets its `Category`). Located by profile name, deleted only
+    /// by the profile GUID read back as credential.
+    WinNetworkProfile,
 }
 
 impl EffectKind {
@@ -125,6 +135,8 @@ impl EffectKind {
         EffectKind::MacUtun,
         EffectKind::Driver,
         EffectKind::ServiceRegistration,
+        EffectKind::WinMagicDnsRecovery,
+        EffectKind::WinNetworkProfile,
     ];
 
     /// Stable storage / report name.
@@ -147,6 +159,8 @@ impl EffectKind {
             EffectKind::MacUtun => "macos.utun",
             EffectKind::Driver => "driver",
             EffectKind::ServiceRegistration => "service_registration",
+            EffectKind::WinMagicDnsRecovery => "win.magic_dns_recovery",
+            EffectKind::WinNetworkProfile => "win.network_profile",
         }
     }
 
@@ -158,8 +172,9 @@ impl EffectKind {
             | EffectKind::WinProgramFirewallRule
             | EffectKind::WinNrptRule
             | EffectKind::LinuxResolvedLink
-            | EffectKind::UpnpMapping => rank::DNS_AND_FIREWALL,
-            EffectKind::WinRegistryValue => rank::REGISTRY,
+            | EffectKind::UpnpMapping
+            | EffectKind::WinMagicDnsRecovery => rank::DNS_AND_FIREWALL,
+            EffectKind::WinRegistryValue | EffectKind::WinNetworkProfile => rank::REGISTRY,
             EffectKind::WinTunAdapter | EffectKind::LinuxTun | EffectKind::MacUtun => {
                 rank::INTERFACE
             }
@@ -253,6 +268,9 @@ pub enum ObjectKey {
     },
     /// Driver or service, by its registered name.
     Service { name: String },
+    /// Windows network-list profile, by its `ProfileName` (the interface
+    /// name). The profile GUID is observed later as an opaque credential.
+    NetworkProfile { profile_name: String },
 }
 
 /// Creation credential, read back from the system once the object exists.
@@ -303,7 +321,7 @@ pub enum SettingValue {
     Bytes(Vec<u8>),
 }
 
-/// How to undo. Both forms are idempotent.
+/// How to undo. Every form is idempotent.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -317,6 +335,11 @@ pub enum Undo {
         ours: SettingValue,
         original: SettingValue,
     },
+    /// Replay the creator's own recovery record named by the key (Windows
+    /// Magic DNS: delete every NRPT rule listed in `NRPTRuleIDs`, restore the
+    /// saved search lists, then delete the record), gated on no other
+    /// process of that creator running.
+    ReplayUpstreamRecovery,
 }
 
 /// How long the object survives on its own.

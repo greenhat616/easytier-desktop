@@ -88,6 +88,7 @@ tracing = { version = "0.1.44", default-features = false }
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", default-features = false }
 tray-icon = { version = "0.26.1", default-features = false }
+url = "2.5.9"
 uuid = { version = "1.29.3", default-features = false }
 windows = { version = "0.62.2", default-features = false }
 windows-service = "0.8.1"

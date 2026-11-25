@@ -103,11 +103,11 @@ async fn six_steps_after_a_crash() {
 async fn a_failed_reclaim_quarantines_only_its_instance() {
     let world = World::new();
     crashed_with(&world, &["a", "b"]).await;
-    let kernels = world.spawned();
     // a's kernel can no longer be identified.
+    let a_kernel = world.kernel_of("a");
     world
         .engine
-        .set_liveness(&kernels[0], Some(Liveness::Uncertain));
+        .set_liveness(&a_kernel, Some(Liveness::Uncertain));
     let mut h = world.start();
     h.until("b restarted", |h| {
         h.status("b")
@@ -121,7 +121,7 @@ async fn a_failed_reclaim_quarantines_only_its_instance() {
             .any(|e| e.kind == EffectKind::Process && e.state == EffectState::Quarantined)
     );
     assert!(open.iter().all(|e| e.scope.generation().unwrap().1.0 == 1));
-    assert!(!world.kernel.calls_kill(&kernels[0]));
+    assert!(!world.kernel.calls_kill(&a_kernel));
 }
 
 #[tokio::test]
@@ -211,6 +211,20 @@ async fn ledger_unavailable_recovers_containers_only() {
     assert!(world.sys.foreign_deleted().is_empty());
 }
 
+/// The crashed host's kernels died with it.
+fn exit_all(world: &World) {
+    for id in world.spawned() {
+        world.engine.exit(
+            &id,
+            etd_proc::Exit {
+                code: None,
+                signal: None,
+                cause: etd_proc::ExitCause::Exited,
+            },
+        );
+    }
+}
+
 fn notices(h: &mut Host<'_>, code: &str) -> Vec<etd_contract::v1::Notice> {
     h.settle_sync();
     h.log
@@ -226,6 +240,9 @@ fn notices(h: &mut Host<'_>, code: &str) -> Vec<etd_contract::v1::Notice> {
 async fn a_failed_sweep_holds_every_start_until_a_retry_succeeds() {
     let world = World::new();
     crashed_with(&world, &["a"]).await;
+    // The crashed kernel died too: only the sweeps enumerate (on macOS a
+    // live recorded kernel is looked up by marker first).
+    exit_all(&world);
     // Both sweeps of this boot fail (per generation and whole run dir).
     for _ in 0..2 {
         world
@@ -467,6 +484,7 @@ async fn ledger_unavailable_cleans_nothing_without_proof() {
 async fn a_resweep_quarantines_an_attributable_survivor() {
     let world = World::new();
     crashed_with(&world, &["a", "b"]).await;
+    exit_all(&world);
     // Every sweep of this boot fails (two generation dirs, the run dir).
     for _ in 0..3 {
         world

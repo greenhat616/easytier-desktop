@@ -457,10 +457,10 @@ async fn host_start(edges: &mut Edges) {
         h.wait_state("b", S::ReadyFull).await;
         h.crash();
     }
-    let kernels = world.spawned();
+    let a_kernel = world.kernel_of("a");
     world
         .engine
-        .set_liveness(&kernels[0], Some(Liveness::Uncertain));
+        .set_liveness(&a_kernel, Some(Liveness::Uncertain));
     // b's DNS rule cannot be removed for now: it starts reclaiming.
     world.sys.inject(
         Fault::on(Step::Reclaim)
@@ -475,8 +475,12 @@ async fn host_start(edges: &mut Edges) {
     edges.extend(h.edges());
     h.crash();
 
-    // Starts held by a failed sweep.
-    world.engine.set_liveness(&kernels[0], None);
+    // Starts held by a failed sweep. The kernels died with the host (on
+    // macOS a live recorded kernel would be looked up by marker first).
+    world.engine.set_liveness(&a_kernel, None);
+    for id in world.spawned() {
+        world.engine.exit(&id, crash());
+    }
     for _ in 0..2 {
         world
             .engine

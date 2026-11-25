@@ -334,6 +334,11 @@ pub enum Persistence {
     Persistent,
     /// Expires by itself (router lease) at the given time.
     Expiring { until: jiff::Timestamp },
+    /// Expires by itself (router lease) `seconds` after the generation's
+    /// process is gone. Planned form of a lease whose absolute end is unknown
+    /// at plan time; the reclaimer closes the record once the process record
+    /// is closed and `seconds` have passed since then. Never reclaimed actively.
+    Lease { seconds: u32 },
 }
 
 impl Persistence {

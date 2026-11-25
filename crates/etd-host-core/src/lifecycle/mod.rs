@@ -345,15 +345,29 @@ impl Actor {
     /// held starts go ahead.
     async fn resweep(&mut self) {
         match boot::resweep(&self.ctx).await {
-            Ok(()) => {
-                self.ctx.set_hold(None);
+            Ok(done) => {
+                for line in done.log {
+                    self.host_log(line);
+                }
                 let at = self.now_ms();
+                for notice in done.notices {
+                    self.publisher.notice(at, notice);
+                }
+                if let Some(report) = &done.report {
+                    self.publisher.reclaim(at, view::reclaim_report(report));
+                }
+                for (instance, (epoch, reason)) in done.quarantined {
+                    if let Some(s) = self.supervisors.get(&instance) {
+                        let _ = s.tx.send(SupCmd::Quarantine { epoch, reason });
+                    }
+                }
+                self.ctx.set_hold(None);
                 self.publisher.notice(
                     at,
                     view::notice(
                         etd_contract::v1::NoticeLevel::Info,
                         "selfcheck.complete",
-                        "the kernel sweep succeeded; instances start",
+                        "the kernel sweep succeeded; reclaim and starts go ahead",
                         "",
                     ),
                 );

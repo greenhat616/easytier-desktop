@@ -6,7 +6,7 @@ mod lifecycle_common;
 
 use etd_contract::v1::event::Payload;
 use etd_contract::{Desired, ErrorCode, HostPhase, InstanceState as S};
-use etd_proc::{Command, Liveness, ProcessEngine};
+use etd_proc::{Command, Liveness, ProcessEngine, ProcessIdentity};
 use etd_sysfx::{EffectKind, EffectState, Ledger, LedgerError, StorageFault};
 use etd_testkit::fakes::process::Call;
 use lifecycle_common::*;
@@ -234,9 +234,15 @@ async fn a_failed_sweep_holds_every_start_until_a_retry_succeeds() {
     }
     let mut h = world.start();
     h.wait_serving().await;
-    h.until_still("waiting", |h| h.state("a") == S::Waiting)
-        .await;
+    h.until_still("held", |h| {
+        h.status("a")
+            .is_some_and(|s| s.state() == S::Reclaiming && s.message.contains("sweep"))
+    })
+    .await;
     assert_eq!(notices(&mut h, "selfcheck.incomplete").len(), 1);
+    // No automatic reclaim without proof: generation 1 untouched.
+    assert!(!world.open_records("a").await.is_empty());
+    assert!(world.sys.deleted().is_empty());
     assert_eq!(
         world.spawned().len(),
         1,
@@ -334,4 +340,174 @@ async fn an_unrecordable_quarantine_reclaims_nothing() {
     assert!(world.sys.deleted().is_empty());
     assert_eq!(world.spawned().len(), 1);
     assert_eq!(h.state("a"), S::Quarantined);
+}
+
+async fn host_log(h: &mut Host<'_>) -> Vec<String> {
+    use futures_util::StreamExt;
+    h.logs("").await.unwrap().map(|l| l.text).collect().await
+}
+
+/// A kernel of ours that no record knows and that cannot be attributed to
+/// an instance (outside any `run/<instance>/<epoch>/`).
+async fn unattributable_stray(world: &World) -> ProcessIdentity {
+    world
+        .engine
+        .spawn(Command {
+            executable: world.store.binary.clone(),
+            args: vec![world.dirs.run_dir.join("stray.toml").into()],
+            env: Vec::new(),
+            cwd: None,
+        })
+        .await
+        .unwrap()
+        .identity()
+        .clone()
+}
+
+#[tokio::test]
+async fn an_unattributable_survivor_defers_every_reclaim() {
+    let world = World::new();
+    crashed_with(&world, &["a"]).await;
+    let stray = unattributable_stray(&world).await;
+    world.engine.set_liveness(&stray, Some(Liveness::Uncertain));
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.until_still("held", |h| {
+        h.status("a")
+            .is_some_and(|s| s.state() == S::Reclaiming && s.message.contains("pid"))
+    })
+    .await;
+    h.idle(
+        std::time::Duration::from_millis(500),
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+    // Nothing reclaimed, nothing started, while it may be alive.
+    let open = world.open_records("a").await;
+    assert!(!open.is_empty());
+    assert!(open.iter().all(|e| e.state != EffectState::Reclaiming));
+    assert!(world.sys.deleted().is_empty());
+    assert_eq!(world.spawned().len(), 1);
+    assert!(
+        host_log(&mut h)
+            .await
+            .iter()
+            .any(|l| l.contains("automatic reclaim deferred"))
+    );
+    // Killable again: the re-sweep proves it and everything goes ahead.
+    world.engine.set_liveness(&stray, None);
+    h.until("a restarted", |h| {
+        h.status("a")
+            .is_some_and(|s| s.epoch == 2 && s.state() == S::ReadyFull)
+    })
+    .await;
+    assert_eq!(world.kernel.liveness(&stray).await, Liveness::Gone);
+    assert_eq!(notices(&mut h, "selfcheck.complete").len(), 1);
+}
+
+#[tokio::test]
+async fn an_unpersisted_quarantine_excludes_its_generations() {
+    let world = World::new();
+    crashed_with(&world, &["a", "b"]).await;
+    // An unkillable orphan of a's closed generation 9: the quarantine
+    // cannot be recorded (nothing open there).
+    let stray = world
+        .engine
+        .spawn(Command {
+            executable: world.store.binary.clone(),
+            args: vec![world.dirs.run_dir.join("a").join("9").join("c.toml").into()],
+            env: Vec::new(),
+            cwd: None,
+        })
+        .await
+        .unwrap()
+        .identity()
+        .clone();
+    std::fs::create_dir_all(world.dirs.run_dir.join("a").join("9")).unwrap();
+    world.engine.set_liveness(&stray, Some(Liveness::Uncertain));
+    let mut h = world.start();
+    h.until("b restarted", |h| {
+        h.status("b")
+            .is_some_and(|s| s.epoch == 2 && s.state() == S::ReadyFull)
+    })
+    .await;
+    h.wait_state("a", S::Quarantined).await;
+    // a's generation 1 was left exactly as it was.
+    let open = world.open_records("a").await;
+    assert!(!open.is_empty());
+    assert!(
+        open.iter().all(|e| e.scope.generation().unwrap().1.0 == 1
+            && matches!(e.state, EffectState::Applied | EffectState::Planned)),
+        "{open:?}"
+    );
+    assert!(world.dirs.run_dir.join("a").join("1").exists());
+}
+
+#[tokio::test]
+async fn ledger_unavailable_cleans_nothing_without_proof() {
+    let world = World::new();
+    crashed_with(&world, &["a"]).await;
+    let stray = unattributable_stray(&world).await;
+    world.engine.set_liveness(&stray, Some(Liveness::Uncertain));
+    *world.ledger.desired_error.lock().unwrap() =
+        Some(LedgerError::Unavailable(StorageFault::Locked));
+    let mut h = world.start();
+    h.until_still("diagnose only", |h| h.phase() == HostPhase::DiagnosticOnly)
+        .await;
+    let log = host_log(&mut h).await;
+    assert!(
+        log.iter().any(|l| l.contains("nothing cleaned up")),
+        "{log:?}"
+    );
+    assert!(world.dirs.run_dir.join("a").join("1").exists());
+    assert!(world.sys.deleted().is_empty());
+}
+
+#[tokio::test]
+async fn a_resweep_quarantines_an_attributable_survivor() {
+    let world = World::new();
+    crashed_with(&world, &["a", "b"]).await;
+    // Every sweep of this boot fails (two generation dirs, the run dir).
+    for _ in 0..3 {
+        world
+            .engine
+            .fail_next_enumeration(etd_proc::ProcessError::Enumeration("denied".into()));
+    }
+    // An unrecorded kernel inside a's open generation that cannot be killed.
+    let stray = world
+        .engine
+        .spawn(Command {
+            executable: world.store.binary.clone(),
+            args: vec![world.dirs.run_dir.join("a").join("1").join("c.toml").into()],
+            env: Vec::new(),
+            cwd: None,
+        })
+        .await
+        .unwrap()
+        .identity()
+        .clone();
+    world.engine.set_liveness(&stray, Some(Liveness::Uncertain));
+    let mut h = world.start();
+    h.wait_serving().await;
+    // The re-sweep finds it: a is quarantined (persisted), b goes ahead.
+    h.until("b restarted", |h| {
+        h.status("b")
+            .is_some_and(|s| s.epoch == 2 && s.state() == S::ReadyFull)
+    })
+    .await;
+    h.wait_state("a", S::Quarantined).await;
+    assert_eq!(
+        notices(&mut h, "selfcheck.incomplete").len(),
+        1,
+        "held at boot"
+    );
+    let n = notices(&mut h, "selfcheck.quarantined");
+    assert!(n.iter().any(|n| n.instance_id == "a"), "{n:?}");
+    let open = world.open_records("a").await;
+    assert!(
+        open.iter()
+            .any(|e| e.kind == EffectKind::Process && e.state == EffectState::Quarantined),
+        "{open:?}"
+    );
+    assert_eq!(world.spawned().len(), 3, "a never restarted");
 }

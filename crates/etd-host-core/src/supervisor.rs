@@ -45,7 +45,7 @@ use etd_proc::{
 use etd_sysfx::{
     Credential, Effect, EffectKind, EffectState, Epoch, FenceSpec, GenerationOutcome,
     GenerationReport, LaunchInputs, LedgerError, ManagementGuard, ObjectKey, Observation,
-    Persistence, StoredGeneration, Undo,
+    Persistence, ScopeFilter, StoredGeneration, Undo,
 };
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -68,6 +68,12 @@ pub(crate) enum SupCmd {
     Recheck,
     /// Another generation closed: a single-writer claim may be free.
     ClaimsChanged,
+    /// A kernel of this generation outside any record could not be killed
+    /// (self-check re-sweep): quarantine, never reclaimed automatically.
+    Quarantine {
+        epoch: Epoch,
+        reason: String,
+    },
     Cut {
         reply: Reply<()>,
     },
@@ -582,6 +588,23 @@ impl Supervisor {
                         return Flow::Continue;
                     }
                     let (epoch, then) = (*epoch, then.clone());
+                    // No automatic reclaim before the self-check has
+                    // accounted for every kernel of ours.
+                    if let Some(why) = self.ctx.held() {
+                        let retry = self.now() + self.ctx.config.reclaim_retry;
+                        self.phase = Phase::Reclaim {
+                            epoch,
+                            then,
+                            retry_at: Some(retry),
+                        };
+                        if self.status.message != why {
+                            self.set_state(InstanceState::Reclaiming, why);
+                        }
+                        if self.shutdown.is_some() {
+                            return Flow::Exit;
+                        }
+                        return Flow::Continue;
+                    }
                     if self.reclaim(epoch, then, false).await == Flow::Exit {
                         return Flow::Exit;
                     }
@@ -1265,8 +1288,14 @@ impl Supervisor {
                         .map_err(|err| format!("ledger: {err}"))?;
                     self.notice(NoticeLevel::Warning, "start.preexisting", message);
                 }
-                // Cannot look: read it back after the spawn as usual.
-                Err(_) => pending.push(e.clone()),
+                // An unknown baseline is never taken as absent: no start.
+                Err(err) => {
+                    return Err(format!(
+                        "cannot check {} {} before the start: {err}",
+                        e.kind,
+                        view::key_text(&e.key)
+                    ));
+                }
             }
         }
         Ok(pending)
@@ -1399,7 +1428,7 @@ impl Supervisor {
             v1::LogSource::CoreStderr => &mut live.stderr,
             _ => &mut live.stdout,
         };
-        for line in buffer.push(bytes) {
+        for line in buffer.push(bytes, &self.secrets) {
             self.log(source, live.epoch, line);
         }
     }
@@ -1420,8 +1449,8 @@ impl Supervisor {
             }
         }
         for (source, rest) in [
-            (v1::LogSource::CoreStdout, live.stdout.finish()),
-            (v1::LogSource::CoreStderr, live.stderr.finish()),
+            (v1::LogSource::CoreStdout, live.stdout.finish(&self.secrets)),
+            (v1::LogSource::CoreStderr, live.stderr.finish(&self.secrets)),
         ] {
             if let Some(line) = rest {
                 self.log(source, live.epoch, line);
@@ -1719,25 +1748,46 @@ impl Supervisor {
 
     // ----- reclaim ---------------------------------------------------------
 
-    /// Kill the kernels running from this generation's runtime directory
-    /// that no record knows. `Err`: one survives or cannot be looked for.
-    async fn kill_generation_orphans(&mut self, epoch: Epoch) -> Result<(), String> {
-        let dir = plan::runtime_dir(&self.ctx, &self.id, epoch);
+    /// An orphan kernel of `epoch` survives: the instance is quarantined
+    /// (records persisted by the self-check where a generation is open).
+    fn quarantine_orphan(&mut self, epoch: Epoch, reason: String) {
+        if matches!(self.phase, Phase::Quarantined { .. } | Phase::Live(_)) {
+            return;
+        }
+        self.waiting = false;
+        self.status.epoch = epoch.0;
+        self.phase = Phase::Quarantined { epoch };
+        if !machine::allowed(self.status.state(), InstanceState::Quarantined) {
+            self.set_state(InstanceState::Reclaiming, reason.clone());
+        }
+        self.set_state(InstanceState::Quarantined, reason);
+    }
+
+    /// Kill the kernels running from any of this instance's runtime
+    /// directories that no open record knows (orphans of open or closed
+    /// generations). `Err`: one survives, or they cannot be looked for.
+    async fn kill_instance_orphans(&mut self) -> Result<(), String> {
+        let dir = self.ctx.deps.dirs.run_dir.join(self.id.as_str());
         let process = self.ctx.deps.process.clone();
         let found = process
             .find_marked(&crate::boot::kernel_marker(&self.ctx, dir))
             .await
             .map_err(|e| format!("process sweep failed: {e}"))?;
-        let recorded: Vec<(u32, String)> =
-            match self.ctx.deps.ledger.generation(&self.id, epoch).await {
-                Ok(Some(g)) => g
-                    .effects
-                    .iter()
-                    .filter_map(crate::reclaimers::recorded_identity)
-                    .map(|id| (id.pid, id.start_token))
-                    .collect(),
-                _ => Vec::new(),
-            };
+        let filter = ScopeFilter {
+            kinds: vec![EffectKind::Process],
+            ..ScopeFilter::instance(self.id.clone())
+        };
+        let recorded: Vec<(u32, String)> = self
+            .ctx
+            .deps
+            .ledger
+            .open_effects(&filter)
+            .await
+            .map_err(|e| format!("process records unreadable: {e}"))?
+            .iter()
+            .filter_map(crate::reclaimers::recorded_identity)
+            .map(|id| (id.pid, id.start_token))
+            .collect();
         for id in found {
             if recorded.contains(&(id.pid, id.start_token.clone())) {
                 continue; // the reclaim engine handles recorded kernels
@@ -1755,7 +1805,6 @@ impl Supervisor {
         }
         Ok(())
     }
-
     async fn reclaim(&mut self, epoch: Epoch, then: Then, retry: bool) -> Flow {
         let engine = self.ctx.deps.reclaim.clone();
         let result = if retry {
@@ -1836,9 +1885,9 @@ impl Supervisor {
                 match &self.phase {
                     Phase::Quarantined { epoch } => {
                         let epoch = *epoch;
-                        // Kernels of this generation outside any record
+                        // Kernels of this instance outside any record
                         // (orphans) must go first.
-                        if let Err(why) = self.kill_generation_orphans(epoch).await {
+                        if let Err(why) = self.kill_instance_orphans().await {
                             self.notice(NoticeLevel::Error, "reclaim.orphan", why);
                             return Flow::Continue;
                         }
@@ -1867,6 +1916,10 @@ impl Supervisor {
             }
             SupCmd::ClaimsChanged => {
                 self.waiting = false;
+                Flow::Continue
+            }
+            SupCmd::Quarantine { epoch, reason } => {
+                self.quarantine_orphan(epoch, reason);
                 Flow::Continue
             }
             SupCmd::Cut { reply } => self.on_cut(reply).await,

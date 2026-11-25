@@ -404,3 +404,76 @@ async fn user_host_attaches_only_to_its_own_kernel() {
     assert!(h.log.iter().any(|e| matches!(&e.payload,
         Payload::Notice(n) if n.code == "management.foreign_listener")));
 }
+
+#[tokio::test]
+async fn endless_output_lines_never_leak_the_secret() {
+    use futures_util::StreamExt;
+    let world = World::new();
+    let mut events = Vec::new();
+    for (i, stream) in [
+        ProcessEvent::Stdout as fn(Vec<u8>) -> ProcessEvent,
+        ProcessEvent::Stderr,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // No newline for longer than the line buffer, the secret cut in
+        // three around the limit, then several lines in one chunk.
+        events.push(stream(vec![b'x'; 65_536 - 3 - i]));
+        events.push(stream(b"s3".to_vec()));
+        events.push(stream(b"cr".to_vec()));
+        events.push(stream(b"et".to_vec()));
+        events.push(stream(vec![b'y'; 70_000]));
+        events.push(stream(b"\none s3cret\ntwo s3cret three\n".to_vec()));
+    }
+    world
+        .engine
+        .push_spawn(Ok(etd_testkit::fakes::process::SpawnScript {
+            events,
+            ..Default::default()
+        }));
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.apply("a", spec("net"), Desired::Running).await;
+    h.wait_state("a", S::ReadyFull).await;
+    h.set_desired("a", Desired::Stopped).await.unwrap();
+    h.wait_state("a", S::Stopped).await;
+    let lines: Vec<String> = h.logs("a").await.unwrap().map(|l| l.text).collect().await;
+    let all = lines.concat();
+    assert!(!all.contains("s3cret"), "leaked");
+    assert_eq!(all.matches("<redacted>").count(), 6);
+    assert_eq!(lines.iter().filter(|l| *l == "one <redacted>").count(), 2);
+}
+
+#[tokio::test]
+async fn an_unknown_baseline_never_starts_the_generation() {
+    use etd_testkit::fakes::system::{Fault, Step};
+    let world = World::new();
+    world.sys.inject(
+        Fault::on(Step::Observe)
+            .kind(EffectKind::WinNrptRule)
+            .times(1)
+            .fail(etd_sysfx::ReclaimError::Busy("cannot look".into())),
+    );
+    let mut h = world.start();
+    h.wait_serving().await;
+    let dns = etd_contract::NetworkSpec {
+        magic_dns: true,
+        ..spec("net")
+    };
+    h.apply("a", dns, Desired::Running).await;
+    h.until("backoff", |h| h.state("a") == S::Backoff).await;
+    assert!(
+        world.spawned().is_empty(),
+        "nothing spawned on an unknown baseline"
+    );
+    assert_eq!(
+        h.status("a").unwrap().restart_attempt,
+        1,
+        "counts toward backoff"
+    );
+    h.until("ready", |h| h.state("a") == S::ReadyFull).await;
+    assert_eq!(world.spawned().len(), 1);
+    let open = world.open_records("a").await;
+    assert!(open.iter().all(|e| e.state != EffectState::Conflict));
+}

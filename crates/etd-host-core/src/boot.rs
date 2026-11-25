@@ -26,14 +26,22 @@
 //!    still open (quarantined or pending generations), then accepted
 //!    tickets are replayed.
 //!
-//! The self-check never passes over a failure (ruling msg#567): if the
-//! process records cannot be read, or a sweep fails or finds a kernel it
-//! cannot kill and cannot attribute, no privileged instance starts until a
-//! later sweep succeeds ([`resweep`]); an orphan attributed to an instance
-//! quarantines that instance. Where the quarantine cannot be persisted
-//! (its generation is already closed, or the ledger refuses the write) the
-//! instance stays quarantined in memory and is never reclaimed or started
-//! automatically; the next host start finds the same orphan again.
+//! The self-check never passes over a failure (rulings msg#567, msg#631):
+//! nothing is reclaimed automatically without proof that no kernel of ours
+//! is alive to use it.
+//! - The process records cannot be read, a sweep fails, or a kernel that
+//!   cannot be attributed survives: step 4 is skipped, no instance starts
+//!   and no supervisor reclaims (`Ctx::hold`) until a re-sweep succeeds
+//!   ([`resweep`], same path as here), which then runs step 4.
+//! - An orphan attributed to an instance (`run/<instance>/<epoch>/`) that
+//!   cannot be killed quarantines that instance, persisted on the
+//!   generation's process records. Where that cannot be persisted (the
+//!   generation is closed, or the ledger refuses the write) the instance
+//!   is quarantined in memory and its generations are left out of step 4,
+//!   as is the exclusive-container sweep; the next host start finds the
+//!   same orphan again. A RetryReclaim first kills the instance's orphans.
+//! - Ledger unavailable: exclusive containers are cleaned only when the
+//!   sweep killed every kernel it found; otherwise diagnosis only.
 //!
 //! Running it twice in a row writes nothing the second time: killed
 //! processes are gone, quarantined records are skipped, and the engine
@@ -42,7 +50,7 @@ use crate::lifecycle::{Ctx, view};
 use crate::reclaimers::{exact_identity, recorded_identity};
 use crate::supervisor::Initial;
 use etd_contract::v1::{self, NoticeLevel};
-use etd_contract::{DesiredInstance, HostMode, InstanceId, Revision};
+use etd_contract::{DesiredInstance, InstanceId, Revision};
 use etd_proc::{KillOutcome, Liveness, ProcessIdentity, ProcessMarker};
 use etd_sysfx::{
     Effect, EffectKind, EffectState, Epoch, GenerationOutcome, LedgerError, ReclaimReport,
@@ -61,7 +69,7 @@ pub(crate) struct BootOutcome {
     /// How each instance's supervisor starts; missing means idle.
     pub initial: BTreeMap<InstanceId, Initial>,
     pub report: Option<ReclaimReport>,
-    /// No privileged instance may start until a sweep succeeds.
+    /// Nothing is reclaimed or started until a sweep succeeds.
     pub hold_starts: Option<String>,
     /// Published once serving.
     pub notices: Vec<v1::Notice>,
@@ -99,15 +107,101 @@ pub(crate) struct Sweep {
     /// Instances whose orphan could not be killed: (epoch, reason).
     pub quarantine: BTreeMap<InstanceId, (Epoch, String)>,
     /// The sweep itself failed, or an orphan nobody can be blamed for
-    /// survived: hold every privileged start.
+    /// survived: no automatic reclaim and no start until a sweep succeeds.
     pub failed: Option<String>,
     pub log: Vec<String>,
 }
 
-/// Starts are held only on a privileged host (a user host's kernels run
-/// with the user's own rights).
-fn privileged(ctx: &Ctx) -> bool {
-    ctx.deps.mode != HostMode::User
+impl Sweep {
+    /// Every kernel of ours it found is verified dead.
+    fn proved(&self) -> bool {
+        self.failed.is_none() && self.quarantine.is_empty()
+    }
+}
+
+/// Orphans that could not be killed: quarantine their instances (persisted
+/// where a generation is open), with a notice each. Returns the instances
+/// whose quarantine is held in memory only: no automatic reclaim for them.
+async fn quarantine_orphans(
+    ctx: &Ctx,
+    orphans: &BTreeMap<InstanceId, (Epoch, String)>,
+    log: &mut Vec<String>,
+    notices: &mut Vec<v1::Notice>,
+) -> BTreeSet<InstanceId> {
+    let mut unpersisted = BTreeSet::new();
+    for (instance, (epoch, reason)) in orphans {
+        notices.push(view::notice(
+            NoticeLevel::Error,
+            "selfcheck.quarantined",
+            reason.clone(),
+            instance.as_str(),
+        ));
+        if !persist_orphan_quarantine(ctx, instance, *epoch, reason, log).await {
+            unpersisted.insert(instance.clone());
+        }
+    }
+    unpersisted
+}
+
+/// Step 4 once the kernels are accounted for: every open generation, the
+/// process record first. Instances in `excluded` (a quarantine not
+/// persisted) are left alone entirely, and so is the exclusive-container
+/// sweep (their kernel may still use what is in it).
+pub(crate) async fn reclaim_proven(
+    ctx: &Ctx,
+    excluded: &BTreeSet<InstanceId>,
+    log: &mut Vec<String>,
+) -> Option<ReclaimReport> {
+    let engine = &ctx.deps.reclaim;
+    if excluded.is_empty() {
+        return match engine.reclaim_all(ReclaimScope::Instances).await {
+            Ok(r) => Some(r),
+            Err(e) => {
+                log.push(format!("self-check: reclaim failed: {e}"));
+                None
+            }
+        };
+    }
+    log.push(format!(
+        "self-check: generations of {} left alone (quarantine held in memory); no container sweep",
+        excluded
+            .iter()
+            .map(InstanceId::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    let open = match ctx.deps.ledger.open_effects(&ScopeFilter::default()).await {
+        Ok(o) => o,
+        Err(e) => {
+            log.push(format!("self-check: reclaim failed: {e}"));
+            return None;
+        }
+    };
+    let generations: BTreeSet<(InstanceId, Epoch)> = open
+        .iter()
+        .filter_map(|e| e.scope.generation().map(|(i, ep)| (i.clone(), ep)))
+        .filter(|(i, _)| !excluded.contains(i))
+        .collect();
+    let mut reports = Vec::new();
+    for (instance, epoch) in generations {
+        match engine.reclaim_generation(&instance, epoch).await {
+            Ok(r) => reports.push(r),
+            Err(e) => log.push(format!(
+                "self-check: reclaim of {instance} generation {} failed: {e}",
+                epoch.0
+            )),
+        }
+    }
+    match engine.report().await {
+        Ok(mut r) => {
+            r.generations = reports;
+            Some(r)
+        }
+        Err(e) => {
+            log.push(format!("self-check: reclaim report unavailable: {e}"));
+            None
+        }
+    }
 }
 
 pub(crate) async fn self_check(ctx: Arc<Ctx>) -> BootOutcome {
@@ -147,12 +241,28 @@ pub(crate) async fn self_check(ctx: Arc<Ctx>) -> BootOutcome {
                 "self-check: ledger unavailable ({e}); recovering without it"
             ));
             let sweep = sweep_orphans(&ctx, &BTreeSet::new()).await;
+            let proved = sweep.proved();
             log.extend(sweep.log);
-            let report = match deps.reclaim.recover_without_ledger().await {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    log.push(format!("self-check: recovery failed: {e}"));
-                    None
+            // Exclusive containers are cleaned only once no kernel of ours
+            // can be alive to use them.
+            let report = if proved {
+                match deps.reclaim.recover_without_ledger().await {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        log.push(format!("self-check: recovery failed: {e}"));
+                        None
+                    }
+                }
+            } else {
+                log.push(
+                    "self-check: a kernel of ours may still be alive; nothing cleaned up".into(),
+                );
+                match deps.reclaim.diagnose().await {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        log.push(format!("self-check: diagnosis failed: {e}"));
+                        None
+                    }
                 }
             };
             return BootOutcome::diagnostic(report, log);
@@ -161,6 +271,7 @@ pub(crate) async fn self_check(ctx: Arc<Ctx>) -> BootOutcome {
 
     // Step 3: orphan kernels.
     let mut quarantined: BTreeMap<InstanceId, (Epoch, String)> = BTreeMap::new();
+    let mut excluded: BTreeSet<InstanceId> = BTreeSet::new();
     let mut notices = Vec::new();
     let mut hold: Option<String> = None;
     let mut known: BTreeSet<(u32, String)> = BTreeSet::new();
@@ -200,6 +311,7 @@ pub(crate) async fn self_check(ctx: Arc<Ctx>) -> BootOutcome {
                             "self-check: quarantine of {instance} not recorded ({err}); \
                              it is held in memory, nothing reclaimed or started"
                         ));
+                        excluded.insert(instance.clone());
                     }
                     notices.push(view::notice(
                         NoticeLevel::Error,
@@ -219,37 +331,30 @@ pub(crate) async fn self_check(ctx: Arc<Ctx>) -> BootOutcome {
     }
     let sweep = sweep_orphans(&ctx, &known).await;
     log.extend(sweep.log);
-    for (instance, (epoch, reason)) in sweep.quarantine {
-        notices.push(view::notice(
-            NoticeLevel::Error,
-            "selfcheck.quarantined",
-            reason.clone(),
-            instance.as_str(),
-        ));
-        persist_orphan_quarantine(&ctx, &instance, epoch, &reason, &mut log).await;
-        quarantined.entry(instance).or_insert((epoch, reason));
+    excluded.extend(quarantine_orphans(&ctx, &sweep.quarantine, &mut log, &mut notices).await);
+    for (instance, q) in sweep.quarantine {
+        quarantined.entry(instance).or_insert(q);
     }
     if let Some(why) = sweep.failed {
         hold.get_or_insert(why);
     }
-    let hold_starts = hold.filter(|_| privileged(&ctx));
-    if let Some(why) = &hold_starts {
+    if let Some(why) = &hold {
         notices.push(view::notice(
             NoticeLevel::Error,
             "selfcheck.incomplete",
-            format!("no instance starts until the kernel sweep succeeds: {why}"),
+            format!("nothing is reclaimed or started until the kernel sweep succeeds: {why}"),
             "",
         ));
     }
 
     // Step 4: reclaim every open generation (the engine holds those whose
-    // kernel is not verified dead).
-    let report = match deps.reclaim.reclaim_all(ReclaimScope::Instances).await {
-        Ok(r) => Some(r),
-        Err(e) => {
-            log.push(format!("self-check: reclaim failed: {e}"));
-            None
-        }
+    // kernel is not verified dead), only once every kernel of ours is
+    // accounted for; otherwise it waits for a successful re-sweep.
+    let report = if hold.is_some() {
+        log.push("self-check: automatic reclaim deferred until the kernel sweep succeeds".into());
+        None
+    } else {
+        reclaim_proven(&ctx, &excluded, &mut log).await
     };
 
     // Step 5: compact closed records.
@@ -295,7 +400,7 @@ pub(crate) async fn self_check(ctx: Arc<Ctx>) -> BootOutcome {
         desired,
         initial,
         report,
-        hold_starts,
+        hold_starts: hold,
         notices,
         log,
     }
@@ -389,7 +494,7 @@ async fn persist_orphan_quarantine(
     epoch: Epoch,
     reason: &str,
     log: &mut Vec<String>,
-) {
+) -> bool {
     let filter = ScopeFilter {
         kinds: vec![EffectKind::Process],
         ..ScopeFilter::epoch(instance.clone(), epoch)
@@ -400,7 +505,7 @@ async fn persist_orphan_quarantine(
             log.push(format!(
                 "self-check: quarantine of {instance} not recorded ({e}); held in memory"
             ));
-            return;
+            return false;
         }
     };
     if records.is_empty() {
@@ -408,7 +513,9 @@ async fn persist_orphan_quarantine(
             "self-check: generation {} of {instance} is closed; its orphan keeps the instance quarantined in memory",
             epoch.0
         ));
+        return false;
     }
+    let mut persisted = true;
     for e in records
         .iter()
         .filter(|e| e.state != EffectState::Quarantined)
@@ -417,8 +524,10 @@ async fn persist_orphan_quarantine(
             log.push(format!(
                 "self-check: quarantine of {instance} not recorded ({err}); held in memory"
             ));
+            persisted = false;
         }
     }
+    persisted
 }
 
 /// Diagnose only: list, never kill.
@@ -549,8 +658,20 @@ async fn kill_orphan(ctx: &Ctx, id: &ProcessIdentity, log: &mut Vec<String>) -> 
     }
 }
 
-/// Retry of a failed sweep while starts are held. `Ok`: starts may go on.
-pub(crate) async fn resweep(ctx: &Ctx) -> Result<(), String> {
+/// A successful re-sweep while everything is held.
+pub(crate) struct Resweep {
+    /// Instances whose orphan could not be killed: quarantined (persisted
+    /// where possible), to be put in quarantine by their supervisors.
+    pub quarantined: BTreeMap<InstanceId, (Epoch, String)>,
+    pub notices: Vec<v1::Notice>,
+    pub report: Option<ReclaimReport>,
+    pub log: Vec<String>,
+}
+
+/// Retry of a failed sweep while starts and reclaims are held, the same
+/// path as the self-check: an attributable unkillable orphan quarantines
+/// its instance; then the deferred reclaim runs. `Err`: still no proof.
+pub(crate) async fn resweep(ctx: &Ctx) -> Result<Resweep, String> {
     let known: BTreeSet<(u32, String)> = ctx
         .deps
         .ledger
@@ -565,9 +686,20 @@ pub(crate) async fn resweep(ctx: &Ctx) -> Result<(), String> {
         .map(|id| (id.pid, id.start_token))
         .collect();
     let sweep = sweep_orphans(ctx, &known).await;
-    match sweep.failed {
-        Some(why) => Err(why),
-        None if sweep.quarantine.is_empty() => Ok(()),
-        None => Err("an orphan kernel could not be killed".into()),
+    if let Some(why) = sweep.failed {
+        return Err(why);
     }
+    let mut log = sweep.log;
+    let mut notices = Vec::new();
+    let excluded = quarantine_orphans(ctx, &sweep.quarantine, &mut log, &mut notices).await;
+    let report = reclaim_proven(ctx, &excluded, &mut log).await;
+    if let Err(e) = ctx.deps.ledger.compact().await {
+        log.push(format!("self-check: compaction failed: {e}"));
+    }
+    Ok(Resweep {
+        quarantined: sweep.quarantine,
+        notices,
+        report,
+        log,
+    })
 }

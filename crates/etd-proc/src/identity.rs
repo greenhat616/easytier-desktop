@@ -255,6 +255,80 @@ pub(crate) fn group_absent(group: i32) -> io::Result<bool> {
     }
 }
 
+/// Independent kernel PID list. sysinfo silently omits a listed PID whose
+/// image and argv it cannot read, so the marker sweep reconciles against it.
+#[cfg(target_os = "macos")]
+pub(crate) fn all_pids() -> io::Result<Vec<u32>> {
+    // SAFETY: a null buffer only asks for the current PID count estimate.
+    let mut capacity = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if capacity < 1 {
+        return Err(io::Error::last_os_error());
+    }
+    loop {
+        let mut pids: Vec<libc::pid_t> = vec![0; usize::try_from(capacity).unwrap_or(0) + 64];
+        let bytes = libc::c_int::try_from(std::mem::size_of_val(pids.as_slice()))
+            .map_err(io::Error::other)?;
+        // SAFETY: the kernel writes at most `bytes` bytes into `pids`.
+        let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let count = usize::try_from(count).map_err(io::Error::other)?;
+        // A full buffer may be truncated; never return a short list.
+        if count < pids.len() {
+            pids.truncate(count);
+            return Ok(pids
+                .into_iter()
+                .filter_map(|pid| u32::try_from(pid).ok())
+                .collect());
+        }
+        capacity = libc::c_int::try_from(count.saturating_mul(2)).map_err(io::Error::other)?;
+    }
+}
+
+/// Kernel state of a PID that the sysinfo snapshot omitted.
+#[cfg(target_os = "macos")]
+pub(crate) struct BsdState {
+    pub(crate) zombie: bool,
+    pub(crate) ruid: libc::uid_t,
+}
+
+/// `Ok(None)` only for ESRCH; any other failure is "cannot look", not absence.
+/// The short BSD info flavor carries no same-user check, so another user's
+/// process yields its owner rather than EPERM.
+#[cfg(target_os = "macos")]
+pub(crate) fn bsd_state(pid: u32) -> io::Result<Option<BsdState>> {
+    let pid = i32::try_from(pid).map_err(io::Error::other)?;
+    // SAFETY: proc_bsdshortinfo is plain old data; all-zero is a valid value.
+    let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    let want = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdshortinfo>())
+        .map_err(io::Error::other)?;
+    // SAFETY: errno is thread-local; clear it so a short fill is not judged
+    // by a stale value. proc_pidinfo writes at most `want` bytes into `info`.
+    let got = unsafe {
+        *libc::__error() = 0;
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDT_SHORTBSDINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast(),
+            want,
+        )
+    };
+    if got == want {
+        return Ok(Some(BsdState {
+            zombie: info.pbsi_status == libc::SZOMB,
+            ruid: info.pbsi_ruid,
+        }));
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(None),
+        Some(0) | None => Err(io::Error::other("short proc_bsdshortinfo read")),
+        _ => Err(error),
+    }
+}
+
 #[cfg(unix)]
 pub(crate) fn pid_absent(pid: u32) -> io::Result<bool> {
     let pid = i32::try_from(pid).map_err(io::Error::other)?;

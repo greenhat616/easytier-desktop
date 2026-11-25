@@ -215,11 +215,13 @@ message NetworkFlags {
   bool disable_p2p = 5;
   bool disable_udp_hole_punching = 6;
   bool relay_all_peer_rpc = 7;
-  bool multi_thread = 8;
+  // Absent preserves the upstream default (true).
+  optional bool multi_thread = 8;
   bool private_mode = 9;
   bool disable_ipv6 = 10;
   bool use_smoltcp = 11;
-  bool bind_device = 12;
+  // Absent preserves the upstream default (true).
+  optional bool bind_device = 12;
   // Kernel compression algorithm name; empty = kernel default.
   string compression = 13;
 }

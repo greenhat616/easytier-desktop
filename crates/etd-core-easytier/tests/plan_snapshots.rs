@@ -360,8 +360,8 @@ fn every_written_key_reads_back() {
             flags.disable_udp_hole_punching,
             sf.disable_udp_hole_punching
         );
-        assert_eq!(flags.multi_thread, sf.multi_thread);
-        assert_eq!(flags.bind_device, sf.bind_device);
+        assert_eq!(flags.multi_thread, sf.multi_thread.unwrap_or(true));
+        assert_eq!(flags.bind_device, sf.bind_device.unwrap_or(true));
         assert_eq!(flags.enable_kcp_proxy, sf.enable_kcp_proxy);
         assert_eq!(flags.enable_quic_proxy, sf.enable_quic_proxy);
         assert_eq!(flags.accept_dns, spec.magic_dns);
@@ -373,4 +373,26 @@ fn every_written_key_reads_back() {
     // The three fixtures together write every key.
     assert_eq!(seen.len(), KEYS.len(), "{seen:?}");
     assert_eq!(seen_flags.len(), FLAG_KEYS.len(), "{seen_flags:?}");
+}
+
+#[test]
+fn optional_flags_omit_defaults_and_honor_explicit_false() {
+    use etd_contract::v1::NetworkFlags;
+    let mut spec = basic();
+    for value in [None, Some(false), Some(true)] {
+        spec.flags = Some(NetworkFlags {
+            multi_thread: value,
+            bind_device: value,
+            ..Default::default()
+        });
+        let text = toml_of(&plan(&ctx(spec.clone()), Platform::Linux));
+        let raw: toml::Table = toml::from_str(&text).unwrap();
+        let flags = raw["flags"].as_table().unwrap();
+        for key in ["multi_thread", "bind_device"] {
+            assert_eq!(flags.get(key).and_then(toml::Value::as_bool), value);
+        }
+        let loaded = TomlConfigLoader::new_from_str(&text).unwrap().get_flags();
+        assert_eq!(loaded.multi_thread, value.unwrap_or(true));
+        assert_eq!(loaded.bind_device, value.unwrap_or(true));
+    }
 }

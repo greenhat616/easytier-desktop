@@ -649,8 +649,45 @@ pub async fn reservation_validation(ledger: &dyn Ledger) {
 }
 
 pub async fn caller_and_purge(ledger: &dyn Ledger) {
-    let original = changes("first", 1, vec![put("a", Desired::Stopped, &[])], vec![]);
+    let allow_list = vec![etd_contract::AllowEntry {
+        principal: Some(etd_contract::OsPrincipal {
+            id: Some(etd_contract::v1::os_principal::Id::UnixUid(0)),
+        }),
+        role: etd_contract::Role::Admin as i32,
+        display_name: "installer".into(),
+    }];
+    let original = changes(
+        "first",
+        1,
+        vec![
+            put("a", Desired::Stopped, &[]),
+            Change::SetAllowList(allow_list.clone()),
+            Change::SelectCore(Some("test-core".into())),
+        ],
+        vec![],
+    );
     let receipt = ledger.commit(0, original.clone()).await.unwrap();
+    assert_eq!(
+        ledger
+            .receipt_for(&original.request.request_id, Some(&original.request.caller))
+            .await
+            .unwrap(),
+        Some(receipt.clone())
+    );
+    assert_eq!(
+        ledger
+            .receipt_for(&original.request.request_id, Some("different-caller"))
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        ledger
+            .receipt_for(&original.request.request_id, None)
+            .await
+            .unwrap(),
+        Some(receipt.clone())
+    );
     let mut impersonated = original.clone();
     impersonated.request.caller = "different-caller".into();
     assert_eq!(
@@ -666,6 +703,9 @@ pub async fn caller_and_purge(ledger: &dyn Ledger) {
     let purge = changes("purge", 2, vec![Change::PurgeAll], vec![]);
     let purge_receipt = ledger.commit(1, purge.clone()).await.unwrap();
     assert_eq!(ledger.desired().await.unwrap(), (2, vec![]));
+    let settings = ledger.settings().await.unwrap();
+    assert_eq!(settings.allow_list, allow_list);
+    assert_eq!(settings.selected_core, None);
     assert_eq!(
         ledger.request_status(&original.request).await.unwrap(),
         RequestStatus::New

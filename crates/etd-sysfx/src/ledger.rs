@@ -295,6 +295,21 @@ pub trait Ledger: Send + Sync {
     /// Receipt of an earlier commit, by request id (GetReceipt).
     async fn receipt(&self, request: &RequestId) -> Result<Option<Receipt>, LedgerError>;
 
+    /// Return a receipt only when its stored canonical caller matches. `None`
+    /// is the unrestricted administrative lookup. Unknown and mismatched ids
+    /// are indistinguishable. Older implementations fail closed for a caller.
+    async fn receipt_for(
+        &self,
+        request: &RequestId,
+        caller: Option<&str>,
+    ) -> Result<Option<Receipt>, LedgerError> {
+        if caller.is_some() {
+            Ok(None)
+        } else {
+            self.receipt(request).await
+        }
+    }
+
     /// Accepted operations not yet marked done (for replay after restart).
     async fn pending_tickets(&self) -> Result<Vec<Ticket>, LedgerError>;
     async fn complete_ticket(&self, ticket: &str) -> Result<(), LedgerError>;

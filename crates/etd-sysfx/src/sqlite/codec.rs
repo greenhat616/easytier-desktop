@@ -135,11 +135,11 @@ pub(super) struct Flags {
     disable_p2p: bool,
     disable_udp_hole_punching: bool,
     relay_all_peer_rpc: bool,
-    multi_thread: bool,
+    multi_thread: Option<bool>,
     private_mode: bool,
     disable_ipv6: bool,
     use_smoltcp: bool,
-    bind_device: bool,
+    bind_device: Option<bool>,
     compression: String,
 }
 impl From<v1::NetworkFlags> for Flags {
@@ -953,5 +953,43 @@ impl From<StoredGenerationEntry> for GenerationEntry {
             claims: value.claims,
             shared: value.shared.into_iter().map(EffectId).collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod optional_flag_format {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn optional_flags_fixed_json_and_legacy_bool_decode() {
+        let value = v1::NetworkFlags {
+            multi_thread: None,
+            bind_device: Some(false),
+            ..Default::default()
+        };
+        let expected = json!({
+            "latency_first": false, "disable_encryption": false,
+            "enable_kcp_proxy": false, "enable_quic_proxy": false,
+            "disable_p2p": false, "disable_udp_hole_punching": false,
+            "relay_all_peer_rpc": false, "multi_thread": null,
+            "private_mode": false, "disable_ipv6": false,
+            "use_smoltcp": false, "bind_device": false, "compression": ""
+        });
+        assert_eq!(
+            serde_json::to_value(Flags::from(value.clone())).unwrap(),
+            expected
+        );
+        assert_eq!(
+            v1::NetworkFlags::from(serde_json::from_value::<Flags>(expected.clone()).unwrap()),
+            value
+        );
+        // Old fixed JSON wrote concrete bools. Preserve their exact behavior.
+        let mut legacy = expected;
+        legacy["multi_thread"] = json!(false);
+        legacy["bind_device"] = json!(true);
+        let decoded = v1::NetworkFlags::from(serde_json::from_value::<Flags>(legacy).unwrap());
+        assert_eq!(decoded.multi_thread, Some(false));
+        assert_eq!(decoded.bind_device, Some(true));
     }
 }

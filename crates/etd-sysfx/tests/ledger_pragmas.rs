@@ -40,6 +40,8 @@ async fn pragmas_and_reopen() {
         public_ipv6_provider: true,
         flags: Some(v1::NetworkFlags {
             private_mode: true,
+            multi_thread: Some(false),
+            bind_device: None,
             compression: "test".into(),
             ..Default::default()
         }),
@@ -110,6 +112,20 @@ async fn pragmas_and_reopen() {
     assert_eq!(ledger.settings().await.unwrap(), settings);
     assert_eq!(ledger.desired().await.unwrap(), desired);
     assert_eq!(ledger.pending_tickets().await.unwrap(), tickets);
+    assert_eq!(
+        ledger
+            .receipt_for(&request.request.request_id, Some(&request.request.caller))
+            .await
+            .unwrap(),
+        Some(receipt.clone())
+    );
+    assert!(
+        ledger
+            .receipt_for(&request.request.request_id, Some("foreign-caller"))
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(ledger.commit(0, request).await.unwrap(), receipt);
     assert_eq!(stored.effects[0].boot, old_boot);
     ledger

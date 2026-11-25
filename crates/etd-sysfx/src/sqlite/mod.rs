@@ -247,13 +247,22 @@ impl Ledger for SqliteLedger {
         .await
     }
     async fn receipt(&self, request: &RequestId) -> Result<Option<Receipt>, LedgerError> {
+        self.receipt_for(request, None).await
+    }
+    async fn receipt_for(
+        &self,
+        request: &RequestId,
+        caller: Option<&str>,
+    ) -> Result<Option<Receipt>, LedgerError> {
         let request = request.clone();
+        let caller = caller.map(str::to_owned);
         self.call(move |worker| {
             worker.refresh()?;
-            if worker.state.is_purge_request(&request) {
+            let receipt = worker.state.receipt_for(&request, caller.as_deref());
+            if receipt.is_some() && worker.state.is_purge_request(&request) {
                 worker.finish_checkpoint()?;
             }
-            Ok(worker.state.receipt(&request))
+            Ok(receipt)
         })
         .await
     }

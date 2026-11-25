@@ -51,6 +51,9 @@ impl ReclaimEngine for ReclaimEngineImpl {
             "reclaim engine not implemented".into(),
         ))
     }
+    async fn reclaim_core(&self, _: &str) -> Result<ReclaimReport, LedgerError> {
+        Err(not_implemented())
+    }
     async fn report(&self) -> Result<ReclaimReport, LedgerError> {
         Err(not_implemented())
     }

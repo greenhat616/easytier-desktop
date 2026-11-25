@@ -47,6 +47,9 @@ pub enum StoreError {
     Manifest(String),
     #[error("kernel store I/O error: {0}")]
     Io(String),
+    /// An open generation still uses this kernel.
+    #[error("kernel {version} is in use")]
+    InUse { version: String },
 }
 
 /// Async because resolving hashes the binary (blocking I/O must run off the
@@ -59,4 +62,10 @@ pub trait CoreStore: Send + Sync {
     async fn resolve(&self, want: &CoreSelector) -> Result<VerifiedCore, StoreError>;
     /// Every kernel in the store with its support level, for ListCores.
     async fn list(&self) -> Result<Vec<CoreEntry>, StoreError>;
+    /// Remove a kernel from the store (host maintenance subcommand, not a
+    /// contract call). The caller first runs
+    /// `ReclaimEngine::reclaim_core(sha256)`, which removes the binary's
+    /// program firewall rules and refuses while an open generation uses it;
+    /// only after that succeeds is the binary deleted.
+    async fn remove(&self, version: &str) -> Result<(), StoreError>;
 }

@@ -43,13 +43,14 @@ pub enum EffectScope {
     /// Belongs to one generation of one instance; reclaimed when that
     /// generation ends.
     Instance { instance: InstanceId, epoch: Epoch },
-    /// Belongs to the product (driver, service registration, program
-    /// firewall rules); only `uninstall` / `reclaim --all --purge` remove it.
+    /// Belongs to the product (driver, service registration); only
+    /// `uninstall` / `reclaim --all --purge` remove it.
     Product,
-    /// Shared by every instance launched from one kernel-store binary
-    /// (identified by its SHA-256, lower-case hex); removable once no open
-    /// generation uses that binary. Reserved so that either ruling on the
-    /// program firewall rules' scope (msg#264) stays additive.
+    /// Tied to one kernel-store binary (SHA-256, lower-case hex), shared by
+    /// every instance launched from it: the two Windows program firewall
+    /// rules (ruling msg#276). Reclaimed when that kernel is removed from the
+    /// store (`ReclaimEngine::reclaim_core`, only while no open generation
+    /// uses it), with `uninstall` / `reclaim --all --purge` as backstop.
     CoreBinary { sha256: String },
 }
 
@@ -87,7 +88,7 @@ pub enum EffectKind {
     WinTunAdapter,
     /// One of the eight per-interface firewall rules.
     WinFirewallRule,
-    /// One of the two per-program firewall rules (product scope).
+    /// One of the two per-program firewall rules (core-binary scope).
     WinProgramFirewallRule,
     /// Tcpip / Tcpip6 / NetBT interface values under the adapter GUID.
     WinRegistryValue,

@@ -137,6 +137,10 @@ pub trait ReclaimEngine: Send + Sync {
     /// read-only diagnosis. Never deletes or changes anything, not even in
     /// exclusive containers; lists candidates only.
     async fn diagnose(&self) -> Result<ReclaimReport, ReclaimError>;
+    /// Before a kernel leaves the store: reclaim every core-binary-scope
+    /// record of that binary (program firewall rules). Fails with
+    /// [`LedgerError::EpochOpen`] while an open generation still uses it.
+    async fn reclaim_core(&self, sha256: &str) -> Result<ReclaimReport, LedgerError>;
     /// The latest report (for snapshots and GetReclaimReport).
     async fn report(&self) -> Result<ReclaimReport, LedgerError>;
 }

@@ -45,11 +45,19 @@ fn macos_minimal(pid: u32) -> bool {
 }
 
 #[cfg(any(windows, test))]
-fn windows_minimal(pid: u32, name: &str, system_or_unknown: bool) -> bool {
+fn windows_minimal(
+    pid: u32,
+    name: &str,
+    system_or_unknown: bool,
+    image_observed: bool,
+    argv_observed: bool,
+) -> bool {
     if matches!(pid, 0 | 4) {
         return true;
     }
-    system_or_unknown
+    !image_observed
+        && !argv_observed
+        && system_or_unknown
         && [
             "System",
             "Registry",
@@ -86,14 +94,12 @@ pub(crate) fn query_access_denied(pid: u32) -> bool {
 }
 
 pub(crate) fn minimal_process(process: &sysinfo::Process) -> bool {
-    // Never exclude a candidate with actual executable/argv observation just
-    // because of its name (a normal program can have a similar basename).
-    if process.exe().is_some() || !process.cmd().is_empty() {
-        return false;
-    }
     let pid = process.pid().as_u32();
     #[cfg(target_os = "linux")]
     {
+        if process.exe().is_some() || !process.cmd().is_empty() {
+            return false;
+        }
         let flags = std::fs::read_to_string(format!("/proc/{pid}/stat"))
             .ok()
             .and_then(|stat| {
@@ -114,7 +120,27 @@ pub(crate) fn minimal_process(process: &sysinfo::Process) -> bool {
     {
         let system = "S-1-5-18".parse::<sysinfo::Uid>().ok();
         let system_or_unknown = process.user_id().is_none() || process.user_id() == system.as_ref();
-        windows_minimal(pid, &process.name().to_string_lossy(), system_or_unknown)
+        let name = process.name().to_string_lossy();
+        if !windows_minimal(pid, &name, system_or_unknown, false, false) {
+            return false;
+        }
+        // PID 0/4 are kernel-defined even when sysinfo returns pseudo-image
+        // or argv labels (observed on the elevated Windows CI runner).
+        // For named minimal/pico processes distinguish those labels from
+        // actual paths/argv; never exclude an ordinary executable by name.
+        let image_observed = process.exe().is_some_and(Path::is_absolute);
+        // A space-separated kernel label (e.g. Memory Compression) can
+        // be split into several tokens; a label alone is not a real argv.
+        let argv_observed = !process.cmd().is_empty()
+            && (process.cmd().iter().any(|arg| Path::new(arg).is_absolute())
+                || !process
+                    .cmd()
+                    .iter()
+                    .map(|arg| arg.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .eq_ignore_ascii_case(&name));
+        windows_minimal(pid, &name, system_or_unknown, image_observed, argv_observed)
     }
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
@@ -364,12 +390,21 @@ mod minimal_snapshot_tests {
             "VmmemWSL",
             "Pico Process",
         ] {
-            assert!(windows_minimal(14, name, true));
-            assert!(!windows_minimal(14, name, false));
+            assert!(windows_minimal(14, name, true, false, false));
+            assert!(!windows_minimal(14, name, false, false, false));
+            assert!(!windows_minimal(14, name, true, true, false));
+            assert!(!windows_minimal(14, name, true, false, true));
         }
-        assert!(windows_minimal(4, "System", true));
-        assert!(!windows_minimal(99, "System.exe", true));
-        assert!(!windows_minimal(99, "easytier-core.exe", true));
+        assert!(windows_minimal(4, "System", true, true, true));
+        assert!(windows_minimal(0, "Idle", true, false, true));
+        assert!(!windows_minimal(99, "System.exe", true, false, false));
+        assert!(!windows_minimal(
+            99,
+            "easytier-core.exe",
+            true,
+            false,
+            false
+        ));
     }
 
     #[cfg(windows)]

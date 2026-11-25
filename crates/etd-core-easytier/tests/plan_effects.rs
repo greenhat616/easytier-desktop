@@ -122,15 +122,24 @@ fn windows_registry_values() {
             other => panic!("unexpected registry record {other:?}"),
         })
         .collect();
-    let tcpip = format!(r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{guid}");
+    let tcpip =
+        format!(r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{guid}");
     let tcpip6 =
         format!(r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\{guid}");
     let netbt =
         format!(r"HKLM\SYSTEM\CurrentControlSet\Services\NetBT\Parameters\Interfaces\Tcpip_{guid}");
     let mut expected = Vec::new();
     for key in [&tcpip, &tcpip6] {
-        expected.push((key.clone(), "RegistrationEnabled".into(), SettingValue::U32(0)));
-        expected.push((key.clone(), "DisableDynamicUpdate".into(), SettingValue::U32(1)));
+        expected.push((
+            key.clone(),
+            "RegistrationEnabled".into(),
+            SettingValue::U32(0),
+        ));
+        expected.push((
+            key.clone(),
+            "DisableDynamicUpdate".into(),
+            SettingValue::U32(1),
+        ));
         expected.push((
             key.clone(),
             "MaxNumberOfAddressesToRegister".into(),
@@ -145,7 +154,11 @@ fn windows_registry_values() {
 fn windows_full_set() {
     let name = interface_name();
     let plan = plan_for(&ctx(basic()), Platform::Windows).unwrap();
-    let mut expected = vec![EffectKind::Driver, EffectKind::Driver, EffectKind::WinTunAdapter];
+    let mut expected = vec![
+        EffectKind::Driver,
+        EffectKind::Driver,
+        EffectKind::WinTunAdapter,
+    ];
     expected.push(EffectKind::Route);
     expected.extend([EffectKind::WinProgramFirewallRule; 2]);
     expected.extend([EffectKind::WinFirewallRule; 8]);
@@ -210,7 +223,9 @@ fn windows_magic_dns_records() {
     }));
     let search: Vec<_> = of(&plan, EffectKind::WinRegistryValue)
         .into_iter()
-        .filter(|e| matches!(&e.key, ObjectKey::Registry { value: Some(v), .. } if v == "SearchList"))
+        .filter(
+            |e| matches!(&e.key, ObjectKey::Registry { value: Some(v), .. } if v == "SearchList"),
+        )
         .collect();
     assert_eq!(search.len(), 2);
     for value in search {
@@ -229,7 +244,10 @@ fn windows_magic_dns_records() {
 #[test]
 fn windows_without_tun() {
     let plan = plan_for(&ctx(no_tun()), Platform::Windows).unwrap();
-    assert_eq!(kinds(&plan), vec![EffectKind::UpnpMapping, EffectKind::Driver].tap_sort());
+    assert_eq!(
+        kinds(&plan),
+        vec![EffectKind::UpnpMapping, EffectKind::Driver].tap_sort()
+    );
 }
 
 #[test]
@@ -238,7 +256,12 @@ fn linux_set() {
     let plan = plan_for(&ctx(basic()), Platform::Linux).unwrap();
     assert_eq!(
         kinds(&plan),
-        vec![EffectKind::LinuxTun, EffectKind::Route, EffectKind::UpnpMapping].tap_sort()
+        vec![
+            EffectKind::LinuxTun,
+            EffectKind::Route,
+            EffectKind::UpnpMapping
+        ]
+        .tap_sort()
     );
     for effect in &plan.effects {
         if effect.kind != EffectKind::UpnpMapping {
@@ -259,7 +282,12 @@ fn macos_set() {
     let plan = plan_for(&ctx(basic()), Platform::MacOs).unwrap();
     assert_eq!(
         kinds(&plan),
-        vec![EffectKind::MacUtun, EffectKind::Route, EffectKind::UpnpMapping].tap_sort()
+        vec![
+            EffectKind::MacUtun,
+            EffectKind::Route,
+            EffectKind::UpnpMapping
+        ]
+        .tap_sort()
     );
     assert_eq!(
         of(&plan, EffectKind::Route)[0].key,
@@ -285,6 +313,7 @@ fn upnp_mapping_is_recorded_everywhere() {
                     description: "EasyTier udp hole punch".into(),
                 }
             );
+            assert_eq!(upnp[0].persistence, Persistence::Lease { seconds: 300 });
         }
     }
 }

@@ -45,9 +45,15 @@ fn check_invariants(ctx: &LaunchContext, plan: &LaunchPlan) {
     assert_eq!(plan.files[0].path, config);
     let args: Vec<_> = plan.command.args.iter().map(|a| a.to_owned()).collect();
     let c = args.iter().position(|a| a == "-c").expect("-c present");
-    assert_eq!(args[c + 1], config.as_os_str(), "-c points at the epoch file");
     assert_eq!(
-        args.iter().filter(|a| *a == "-c" || *a == "--config-file").count(),
+        args[c + 1],
+        config.as_os_str(),
+        "-c points at the epoch file"
+    );
+    assert_eq!(
+        args.iter()
+            .filter(|a| *a == "-c" || *a == "--config-file")
+            .count(),
         1
     );
     assert!(std::path::Path::new(&args[c + 1]).starts_with(&ctx.inputs.runtime_dir));
@@ -72,15 +78,25 @@ fn check_invariants(ctx: &LaunchContext, plan: &LaunchPlan) {
     let portal = args.iter().position(|a| a == "--rpc-portal").unwrap();
     assert_eq!(args[portal + 1], "127.0.0.1:15999");
     assert!(plan.command.env.is_empty());
-    assert_eq!(plan.command.cwd.as_deref(), Some(ctx.inputs.runtime_dir.as_path()));
+    assert_eq!(
+        plan.command.cwd.as_deref(),
+        Some(ctx.inputs.runtime_dir.as_path())
+    );
     assert_eq!(plan.command.executable, ctx.inputs.core.binary);
     // Upstream's loader reads the file back.
     let loaded = TomlConfigLoader::new_from_str(&toml).expect("upstream parses the TOML");
     let spec = &ctx.inputs.spec;
-    assert_eq!(loaded.get_network_identity().network_name, spec.network_name);
     assert_eq!(
-        loaded.get_network_identity().network_secret,
-        spec.network_secret.clone().filter(|s| !s.is_empty())
+        loaded.get_network_identity().network_name,
+        spec.network_name
+    );
+    // Upstream reads an absent secret as the empty one.
+    assert_eq!(
+        loaded
+            .get_network_identity()
+            .network_secret
+            .unwrap_or_default(),
+        spec.network_secret.clone().unwrap_or_default()
     );
     assert_eq!(loaded.get_flags().no_tun, spec.no_tun);
     assert_eq!(loaded.get_flags().accept_dns, spec.magic_dns);
@@ -183,7 +199,8 @@ fn deterministic_for_replay() {
     for spec in [basic(), dhcp(), full(), magic_dns()] {
         let ctx = ctx(spec);
         for platform in [Platform::Windows, Platform::Linux, Platform::MacOs] {
-            assert_eq!(plan(&ctx, platform), plan(&ctx, platform));
+            // Refusals (macOS Magic DNS) must be just as repeatable.
+            assert_eq!(plan_for(&ctx, platform), plan_for(&ctx, platform));
         }
     }
 }

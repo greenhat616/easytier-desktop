@@ -124,7 +124,10 @@ fn parse_ipv4_net(field: &str, text: &str) -> Result<Ipv4Net, CoreError> {
 pub enum Ipv4Mode {
     /// Neither address nor DHCP: no IPv4 on the interface until configured.
     None,
-    Static { addr: Ipv4Addr, len: u8 },
+    Static {
+        addr: Ipv4Addr,
+        len: u8,
+    },
     Dhcp,
 }
 
@@ -197,16 +200,16 @@ impl Settings {
             .exit_nodes
             .iter()
             .map(|text| {
-                text.parse::<IpAddr>().map_err(|_| {
-                    invalid(format!("exit_nodes: {text:?} is not an IP address"))
-                })
+                text.parse::<IpAddr>()
+                    .map_err(|_| invalid(format!("exit_nodes: {text:?} is not an IP address")))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let socks5_port = match spec.socks5_port {
             0 => None,
-            port => Some(u16::try_from(port).map_err(|_| {
-                invalid(format!("socks5_port: {port} is not a port"))
-            })?),
+            port => Some(
+                u16::try_from(port)
+                    .map_err(|_| invalid(format!("socks5_port: {port} is not a port")))?,
+            ),
         };
         let port_forwards = spec
             .port_forwards
@@ -266,7 +269,12 @@ fn forward(pf: &PortForward) -> Result<Forward, CoreError> {
     let proto = match TransportProtocol::try_from(pf.protocol) {
         Ok(TransportProtocol::Tcp) => "tcp",
         Ok(TransportProtocol::Udp) => "udp",
-        _ => return Err(invalid(format!("protocol {} is not tcp or udp", pf.protocol))),
+        _ => {
+            return Err(invalid(format!(
+                "protocol {} is not tcp or udp",
+                pf.protocol
+            )));
+        }
     };
     let bind = pf
         .bind
@@ -394,7 +402,11 @@ pub fn render_toml(
         dhcp: (settings.ipv4 == Ipv4Mode::Dhcp).then_some(true),
         ipv6_public_addr_provider: settings.public_ipv6_provider.then_some(true),
         listeners: settings.listeners.iter().map(|l| l.uri.as_str()).collect(),
-        exit_nodes: settings.exit_nodes.iter().map(ToString::to_string).collect(),
+        exit_nodes: settings
+            .exit_nodes
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         socks5_proxy: settings
             .socks5_port
             .map(|port| format!("socks5://0.0.0.0:{port}")),

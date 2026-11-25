@@ -17,7 +17,11 @@ pub fn magic_dns_active(settings: &Settings) -> bool {
     settings.magic_dns && !settings.no_tun
 }
 
-pub fn classify(settings: &Settings, platform: Platform, privilege: Privilege) -> Vec<FeatureVerdict> {
+pub fn classify(
+    settings: &Settings,
+    platform: Platform,
+    privilege: Privilege,
+) -> Vec<FeatureVerdict> {
     let privileged = privilege == Privilege::System;
     let mut verdicts = Vec::new();
     let mut push = |feature: &str, class: FeatureClass| {

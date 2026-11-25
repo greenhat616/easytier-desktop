@@ -65,7 +65,10 @@ fn linux_magic_dns_is_supported_per_link() {
 fn public_ipv6_elsewhere_changes_nothing() {
     for platform in [Platform::Windows, Platform::MacOs] {
         let plan = plan_for(&ctx(public_ipv6()), platform).unwrap();
-        assert_eq!(class_of(&plan, "public_ipv6_provider"), FeatureClass::Supported);
+        assert_eq!(
+            class_of(&plan, "public_ipv6_provider"),
+            FeatureClass::Supported
+        );
     }
 }
 
@@ -81,7 +84,12 @@ fn kernel_without_profile_is_refused_on_a_privileged_host() {
     // A profile id this adapter does not ship, or one paired with another
     // kernel, is no profile either.
     for profile in ["9.9.9-0000000", "2.7.1-c97f36b"] {
-        let mut ctx = ctx_with(basic(), Privilege::System, ManagementGuard::Fence, Some(profile));
+        let mut ctx = ctx_with(
+            basic(),
+            Privilege::System,
+            ManagementGuard::Fence,
+            Some(profile),
+        );
         ctx.inputs.core.proto_revision = "0123456".into();
         assert!(matches!(
             plan_for(&ctx, Platform::Windows),
@@ -92,7 +100,12 @@ fn kernel_without_profile_is_refused_on_a_privileged_host() {
 
 #[test]
 fn user_host_runs_unknown_kernels_lifecycle_only() {
-    let ctx = ctx_with(no_tun(), Privilege::User, ManagementGuard::LifecycleOnly, None);
+    let ctx = ctx_with(
+        no_tun(),
+        Privilege::User,
+        ManagementGuard::LifecycleOnly,
+        None,
+    );
     let plan = plan_for(&ctx, Platform::Linux).unwrap();
     assert_eq!(plan.management, ManagementGuard::LifecycleOnly);
     let ctx = ctx_with(no_tun(), Privilege::User, ManagementGuard::Unguarded, None);
@@ -116,7 +129,11 @@ fn guards_per_host() {
         (Privilege::User, ManagementGuard::DenyAll, false),
     ];
     for (privilege, guard, ok) in cases {
-        let spec = if privilege == Privilege::System { basic() } else { no_tun() };
+        let spec = if privilege == Privilege::System {
+            basic()
+        } else {
+            no_tun()
+        };
         let ctx = ctx_with(spec, privilege, guard, Some("2.7.1-c97f36b"));
         let result = plan_for(&ctx, Platform::Windows);
         if ok {
@@ -142,7 +159,10 @@ fn deny_all_whitelist_admits_no_client() {
         ManagementGuard::DenyAll,
     );
     let args: Vec<_> = cmd.args.iter().map(|a| a.to_string_lossy()).collect();
-    let i = args.iter().position(|a| a == "--rpc-portal-whitelist").unwrap();
+    let i = args
+        .iter()
+        .position(|a| a == "--rpc-portal-whitelist")
+        .unwrap();
     assert_eq!(args[i + 1], "255.255.255.255/32");
 }
 
@@ -158,7 +178,10 @@ fn user_host_cannot_run_a_tun() {
     spec.public_ipv6_provider = true;
     let plan = plan_for(&user_ctx(spec), Platform::Linux).unwrap();
     assert_eq!(class_of(&plan, "magic_dns"), FeatureClass::Supported);
-    assert_eq!(class_of(&plan, "public_ipv6_provider"), FeatureClass::Supported);
+    assert_eq!(
+        class_of(&plan, "public_ipv6_provider"),
+        FeatureClass::Supported
+    );
 }
 
 #[test]
@@ -174,7 +197,11 @@ fn every_configured_feature_has_a_verdict() {
         "socks5_port",
         "port_forwards",
     ] {
-        assert_eq!(class_of(&plan, feature), FeatureClass::Supported, "{feature}");
+        assert_eq!(
+            class_of(&plan, feature),
+            FeatureClass::Supported,
+            "{feature}"
+        );
     }
 }
 
@@ -220,18 +247,30 @@ fn invalid_specs() {
     cases.push(("exit node", spec));
     for (name, spec) in cases {
         assert!(
-            matches!(plan_for(&ctx(spec), Platform::Linux), Err(CoreError::InvalidSpec(_))),
+            matches!(
+                plan_for(&ctx(spec), Platform::Linux),
+                Err(CoreError::InvalidSpec(_))
+            ),
             "{name}"
         );
     }
     // Host-chosen inputs are checked too.
     let mut bad = ctx(basic());
     bad.inputs.management = "0.0.0.0:15999".parse().unwrap();
-    assert!(matches!(plan_for(&bad, Platform::Linux), Err(CoreError::InvalidSpec(_))));
+    assert!(matches!(
+        plan_for(&bad, Platform::Linux),
+        Err(CoreError::InvalidSpec(_))
+    ));
     let mut bad = ctx(basic());
     bad.inputs.management = "127.0.0.1:0".parse().unwrap();
-    assert!(matches!(plan_for(&bad, Platform::Linux), Err(CoreError::InvalidSpec(_))));
+    assert!(matches!(
+        plan_for(&bad, Platform::Linux),
+        Err(CoreError::InvalidSpec(_))
+    ));
     let mut bad = ctx(basic());
     bad.inputs.runtime_dir = "run/x/7".into();
-    assert!(matches!(plan_for(&bad, Platform::Linux), Err(CoreError::InvalidSpec(_))));
+    assert!(matches!(
+        plan_for(&bad, Platform::Linux),
+        Err(CoreError::InvalidSpec(_))
+    ));
 }

@@ -10,11 +10,7 @@
 //!   `reg_change_catrgory_in_profile`): written only into a profile Windows
 //!   already created under the interface's name; its key is not known
 //!   before launch.
-use super::{
-    Platform,
-    classify::magic_dns_active,
-    spec::Settings,
-};
+use super::{Platform, classify::magic_dns_active, spec::Settings};
 use etd_core_api::LaunchContext;
 use etd_sysfx::{
     EffectIntent, EffectKind, EffectScope, ObjectKey, Persistence, SettingValue, Undo, naming,
@@ -40,7 +36,7 @@ pub const MAGIC_DNS_ZONE: &str = "et.net";
 
 /// UPnP / NAT-PMP mapping description and lease (`common/upnp.rs`).
 pub const UPNP_DESCRIPTION: &str = "EasyTier udp hole punch";
-pub const UPNP_LEASE_SECONDS: i64 = 300;
+pub const UPNP_LEASE_SECONDS: u32 = 300;
 
 /// Driver services (product scope, removed only on uninstall).
 pub const WINTUN_DRIVER: &str = "wintun";
@@ -163,9 +159,6 @@ impl Builder<'_> {
     /// false), port chosen at run time, so the key names the description
     /// and leaves the port open (0). Lease 300 s, renewed every 240 s.
     fn upnp(&mut self) {
-        let until = jiff::Timestamp::UNIX_EPOCH
-            .checked_add(jiff::SignedDuration::from_secs(UPNP_LEASE_SECONDS))
-            .expect("in range");
         self.absent(
             EffectKind::UpnpMapping,
             ObjectKey::PortMapping {
@@ -174,9 +167,10 @@ impl Builder<'_> {
                 external_port: None,
                 description: UPNP_DESCRIPTION.into(),
             },
-            // Lease length since the generation ended, pending the ruling on
-            // how a pure plan expresses an expiry (see the E1 report).
-            Persistence::Expiring { until },
+            // Record only: the router drops it one lease after the process.
+            Persistence::Lease {
+                seconds: UPNP_LEASE_SECONDS,
+            },
         );
     }
 
@@ -267,7 +261,11 @@ impl Builder<'_> {
                 self.registry_value(format!("{prefix}{guid}"), value, SettingValue::U32(data));
             }
         }
-        self.registry_value(format!("{NETBT}{guid}"), "NetbiosOptions", SettingValue::U32(2));
+        self.registry_value(
+            format!("{NETBT}{guid}"),
+            "NetbiosOptions",
+            SettingValue::U32(2),
+        );
 
         if magic_dns_active(settings) {
             // Two NRPT rules under DnsPolicyConfig\{random id}: the zone and

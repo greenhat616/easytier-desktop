@@ -33,7 +33,9 @@ pub async fn identify(binary: &Path) -> Result<CoreDescriptor, CoreError> {
     let output = tokio::time::timeout(VERSION_TIMEOUT, command.output())
         .await
         .map_err(|_| CoreError::Identify(format!("{} --version timed out", binary.display())))?
-        .map_err(|error| CoreError::Identify(format!("cannot run {}: {error}", binary.display())))?;
+        .map_err(|error| {
+            CoreError::Identify(format!("cannot run {}: {error}", binary.display()))
+        })?;
     if !output.status.success() {
         return Err(CoreError::Identify(format!(
             "{} --version exited with {}",
@@ -88,7 +90,10 @@ pub fn parse_version_output(text: &str) -> Result<CoreDescriptor, CoreError> {
 fn revision_of(describe: &str) -> String {
     let is_hash = |s: &str| s.len() >= 7 && s.bytes().all(|b| b.is_ascii_hexdigit());
     let dirty = describe.contains('~');
-    let tokens: Vec<&str> = describe.split('-').map(|t| t.trim_end_matches('~')).collect();
+    let tokens: Vec<&str> = describe
+        .split('-')
+        .map(|t| t.trim_end_matches('~'))
+        .collect();
     let hash = tokens
         .iter()
         .rev()
@@ -130,7 +135,10 @@ mod tests {
             parse("easytier-core 2.7.1-c97f36b8"),
             ("2.7.1".into(), "c97f36b8".into())
         );
-        assert_eq!(parse("easytier-core 2.7.1\n"), ("2.7.1".into(), String::new()));
+        assert_eq!(
+            parse("easytier-core 2.7.1\n"),
+            ("2.7.1".into(), String::new())
+        );
         assert_eq!(
             parse("easytier-core 2.7.1-c97f36b8~-20261124"),
             ("2.7.1".into(), "c97f36b8~".into())
@@ -155,7 +163,12 @@ mod tests {
 
     #[test]
     fn rejects_other_programs_and_garbage() {
-        for text in ["", "easytier-cli 2.7.1-c97f36b8", "easytier-core", "easytier-core x.y"] {
+        for text in [
+            "",
+            "easytier-cli 2.7.1-c97f36b8",
+            "easytier-core",
+            "easytier-core x.y",
+        ] {
             assert!(matches!(
                 parse_version_output(text),
                 Err(CoreError::Identify(_))

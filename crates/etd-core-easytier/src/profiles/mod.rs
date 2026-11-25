@@ -95,7 +95,11 @@ mod tests {
 
     #[test]
     fn deny_all_is_unverified_until_privileged_tests_pass() {
-        assert!(!profile_for(&core("2.7.1", "c97f36b")).unwrap().deny_all_verified);
+        assert!(
+            !profile_for(&core("2.7.1", "c97f36b"))
+                .unwrap()
+                .deny_all_verified
+        );
     }
 
     #[test]

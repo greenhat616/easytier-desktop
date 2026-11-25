@@ -55,12 +55,19 @@ fn secret_only_in_the_file() {
         assert!(!format!("{plan:?}").contains(SECRET), "secret in Debug");
         assert!(!format!("{plan:#?}").contains(SECRET), "secret in Debug");
         for arg in &plan.command.args {
-            assert!(!arg.to_string_lossy().contains(SECRET), "secret on the command line");
+            assert!(
+                !arg.to_string_lossy().contains(SECRET),
+                "secret on the command line"
+            );
         }
         assert!(plan.command.env.is_empty());
         let file = String::from_utf8(plan.files[0].contents.clone()).unwrap();
-        // The file carries it, TOML-escaped.
-        assert!(file.contains(r#"network_secret = "s3cr3t-\"quoted\"-p@ss""#));
+        // The file carries it, quoted so that TOML reads it back verbatim.
+        let doc: toml::Table = toml::from_str(&file).unwrap();
+        assert_eq!(
+            doc["network_identity"]["network_secret"].as_str(),
+            Some(SECRET)
+        );
     }
 }
 
@@ -81,8 +88,16 @@ fn snapshots_are_redacted() {
     for entry in std::fs::read_dir(&dir).expect("snapshots exist") {
         let path = entry.unwrap().path();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(!text.contains(SECRET), "{} holds the secret", path.display());
-        assert!(!text.contains("s3cr3t"), "{} holds the secret", path.display());
+        assert!(
+            !text.contains(SECRET),
+            "{} holds the secret",
+            path.display()
+        );
+        assert!(
+            !text.contains("s3cr3t"),
+            "{} holds the secret",
+            path.display()
+        );
         if text.contains("network_secret") {
             assert!(text.contains("<SECRET>"), "{}", path.display());
             seen += 1;

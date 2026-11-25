@@ -55,7 +55,12 @@ pub fn plan_launch(ctx: &LaunchContext) -> Result<LaunchPlan, CoreError> {
 pub fn plan_for(ctx: &LaunchContext, platform: Platform) -> Result<LaunchPlan, CoreError> {
     let inputs = &ctx.inputs;
     let profile = resolve_profile(ctx)?;
-    check_guard(inputs.privilege, inputs.guard, profile, &inputs.core.version)?;
+    check_guard(
+        inputs.privilege,
+        inputs.guard,
+        profile,
+        &inputs.core.version,
+    )?;
     check_management(inputs.management)?;
     check_interface_name(&inputs.interface_name)?;
     if !inputs.runtime_dir.is_absolute() {
@@ -98,7 +103,12 @@ pub fn plan_for(ctx: &LaunchContext, platform: Platform) -> Result<LaunchPlan, C
     Ok(LaunchPlan {
         command,
         files: vec![config],
-        readiness: readiness(&settings, platform, &inputs.interface_name, inputs.management),
+        readiness: readiness(
+            &settings,
+            platform,
+            &inputs.interface_name,
+            inputs.management,
+        ),
         effects,
         management: inputs.guard,
         endpoint: CoreEndpoint(inputs.management),
@@ -174,7 +184,9 @@ fn check_management(addr: SocketAddr) -> Result<(), CoreError> {
 fn check_interface_name(name: &str) -> Result<(), CoreError> {
     let suffix = name.strip_prefix(naming::INTERFACE_PREFIX);
     let valid = suffix.is_some_and(|s| {
-        s.len() == 8 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        s.len() == 8
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     });
     if !valid {
         return Err(CoreError::InvalidSpec(format!(

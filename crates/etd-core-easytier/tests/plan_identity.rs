@@ -92,7 +92,14 @@ fn plan_uses_the_derived_name_and_guid() {
 
 #[test]
 fn only_derived_names_are_planned() {
-    for bad in ["et_1", "etd-3F9A1C2E", "etd-3f9a1c2", "etd-3f9a1c2e0", "wintun", ""] {
+    for bad in [
+        "et_1",
+        "etd-3F9A1C2E",
+        "etd-3f9a1c2",
+        "etd-3f9a1c2e0",
+        "wintun",
+        "",
+    ] {
         let mut ctx = ctx(basic());
         ctx.inputs.interface_name = bad.into();
         assert!(

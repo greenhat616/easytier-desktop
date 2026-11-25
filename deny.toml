@@ -2,6 +2,36 @@
 # New licenses and sources must be inspected rather than silently ignored.
 [advisories]
 yanked = "deny"
+# Temporary exceptions for EasyTier c97f36b (2026-11-25); no compatible
+# patched versions resolved by cargo update -p. Revisit on every upstream
+# revision change and before enabling the real kernel adapter or publishing.
+# New advisory IDs still fail CI. These are not fixes to the upstream crates.
+ignore = [
+    { id = "RUSTSEC-2026-0118", reason = "etd-host -> etd-core-easytier -> easytier-core -> hickory-proto 0.25.2; upstream ^0.25.2 has no compatible fix; DNSSEC features disabled. Recheck and remove with patched upstream or before enabling runtime adapter." },
+    { id = "RUSTSEC-2026-0119", reason = "etd-host -> etd-core-easytier -> easytier-core -> hickory-proto 0.25.2; upstream ^0.25.2 has no compatible fix; current scaffold does not invoke DNS processing. Recheck and remove with patched upstream or before enabling runtime adapter." },
+    { id = "RUSTSEC-2026-0487", reason = "etd-host -> etd-core-easytier -> easytier-core -> hickory-proto 0.25.2; upstream ^0.25.2 has no compatible fix; current scaffold does not invoke DNS processing. Recheck and remove with patched upstream or before enabling runtime adapter." },
+    { id = "RUSTSEC-2026-0489", reason = "etd-host -> etd-core-easytier -> easytier-core -> hickory-proto 0.25.2; upstream ^0.25.2 has no compatible fix; current scaffold does not invoke DNS processing. Recheck and remove with patched upstream or before enabling runtime adapter." },
+    { id = "RUSTSEC-2026-0490", reason = "etd-host -> etd-core-easytier -> easytier-core -> hickory-proto 0.25.2; upstream ^0.25.2 has no compatible fix; current scaffold does not invoke DNS processing. Recheck and remove with patched upstream or before enabling runtime adapter." },
+    { id = "RUSTSEC-2026-0491", reason = "etd-host -> etd-core-easytier -> easytier-core -> hickory-proto 0.25.2; upstream ^0.25.2 has no compatible fix; current scaffold does not invoke DNS processing. Recheck and remove with patched upstream or before enabling runtime adapter." },
+    { id = "RUSTSEC-2026-0504", reason = "etd-host -> etd-core-easytier -> easytier-core -> hickory-proto 0.25.2; upstream ^0.25.2 has no compatible fix; DNSSEC features disabled. Recheck and remove with patched upstream or before enabling runtime adapter." },
+    { id = "RUSTSEC-2026-0505", reason = "etd-host -> etd-core-easytier -> easytier-core -> hickory-proto 0.25.2; upstream ^0.25.2 has no compatible fix; DNSSEC features disabled. Recheck and remove with patched upstream or before enabling runtime adapter." },
+    { id = "RUSTSEC-2026-0511", reason = "etd-host -> etd-core-easytier -> easytier-core -> hickory-proto 0.25.2; upstream ^0.25.2 has no compatible fix; DNSSEC features disabled. Recheck and remove with patched upstream or before enabling runtime adapter." },
+    { id = "RUSTSEC-2026-0512", reason = "etd-host -> etd-core-easytier -> easytier-core -> hickory-proto 0.25.2; upstream ^0.25.2 has no compatible fix; DNSSEC features disabled. Recheck and remove with patched upstream or before enabling runtime adapter." },
+    { id = "RUSTSEC-2026-0530", reason = "etd-host -> etd-core-easytier -> easytier-core -> hickory-proto 0.25.2; upstream ^0.25.2 has no compatible fix; DNSSEC features disabled. Recheck and remove with patched upstream or before enabling runtime adapter." },
+    { id = "RUSTSEC-2026-0531", reason = "etd-host -> etd-core-easytier -> easytier-core -> hickory-proto 0.25.2; upstream ^0.25.2 has no compatible fix; DNSSEC features disabled. Recheck and remove with patched upstream or before enabling runtime adapter." },
+    { id = "RUSTSEC-2026-0532", reason = "etd-host -> etd-core-easytier -> easytier-core -> hickory-proto 0.25.2; upstream ^0.25.2 has no compatible fix; DNSSEC features disabled. Recheck and remove with patched upstream or before enabling runtime adapter." },
+    { id = "RUSTSEC-2026-0549", reason = "etd-host -> etd-core-easytier -> easytier-core -> hickory-proto 0.25.2; upstream ^0.25.2 has no compatible fix; DNSSEC features disabled. Recheck and remove with patched upstream or before enabling runtime adapter." },
+    { id = "RUSTSEC-2026-0550", reason = "etd-host -> etd-core-easytier -> easytier-core -> hickory-proto 0.25.2; upstream ^0.25.2 has no compatible fix; DNSSEC features disabled. Recheck and remove with patched upstream or before enabling runtime adapter." },
+    { id = "RUSTSEC-2026-0551", reason = "etd-host -> etd-core-easytier -> easytier-core -> hickory-proto 0.25.2; upstream ^0.25.2 has no compatible fix; DNSSEC features disabled. Recheck and remove with patched upstream or before enabling runtime adapter." },
+    { id = "RUSTSEC-2026-0367", reason = "etd-host -> etd-core-easytier -> easytier-proto -> zip 8.6.0 (build-dependency); upstream ^8.6.0 has no compatible fix; CI supplies verified protoc and includes, avoiding Windows fallback ZIP processing. Recheck and remove when upstream upgrades zip or removes fallback." },
+    { id = "RUSTSEC-2026-0368", reason = "etd-host -> etd-core-easytier -> easytier-proto -> zip 8.6.0 (build-dependency); upstream ^8.6.0 has no compatible fix; CI supplies verified protoc and includes, avoiding Windows fallback ZIP processing. Recheck and remove when upstream upgrades zip or removes fallback." },
+    { id = "RUSTSEC-2026-0369", reason = "etd-host -> etd-core-easytier -> easytier-proto -> zip 8.6.0 (build-dependency); upstream ^8.6.0 has no compatible fix; CI supplies verified protoc and includes, avoiding Windows fallback ZIP processing. Recheck and remove when upstream upgrades zip or removes fallback." },
+    { id = "RUSTSEC-2026-0429", reason = "etd-host -> etd-core-easytier -> easytier-proto -> zip 8.6.0 (build-dependency); upstream ^8.6.0 has no compatible fix; CI supplies verified protoc and includes, avoiding Windows fallback ZIP processing. Recheck and remove when upstream upgrades zip or removes fallback." },
+    { id = "RUSTSEC-2026-0545", reason = "etd-host -> etd-core-easytier -> easytier-proto -> zip 8.6.0 (build-dependency); upstream ^8.6.0 has no compatible fix; CI supplies verified protoc and includes, avoiding Windows fallback ZIP processing. Recheck and remove when upstream upgrades zip or removes fallback." },
+    { id = "RUSTSEC-2026-0546", reason = "etd-host -> etd-core-easytier -> easytier-proto -> zip 8.6.0 (build-dependency); upstream ^8.6.0 has no compatible fix; CI supplies verified protoc and includes, avoiding Windows fallback ZIP processing. Recheck and remove when upstream upgrades zip or removes fallback." },
+    { id = "RUSTSEC-2026-0547", reason = "etd-host -> etd-core-easytier -> easytier-proto -> zip 8.6.0 (build-dependency); upstream ^8.6.0 has no compatible fix; CI supplies verified protoc and includes, avoiding Windows fallback ZIP processing. Recheck and remove when upstream upgrades zip or removes fallback." },
+    { id = "RUSTSEC-2026-0548", reason = "etd-host -> etd-core-easytier -> easytier-proto -> zip 8.6.0 (build-dependency); upstream ^8.6.0 has no compatible fix; CI supplies verified protoc and includes, avoiding Windows fallback ZIP processing. Recheck and remove when upstream upgrades zip or removes fallback." },
+]
 
 [licenses]
 allow = [
@@ -13,6 +43,20 @@ allow = [
     "0BSD", "NCSA", "MIT-0", "CDLA-Permissive-2.0", "bzip2-1.0.6",
 ]
 confidence-threshold = 0.8
+
+
+# The pinned upstream packages declare license-file = "../LICENSE" rather than
+# an SPDX identifier. The file is the LGPL version 3 text (checked at c97f36b).
+# cargo-deny could not identify it automatically; retain hash validation.
+[[licenses.clarify]]
+crate = "easytier-core@=2.7.1"
+expression = "LGPL-3.0-only"
+license-files = [{ path = "../LICENSE", hash = 0xdb3c2abe }]
+
+[[licenses.clarify]]
+crate = "easytier-proto@=2.7.1"
+expression = "LGPL-3.0-only"
+license-files = [{ path = "../LICENSE", hash = 0xdb3c2abe }]
 
 [bans]
 multiple-versions = "warn"

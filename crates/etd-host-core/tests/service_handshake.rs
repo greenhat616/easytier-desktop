@@ -101,6 +101,7 @@ async fn generated_server_in_memory_grpc_roundtrip() {
         minor: VERSION_MINOR,
         ..Default::default()
     });
+    client.ready().await.unwrap();
     let result: Result<tonic::Response<Welcome>, _> = client
         .unary(missing, path, tonic_prost::ProstCodec::default())
         .await;
@@ -228,6 +229,7 @@ async fn tonic_duplex_preserves_os_connect_info_and_checks_version() {
         minor: VERSION_MINOR,
         ..Default::default()
     });
+    client.ready().await.unwrap();
     let result: Result<tonic::Response<Welcome>, _> = client
         .unary(req, path, tonic_prost::ProstCodec::default())
         .await;

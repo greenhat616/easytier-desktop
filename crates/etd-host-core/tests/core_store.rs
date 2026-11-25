@@ -11,13 +11,13 @@ use std::{
     sync::Arc,
 };
 
-struct Driver(bool);
+struct Driver(bool, &'static str);
 #[async_trait::async_trait]
 impl CoreDriver for Driver {
     async fn identify(&self, _: &Path) -> Result<CoreDescriptor, CoreError> {
         Ok(CoreDescriptor {
             version: "1.2.3".into(),
-            proto_revision: "rev".into(),
+            proto_revision: self.1.into(),
         })
     }
     fn profile(&self, _: &CoreDescriptor) -> Option<AdapterProfile> {
@@ -75,7 +75,11 @@ impl Drop for Root {
 #[tokio::test]
 async fn hash_is_checked_every_time() {
     let (root, binary) = Root::new();
-    let store = ManifestCoreStore::new(root.0.clone(), HostMode::Service, Arc::new(Driver(true)));
+    let store = ManifestCoreStore::new(
+        root.0.clone(),
+        HostMode::Service,
+        Arc::new(Driver(true, "rev")),
+    );
     assert!(matches!(
         store.resolve(&CoreSelector::default()).await.unwrap().usage,
         CoreUsage::Profiled(_)
@@ -93,13 +97,20 @@ async fn hash_is_checked_every_time() {
 #[tokio::test]
 async fn profile_required_for_privileged_host() {
     let (root, _) = Root::new();
-    let service =
-        ManifestCoreStore::new(root.0.clone(), HostMode::Service, Arc::new(Driver(false)));
+    let service = ManifestCoreStore::new(
+        root.0.clone(),
+        HostMode::Service,
+        Arc::new(Driver(false, "rev")),
+    );
     assert!(matches!(
         service.resolve(&CoreSelector::default()).await,
         Err(StoreError::NoProfile { .. })
     ));
-    let user = ManifestCoreStore::new(root.0.clone(), HostMode::User, Arc::new(Driver(false)));
+    let user = ManifestCoreStore::new(
+        root.0.clone(),
+        HostMode::User,
+        Arc::new(Driver(false, "rev")),
+    );
     assert_eq!(
         user.resolve(&CoreSelector::default()).await.unwrap().usage,
         CoreUsage::LifecycleOnly
@@ -110,7 +121,11 @@ async fn remove_only_selected_hash_directory_and_clear_default() {
     let (root, binary) = Root::new();
     let other = root.0.join("unrelated");
     fs::write(&other, b"keep").unwrap();
-    let store = ManifestCoreStore::new(root.0.clone(), HostMode::Service, Arc::new(Driver(true)));
+    let store = ManifestCoreStore::new(
+        root.0.clone(),
+        HostMode::Service,
+        Arc::new(Driver(true, "rev")),
+    );
     store.remove("1.2.3").await.unwrap();
     assert!(!binary.exists());
     assert!(!binary.parent().unwrap().exists());
@@ -119,5 +134,28 @@ async fn remove_only_selected_hash_directory_and_clear_default() {
     assert!(matches!(
         store.resolve(&CoreSelector::default()).await,
         Err(StoreError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn gitless_core_is_user_lifecycle_only_and_privileged_refuses() {
+    let (root, _) = Root::new();
+    let path = root.0.join(MANIFEST_FILE);
+    let mut manifest: Manifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest.cores[0].proto_revision.clear();
+    fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let user = ManifestCoreStore::new(root.0.clone(), HostMode::User, Arc::new(Driver(false, "")));
+    assert_eq!(
+        user.resolve(&CoreSelector::default()).await.unwrap().usage,
+        CoreUsage::LifecycleOnly
+    );
+    let privileged = ManifestCoreStore::new(
+        root.0.clone(),
+        HostMode::Service,
+        Arc::new(Driver(false, "")),
+    );
+    assert!(matches!(
+        privileged.resolve(&CoreSelector::default()).await,
+        Err(StoreError::NoProfile { .. })
     ));
 }

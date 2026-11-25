@@ -37,6 +37,7 @@ pub struct Manifest {
 #[serde(deny_unknown_fields)]
 pub struct ManifestEntry {
     pub version: String,
+    /// Empty for a git-less kernel; never profiled, but usable under a user host.
     pub proto_revision: String,
     pub sha256: String,
 }
@@ -46,7 +47,6 @@ impl Manifest {
         let mut hashes = HashSet::new();
         for entry in &self.cores {
             if entry.version.is_empty()
-                || entry.proto_revision.is_empty()
                 || !versions.insert(&entry.version)
                 || !hashes.insert(&entry.sha256)
                 || parse_hash(&entry.sha256).is_none()

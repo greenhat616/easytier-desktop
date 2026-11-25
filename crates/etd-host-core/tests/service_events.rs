@@ -1,6 +1,6 @@
 mod common;
 use common::*;
-use etd_contract::{v1::*, *};
+use etd_contract::v1::*;
 use etd_host_core::{api::HostEvent, stub::host_service_server::HostService};
 use futures_util::StreamExt;
 #[tokio::test]

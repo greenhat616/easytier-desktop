@@ -1,6 +1,6 @@
 mod common;
 use common::*;
-use etd_contract::{v1::*, *};
+use etd_contract::v1::*;
 use etd_host_core::stub::host_service_server::HostService;
 use etd_sysfx::Ledger;
 use std::sync::atomic::Ordering;
@@ -77,13 +77,10 @@ async fn durable_retry_and_old_revision() {
     assert_eq!(plans.load(Ordering::SeqCst), 1);
 }
 
-// L1 has implemented removal-pending in its worktree. Enable after the
-// L1 change is merged into main; this branch still uses the earlier M1.
 #[tokio::test]
-#[ignore = "pending merge of L1 removal-pending ledger"]
 async fn remove_accepts_stop_before_open_generation_closes() {
     use etd_sysfx::{EffectState, ScopeFilter};
-    use etd_testkit::conformance::ledger::{changes, plan, put};
+    use etd_testkit::conformance::ledger::{changes, plan_at, put};
     let f = Fixture::new().await;
     f.ledger
         .commit(
@@ -92,7 +89,7 @@ async fn remove_accepts_stop_before_open_generation_closes() {
                 "seed-instance",
                 2,
                 vec![put(INSTANCE, Desired::Running, &[])],
-                vec![plan(INSTANCE, 1, &[])],
+                vec![plan_at(INSTANCE, 1, &[], 2)],
             ),
         )
         .await
@@ -125,6 +122,23 @@ async fn remove_accepts_stop_before_open_generation_closes() {
             .receipt
             .unwrap(),
         receipt
+    );
+    let cannot_revive = SetDesiredRequest {
+        header: Some(MutationHeader {
+            request_id: "pending".into(),
+            expected_revision: receipt.revision,
+        }),
+        instance_id: INSTANCE.into(),
+        desired: Desired::Stopped as i32,
+    };
+    assert_eq!(
+        code(
+            f.service
+                .set_desired(request(cannot_revive, Role::Control))
+                .await
+                .unwrap_err()
+        ),
+        ErrorCode::InstanceBusy
     );
     let effects = f.ledger.open_effects(&ScopeFilter::all()).await.unwrap();
     for e in effects {
@@ -279,4 +293,143 @@ async fn cancellation_after_durable_commit_does_not_lose_notification_or_receipt
         .unwrap();
     assert_eq!(receipt, retry);
     assert_eq!(f.ledger.desired().await.unwrap().0, 3);
+}
+
+#[tokio::test]
+async fn request_digest_binds_caller_revision_method_and_presence() {
+    let mut f = Fixture::new().await;
+    let plans = f.start_commands();
+    let body = ApplyRequest {
+        header: Some(MutationHeader {
+            request_id: "digest".into(),
+            expected_revision: 1,
+        }),
+        instance_id: INSTANCE.into(),
+        spec: Some(NetworkSpec {
+            flags: Some(NetworkFlags::default()),
+            ..Default::default()
+        }),
+        desired: Desired::Stopped as i32,
+    };
+    f.service
+        .apply(request(body.clone(), Role::Control))
+        .await
+        .unwrap();
+    assert_eq!(
+        code(
+            f.service
+                .apply(request(body.clone(), Role::Admin))
+                .await
+                .unwrap_err()
+        ),
+        ErrorCode::RequestIdReused
+    );
+    let mut changed = body.clone();
+    changed.header.as_mut().unwrap().expected_revision = 2;
+    assert_eq!(
+        code(
+            f.service
+                .apply(request(changed, Role::Control))
+                .await
+                .unwrap_err()
+        ),
+        ErrorCode::RequestIdReused
+    );
+    let mut changed = body.clone();
+    changed
+        .spec
+        .as_mut()
+        .unwrap()
+        .flags
+        .as_mut()
+        .unwrap()
+        .multi_thread = Some(false);
+    assert_eq!(
+        code(
+            f.service
+                .apply(request(changed, Role::Control))
+                .await
+                .unwrap_err()
+        ),
+        ErrorCode::RequestIdReused
+    );
+    let changed = SetDesiredRequest {
+        header: body.header,
+        instance_id: INSTANCE.into(),
+        desired: Desired::Stopped as i32,
+    };
+    assert_eq!(
+        code(
+            f.service
+                .set_desired(request(changed, Role::Control))
+                .await
+                .unwrap_err()
+        ),
+        ErrorCode::RequestIdReused
+    );
+    assert_eq!(plans.load(Ordering::SeqCst), 1);
+    assert_eq!(f.ledger.desired().await.unwrap().0, 2);
+}
+
+#[tokio::test]
+async fn generation_is_committed_atomically_with_request_and_config_revision() {
+    use etd_sysfx::{Epoch, ScopeFilter};
+    let mut f = Fixture::new().await;
+    let plans = f.start_commands();
+    let body = ApplyRequest {
+        header: Some(MutationHeader {
+            request_id: "start".into(),
+            expected_revision: 1,
+        }),
+        instance_id: INSTANCE.into(),
+        spec: Some(NetworkSpec {
+            network_name: "network".into(),
+            ..Default::default()
+        }),
+        desired: Desired::Running as i32,
+    };
+    let receipt = f
+        .service
+        .apply(request(body.clone(), Role::Control))
+        .await
+        .unwrap()
+        .into_inner()
+        .receipt
+        .unwrap();
+    assert_eq!(receipt.revision, 2);
+    let generation = f
+        .ledger
+        .generation(&INSTANCE.into(), Epoch(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(generation.inputs.spec_revision, 2);
+    assert_eq!(generation.inputs.spec, body.spec.clone().unwrap());
+    assert_eq!(
+        f.ledger
+            .open_effects(&ScopeFilter::all())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        f.ledger
+            .pending_tickets()
+            .await
+            .unwrap()
+            .iter()
+            .any(|t| t.receipt == receipt && t.generations == vec![(INSTANCE.into(), Epoch(1))])
+    );
+    assert_eq!(
+        f.service
+            .apply(request(body, Role::Control))
+            .await
+            .unwrap()
+            .into_inner()
+            .receipt
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(plans.load(Ordering::SeqCst), 1);
 }

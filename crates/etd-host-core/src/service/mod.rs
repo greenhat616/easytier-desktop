@@ -145,12 +145,8 @@ impl ContractService {
             if header.request_id.is_empty() || header.request_id.len() > 256 {
                 return Err(invalid("Invalid request id"));
             }
-            let mut digest = Sha256::new();
-            digest.update(method.as_bytes());
-            digest.update([0]);
-            digest.update(request.get_ref().encode_to_vec());
             let caller = match peer.user {
-                OsUserId::WindowsSid(s) => s,
+                OsUserId::WindowsSid(s) => s.to_ascii_uppercase(),
                 OsUserId::UnixUid(uid) => uid.to_string(),
                 _ => {
                     return Err(rejection(
@@ -159,10 +155,12 @@ impl ContractService {
                     ));
                 }
             };
+            let digest =
+                request_digest(method, &caller, header.expected_revision, request.get_ref());
             let record = RequestRecord {
                 request_id: RequestId(header.request_id),
                 caller,
-                digest: RequestDigest(digest.finalize().into()),
+                digest,
             };
             service
                 .commit(header.expected_revision, record, mutation)
@@ -430,10 +428,10 @@ impl ContractService {
     }
 }
 fn redact(instance: Option<&mut DesiredInstance>) {
-    if let Some(spec) = instance.and_then(|v| v.spec.as_mut()) {
-        if let Some(secret) = spec.network_secret.take() {
-            spec.network_secret_set = !secret.is_empty();
-        }
+    if let Some(spec) = instance.and_then(|v| v.spec.as_mut())
+        && let Some(secret) = spec.network_secret.take()
+    {
+        spec.network_secret_set = !secret.is_empty();
     }
 }
 fn instance_id(s: &str) -> Result<InstanceId, Status> {
@@ -454,6 +452,28 @@ fn host_closed() -> Status {
         ErrorCode::HostNotServing,
         "Host is not serving control requests",
     )
+}
+/// Hash the canonical decoded protobuf, not its received wire spelling. The
+/// contract has no maps, so prost's field-order encoding is deterministic and
+/// includes optional presence, repeated order and every known field. Frame
+/// each component and bind the authenticated principal and revision as well.
+fn request_digest<T: Message>(
+    method: &str,
+    caller: &str,
+    expected_revision: Revision,
+    request: &T,
+) -> RequestDigest {
+    let mut digest = Sha256::new();
+    digest.update(b"etd.v1/request/v1\0");
+    for bytes in [method.as_bytes(), caller.as_bytes()] {
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+    }
+    digest.update(expected_revision.to_be_bytes());
+    let body = request.encode_to_vec();
+    digest.update((body.len() as u64).to_be_bytes());
+    digest.update(body);
+    RequestDigest(digest.finalize().into())
 }
 fn ledger_error(error: LedgerError) -> Status {
     match error {
@@ -477,6 +497,13 @@ fn ledger_error(error: LedgerError) -> Status {
         LedgerError::EpochOpen { .. } | LedgerError::EpochNotNext { .. } => {
             rejection(ErrorCode::InstanceBusy, "Instance generation still open")
         }
+        LedgerError::RemovalPending { .. } => {
+            rejection(ErrorCode::InstanceBusy, "Instance removal pending")
+        }
+        LedgerError::InvalidPlan { .. } => rejection(
+            ErrorCode::HostNotServing,
+            "Orchestrator returned an invalid generation plan",
+        ),
         _ => rejection(ErrorCode::LedgerUnavailable, "Ledger unavailable"),
     }
 }

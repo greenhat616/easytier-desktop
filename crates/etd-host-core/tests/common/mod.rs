@@ -108,7 +108,7 @@ impl Fixture {
             auth,
         }
     }
-    pub fn start_commands(self: &mut Self) -> Arc<AtomicUsize> {
+    pub fn start_commands(&mut self) -> Arc<AtomicUsize> {
         let (_, replacement) = orchestrator_channel(1, HostView::default());
         let mut port = std::mem::replace(&mut self.port, replacement);
         let ledger = self.ledger.clone();
@@ -117,12 +117,45 @@ impl Fixture {
         tokio::spawn(async move {
             while let Some(cmd) = port.commands.recv().await {
                 match cmd {
-                    Command::Plan { reply, .. } => {
+                    Command::Plan {
+                        instance,
+                        spec,
+                        start,
+                        reply,
+                    } => {
                         plans.fetch_add(1, Ordering::SeqCst);
+                        let (revision, desired) = ledger.desired().await.unwrap();
+                        let generation = if start {
+                            let (spec, spec_revision) = if let Some(spec) = spec {
+                                (*spec, revision + 1)
+                            } else {
+                                (
+                                    desired
+                                        .iter()
+                                        .find(|v| v.instance_id == instance.0)
+                                        .unwrap()
+                                        .spec
+                                        .clone()
+                                        .unwrap(),
+                                    ledger.spec_revision(&instance).await.unwrap(),
+                                )
+                            };
+                            let epoch = ledger.next_epoch(&instance).await.unwrap();
+                            let mut plan = etd_testkit::conformance::ledger::plan_at(
+                                &instance.0,
+                                epoch.0,
+                                &[],
+                                spec_revision,
+                            );
+                            plan.inputs.spec = spec;
+                            Some(plan)
+                        } else {
+                            None
+                        };
                         let _ = reply.send(Ok(Planned {
                             claims: vec![],
-                            generation: None,
-                            revision: ledger.desired().await.unwrap().0,
+                            generation,
+                            revision,
                         }));
                     }
                     Command::Query { reply, .. } => {

@@ -97,6 +97,9 @@ pub enum ProcessEvent {
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
     Exited(Exit),
+    /// Terminal: containment could not be confirmed empty. Quarantine the
+    /// generation; this is not an exit and must not trigger a restart.
+    CleanupUncertain(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -109,6 +112,15 @@ pub enum ProcessError {
         executable: PathBuf,
         message: String,
     },
+    /// A child started, but its identity could not be captured before it
+    /// exited or was rolled back. Its containment has been confirmed empty.
+    /// The host feeds this abnormal exit to the restart policy.
+    #[error("child exited before identity capture: {0:?}")]
+    ExitedBeforeIdentity(Exit),
+    /// The process tree could not be confirmed empty. Keep the generation
+    /// quarantined, not stopped or eligible for restart.
+    #[error("process cleanup uncertain: {0}")]
+    CleanupUncertain(String),
     #[error("permission denied: {0}")]
     PermissionDenied(String),
     /// The child could not be placed in its job object / cgroup / group.

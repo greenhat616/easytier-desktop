@@ -27,8 +27,23 @@ const IP_SCHEMES: &[&str] = &["tcp", "udp", "wg", "quic", "ws", "wss", "faketcp"
 /// (`TunnelScheme`: http/https/txt/srv discovery).
 const DISCOVERY_SCHEMES: &[&str] = &["http", "https", "txt", "srv"];
 
-/// A validated listener or peer URI.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A URI with any userinfo (`user:pass@`) replaced by `***@`, for logs,
+/// errors and `Debug`. The generated file keeps the URI as given.
+pub fn redact_uri(uri: &str) -> String {
+    let (prefix, rest) = match uri.find("://") {
+        Some(i) => uri.split_at(i + 3),
+        None => ("", uri),
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    match authority.rfind('@') {
+        Some(at) => format!("{prefix}***{}{tail}", &authority[at..]),
+        None => uri.to_owned(),
+    }
+}
+
+/// A validated listener or peer URI. `Debug` redacts userinfo.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Endpoint {
     pub uri: String,
     pub scheme: String,
@@ -38,7 +53,8 @@ pub struct Endpoint {
 
 impl Endpoint {
     fn parse(field: &str, uri: &str, listener: bool) -> Result<Self, CoreError> {
-        let invalid = |why: &str| CoreError::InvalidSpec(format!("{field}: {uri:?} {why}"));
+        let invalid =
+            |why: &str| CoreError::InvalidSpec(format!("{field}: {:?} {why}", redact_uri(uri)));
         let (scheme, rest) = uri
             .split_once("://")
             .ok_or_else(|| invalid("is not a scheme://host:port URI"))?;
@@ -61,6 +77,16 @@ impl Endpoint {
             scheme,
             socket,
         })
+    }
+}
+
+impl std::fmt::Debug for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Endpoint")
+            .field("uri", &redact_uri(&self.uri))
+            .field("scheme", &self.scheme)
+            .field("socket", &self.socket)
+            .finish()
     }
 }
 

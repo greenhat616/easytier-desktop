@@ -81,6 +81,50 @@ fn settings_debug_is_redacted() {
 }
 
 #[test]
+fn uri_userinfo_is_redacted() {
+    use etd_core_easytier::plan::spec::{Settings, redact_uri};
+    assert_eq!(redact_uri("ws://user:pa55@host:80/p"), "ws://***@host:80/p");
+    assert_eq!(redact_uri("tcp://1.2.3.4:11010"), "tcp://1.2.3.4:11010");
+    assert_eq!(redact_uri("u:p@host:1"), "***@host:1");
+    assert_eq!(redact_uri("wss://a@b@host/x@y"), "wss://***@host/x@y");
+
+    let mut spec = full();
+    spec.peers
+        .push("wss://alice:pa55word@relay.example.org:443/et".into());
+    let settings = Settings::from_spec(&spec).unwrap();
+    let debug = format!("{settings:?}{settings:#?}");
+    assert!(!debug.contains("pa55word") && !debug.contains("alice"));
+    assert!(debug.contains("***@relay.example.org"));
+
+    // Errors name the URI without its credentials.
+    for bad in [
+        "ftp://alice:pa55word@example.org:21",
+        "alice:pa55word@example.org:21",
+    ] {
+        let mut spec = full();
+        spec.peers.push(bad.into());
+        let err = plan_for(&ctx(spec), Platform::Linux).unwrap_err();
+        assert!(!err.to_string().contains("pa55word"), "{err}");
+        assert!(!format!("{err:?}").contains("alice"), "{err:?}");
+    }
+    let mut spec = full();
+    spec.listeners.push("tcp://alice:pa55word@0.0.0.0:1".into());
+    let err = plan_for(&ctx(spec), Platform::Linux).unwrap_err();
+    assert!(!err.to_string().contains("pa55word"), "{err}");
+
+    // The plan itself never shows them either; only the file carries them.
+    let mut spec = full();
+    spec.peers
+        .push("wss://alice:pa55word@relay.example.org:443/et".into());
+    let capture = Capture::default();
+    let plan = tracing::subscriber::with_default(capture.clone(), || {
+        plan_for(&ctx(spec), Platform::Linux).unwrap()
+    });
+    assert!(!format!("{plan:?}").contains("pa55word"));
+    assert!(!capture.0.lock().unwrap().contains("pa55word"));
+}
+
+#[test]
 fn errors_do_not_carry_the_secret() {
     let mut spec = full();
     spec.peers.push("bogus".into());

@@ -1260,15 +1260,20 @@ mod audit_tests {
             .spawn()
             .unwrap();
         let pid = child.id();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            match identity::bsd_state(pid).unwrap() {
-                Some(state) if state.zombie => break,
-                Some(_) => std::thread::sleep(Duration::from_millis(10)),
-                None => panic!("unreaped child must remain a zombie"),
-            }
-            assert!(std::time::Instant::now() < deadline, "child never exited");
-        }
+        // Block until the child has exited, but leave it unreaped (WNOWAIT).
+        // SAFETY: siginfo_t is plain old data; waitid only writes into it.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: waits on our own child; WNOWAIT keeps it a zombie.
+        let rc =
+            unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+        // Observed on macOS CI: the short BSD info flavor reports an
+        // unreaped zombie as ESRCH, so either answer must exclude it.
+        assert!(
+            identity::bsd_state(pid)
+                .unwrap()
+                .is_none_or(|state| state.zombie)
+        );
         assert!(identity::all_pids().unwrap().contains(&std::process::id()));
         let snapshot = identity::snapshot(ProcessesToUpdate::All).unwrap();
         let own = snapshot

@@ -295,7 +295,8 @@ pub(crate) struct BsdState {
 
 /// `Ok(None)` only for ESRCH; any other failure is "cannot look", not absence.
 /// The short BSD info flavor carries no same-user check, so another user's
-/// process yields its owner rather than EPERM.
+/// process yields its owner rather than EPERM. It does not look up zombies:
+/// an unreaped zombie reports ESRCH (observed on macOS CI), i.e. `Ok(None)`.
 #[cfg(target_os = "macos")]
 pub(crate) fn bsd_state(pid: u32) -> io::Result<Option<BsdState>> {
     let pid = i32::try_from(pid).map_err(io::Error::other)?;

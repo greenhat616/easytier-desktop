@@ -135,3 +135,86 @@ async fn retained_cursor_gap_resyncs_and_secret_is_redacted() {
         Some(event::Payload::ResyncRequired(_))
     ));
 }
+
+#[tokio::test]
+async fn idle_event_and_log_streams_end_immediately_after_revocation() {
+    use etd_host_core::api::Command;
+    use std::time::Duration;
+    let mut f = Fixture::new().await;
+    let mut events = f
+        .service
+        .subscribe(request(SubscribeRequest::default(), Role::Viewer))
+        .await
+        .unwrap()
+        .into_inner();
+    let logs_call = tokio::spawn({
+        let service = f.service.clone();
+        async move {
+            service
+                .stream_logs(request(StreamLogsRequest::default(), Role::Viewer))
+                .await
+        }
+    });
+    // The unpolled log stream has a buffered item; it must discard the
+    // item and release presence even before the consumer polls it.
+    loop {
+        if let Command::Logs { reply, .. } = f.port.commands.recv().await.unwrap() {
+            assert!(
+                reply
+                    .send(Ok(Box::pin(
+                        futures_util::stream::once(async { LogLine::default() })
+                            .chain(futures_util::stream::pending())
+                    )))
+                    .is_ok()
+            );
+            break;
+        }
+    }
+    let mut logs = logs_call.await.unwrap().unwrap().into_inner();
+    loop {
+        if let Command::Clients(presence) = f.port.commands.recv().await.unwrap()
+            && presence.subscribers == 2
+        {
+            break;
+        }
+    }
+    let event_reader = tokio::spawn(async move {
+        assert_eq!(
+            code(events.next().await.unwrap().unwrap_err()),
+            ErrorCode::PermissionDenied
+        );
+        assert!(events.next().await.is_none());
+    });
+    tokio::task::yield_now().await;
+    f.service
+        .set_allow_list(request(
+            SetAllowListRequest {
+                header: Some(MutationHeader {
+                    request_id: "revoke-idle-streams".into(),
+                    expected_revision: 1,
+                }),
+                entries: vec![entry(0, Role::Admin)],
+            },
+            Role::Admin,
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        event_reader.await.unwrap();
+        loop {
+            if let Command::Clients(presence) = f.port.commands.recv().await.unwrap()
+                && presence.subscribers == 0
+            {
+                break;
+            }
+        }
+        // The log consumer was never polled while authorized.
+        assert_eq!(
+            code(logs.next().await.unwrap().unwrap_err()),
+            ErrorCode::PermissionDenied
+        );
+        assert!(logs.next().await.is_none());
+    })
+    .await
+    .unwrap();
+}

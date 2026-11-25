@@ -10,11 +10,12 @@ use etd_core_api::{CoreDescriptor, CoreDriver};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex as SyncMutex},
+    time::SystemTime,
 };
 use tokio::sync::Mutex;
 
@@ -73,55 +74,95 @@ impl Manifest {
             .ok_or_else(|| StoreError::NotFound(want.clone()))
     }
 }
+// Keep the opened file identity, not a pathname-derived surrogate. The
+// cached handle prevents reuse of its file id while the entry is retained.
+#[derive(PartialEq, Eq)]
+struct FileStamp {
+    size: u64,
+    modified: SystemTime,
+    identity: same_file::Handle,
+}
+struct OpenCore {
+    binary: PathBuf,
+    stamp: Arc<FileStamp>,
+}
+struct CachedCore {
+    stamp: Arc<FileStamp>,
+    descriptor: CoreDescriptor,
+    support: CoreSupport,
+}
+
 pub struct ManifestCoreStore {
     root: PathBuf,
     mode: HostMode,
     driver: Arc<dyn CoreDriver>,
-    // Avoid resolving across an in-process removal. The singleton lock is
-    // still mandatory across processes; this is not a substitute for it.
+    // Short manifest/removal critical sections only: hashing and identify
+    // never hold this lock during normal resolution or ListCores.
     operations: Mutex<()>,
+    cache: SyncMutex<HashMap<String, CachedCore>>,
+    list_verification: Mutex<()>,
 }
 impl ManifestCoreStore {
-    pub fn new(root: PathBuf, mode: HostMode, driver: Arc<dyn CoreDriver>) -> Self {
-        Self {
+    pub fn new(
+        root: PathBuf,
+        mode: HostMode,
+        driver: Arc<dyn CoreDriver>,
+    ) -> Result<Self, StoreError> {
+        check_type(&root, true)?;
+        let root = fs::canonicalize(root).map_err(io_error)?;
+        check_type(&root, true)?;
+        Ok(Self {
             root,
             mode,
             driver,
             operations: Mutex::new(()),
-        }
+            cache: SyncMutex::new(HashMap::new()),
+            list_verification: Mutex::new(()),
+        })
     }
     async fn manifest(&self) -> Result<Manifest, StoreError> {
+        let _guard = self.operations.lock().await;
         let root = self.root.clone();
         blocking(move || read_manifest(&root)).await
     }
-    async fn verify(&self, entry: ManifestEntry) -> Result<VerifiedCore, StoreError> {
+    async fn open(&self, entry: &ManifestEntry) -> Result<OpenCore, StoreError> {
         let root = self.root.clone();
+        let entry = entry.clone();
+        blocking(move || open_core(&root, &entry)).await
+    }
+    async fn verify(
+        &self,
+        entry: &ManifestEntry,
+        open: OpenCore,
+    ) -> Result<VerifiedCore, StoreError> {
         let item = entry.clone();
-        let (binary, sha256) = blocking(move || verify_file(&root, &item)).await?;
-        let declared = CoreDescriptor {
-            version: entry.version.clone(),
-            proto_revision: entry.proto_revision.clone(),
-        };
-        // Never execute an unprofiled binary even for identification in a
-        // privileged host. The manifest is from the protected store.
+        let (open, sha256) = blocking(move || {
+            let sha256 = hash_core(&open, &item)?;
+            Ok((open, sha256))
+        })
+        .await?;
+        let declared = entry.descriptor();
+        // Verify the protected hash before asking the binary to identify itself.
         if self.mode != HostMode::User && self.driver.profile(&declared).is_none() {
             return Err(StoreError::NoProfile {
-                version: entry.version,
+                version: entry.version.clone(),
             });
         }
         let descriptor = self
             .driver
-            .identify(&binary)
+            .identify(&open.binary)
             .await
             .map_err(|_| StoreError::Manifest("Kernel identification failed".into()))?;
-        if descriptor
-            != (CoreDescriptor {
-                version: entry.version.clone(),
-                proto_revision: entry.proto_revision,
-            })
-        {
+        if descriptor != declared {
             return Err(StoreError::Manifest(
                 "Kernel descriptor differs from manifest".into(),
+            ));
+        }
+        // Detect replacement between opening, hashing and identification.
+        let current = self.open(entry).await?;
+        if current.stamp != open.stamp || current.binary != open.binary {
+            return Err(StoreError::Manifest(
+                "Kernel changed during verification".into(),
             ));
         }
         let usage = match self.driver.profile(&descriptor) {
@@ -129,40 +170,86 @@ impl ManifestCoreStore {
             None if self.mode == HostMode::User => CoreUsage::LifecycleOnly,
             None => {
                 return Err(StoreError::NoProfile {
-                    version: entry.version,
+                    version: entry.version.clone(),
                 });
             }
         };
         Ok(VerifiedCore {
-            binary,
+            binary: open.binary,
             descriptor,
             sha256,
             usage,
         })
     }
+    async fn support(&self, entry: &ManifestEntry) -> CoreSupport {
+        // Single-flight cache misses, without holding the operations lock.
+        let _verification = self.list_verification.lock().await;
+        let open = match self.open(entry).await {
+            Ok(open) => open,
+            Err(_) => {
+                self.cache.lock().unwrap().remove(&entry.sha256);
+                return CoreSupport::Rejected;
+            }
+        };
+        let descriptor = entry.descriptor();
+        if let Some(support) = self
+            .cache
+            .lock()
+            .unwrap()
+            .get(&entry.sha256)
+            .filter(|cached| cached.stamp == open.stamp && cached.descriptor == descriptor)
+            .map(|cached| cached.support)
+        {
+            return support;
+        }
+        let stamp = open.stamp.clone();
+        let support = match self.verify(entry, open).await {
+            Ok(VerifiedCore {
+                usage: CoreUsage::Profiled(_),
+                ..
+            }) => CoreSupport::Profiled,
+            Ok(VerifiedCore {
+                usage: CoreUsage::LifecycleOnly,
+                ..
+            }) => CoreSupport::LifecycleOnly,
+            _ => CoreSupport::Rejected,
+        };
+        self.cache.lock().unwrap().insert(
+            entry.sha256.clone(),
+            CachedCore {
+                stamp,
+                descriptor,
+                support,
+            },
+        );
+        support
+    }
+}
+impl ManifestEntry {
+    fn descriptor(&self) -> CoreDescriptor {
+        CoreDescriptor {
+            version: self.version.clone(),
+            proto_revision: self.proto_revision.clone(),
+        }
+    }
 }
 #[async_trait::async_trait]
 impl CoreStore for ManifestCoreStore {
     async fn resolve(&self, want: &CoreSelector) -> Result<VerifiedCore, StoreError> {
-        let _guard = self.operations.lock().await;
-        self.verify(self.manifest().await?.select(want)?.clone())
-            .await
+        let entry = self.manifest().await?.select(want)?.clone();
+        // Launch resolution always re-hashes, even if ListCores cached support.
+        let open = self.open(&entry).await?;
+        self.verify(&entry, open).await
     }
     async fn list(&self) -> Result<Vec<CoreEntry>, StoreError> {
-        let _guard = self.operations.lock().await;
+        let manifest = self.manifest().await?;
+        self.cache
+            .lock()
+            .unwrap()
+            .retain(|hash, _| manifest.cores.iter().any(|entry| &entry.sha256 == hash));
         let mut cores = Vec::new();
-        for entry in self.manifest().await?.cores {
-            let support = match self.verify(entry.clone()).await {
-                Ok(VerifiedCore {
-                    usage: CoreUsage::Profiled(_),
-                    ..
-                }) => CoreSupport::Profiled,
-                Ok(VerifiedCore {
-                    usage: CoreUsage::LifecycleOnly,
-                    ..
-                }) => CoreSupport::LifecycleOnly,
-                _ => CoreSupport::Rejected,
-            };
+        for entry in manifest.cores {
+            let support = self.support(&entry).await;
             cores.push(CoreEntry {
                 version: entry.version,
                 proto_revision: entry.proto_revision,
@@ -172,8 +259,13 @@ impl CoreStore for ManifestCoreStore {
         }
         Ok(cores)
     }
+    async fn default_version(&self) -> Result<Option<String>, StoreError> {
+        Ok(self.manifest().await?.default_version)
+    }
     async fn remove(&self, version: &str) -> Result<(), StoreError> {
         let _guard = self.operations.lock().await;
+        // Release retained file handles before the maintenance deletion.
+        self.cache.lock().unwrap().clear();
         let root = self.root.clone();
         let version = version.to_owned();
         blocking(move || remove_entry(&root, &version)).await
@@ -234,15 +326,35 @@ fn read_manifest(root: &Path) -> Result<Manifest, StoreError> {
     manifest.validate()?;
     Ok(manifest)
 }
-fn verify_file(root: &Path, entry: &ManifestEntry) -> Result<(PathBuf, [u8; 32]), StoreError> {
-    let expected =
-        parse_hash(&entry.sha256).ok_or_else(|| StoreError::Manifest("Invalid SHA-256".into()))?;
+fn open_core(root: &Path, entry: &ManifestEntry) -> Result<OpenCore, StoreError> {
+    if parse_hash(&entry.sha256).is_none() {
+        return Err(StoreError::Manifest("Invalid SHA-256".into()));
+    }
     check_type(root, true)?;
     let dir = root.join(&entry.sha256);
     check_type(&dir, true)?;
     let binary = dir.join(CORE_FILE);
     check_type(&binary, false)?;
-    let mut file = fs::File::open(&binary).map_err(io_error)?;
+    let binary = fs::canonicalize(binary).map_err(io_error)?;
+    if !binary.starts_with(root) || binary.parent() != Some(dir.as_path()) {
+        return Err(StoreError::Manifest(
+            "Kernel path escapes its SHA directory".into(),
+        ));
+    }
+    let identity = same_file::Handle::from_file(fs::File::open(&binary).map_err(io_error)?)
+        .map_err(io_error)?;
+    let meta = identity.as_file().metadata().map_err(io_error)?;
+    let stamp = Arc::new(FileStamp {
+        size: meta.len(),
+        modified: meta.modified().map_err(io_error)?,
+        identity,
+    });
+    Ok(OpenCore { binary, stamp })
+}
+fn hash_core(open: &OpenCore, entry: &ManifestEntry) -> Result<[u8; 32], StoreError> {
+    let expected =
+        parse_hash(&entry.sha256).ok_or_else(|| StoreError::Manifest("Invalid SHA-256".into()))?;
+    let mut file = open.stamp.identity.as_file();
     let mut hash = Sha256::new();
     let mut buf = [0; 64 * 1024];
     loop {
@@ -258,7 +370,7 @@ fn verify_file(root: &Path, entry: &ManifestEntry) -> Result<(PathBuf, [u8; 32])
             version: entry.version.clone(),
         });
     }
-    Ok((binary, actual))
+    Ok(actual)
 }
 fn remove_entry(root: &Path, version: &str) -> Result<(), StoreError> {
     let mut manifest = read_manifest(root)?;
@@ -285,7 +397,7 @@ fn remove_entry(root: &Path, version: &str) -> Result<(), StoreError> {
             let binary = dir.join(CORE_FILE);
             match fs::symlink_metadata(&binary) {
                 Ok(_) => {
-                    verify_file(root, &entry)?;
+                    hash_core(&open_core(root, &entry)?, &entry)?;
                     fs::remove_file(&binary).map_err(io_error)?;
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}

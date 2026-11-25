@@ -76,6 +76,11 @@ pub trait CoreStore: Send + Sync {
     async fn resolve(&self, want: &CoreSelector) -> Result<VerifiedCore, StoreError>;
     /// Every kernel in the store with its support level, for ListCores.
     async fn list(&self) -> Result<Vec<CoreEntry>, StoreError>;
+    /// Configured store default without executing or hashing a kernel. Callers
+    /// validate support against `list`; older implementations report no default.
+    async fn default_version(&self) -> Result<Option<String>, StoreError> {
+        Ok(None)
+    }
     /// Remove a kernel from the store (maintenance subcommand under the
     /// singleton lock, see the module docs). The caller first runs
     /// `ReclaimEngine::reclaim_core(sha256)`, which removes the binary's

@@ -3,21 +3,21 @@ use crate::auth::Authorizer;
 use etd_contract::{AllowEntry, HostMode, Role, v1::os_principal::Id};
 use etd_ipc::{OsGroupId, OsUserId, PeerIdentity};
 use etd_sysfx::{Ledger, LedgerError};
-use std::sync::RwLock;
+use tokio::sync::watch;
 
 /// Fail-closed until initialized. The contract service serializes mutations
 /// and replaces this snapshot before returning an allow-list receipt.
 pub struct AllowListAuthorizer {
     mode: HostMode,
     owner: Option<OsUserId>,
-    entries: RwLock<Option<Vec<AllowEntry>>>,
+    entries: watch::Sender<Option<Vec<AllowEntry>>>,
 }
 impl AllowListAuthorizer {
     pub fn new(mode: HostMode, owner: Option<OsUserId>) -> Self {
         Self {
             mode,
             owner,
-            entries: RwLock::new(None),
+            entries: watch::channel(None).0,
         }
     }
     pub async fn load(&self, ledger: &dyn Ledger) -> Result<(), LedgerError> {
@@ -28,18 +28,27 @@ impl AllowListAuthorizer {
                 Ok(())
             }
             Err(e) => {
-                *self.entries.write().unwrap_or_else(|e| e.into_inner()) = None;
+                self.invalidate();
                 Err(e)
             }
         }
     }
     pub(crate) fn replace(&self, entries: Vec<AllowEntry>) {
-        *self.entries.write().unwrap_or_else(|e| e.into_inner()) = Some(entries);
+        self.entries.send_replace(Some(entries));
+    }
+    pub(crate) fn invalidate(&self) {
+        self.entries.send_replace(None);
+    }
+    pub(crate) fn is_loaded(&self) -> bool {
+        self.entries.borrow().is_some()
+    }
+    pub(crate) fn watch(&self) -> watch::Receiver<Option<Vec<AllowEntry>>> {
+        self.entries.subscribe()
     }
 }
 impl Authorizer for AllowListAuthorizer {
     fn role_of(&self, peer: &PeerIdentity) -> Option<Role> {
-        let guard = self.entries.read().ok()?;
+        let guard = self.entries.borrow();
         let entries = guard.as_ref()?;
         if self.mode == HostMode::User {
             let owner = match (&self.owner, &peer.user) {

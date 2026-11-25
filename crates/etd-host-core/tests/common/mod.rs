@@ -95,6 +95,7 @@ impl Fixture {
         let service = ContractService::new(
             HostMode::Service,
             ledger.clone(),
+            etd_sysfx::InstallKey([7; 32]),
             auth.clone(),
             Arc::new(FakeCoreStore::default()),
             handle,

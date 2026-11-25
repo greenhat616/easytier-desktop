@@ -45,6 +45,9 @@ impl CoreStore for FakeCoreStore {
             })
             .collect())
     }
+    async fn default_version(&self) -> Result<Option<String>, StoreError> {
+        Ok(self.state.lock().unwrap().0.clone())
+    }
     async fn remove(&self, version: &str) -> Result<(), StoreError> {
         let mut state = self.state.lock().unwrap();
         let pos = state

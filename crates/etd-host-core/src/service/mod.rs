@@ -11,13 +11,20 @@ use crate::{
 use etd_contract::{v1::*, *};
 use etd_ipc::{OsUserId, PeerIdentity};
 use etd_sysfx::{
-    Change, ChangeSet, Ledger, LedgerError, RequestDigest, RequestRecord, RequestStatus,
+    Change, ChangeSet, InstallKey, Ledger, LedgerError, RequestDigest, RequestRecord, RequestStatus,
 };
-use futures_util::{StreamExt, stream::BoxStream};
+use futures_util::{
+    StreamExt,
+    stream::{self, BoxStream},
+};
+use hmac::{Hmac, KeyInit, Mac};
 use prost::Message;
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
-use tokio::sync::{Mutex, oneshot, watch};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tonic::{Request, Response, Status};
 
 #[derive(Clone)]
@@ -27,6 +34,7 @@ pub struct ContractService {
 struct Inner {
     mode: HostMode,
     ledger: Arc<dyn Ledger>,
+    install_key: InstallKey,
     authorizer: Arc<AllowListAuthorizer>,
     store: Arc<dyn CoreStore>,
     handle: OrchestratorHandle,
@@ -38,9 +46,11 @@ struct Inner {
 impl ContractService {
     /// The composition root must initialize the authorizer from the ledger
     /// before accepting requests. The same authorizer is shared with HostDeps.
+    #[allow(clippy::too_many_arguments)] // composition root injects independent dependencies
     pub fn new(
         mode: HostMode,
         ledger: Arc<dyn Ledger>,
+        install_key: InstallKey,
         authorizer: Arc<AllowListAuthorizer>,
         store: Arc<dyn CoreStore>,
         handle: OrchestratorHandle,
@@ -62,6 +72,7 @@ impl ContractService {
             inner: Arc::new(Inner {
                 mode,
                 ledger,
+                install_key,
                 authorizer,
                 store,
                 handle,
@@ -82,6 +93,12 @@ impl ContractService {
     }
     fn guard<T>(&self, request: &Request<T>, method: &str) -> Result<(PeerIdentity, Role), Status> {
         check_version(request)?;
+        if self.inner.mode == HostMode::ElevatedSession {
+            return Err(rejection(
+                ErrorCode::FeatureRejected,
+                "elevated session mode is not available in this version",
+            ));
+        }
         let peer = request
             .extensions()
             .get::<PeerIdentity>()
@@ -128,7 +145,7 @@ impl ContractService {
             .map_err(|_| host_closed())?;
         rx.await.map_err(|_| host_closed())?.map_err(status)
     }
-    async fn submit<T: Message + Send + 'static>(
+    async fn submit<T: DigestMessage + Send + 'static>(
         &self,
         request: Request<T>,
         method: &'static str,
@@ -145,18 +162,14 @@ impl ContractService {
             if header.request_id.is_empty() || header.request_id.len() > 256 {
                 return Err(invalid("Invalid request id"));
             }
-            let caller = match peer.user {
-                OsUserId::WindowsSid(s) => s.to_ascii_uppercase(),
-                OsUserId::UnixUid(uid) => uid.to_string(),
-                _ => {
-                    return Err(rejection(
-                        ErrorCode::PermissionDenied,
-                        "Unsupported peer identity",
-                    ));
-                }
-            };
-            let digest =
-                request_digest(method, &caller, header.expected_revision, request.get_ref());
+            let caller = canonical_caller(&peer)?;
+            let digest = request_digest(
+                method,
+                &caller,
+                header.expected_revision,
+                request.get_ref(),
+                &service.inner.install_key,
+            );
             let record = RequestRecord {
                 request_id: RequestId(header.request_id),
                 caller,
@@ -226,11 +239,8 @@ impl ContractService {
             };
             match self.inner.ledger.commit(expected, changes).await {
                 Ok(receipt) => {
-                    match &mutation {
-                        Mutation::AllowList(entries) => {
-                            self.inner.authorizer.replace(entries.clone())
-                        }
-                        _ => {}
+                    if let Mutation::AllowList(entries) = &mutation {
+                        self.inner.authorizer.replace(entries.clone());
                     }
                     // Durable tickets are also replayed by H1 after restart.
                     let _ = self
@@ -261,6 +271,20 @@ impl ContractService {
         error: LedgerError,
         mutation: &Mutation,
     ) -> Result<Receipt, Status> {
+        if matches!(mutation, Mutation::AllowList(_) | Mutation::Purge(true)) {
+            // A storage error may follow a durable transaction (e.g. the
+            // purge checkpoint). No old authorization may survive ambiguity.
+            self.inner.authorizer.invalidate();
+            if self
+                .inner
+                .authorizer
+                .load(self.inner.ledger.as_ref())
+                .await
+                .is_err()
+            {
+                self.retry_authorization_reload();
+            }
+        }
         if matches!(error, LedgerError::Unavailable(_))
             && let Mutation::Desired(id, Desired::Stopped) = mutation
         {
@@ -268,6 +292,26 @@ impl ContractService {
             self.ask(|reply| Command::Cut { instance, reply }).await?;
         }
         Err(ledger_error(error))
+    }
+    // An ambiguous commit may coincide with an unavailable ledger. Keep the
+    // invalid snapshot until a committed settings read succeeds; synchronize
+    // retries with mutations and do not retain the service after shutdown.
+    fn retry_authorization_reload(&self) {
+        let inner = Arc::downgrade(&self.inner);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
+                let _lock = inner.mutations.lock().await;
+                if inner.authorizer.is_loaded()
+                    || inner.authorizer.load(inner.ledger.as_ref()).await.is_ok()
+                {
+                    return;
+                }
+            }
+        });
     }
     async fn plan(
         &self,
@@ -452,24 +496,76 @@ fn host_closed() -> Status {
         "Host is not serving control requests",
     )
 }
+fn canonical_caller(peer: &PeerIdentity) -> Result<String, Status> {
+    match &peer.user {
+        OsUserId::WindowsSid(s) => Ok(s.to_ascii_uppercase()),
+        OsUserId::UnixUid(uid) => Ok(uid.to_string()),
+        _ => Err(rejection(
+            ErrorCode::PermissionDenied,
+            "Unsupported peer identity",
+        )),
+    }
+}
+
+trait DigestMessage: Message + Sized {
+    fn digest_bytes(&self, _key: &InstallKey) -> Vec<u8> {
+        self.encode_to_vec()
+    }
+}
+macro_rules! digest_messages {
+    ($($ty:ty),+ $(,)?) => { $(impl DigestMessage for $ty {})+ };
+}
+digest_messages!(
+    SetDesiredRequest,
+    RemoveInstanceRequest,
+    RetryReclaimRequest,
+    RetryStartRequest,
+    ResolveCandidatesRequest,
+    SetAllowListRequest,
+    SelectCoreRequest,
+    PurgeAllDataRequest
+);
+impl DigestMessage for ApplyRequest {
+    fn digest_bytes(&self, key: &InstallKey) -> Vec<u8> {
+        let mut canonical = self.clone();
+        if let Some(secret) = canonical
+            .spec
+            .as_mut()
+            .and_then(|spec| spec.network_secret.as_mut())
+        {
+            let mut mac =
+                Hmac::<Sha256>::new_from_slice(&key.0).expect("HMAC accepts any key length");
+            mac.update(secret.as_bytes());
+            *secret = mac
+                .finalize()
+                .into_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+        }
+        canonical.encode_to_vec()
+    }
+}
+
 /// Hash the canonical decoded protobuf, not its received wire spelling. The
 /// contract has no maps, so prost's field-order encoding is deterministic and
 /// includes optional presence, repeated order and every known field. Frame
 /// each component and bind the authenticated principal and revision as well.
-fn request_digest<T: Message>(
+fn request_digest<T: DigestMessage>(
     method: &str,
     caller: &str,
     expected_revision: Revision,
     request: &T,
+    install_key: &InstallKey,
 ) -> RequestDigest {
     let mut digest = Sha256::new();
-    digest.update(b"etd.v1/request/v1\0");
+    digest.update(b"etd.v1/request/v2\0");
     for bytes in [method.as_bytes(), caller.as_bytes()] {
         digest.update((bytes.len() as u64).to_be_bytes());
         digest.update(bytes);
     }
     digest.update(expected_revision.to_be_bytes());
-    let body = request.encode_to_vec();
+    let body = request.digest_bytes(install_key);
     digest.update((body.len() as u64).to_be_bytes());
     digest.update(body);
     RequestDigest(digest.finalize().into())
@@ -517,6 +613,95 @@ impl Drop for SubscriptionPresence {
     fn drop(&mut self) {
         self.0.send_modify(|value| value.subscribers -= 1);
     }
+}
+/// A bounded pump watches authorization independently of the consumer's
+/// polling (including HTTP/2 backpressure). Revocation closes the source and
+/// presence immediately; buffered data is discarded, never delivered afterward.
+fn authorized_stream<T: Send + 'static>(
+    mut source: BoxStream<'static, T>,
+    authorizer: Arc<AllowListAuthorizer>,
+    peer: PeerIdentity,
+    presence: Option<SubscriptionPresence>,
+) -> BoxStream<'static, Result<T, Status>> {
+    let mut updates = authorizer.watch();
+    let (tx, rx) = mpsc::channel(1);
+    let revoked = Arc::new(AtomicBool::new(false));
+    let revoked_by_pump = revoked.clone();
+    let pump_auth = authorizer.clone();
+    let pump_peer = peer.clone();
+    tokio::spawn(async move {
+        let _presence = presence;
+        let authorized = || {
+            pump_auth
+                .role_of(&pump_peer)
+                .is_some_and(|role| role_allows(role, Role::Viewer))
+        };
+        'pump: loop {
+            if !authorized() {
+                revoked_by_pump.store(true, Ordering::Release);
+                break;
+            }
+            let item = tokio::select! {
+                biased;
+                updated = updates.changed() => {
+                    if updated.is_err() { revoked_by_pump.store(true, Ordering::Release); break; }
+                    continue;
+                }
+                _ = tx.closed() => break,
+                item = source.next() => { let Some(item) = item else { break; }; item }
+            };
+            // A full output buffer must not postpone an authorization change.
+            loop {
+                if !authorized() {
+                    revoked_by_pump.store(true, Ordering::Release);
+                    break 'pump;
+                }
+                tokio::select! {
+                    biased;
+                    updated = updates.changed() => {
+                        if updated.is_err() { revoked_by_pump.store(true, Ordering::Release); break 'pump; }
+                    }
+                    permit = tx.reserve() => {
+                        let Ok(permit) = permit else { break 'pump; };
+                        permit.send(item);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    Box::pin(stream::unfold(
+        Some((rx, revoked, authorizer, peer)),
+        |state| async move {
+            let (mut rx, revoked, authorizer, peer) = state?;
+            let unauthorized = || {
+                revoked.load(Ordering::Acquire)
+                    || !authorizer
+                        .role_of(&peer)
+                        .is_some_and(|role| role_allows(role, Role::Viewer))
+            };
+            if unauthorized() {
+                return Some((
+                    Err(rejection(
+                        ErrorCode::PermissionDenied,
+                        "Peer authorization revoked",
+                    )),
+                    None,
+                ));
+            }
+            let item = rx.recv().await;
+            if unauthorized() {
+                return Some((
+                    Err(rejection(
+                        ErrorCode::PermissionDenied,
+                        "Peer authorization revoked",
+                    )),
+                    None,
+                ));
+            }
+            item.map(|item| (Ok(item), Some((rx, revoked, authorizer, peer))))
+        },
+    ))
 }
 enum Mutation {
     Apply(String, Option<Box<NetworkSpec>>, i32),
@@ -591,23 +776,18 @@ impl HostService for ContractService {
             .inner
             .journal
             .subscribe(request.into_inner().after, self.inner.handle.view().seq)
-            .map(move |mut event| {
-                let _presence = &presence;
-                if !authorizer
-                    .role_of(&peer)
-                    .is_some_and(|role| role_allows(role, Role::Viewer))
-                {
-                    return Err(rejection(
-                        ErrorCode::PermissionDenied,
-                        "Peer authorization revoked",
-                    ));
-                }
+            .map(|mut event| {
                 if let Some(v1::event::Payload::DesiredChanged(change)) = event.payload.as_mut() {
                     redact(change.instance.as_mut());
                 }
-                Ok(event)
+                event
             });
-        Ok(Response::new(Box::pin(stream)))
+        Ok(Response::new(authorized_stream(
+            Box::pin(stream),
+            authorizer,
+            peer,
+            Some(presence),
+        )))
     }
     async fn apply(
         &self,
@@ -735,11 +915,15 @@ impl HostService for ContractService {
         &self,
         request: Request<GetReceiptRequest>,
     ) -> Result<Response<GetReceiptResponse>, Status> {
-        self.guard(&request, "GetReceipt")?;
+        let (peer, role) = self.guard(&request, "GetReceipt")?;
+        let caller = canonical_caller(&peer)?;
         let receipt = self
             .inner
             .ledger
-            .receipt(&RequestId(request.into_inner().request_id))
+            .receipt_for(
+                &RequestId(request.into_inner().request_id),
+                (role != Role::Admin).then_some(caller.as_str()),
+            )
             .await
             .map_err(ledger_error)?;
         Ok(Response::new(GetReceiptResponse { receipt }))
@@ -772,23 +956,14 @@ impl HostService for ContractService {
         let (peer, _) = self.guard(&request, "StreamLogs")?;
         let authorizer = self.inner.authorizer.clone();
         let request = request.into_inner();
-        let stream = self
-            .ask(|reply| Command::Logs { request, reply })
-            .await?
-            .map(move |line| {
-                if authorizer
-                    .role_of(&peer)
-                    .is_some_and(|role| role_allows(role, Role::Viewer))
-                {
-                    Ok(line)
-                } else {
-                    Err(rejection(
-                        ErrorCode::PermissionDenied,
-                        "Peer authorization revoked",
-                    ))
-                }
-            });
-        Ok(Response::new(Box::pin(stream)))
+        let stream = self.ask(|reply| Command::Logs { request, reply }).await?;
+        let presence = SubscriptionPresence::new(self.inner.presence.clone());
+        Ok(Response::new(authorized_stream(
+            stream,
+            authorizer,
+            peer,
+            Some(presence),
+        )))
     }
     async fn get_reclaim_report(
         &self,
@@ -854,20 +1029,68 @@ impl HostService for ContractService {
             .await
             .map_err(|_| rejection(ErrorCode::CoreUnavailable, "Kernel store unavailable"))?;
         let settings = self.inner.ledger.settings().await.map_err(ledger_error)?;
-        let default_version = match self
-            .inner
-            .store
-            .resolve(&CoreSelector {
-                version: settings.selected_core,
+        let selected =
+            match settings.selected_core {
+                Some(version) => Some(version),
+                None => self.inner.store.default_version().await.map_err(|_| {
+                    rejection(ErrorCode::CoreUnavailable, "Kernel store unavailable")
+                })?,
+            };
+        let default_version = selected
+            .filter(|version| {
+                cores.iter().any(|entry| {
+                    entry.version == *version
+                        && matches!(
+                            entry.support(),
+                            CoreSupport::Profiled | CoreSupport::LifecycleOnly
+                        )
+                })
             })
-            .await
-        {
-            Ok(core) => core.descriptor.version,
-            Err(_) => String::new(),
-        };
+            .unwrap_or_default();
         Ok(Response::new(ListCoresResponse {
             cores,
             default_version,
         }))
+    }
+}
+
+#[cfg(test)]
+mod digest_tests {
+    use super::*;
+
+    #[test]
+    fn apply_digest_replaces_secret_with_keyed_mac_and_preserves_presence() {
+        let mut body = ApplyRequest {
+            spec: Some(NetworkSpec {
+                network_secret: Some("synthetic-test".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let key = InstallKey([7; 32]);
+        let canonical = ApplyRequest::decode(body.digest_bytes(&key).as_slice()).unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(&key.0).unwrap();
+        mac.update(b"synthetic-test");
+        let expected: String = mac
+            .finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(canonical.spec.unwrap().network_secret, Some(expected));
+        assert_eq!(
+            body.spec.as_ref().unwrap().network_secret.as_deref(),
+            Some("synthetic-test")
+        );
+        let original = request_digest("Apply", "20", 1, &body, &key);
+        assert_ne!(
+            original,
+            request_digest("Apply", "20", 1, &body, &InstallKey([8; 32]))
+        );
+        body.spec.as_mut().unwrap().network_secret = Some(String::new());
+        let clear = request_digest("Apply", "20", 1, &body, &key);
+        body.spec.as_mut().unwrap().network_secret = None;
+        assert_ne!(clear, request_digest("Apply", "20", 1, &body, &key));
+        assert_ne!(clear, original);
     }
 }

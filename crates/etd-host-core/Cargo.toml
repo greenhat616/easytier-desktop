@@ -15,6 +15,8 @@ etd-proc = { workspace = true }
 etd-sysfx = { workspace = true }
 async-trait = { workspace = true }
 futures-util = { workspace = true, features = ["std"] }
+hmac = { workspace = true }
+same-file = { workspace = true }
 jiff = { workspace = true, features = ["std", "serde"] }
 prost = { workspace = true }
 serde = { workspace = true, features = ["std", "derive"] }

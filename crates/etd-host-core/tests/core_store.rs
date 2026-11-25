@@ -11,10 +11,16 @@ use std::{
     sync::Arc,
 };
 
-struct Driver(bool, &'static str);
+struct Driver(bool, &'static str, std::sync::atomic::AtomicUsize);
+impl Driver {
+    fn new(profiled: bool, revision: &'static str) -> Self {
+        Self(profiled, revision, 0.into())
+    }
+}
 #[async_trait::async_trait]
 impl CoreDriver for Driver {
     async fn identify(&self, _: &Path) -> Result<CoreDescriptor, CoreError> {
+        self.2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(CoreDescriptor {
             version: "1.2.3".into(),
             proto_revision: self.1.into(),
@@ -78,8 +84,9 @@ async fn hash_is_checked_every_time() {
     let store = ManifestCoreStore::new(
         root.0.clone(),
         HostMode::Service,
-        Arc::new(Driver(true, "rev")),
-    );
+        Arc::new(Driver::new(true, "rev")),
+    )
+    .unwrap();
     assert!(matches!(
         store.resolve(&CoreSelector::default()).await.unwrap().usage,
         CoreUsage::Profiled(_)
@@ -100,8 +107,9 @@ async fn profile_required_for_privileged_host() {
     let service = ManifestCoreStore::new(
         root.0.clone(),
         HostMode::Service,
-        Arc::new(Driver(false, "rev")),
-    );
+        Arc::new(Driver::new(false, "rev")),
+    )
+    .unwrap();
     assert!(matches!(
         service.resolve(&CoreSelector::default()).await,
         Err(StoreError::NoProfile { .. })
@@ -109,8 +117,9 @@ async fn profile_required_for_privileged_host() {
     let user = ManifestCoreStore::new(
         root.0.clone(),
         HostMode::User,
-        Arc::new(Driver(false, "rev")),
-    );
+        Arc::new(Driver::new(false, "rev")),
+    )
+    .unwrap();
     assert_eq!(
         user.resolve(&CoreSelector::default()).await.unwrap().usage,
         CoreUsage::LifecycleOnly
@@ -124,8 +133,9 @@ async fn remove_only_selected_hash_directory_and_clear_default() {
     let store = ManifestCoreStore::new(
         root.0.clone(),
         HostMode::Service,
-        Arc::new(Driver(true, "rev")),
-    );
+        Arc::new(Driver::new(true, "rev")),
+    )
+    .unwrap();
     store.remove("1.2.3").await.unwrap();
     assert!(!binary.exists());
     assert!(!binary.parent().unwrap().exists());
@@ -144,7 +154,12 @@ async fn gitless_core_is_user_lifecycle_only_and_privileged_refuses() {
     let mut manifest: Manifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     manifest.cores[0].proto_revision.clear();
     fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-    let user = ManifestCoreStore::new(root.0.clone(), HostMode::User, Arc::new(Driver(false, "")));
+    let user = ManifestCoreStore::new(
+        root.0.clone(),
+        HostMode::User,
+        Arc::new(Driver::new(false, "")),
+    )
+    .unwrap();
     assert_eq!(
         user.resolve(&CoreSelector::default()).await.unwrap().usage,
         CoreUsage::LifecycleOnly
@@ -152,10 +167,103 @@ async fn gitless_core_is_user_lifecycle_only_and_privileged_refuses() {
     let privileged = ManifestCoreStore::new(
         root.0.clone(),
         HostMode::Service,
-        Arc::new(Driver(false, "")),
-    );
+        Arc::new(Driver::new(false, "")),
+    )
+    .unwrap();
     assert!(matches!(
         privileged.resolve(&CoreSelector::default()).await,
         Err(StoreError::NoProfile { .. })
     ));
 }
+
+#[tokio::test]
+async fn list_caches_identity_and_resolve_returns_canonical_path() {
+    use std::sync::atomic::Ordering;
+    let (root, binary) = Root::new();
+    let driver = Arc::new(Driver::new(true, "rev"));
+    let store = ManifestCoreStore::new(root.0.clone(), HostMode::Service, driver.clone()).unwrap();
+    assert_eq!(
+        store.default_version().await.unwrap().as_deref(),
+        Some("1.2.3")
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            store.list().await.unwrap()[0].support(),
+            etd_contract::v1::CoreSupport::Profiled
+        );
+    }
+    assert_eq!(driver.2.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store
+            .resolve(&CoreSelector::default())
+            .await
+            .unwrap()
+            .binary,
+        fs::canonicalize(&binary).unwrap()
+    );
+    assert_eq!(driver.2.load(Ordering::SeqCst), 2);
+    // Replace with a distinct file identity, preserving size and mtime.
+    let metadata = fs::metadata(&binary).unwrap();
+    let replacement = binary.with_extension("replacement");
+    fs::write(&replacement, vec![b'x'; metadata.len() as usize]).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&replacement)
+        .unwrap()
+        .set_modified(metadata.modified().unwrap())
+        .unwrap();
+    fs::rename(&replacement, &binary).unwrap();
+    assert_eq!(
+        store.list().await.unwrap()[0].support(),
+        etd_contract::v1::CoreSupport::Rejected
+    );
+    assert_eq!(driver.2.load(Ordering::SeqCst), 2); // Failed hash never executes identify.
+}
+
+#[tokio::test]
+async fn list_cores_rpc_never_resolves_default_for_each_call() {
+    use etd_contract::{HostPhase, HostSnapshot, Role, v1::ListCoresRequest};
+    use etd_host_core::{
+        api::{HostView, orchestrator_channel},
+        service::ContractService,
+        stub::host_service_server::HostService,
+    };
+    use std::sync::atomic::Ordering;
+    let f = common::Fixture::new().await;
+    let (root, _) = Root::new();
+    let driver = Arc::new(Driver::new(true, "rev"));
+    let store = Arc::new(
+        ManifestCoreStore::new(root.0.clone(), HostMode::Service, driver.clone()).unwrap(),
+    );
+    let (handle, _port) = orchestrator_channel(
+        8,
+        HostView {
+            seq: 0,
+            snapshot: HostSnapshot {
+                phase: HostPhase::Serving as i32,
+                ..Default::default()
+            },
+        },
+    );
+    let service = ContractService::new(
+        HostMode::Service,
+        f.ledger,
+        etd_sysfx::InstallKey([7; 32]),
+        f.auth,
+        store,
+        handle,
+        vec![],
+        8,
+    );
+    for _ in 0..3 {
+        let list = service
+            .list_cores(common::request(ListCoresRequest {}, Role::Viewer))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(list.default_version, "1.2.3");
+        assert_eq!(list.cores.len(), 1);
+    }
+    assert_eq!(driver.2.load(Ordering::SeqCst), 1);
+}
+mod common;

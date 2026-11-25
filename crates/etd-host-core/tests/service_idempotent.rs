@@ -46,7 +46,7 @@ async fn durable_retry_and_old_revision() {
             GetReceiptRequest {
                 request_id: "one".into(),
             },
-            Role::Viewer,
+            Role::Control,
         ))
         .await
         .unwrap()
@@ -244,6 +244,7 @@ async fn cancellation_after_durable_commit_does_not_lose_notification_or_receipt
     let service = ContractService::new(
         HostMode::Service,
         f.ledger.clone(),
+        etd_sysfx::InstallKey([7; 32]),
         f.auth,
         Arc::new(FakeCoreStore::default()),
         handle,
@@ -432,4 +433,45 @@ async fn generation_is_committed_atomically_with_request_and_config_revision() {
         receipt
     );
     assert_eq!(plans.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn receipt_is_visible_only_to_original_caller_or_admin() {
+    let mut f = Fixture::new().await;
+    f.start_commands();
+    let body = ApplyRequest {
+        header: Some(MutationHeader {
+            request_id: "private-receipt".into(),
+            expected_revision: 1,
+        }),
+        instance_id: INSTANCE.into(),
+        spec: Some(NetworkSpec::default()),
+        desired: Desired::Stopped as i32,
+    };
+    let receipt = f
+        .service
+        .apply(request(body, Role::Control))
+        .await
+        .unwrap()
+        .into_inner()
+        .receipt;
+    for (role, expected) in [
+        (Role::Viewer, None),
+        (Role::Control, receipt.clone()),
+        (Role::Admin, receipt.clone()),
+    ] {
+        let actual = f
+            .service
+            .get_receipt(request(
+                GetReceiptRequest {
+                    request_id: "private-receipt".into(),
+                },
+                role,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .receipt;
+        assert_eq!(actual, expected);
+    }
 }

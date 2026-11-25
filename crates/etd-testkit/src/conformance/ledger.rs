@@ -680,3 +680,65 @@ pub async fn caller_and_purge(ledger: &dyn Ledger) {
     assert_eq!(ledger.pending_tickets().await.unwrap().len(), 1);
     assert_eq!(ledger.commit(0, purge).await.unwrap(), purge_receipt);
 }
+
+pub async fn per_instance_spec_revision(ledger: &dyn Ledger) {
+    let id = InstanceId::from("a");
+    commit(
+        ledger,
+        0,
+        changes("one", 1, vec![put("a", Desired::Stopped, &[])], vec![]),
+    )
+    .await;
+    commit(
+        ledger,
+        1,
+        changes("two", 2, vec![put("b", Desired::Stopped, &[])], vec![]),
+    )
+    .await;
+    assert_eq!(ledger.spec_revision(&id).await.unwrap(), 1);
+    assert_eq!(ledger.spec_revision(&"b".into()).await.unwrap(), 2);
+    commit(
+        ledger,
+        2,
+        changes(
+            "start",
+            3,
+            vec![Change::SetDesired {
+                instance: id.clone(),
+                desired: Desired::Running,
+            }],
+            vec![plan_at("a", 1, &[], 1)],
+        ),
+    )
+    .await;
+    assert_eq!(ledger.spec_revision(&id).await.unwrap(), 1);
+    let effect = ledger
+        .open_effects(&ScopeFilter::instance(id.clone()))
+        .await
+        .unwrap()
+        .remove(0);
+    ledger
+        .transition(&effect.id, EffectState::Reclaimed, None)
+        .await
+        .unwrap();
+    commit(
+        ledger,
+        3,
+        changes(
+            "unrelated",
+            4,
+            vec![Change::SelectCore(Some("next".into()))],
+            vec![],
+        ),
+    )
+    .await;
+    ledger.begin_epoch(plan_at("a", 2, &[], 1)).await.unwrap();
+    assert_eq!(ledger.spec_revision(&id).await.unwrap(), 1);
+    commit(
+        ledger,
+        4,
+        changes("replace", 5, vec![put("a", Desired::Running, &[])], vec![]),
+    )
+    .await;
+    assert_eq!(ledger.spec_revision(&id).await.unwrap(), 5);
+}

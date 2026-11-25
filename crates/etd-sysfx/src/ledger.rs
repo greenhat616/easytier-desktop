@@ -301,6 +301,18 @@ pub trait Ledger: Send + Sync {
 
     /// Desired state; the only input for starting instances after boot.
     async fn desired(&self) -> Result<(Revision, Vec<DesiredInstance>), LedgerError>;
+    /// Revision at which the instance configuration was last committed.
+    /// Generation plans must use this revision (or the next revision of
+    /// the commit that puts a new configuration). The default preserves
+    /// compatibility for adapters that only track a global revision.
+    async fn spec_revision(&self, instance: &InstanceId) -> Result<Revision, LedgerError> {
+        let (revision, instances) = self.desired().await?;
+        if instances.iter().any(|i| i.instance_id == instance.0) {
+            Ok(revision)
+        } else {
+            Err(LedgerError::UnknownInstance(instance.clone()))
+        }
+    }
     async fn settings(&self) -> Result<HostSettings, LedgerError>;
     /// Every claim currently held, from both sources, as committed. The
     /// planner uses it to decide whether a start must be deferred.

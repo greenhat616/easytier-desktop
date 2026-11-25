@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct LedgerState {
     pub(super) revision: Revision,
     pub(super) instances: BTreeMap<InstanceId, (DesiredInstance, Vec<String>)>,
+    pub(super) spec_revisions: BTreeMap<InstanceId, Revision>,
     pub(super) removal_pending: BTreeSet<InstanceId>,
     pub(super) settings: HostSettings,
     pub(super) requests: BTreeMap<RequestId, (RequestRecord, Ticket)>,
@@ -53,6 +54,13 @@ impl LedgerState {
     }
 
     pub fn complete_ticket(&mut self, ticket: &str) -> Result<(), LedgerError> {
+        if self.is_purge_ticket(ticket)
+            && let Some(instance) = self.removal_pending.iter().next()
+        {
+            return Err(LedgerError::RemovalPending {
+                instance: instance.clone(),
+            });
+        }
         let (_, t) = self
             .requests
             .values_mut()
@@ -72,11 +80,44 @@ impl LedgerState {
             .any(|(_, t)| !t.done && t.changes.iter().any(|c| matches!(c, Change::PurgeAll)))
     }
 
+    pub(super) fn is_purge_request(&self, id: &RequestId) -> bool {
+        self.requests.get(id).is_some_and(|(_, t)| {
+            !t.done && t.changes.iter().any(|c| matches!(c, Change::PurgeAll))
+        })
+    }
+
+    pub(super) fn is_purge_ticket(&self, ticket: &str) -> bool {
+        self.requests.values().any(|(_, t)| {
+            t.receipt.ticket == ticket
+                && !t.done
+                && t.changes.iter().any(|c| matches!(c, Change::PurgeAll))
+        })
+    }
+
+    pub(super) fn scrub_completed(&mut self) -> bool {
+        let mut changed = false;
+        for (_, t) in self.requests.values_mut() {
+            if t.done && (!t.changes.is_empty() || !t.generations.is_empty()) {
+                t.changes.clear();
+                t.generations.clear();
+                changed = true;
+            }
+        }
+        changed
+    }
+
     pub fn desired(&self) -> (Revision, Vec<DesiredInstance>) {
         (
             self.revision,
             self.instances.values().map(|(i, _)| i.clone()).collect(),
         )
+    }
+
+    pub fn spec_revision(&self, instance: &InstanceId) -> Result<Revision, LedgerError> {
+        self.spec_revisions
+            .get(instance)
+            .copied()
+            .ok_or_else(|| LedgerError::UnknownInstance(instance.clone()))
     }
 
     pub fn settings(&self) -> HostSettings {
@@ -152,6 +193,7 @@ impl LedgerState {
         stored.desired = Desired::Stopped as i32;
         if self.ensure_closed(instance).is_ok() {
             self.instances.remove(instance);
+            self.spec_revisions.remove(instance);
             self.removal_pending.remove(instance);
         } else {
             self.removal_pending.insert(instance.clone());
@@ -190,6 +232,8 @@ impl LedgerState {
                     InstanceId(instance.instance_id.clone()),
                     (*instance.clone(), claims),
                 );
+                self.spec_revisions
+                    .insert(InstanceId(instance.instance_id.clone()), self.revision);
             }
             Change::SetDesired { instance, desired } => {
                 self.reject_pending_removal(instance)?;
@@ -248,6 +292,10 @@ impl LedgerState {
             });
         }
         let mut staged = self.clone();
+        staged.revision = staged
+            .revision
+            .checked_add(1)
+            .ok_or(LedgerError::CounterExhausted("revision"))?;
         for item in &change.changes {
             staged.apply_change(item)?;
         }
@@ -256,10 +304,6 @@ impl LedgerState {
                 staged.check_claims(id, resources, true)?;
             }
         }
-        staged.revision = staged
-            .revision
-            .checked_add(1)
-            .ok_or(LedgerError::CounterExhausted("revision"))?;
         let generations = change
             .generations
             .iter()
@@ -328,9 +372,10 @@ impl LedgerState {
                 reason: "instance is not desired RUNNING".into(),
             });
         }
-        if plan.inputs.spec_revision != self.revision {
+        let config_revision = self.spec_revision(&plan.instance)?;
+        if plan.inputs.spec_revision != config_revision {
             return Err(LedgerError::Conflict {
-                current: self.revision,
+                current: config_revision,
             });
         }
         if desired.spec.as_ref() != Some(&plan.inputs.spec) {
@@ -513,6 +558,7 @@ impl LedgerState {
                     .checked_add(1)
                     .ok_or(LedgerError::CounterExhausted("revision"))?;
                 self.instances.remove(&instance);
+                self.spec_revisions.remove(&instance);
                 self.removal_pending.remove(&instance);
             }
         }

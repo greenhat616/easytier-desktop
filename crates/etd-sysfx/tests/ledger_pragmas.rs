@@ -102,6 +102,7 @@ async fn pragmas_and_reopen() {
     let ledger = SqliteLedger::open(&path, BootId("boot-b".into()))
         .await
         .unwrap();
+    assert_eq!(ledger.spec_revision(&"a".into()).await.unwrap(), 1);
     assert_eq!(
         ledger.generation(&"a".into(), Epoch(1)).await.unwrap(),
         Some(stored.clone())
@@ -181,6 +182,10 @@ async fn completed_ticket_and_purge_remove_historical_secret() {
         .commit(1, changes("purge", 2, vec![Change::PurgeAll], vec![]))
         .await
         .unwrap();
+    assert!(matches!(
+        ledger.complete_ticket(&purge.ticket).await,
+        Err(LedgerError::RemovalPending { .. })
+    ));
     assert_eq!(
         ledger.desired().await.unwrap().1[0].desired(),
         Desired::Stopped

@@ -163,3 +163,12 @@ async fn memory_caller_and_purge() {
 async fn sqlite_caller_and_purge() {
     sqlite_case(|l| Box::pin(ledger::caller_and_purge(l))).await;
 }
+
+#[tokio::test]
+async fn memory_per_instance_spec_revision() {
+    ledger::per_instance_spec_revision(&MemoryLedger::default()).await;
+}
+#[tokio::test]
+async fn sqlite_per_instance_spec_revision() {
+    sqlite_case(|l| Box::pin(ledger::per_instance_spec_revision(l))).await;
+}

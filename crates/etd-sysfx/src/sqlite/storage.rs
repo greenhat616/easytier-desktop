@@ -85,7 +85,8 @@ pub(super) fn open(
         if empty || version != VERSION {
             return Err(LedgerError::Unavailable(StorageFault::ReadOnly));
         }
-        let state = load(&conn, VERSION)?;
+        let mut state = load(&conn, VERSION)?;
+        state.scrub_completed();
         return Ok((conn, state));
     }
     let mode: String = conn
@@ -115,7 +116,14 @@ pub(super) fn open(
         conn.pragma_update(None, "max_page_count", max)
             .map_err(storage_error)?;
     }
-    let state = load(&conn, VERSION)?;
+    let original = load(&conn, VERSION)?;
+    let mut state = original.clone();
+    if state.scrub_completed() {
+        // Old completed tickets may contain historical config secrets.
+        // Remove them durably on a writable open, not just from the cache.
+        persist(&mut conn, &original, &state, &|_| {})?;
+        let _ = checkpoint_truncate(&conn);
+    }
     Ok((conn, state))
 }
 
@@ -142,8 +150,9 @@ fn validate_schema(conn: &Connection, version: u32) -> Result<bool, LedgerError>
         ("requests", &["id", "payload"][..]),
         ("settings", &["singleton", "payload"][..]),
         ("removal_pending", &["id"][..]),
+        ("spec_revisions", &["id", "revision"][..]),
     ];
-    let mut expected = expected[..if version == 0 { 6 } else { 8 }].to_vec();
+    let mut expected = expected[..if version == 0 { 6 } else { 9 }].to_vec();
     expected.sort_by_key(|(name, _)| *name);
     if objects.len() != expected.len() {
         return Err(unreadable());
@@ -205,6 +214,32 @@ fn load(conn: &Connection, version: u32) -> Result<LedgerState, LedgerError> {
             return Err(unreadable());
         }
         state.instances.insert(InstanceId(id), (row.into(), claims));
+    }
+    if version >= 1 {
+        let mut stmt = conn
+            .prepare("SELECT id, revision FROM spec_revisions")
+            .map_err(storage_error)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(storage_error)?;
+        for row in rows {
+            let (id, rev) = row.map_err(storage_error)?;
+            let id = InstanceId(id);
+            let revision = number(rev)?;
+            if !state.instances.contains_key(&id) || revision > state.revision {
+                return Err(unreadable());
+            }
+            state.spec_revisions.insert(id, revision);
+        }
+        if state.spec_revisions.len() != state.instances.len() {
+            return Err(unreadable());
+        }
+    } else {
+        state.spec_revisions = state
+            .instances
+            .keys()
+            .map(|id| (id.clone(), state.revision))
+            .collect();
     }
     for (id, raw) in payload_rows(conn, "requests")? {
         let request = RequestId(id);
@@ -360,6 +395,19 @@ pub(super) fn persist(
             )?;
         }
     }
+    for id in old
+        .spec_revisions
+        .keys()
+        .filter(|id| !new.spec_revisions.contains_key(*id))
+    {
+        tx.execute("DELETE FROM spec_revisions WHERE id=?1", [&id.0])
+            .map_err(storage_error)?;
+    }
+    for (id, revision) in &new.spec_revisions {
+        if old.spec_revisions.get(id) != Some(revision) {
+            tx.execute("INSERT INTO spec_revisions VALUES (?1,?2) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision", params![id.0,revision.to_string()]).map_err(storage_error)?;
+        }
+    }
     for id in old.removal_pending.difference(&new.removal_pending) {
         tx.execute("DELETE FROM removal_pending WHERE id=?1", [&id.0])
             .map_err(storage_error)?;
@@ -452,11 +500,20 @@ pub(super) fn pragmas(conn: &Connection) -> Result<super::LedgerPragmas, LedgerE
 }
 
 pub(super) fn checkpoint_truncate(conn: &Connection) -> Result<(), LedgerError> {
-    let (busy, _, _): (i64, i64, i64) = conn
-        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
+    // A diagnostic reader can pin WAL frames. Don't wait on that reader
+    // on every queued ledger call; report busy and retry on a later call.
+    conn.busy_timeout(std::time::Duration::ZERO)
         .map_err(storage_error)?;
+    let result = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    });
+    conn.busy_timeout(std::time::Duration::from_secs(2))
+        .map_err(storage_error)?;
+    let (busy, _, _) = result.map_err(storage_error)?;
     if busy != 0 {
         return Err(LedgerError::Unavailable(StorageFault::Locked));
     }
@@ -464,5 +521,7 @@ pub(super) fn checkpoint_truncate(conn: &Connection) -> Result<(), LedgerError> 
 }
 
 pub(super) fn reload(conn: &Connection) -> Result<LedgerState, LedgerError> {
-    load(conn, VERSION)
+    let mut state = load(conn, VERSION)?;
+    state.scrub_completed();
+    Ok(state)
 }

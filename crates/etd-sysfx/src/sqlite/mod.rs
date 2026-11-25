@@ -75,12 +75,17 @@ impl Worker {
             self.pending_checkpoint |= self.state.has_pending_purge();
             self.reload = false;
         }
-        self.finish_checkpoint()?;
+        // A reader pinning WAL frames must not block unrelated operations.
+        // Only the purge's own receipt and completion require success.
+        let _ = self.finish_checkpoint();
         Ok(())
     }
 
     fn finish_checkpoint(&mut self) -> Result<(), LedgerError> {
-        if self.pending_checkpoint && !self.options.read_only {
+        if self.pending_checkpoint {
+            if self.options.read_only {
+                return Err(LedgerError::Unavailable(StorageFault::ReadOnly));
+            }
             storage::checkpoint_truncate(&self.conn)?;
             self.pending_checkpoint = false;
         }
@@ -112,7 +117,7 @@ impl Worker {
         // on reopen before its receipt can be returned.
         self.pending_checkpoint |= self.state.has_pending_purge() || staged.has_pending_purge();
         self.state = staged;
-        self.finish_checkpoint()?;
+        let _ = self.finish_checkpoint();
         Ok(value)
     }
 }
@@ -147,10 +152,7 @@ impl SqliteLedger {
                         return;
                     }
                 };
-                if let Err(error) = worker.finish_checkpoint() {
-                    let _ = ready.send(Err(error));
-                    return;
-                }
+                let _ = worker.finish_checkpoint();
                 if ready.send(Ok(())).is_err() {
                     return;
                 }
@@ -216,32 +218,65 @@ impl Ledger for SqliteLedger {
     async fn commit(&self, expected: Revision, change: ChangeSet) -> Result<Receipt, LedgerError> {
         self.call(move |worker| {
             worker.refresh()?;
-            match worker.state.request_status(&change.request) {
+            let request_id = change.request.request_id.clone();
+            let receipt = match worker.state.request_status(&change.request) {
                 RequestStatus::Done(receipt) => Ok(receipt),
                 RequestStatus::Reused => Err(LedgerError::RequestReused(change.request.request_id)),
                 RequestStatus::New => worker
                     .write(move |s, boot| s.commit(expected, change, boot, jiff::Timestamp::now())),
+            }?;
+            if worker.state.is_purge_request(&request_id) {
+                worker.finish_checkpoint()?;
             }
+            Ok(receipt)
         })
         .await
     }
     async fn request_status(&self, request: &RequestRecord) -> Result<RequestStatus, LedgerError> {
         let request = request.clone();
-        self.read(move |s| Ok(s.request_status(&request))).await
+        self.call(move |worker| {
+            worker.refresh()?;
+            let status = worker.state.request_status(&request);
+            if matches!(status, RequestStatus::Done(_))
+                && worker.state.is_purge_request(&request.request_id)
+            {
+                worker.finish_checkpoint()?;
+            }
+            Ok(status)
+        })
+        .await
     }
     async fn receipt(&self, request: &RequestId) -> Result<Option<Receipt>, LedgerError> {
         let request = request.clone();
-        self.read(move |s| Ok(s.receipt(&request))).await
+        self.call(move |worker| {
+            worker.refresh()?;
+            if worker.state.is_purge_request(&request) {
+                worker.finish_checkpoint()?;
+            }
+            Ok(worker.state.receipt(&request))
+        })
+        .await
     }
     async fn pending_tickets(&self) -> Result<Vec<Ticket>, LedgerError> {
         self.read(move |s| Ok(s.pending_tickets())).await
     }
     async fn complete_ticket(&self, ticket: &str) -> Result<(), LedgerError> {
         let ticket = ticket.to_owned();
-        self.write(move |s, _| s.complete_ticket(&ticket)).await
+        self.call(move |worker| {
+            worker.refresh()?;
+            if worker.state.is_purge_ticket(&ticket) {
+                worker.finish_checkpoint()?;
+            }
+            worker.write(move |s, _| s.complete_ticket(&ticket))
+        })
+        .await
     }
     async fn desired(&self) -> Result<(Revision, Vec<DesiredInstance>), LedgerError> {
         self.read(move |s| Ok(s.desired())).await
+    }
+    async fn spec_revision(&self, instance: &InstanceId) -> Result<Revision, LedgerError> {
+        let instance = instance.clone();
+        self.read(move |s| s.spec_revision(&instance)).await
     }
     async fn settings(&self) -> Result<HostSettings, LedgerError> {
         self.read(move |s| Ok(s.settings())).await

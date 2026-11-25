@@ -111,3 +111,88 @@ async fn corrupt_database_refused() {
     ));
     assert_eq!(std::fs::read(&path).unwrap(), b"not SQLite");
 }
+
+#[tokio::test]
+async fn pinned_reader_defers_only_purge_receipt_and_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite");
+    let boot = BootId("boot".into());
+    let ledger = SqliteLedger::open(&path, boot).await.unwrap();
+    ledger
+        .commit(
+            0,
+            changes(
+                "start",
+                1,
+                vec![put("a", Desired::Running, &[])],
+                vec![plan("a", 1, &[])],
+            ),
+        )
+        .await
+        .unwrap();
+    let reader = rusqlite::Connection::open(&path).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    assert_eq!(
+        reader
+            .query_row("SELECT COUNT(*) FROM requests", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+
+    let purge = changes("purge", 2, vec![Change::PurgeAll], vec![]);
+    assert_eq!(
+        ledger.commit(1, purge.clone()).await,
+        Err(LedgerError::Unavailable(StorageFault::Locked))
+    );
+    assert_eq!(
+        ledger.desired().await.unwrap().1[0].desired(),
+        Desired::Stopped
+    );
+    let ticket = ledger.pending_tickets().await.unwrap().remove(0);
+    assert_eq!(
+        ledger.receipt(&purge.request.request_id).await,
+        Err(LedgerError::Unavailable(StorageFault::Locked))
+    );
+    assert_eq!(
+        ledger.complete_ticket(&ticket.receipt.ticket).await,
+        Err(LedgerError::Unavailable(StorageFault::Locked))
+    );
+    // Other writes, including closing the last generation, are not blocked.
+    ledger
+        .commit(
+            2,
+            changes(
+                "settings",
+                3,
+                vec![Change::SelectCore(Some("new".into()))],
+                vec![],
+            ),
+        )
+        .await
+        .unwrap();
+    let effect = ledger
+        .open_effects(&ScopeFilter::all())
+        .await
+        .unwrap()
+        .remove(0);
+    ledger
+        .transition(&effect.id, EffectState::Reclaimed, None)
+        .await
+        .unwrap();
+    assert_eq!(ledger.desired().await.unwrap(), (4, vec![]));
+    reader.execute_batch("ROLLBACK").unwrap();
+    drop(reader);
+    assert_eq!(
+        ledger.request_status(&purge.request).await.unwrap(),
+        RequestStatus::Done(ticket.receipt.clone())
+    );
+    ledger
+        .complete_ticket(&ticket.receipt.ticket)
+        .await
+        .unwrap();
+    assert_eq!(
+        ledger.receipt(&purge.request.request_id).await.unwrap(),
+        Some(ticket.receipt)
+    );
+    ledger.close().await.unwrap();
+}

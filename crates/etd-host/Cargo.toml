@@ -1,0 +1,18 @@
+[package]
+name = "etd-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+etd-host-core = { workspace = true }
+etd-core-api = { workspace = true }
+etd-core-easytier = { workspace = true }
+etd-proc = { workspace = true }
+etd-sysfx = { workspace = true }
+etd-sysfx-os = { workspace = true }
+etd-ipc = { workspace = true }
+etd-contract = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,15 @@
+[package]
+name = "etd-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+etd-client = { workspace = true }
+etd-ipc = { workspace = true }
+etd-contract = { workspace = true }
+async-trait = { workspace = true }
+async-channel = { workspace = true }
+thiserror = { workspace = true }

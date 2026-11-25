@@ -1,0 +1,65 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/etd-contract",
+    "crates/etd-ipc",
+    "crates/etd-client",
+    "crates/etd-app",
+    "crates/etd-ui",
+    "crates/etd-ctl",
+    "crates/etd-host",
+    "crates/etd-host-core",
+    "crates/etd-proc",
+    "crates/etd-sysfx",
+    "crates/etd-sysfx-os",
+    "crates/etd-core-api",
+    "crates/etd-core-easytier",
+    "crates/etd-testkit",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "LGPL-3.0-or-later"
+publish = false
+
+[workspace.dependencies]
+etd-contract = { path = "crates/etd-contract" }
+etd-ipc = { path = "crates/etd-ipc" }
+etd-client = { path = "crates/etd-client" }
+etd-app = { path = "crates/etd-app" }
+etd-host-core = { path = "crates/etd-host-core" }
+etd-proc = { path = "crates/etd-proc" }
+etd-sysfx = { path = "crates/etd-sysfx" }
+etd-sysfx-os = { path = "crates/etd-sysfx-os" }
+etd-core-api = { path = "crates/etd-core-api" }
+etd-core-easytier = { path = "crates/etd-core-easytier" }
+
+anyhow = "1.0.105"
+async-channel = "2.5.0"
+async-trait = "0.1.92"
+cargo_metadata = "0.23.1"
+futures-util = { version = "0.3.34", default-features = false }
+gpui-kit = { version = "=0.11.0", default-features = false }
+insta = "1.49.0"
+jiff = { version = "1.0.3", default-features = false }
+mockall = "0.15.0"
+muda = { version = "0.21.2", default-features = false }
+processkit = { version = "=3.3.4", default-features = false }
+proptest = "1.12.0"
+prost = "=0.14.6"
+prost-build = "=0.14.6"
+rusqlite = { version = "0.43.0", default-features = false }
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", default-features = false }
+tonic = { version = "=0.14.9", default-features = false }
+tonic-prost = "=0.14.9"
+tonic-prost-build = "=0.14.9"
+tray-icon = { version = "0.26.1", default-features = false }
+
+# EasyTier prototype pin (keep upstream types inside etd-core-easytier).
+easytier-proto = { git = "https://github.com/EasyTier/EasyTier.git", rev = "c97f36b8d40f3bde7a95cc9ec99fe95fe35a6ff0", default-features = false }
+easytier-core = { git = "https://github.com/EasyTier/EasyTier.git", rev = "c97f36b8d40f3bde7a95cc9ec99fe95fe35a6ff0", default-features = false }

@@ -1,0 +1,15 @@
+[package]
+name = "etd-sysfx"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+etd-contract = { workspace = true }
+async-trait = { workspace = true }
+futures-util = { workspace = true, features = ["std"] }
+thiserror = { workspace = true }
+rusqlite = { workspace = true, features = ["bundled"] }
+jiff = { workspace = true, features = ["std"] }

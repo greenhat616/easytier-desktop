@@ -1,0 +1,16 @@
+[package]
+name = "etd-core-easytier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+etd-core-api = { workspace = true }
+etd-contract = { workspace = true }
+etd-proc = { workspace = true }
+etd-sysfx = { workspace = true }
+async-trait = { workspace = true }
+easytier-proto = { workspace = true }
+easytier-core = { workspace = true }

@@ -1,0 +1,19 @@
+[package]
+name = "etd-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+etd-contract = { workspace = true }
+etd-ipc = { workspace = true }
+async-trait = { workspace = true }
+futures-util = { workspace = true, features = ["std"] }
+tonic = { workspace = true, features = ["channel", "codegen"] }
+tonic-prost = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }

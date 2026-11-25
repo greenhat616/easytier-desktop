@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package etd.v1;
+
+service HostService {
+  rpc Handshake(Hello) returns (Welcome);
+  rpc Snapshot(SnapshotRequest) returns (HostSnapshot);
+}
+
+message Hello {
+  uint32 major = 1;
+  uint32 minor = 2;
+  string build = 3;
+}
+
+message Welcome {
+  uint32 major = 1;
+  uint32 minor = 2;
+  repeated string capabilities = 3;
+  Role role = 4;
+}
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_VIEWER = 1;
+  ROLE_OPERATOR = 2;
+  ROLE_ADMIN = 3;
+}
+
+message SnapshotRequest {}
+
+message HostSnapshot {
+  uint64 revision = 1;
+  repeated DesiredInstance instances = 2;
+}
+
+message DesiredInstance {
+  string instance_id = 1;
+  NetworkSpec spec = 2;
+  Desired desired = 3;
+}
+
+message NetworkSpec {
+  string name = 1;
+}
+
+enum Desired {
+  DESIRED_UNSPECIFIED = 0;
+  DESIRED_STOPPED = 1;
+  DESIRED_RUNNING = 2;
+}

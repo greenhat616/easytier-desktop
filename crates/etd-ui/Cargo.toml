@@ -1,0 +1,17 @@
+[package]
+name = "etd-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+etd-app = { workspace = true }
+gpui-kit = { workspace = true, features = ["component", "assets", "x11"] }
+tray-icon = { workspace = true }
+muda = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tray-icon = { workspace = true, features = ["ksni"] }
+muda = { workspace = true, features = ["snapshot"] }

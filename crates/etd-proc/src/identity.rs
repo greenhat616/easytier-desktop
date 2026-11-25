@@ -28,6 +28,158 @@ pub(crate) fn normalized(path: &Path) -> io::Result<PathBuf> {
     path.canonicalize()
 }
 
+// Only kernel-defined minimal processes may bypass the unobservable-candidate
+// rule. An ordinary user process is never excluded merely for a missing image.
+#[cfg(any(target_os = "linux", test))]
+fn linux_minimal(pid: u32, parent: Option<u32>, flags: Option<u64>) -> bool {
+    const PF_KTHREAD: u64 = 0x0020_0000;
+    match flags {
+        Some(flags) => flags & PF_KTHREAD != 0,
+        None => pid == 2 || parent == Some(2),
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_minimal(pid: u32) -> bool {
+    pid == 0
+}
+
+#[cfg(any(windows, test))]
+fn windows_minimal(pid: u32, name: &str, system_or_unknown: bool) -> bool {
+    if matches!(pid, 0 | 4) {
+        return true;
+    }
+    system_or_unknown
+        && [
+            "System",
+            "Registry",
+            "Memory Compression",
+            "MemCompression",
+            "Secure System",
+            "System Idle Process",
+            "Idle",
+            "Pico Process",
+            "Vmmem",
+            "VmmemWSL",
+        ]
+        .iter()
+        .any(|known| name.eq_ignore_ascii_case(known))
+}
+
+pub(crate) fn minimal_process(process: &sysinfo::Process) -> bool {
+    // Never exclude a candidate with actual executable/argv observation just
+    // because of its name (a normal program can have a similar basename).
+    if process.exe().is_some() || !process.cmd().is_empty() {
+        return false;
+    }
+    let pid = process.pid().as_u32();
+    #[cfg(target_os = "linux")]
+    {
+        let flags = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(')')?
+                    .1
+                    .split_whitespace()
+                    .nth(6)?
+                    .parse()
+                    .ok()
+            });
+        linux_minimal(pid, process.parent().map(|p| p.as_u32()), flags)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_minimal(pid)
+    }
+    #[cfg(windows)]
+    {
+        let system = "S-1-5-18".parse::<sysinfo::Uid>().ok();
+        let system_or_unknown = process.user_id().is_none() || process.user_id() == system.as_ref();
+        windows_minimal(pid, &process.name().to_string_lossy(), system_or_unknown)
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn cgroup_v2(pid: u32) -> io::Result<Option<PathBuf>> {
+    let contents = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+    Ok(contents
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(PathBuf::from))
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn processkit_cgroup(path: &Path) -> Option<PathBuf> {
+    let mut current = PathBuf::new();
+    let mut domain = None;
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if component
+            .as_os_str()
+            .to_string_lossy()
+            .starts_with("processkit-")
+        {
+            domain = Some(current.clone());
+        }
+    }
+    domain
+}
+
+#[cfg(test)]
+mod minimal_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn linux_kernel_threads_do_not_become_unobservable_core_candidates() {
+        assert!(linux_minimal(9, Some(2), Some(0x0020_0000)));
+        assert!(linux_minimal(2, Some(0), None));
+        assert!(linux_minimal(10, Some(2), None));
+        // A PID namespace's PID 2 need not actually be a kernel thread.
+        assert!(!linux_minimal(2, Some(1), Some(0)));
+        assert!(!linux_minimal(99, Some(1), None));
+    }
+
+    #[test]
+    fn macos_kernel_task_is_not_a_user_process() {
+        assert!(macos_minimal(0));
+        assert!(!macos_minimal(1));
+        assert!(!macos_minimal(99));
+    }
+
+    #[test]
+    fn windows_system_minimal_and_pico_snapshots_are_excluded() {
+        for name in [
+            "System",
+            "Registry",
+            "Memory Compression",
+            "Secure System",
+            "VmmemWSL",
+            "Pico Process",
+        ] {
+            assert!(windows_minimal(14, name, true));
+            assert!(!windows_minimal(14, name, false));
+        }
+        assert!(windows_minimal(4, "System", true));
+        assert!(!windows_minimal(99, "System.exe", true));
+        assert!(!windows_minimal(99, "easytier-core.exe", true));
+    }
+
+    #[test]
+    fn cgroup_membership_uses_processkit_subtree_not_ui_pgid() {
+        let path = Path::new("/user.slice/processkit-12-abcd-1/nested");
+        assert_eq!(
+            processkit_cgroup(path).unwrap(),
+            Path::new("/user.slice/processkit-12-abcd-1")
+        );
+        assert!(processkit_cgroup(Path::new("/user.slice/app.scope")).is_none());
+    }
+}
+
 /// Require a path component boundary; a substring, a sibling with a common
 /// prefix, or an unresolved `..` never qualifies as a marker.
 pub(crate) fn under(path: &Path, root: &Path) -> bool {

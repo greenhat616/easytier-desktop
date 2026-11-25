@@ -272,7 +272,9 @@ async fn marked_orphan_fixture() {
         .into_iter()
         .find(|id| Some(id.pid) == child.id())
         .expect("marked orphan");
-    let outcome = engine.kill_verified(&id).await.unwrap();
+    // Discovery and recovery can use distinct facade instances; the exact
+    // identity-to-marker binding is process-global.
+    let outcome = ProcessKitEngine::new().kill_verified(&id).await.unwrap();
     assert_eq!(outcome, KillOutcome::Killed);
     timeout(Duration::from_secs(5), child.wait())
         .await

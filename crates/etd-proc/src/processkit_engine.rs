@@ -20,7 +20,6 @@ use tokio::{
 #[derive(Default, Clone)]
 pub struct ProcessKitEngine {
     console_helper: Option<PathBuf>,
-    markers: Arc<Mutex<HashMap<ProcessIdentity, ProcessMarker>>>,
 }
 
 impl ProcessKitEngine {
@@ -33,15 +32,58 @@ impl ProcessKitEngine {
     pub fn with_console_helper(executable: PathBuf) -> Self {
         Self {
             console_helper: Some(executable),
-            ..Self::default()
         }
     }
 }
 
-type Registry = Mutex<HashMap<ProcessIdentity, Weak<Live>>>;
+#[derive(Clone)]
+enum RegistryEntry {
+    Live(Weak<Live>),
+    // Keep the actual containment alive until a later verified cleanup.
+    // Across host restart the durable generation ledger owns quarantine.
+    Quarantined(Arc<processkit::ProcessGroup>),
+    Confirmed,
+}
+type Registry = Mutex<HashMap<ProcessIdentity, RegistryEntry>>;
 fn registry() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn marker_registry() -> &'static Mutex<HashMap<ProcessIdentity, ProcessMarker>> {
+    static MARKERS: OnceLock<Mutex<HashMap<ProcessIdentity, ProcessMarker>>> = OnceLock::new();
+    MARKERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn registry_entry(id: &ProcessIdentity) -> Option<RegistryEntry> {
+    registry().lock().unwrap().get(id).cloned()
+}
+
+async fn retry_quarantine(
+    id: ProcessIdentity,
+    group: Arc<processkit::ProcessGroup>,
+) -> Result<KillOutcome, ProcessError> {
+    let proof_id = id.clone();
+    let proof_group = group.clone();
+    let confirmed = tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        Ok::<_, std::io::Error>(
+            runtime.block_on(confirm_empty(&proof_group)).is_ok()
+                && matches!(liveness(&proof_id), Liveness::Gone | Liveness::Reused),
+        )
+    })
+    .await
+    .map_err(|e| ProcessError::CleanupUncertain(e.to_string()))??;
+    if !confirmed {
+        return Ok(KillOutcome::Uncertain);
+    }
+    let mut registry = registry().lock().unwrap();
+    if matches!(registry.get(&id), Some(RegistryEntry::Quarantined(current)) if Arc::ptr_eq(current, &group))
+    {
+        registry.insert(id, RegistryEntry::Confirmed);
+    }
+    Ok(KillOutcome::Gone)
 }
 struct Live {
     requests: mpsc::Sender<Request>,
@@ -257,69 +299,57 @@ fn marked(marker: &ProcessMarker) -> Result<Vec<ProcessIdentity>, ProcessError> 
         .ok_or_else(|| ProcessError::Enumeration("cannot determine host user".into()))?;
     let mut found = Vec::new();
     for process in snapshot.processes().values() {
-        let cmd_matches = process
-            .cmd()
-            .iter()
-            .skip(1)
-            .any(|arg| identity::under(Path::new(arg), &marker.cmdline_root));
-        let image_matches = process
-            .exe()
-            .is_some_and(|exe| identity::under(exe, &marker.exe_root));
-        // Positive evidence from either marker component makes this a
-        // candidate. System processes with no matching evidence are not
-        // candidates. Re-inspect every candidate before excluding it.
-        if !cmd_matches && !image_matches {
-            if process.user_id() == Some(own)
-                && process.exe().is_none()
-                && process.cmd().is_empty()
-                && !matches!(
-                    process.status(),
-                    ProcessStatus::Zombie | ProcessStatus::Dead
-                )
-            {
-                if read_token(process.pid().as_u32())?.is_none() {
-                    continue;
-                }
-                return Err(ProcessError::Enumeration(
-                    "same-user process image and argv are both unobservable".into(),
-                ));
-            }
-            continue;
-        }
-        // Known mismatch is already proof of unrelatedness, even when the
-        // other marker criterion shares the broad kernel-store root. Avoid
-        // pinning every unrelated short-lived process in that directory.
-        if matches!(candidate_matches(process, own, marker), Ok(false)) {
+        // Both passes use the same tri-state predicate. A positive mismatch
+        // is a negative candidate; a missing field is not. Kernel-defined
+        // minimal processes are exempt because they cannot execute our core.
+        if identity::minimal_process(process)
+            || matches!(candidate_matches(process, own, marker), Ok(false))
+        {
             continue;
         }
         let pid = process.pid().as_u32();
+        let candidate_error = |error: ProcessError| {
+            ProcessError::Enumeration(format!(
+                "marker candidate PID {pid} ({:?}): {error}",
+                process.name()
+            ))
+        };
         // On platforms with an object/descriptor handle, keep that object
         // pinned throughout candidate verification (including owner & argv).
         #[cfg(any(windows, target_os = "linux"))]
         let pin = match identity::Pin::open(pid, false) {
             Ok(pin) => pin,
             Err(error) => {
-                if read_token(pid)?.is_none() {
+                if read_token(pid).map_err(candidate_error)?.is_none() {
                     continue;
                 }
-                return Err(ProcessError::Enumeration(error.to_string()));
+                return Err(candidate_error(ProcessError::Enumeration(
+                    error.to_string(),
+                )));
             }
         };
-        let Some(token) = read_token(pid)? else {
+        let Some(token) = read_token(pid).map_err(candidate_error)? else {
             continue;
         };
         let pids = [identity::pid(pid)];
         let fresh = identity::snapshot(ProcessesToUpdate::Some(&pids))?;
         let Some(p) = fresh.process(pids[0]) else {
-            if read_token(pid)?.is_none() {
+            if read_token(pid).map_err(candidate_error)?.is_none() {
                 continue;
             }
             return Err(ProcessError::Enumeration(
                 "candidate disappeared from snapshot but is not confirmed exited".into(),
             ));
         };
-        if !candidate_matches(p, own, marker)? {
-            continue;
+        match candidate_matches(p, own, marker) {
+            Ok(false) => continue,
+            Ok(true) => {}
+            Err(error) => {
+                if read_token(pid).map_err(candidate_error)?.is_none() {
+                    continue;
+                }
+                return Err(candidate_error(error));
+            }
         }
         let current = match inspect(pid) {
             Ok(current) => current,
@@ -402,6 +432,23 @@ fn verify_marked_identity(
     Ok(candidate_matches(p, own, marker)? && liveness(id) == Liveness::Same)
 }
 
+enum OrphanDomain {
+    #[cfg(unix)]
+    ProcessGroup(i32),
+    #[cfg(target_os = "linux")]
+    Cgroup(PathBuf),
+}
+
+#[cfg(target_os = "linux")]
+fn linux_orphan_domain(pid: u32) -> io::Result<OrphanDomain> {
+    if let Some(path) = identity::cgroup_v2(pid)?
+        && let Some(domain) = identity::processkit_cgroup(&path)
+    {
+        return Ok(OrphanDomain::Cgroup(domain));
+    }
+    Ok(OrphanDomain::ProcessGroup(identity::process_group(pid)?))
+}
+
 /// Post-termination enumeration. A Unix descendant can be reparented before
 /// this snapshot; a newly observed same-user process in the old group (or
 /// matching the marker) is possible residual work, not proof of absence.
@@ -409,7 +456,7 @@ fn orphan_recheck(
     before: &sysinfo::System,
     id: &ProcessIdentity,
     marker: Option<&ProcessMarker>,
-    group: Option<i32>,
+    domain: Option<OrphanDomain>,
 ) -> Result<KillOutcome, ProcessError> {
     let after = identity::snapshot(ProcessesToUpdate::All)?;
     if !possible_children(&after, id)?.is_empty() {
@@ -427,11 +474,41 @@ fn orphan_recheck(
             {
                 continue;
             }
-            if before
+            let same_marker = marker.is_some_and(|m| {
+                p.user_id().is_none_or(|owner| owner == uid)
+                    && p.exe().is_some_and(|exe| identity::under(exe, &m.exe_root))
+                    && p.cmd()
+                        .iter()
+                        .skip(1)
+                        .any(|arg| identity::under(Path::new(arg), &m.cmdline_root))
+            });
+            let existed = before
                 .process(p.pid())
-                .is_some_and(|old| old.start_time() == p.start_time())
-            {
+                .is_some_and(|old| old.start_time() == p.start_time());
+            #[cfg(target_os = "linux")]
+            if let Some(OrphanDomain::Cgroup(root)) = &domain {
+                // The old cgroup is the containment credential, not the
+                // inherited UI/host pgid. Check every live member including
+                // already-reparented descendants from before the snapshot.
+                if identity::minimal_process(p) {
+                    continue;
+                }
+                match identity::cgroup_v2(p.pid().as_u32()) {
+                    Ok(Some(path)) if path.starts_with(root) => return Ok(KillOutcome::Uncertain),
+                    Ok(_) => {}
+                    Err(_) if read_token(p.pid().as_u32())?.is_none() => continue,
+                    Err(_) => return Ok(KillOutcome::Uncertain),
+                }
+                if !existed && same_marker {
+                    return Ok(KillOutcome::Uncertain);
+                }
                 continue;
+            }
+            if existed {
+                continue;
+            }
+            if same_marker {
+                return Ok(KillOutcome::Uncertain);
             }
             if p.user_id().is_some_and(|owner| owner != uid) {
                 continue;
@@ -439,7 +516,9 @@ fn orphan_recheck(
             let pid = p.pid().as_u32();
             // No signals are sent during this independent observation.
             let same_group = match identity::process_group(pid) {
-                Ok(g) => group == Some(g),
+                Ok(g) => {
+                    matches!(&domain, Some(OrphanDomain::ProcessGroup(expected)) if g == *expected)
+                }
                 Err(_) => {
                     if read_token(pid)?.is_none() {
                         continue;
@@ -447,20 +526,13 @@ fn orphan_recheck(
                     return Ok(KillOutcome::Uncertain);
                 }
             };
-            let same_marker = marker.is_some_and(|m| {
-                p.exe().is_some_and(|exe| identity::under(exe, &m.exe_root))
-                    && p.cmd()
-                        .iter()
-                        .skip(1)
-                        .any(|arg| identity::under(Path::new(arg), &m.cmdline_root))
-            });
-            if same_group || same_marker {
+            if same_group {
                 return Ok(KillOutcome::Uncertain);
             }
         }
     }
     #[cfg(not(unix))]
-    let _ = (before, marker, group);
+    let _ = (before, marker, domain);
     Ok(KillOutcome::Killed)
 }
 
@@ -507,9 +579,9 @@ fn kill_orphan(
         return Ok(KillOutcome::Uncertain);
     }
     #[cfg(target_os = "linux")]
-    let group = Some(identity::process_group(id.pid)?);
+    let domain = Some(linux_orphan_domain(id.pid)?);
     #[cfg(windows)]
-    let group = None;
+    let domain = None;
     if pin.gone() || liveness(id) != Liveness::Same {
         return Ok(KillOutcome::Uncertain);
     }
@@ -526,7 +598,7 @@ fn kill_orphan(
     }
     for _ in 0..100 {
         if pin.gone() {
-            return orphan_recheck(&before, id, marker, group);
+            return orphan_recheck(&before, id, marker, domain);
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -575,7 +647,12 @@ fn kill_orphan(
         if matches!(liveness(id), Liveness::Gone | Liveness::Reused)
             && (!own_group || identity::group_absent(group)?)
         {
-            return orphan_recheck(&before, id, Some(marker), Some(group));
+            return orphan_recheck(
+                &before,
+                id,
+                Some(marker),
+                Some(OrphanDomain::ProcessGroup(group)),
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -610,11 +687,21 @@ impl ProcessEngine for ProcessKitEngine {
         Ok(Box::new(handle))
     }
     async fn liveness(&self, id: &ProcessIdentity) -> Liveness {
-        let live = registry().lock().unwrap().get(id).and_then(Weak::upgrade);
-        let id = id.clone();
-        let result = tokio::task::spawn_blocking(move || liveness(&id))
+        match registry_entry(id) {
+            Some(RegistryEntry::Quarantined(_)) => return Liveness::Uncertain,
+            Some(RegistryEntry::Confirmed) => return Liveness::Gone,
+            _ => {}
+        }
+        let query = id.clone();
+        let result = tokio::task::spawn_blocking(move || liveness(&query))
             .await
             .unwrap_or(Liveness::Uncertain);
+        let live = match registry_entry(id) {
+            Some(RegistryEntry::Quarantined(_)) => return Liveness::Uncertain,
+            Some(RegistryEntry::Confirmed) => return Liveness::Gone,
+            Some(RegistryEntry::Live(live)) => live.upgrade(),
+            _ => None,
+        };
         if let Some(live) = live {
             match &*live.terminal.borrow() {
                 Some(Ok(_)) => {}
@@ -626,7 +713,14 @@ impl ProcessEngine for ProcessKitEngine {
         result
     }
     async fn kill_verified(&self, id: &ProcessIdentity) -> Result<KillOutcome, ProcessError> {
-        let live = registry().lock().unwrap().get(id).and_then(Weak::upgrade);
+        let live = match registry_entry(id) {
+            Some(RegistryEntry::Quarantined(group)) => {
+                return retry_quarantine(id.clone(), group).await;
+            }
+            Some(RegistryEntry::Confirmed) => return Ok(KillOutcome::Gone),
+            Some(RegistryEntry::Live(live)) => live.upgrade(),
+            None => None,
+        };
         if let Some(live) = live {
             // The exact registered identity owns a private containment;
             // root liveness alone cannot prove the group is drained.
@@ -637,7 +731,7 @@ impl ProcessEngine for ProcessKitEngine {
                 Err(error) => Err(error),
             };
         }
-        let marker = self.markers.lock().unwrap().get(id).cloned();
+        let marker = marker_registry().lock().unwrap().get(id).cloned();
         let id = id.clone();
         tokio::task::spawn_blocking(move || kill_orphan(&id, marker.as_ref()))
             .await
@@ -651,7 +745,7 @@ impl ProcessEngine for ProcessKitEngine {
         let found = tokio::task::spawn_blocking(move || marked(&query))
             .await
             .map_err(|e| ProcessError::Enumeration(e.to_string()))??;
-        let mut bindings = self.markers.lock().unwrap();
+        let mut bindings = marker_registry().lock().unwrap();
         bindings.retain(|_, existing| existing != marker);
         for id in &found {
             bindings.insert(id.clone(), marker.clone());
@@ -914,10 +1008,27 @@ async fn run(
         requests,
         terminal: terminal_rx,
     });
-    {
+    let registered = {
         let mut registry = registry().lock().unwrap();
-        registry.retain(|_, live| live.strong_count() != 0);
-        registry.insert(id.clone(), Arc::downgrade(&live));
+        registry.retain(|_, entry| match entry {
+            RegistryEntry::Live(live) => live.strong_count() != 0,
+            _ => true,
+        });
+        if let std::collections::hash_map::Entry::Vacant(slot) = registry.entry(id.clone()) {
+            slot.insert(RegistryEntry::Live(Arc::downgrade(&live)));
+            true
+        } else {
+            false
+        }
+    };
+    if !registered {
+        let result = rollback_started(&group, running).await;
+        let reason = result.err().map_or_else(
+            || "process identity collides with an existing containment".into(),
+            |error| error.to_string(),
+        );
+        let _ = ready.send(Err(ProcessError::CleanupUncertain(reason)));
+        return;
     }
     // Keep the containment discoverable even if its public handle was
     // dropped. The handle's cancellation sender, not registry Arc count,
@@ -1037,6 +1148,17 @@ async fn run(
     };
     // Send exactly one terminal notification. Uncertainty is neither Exited
     // nor proof of root death, and the frozen wait() cannot manufacture Exit.
+    let group = if result.is_err() {
+        // Install the strong tombstone before the terminal event is visible.
+        // Dropping the public handle/worker cannot discard this proof anchor.
+        registry()
+            .lock()
+            .unwrap()
+            .insert(id.clone(), RegistryEntry::Quarantined(Arc::new(group)));
+        None
+    } else {
+        Some(group)
+    };
     terminal_tx.send_replace(Some(result.clone()));
     for reply in pending {
         let _ = reply.send(result.clone().map_err(ProcessError::CleanupUncertain));
@@ -1055,11 +1177,60 @@ mod audit_tests {
 
     #[test]
     fn missing_marker_metadata_is_not_a_negative_match() {
+        assert!(match_criteria(None, None, None).is_err());
         assert!(match_criteria(Some(true), None, Some(true)).is_err());
         assert!(match_criteria(None, Some(true), Some(true)).is_err());
         assert!(match_criteria(Some(true), Some(true), None).is_err());
         assert!(!match_criteria(None, Some(false), None).unwrap());
         assert!(match_criteria(Some(true), Some(true), Some(true)).unwrap());
+    }
+
+    #[tokio::test]
+    async fn quarantine_survives_worker_and_handle_drop_until_group_is_confirmed() {
+        // A valid positive PID outside supported PID allocator ranges; no
+        // signal to it is ever issued. The tombstone holds our empty group.
+        let id = ProcessIdentity {
+            pid: 2_000_000_000,
+            start_token: "test-quarantine".into(),
+            exe: "absent-test-process".into(),
+        };
+        assert_eq!(liveness(&id), Liveness::Gone);
+        let group = Arc::new(processkit::ProcessGroup::new().unwrap());
+        let weak = Arc::downgrade(&group);
+        registry()
+            .lock()
+            .unwrap()
+            .insert(id.clone(), RegistryEntry::Quarantined(group.clone()));
+        drop(group);
+        let engine = ProcessKitEngine::new();
+        assert!(weak.upgrade().is_some());
+        assert_eq!(engine.liveness(&id).await, Liveness::Uncertain);
+        assert_eq!(engine.kill_verified(&id).await.unwrap(), KillOutcome::Gone);
+        assert_eq!(engine.liveness(&id).await, Liveness::Gone);
+        assert_eq!(engine.kill_verified(&id).await.unwrap(), KillOutcome::Gone);
+        assert!(weak.upgrade().is_none());
+        registry().lock().unwrap().remove(&id);
+    }
+
+    #[tokio::test]
+    async fn empty_group_without_root_death_keeps_quarantine() {
+        let id = inspect(std::process::id()).unwrap().unwrap();
+        let group = Arc::new(processkit::ProcessGroup::new().unwrap());
+        registry()
+            .lock()
+            .unwrap()
+            .insert(id.clone(), RegistryEntry::Quarantined(group));
+        let engine = ProcessKitEngine::new();
+        assert_eq!(
+            engine.kill_verified(&id).await.unwrap(),
+            KillOutcome::Uncertain
+        );
+        assert_eq!(engine.liveness(&id).await, Liveness::Uncertain);
+        assert!(matches!(
+            registry_entry(&id),
+            Some(RegistryEntry::Quarantined(_))
+        ));
+        registry().lock().unwrap().remove(&id);
     }
 
     #[tokio::test]

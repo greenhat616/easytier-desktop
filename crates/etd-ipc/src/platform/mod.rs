@@ -1,7 +1,8 @@
 //! Local authenticated transports. Hold a policy handle in the host composition
 //! root before handing the listener to `tonic_io::incoming`.
 use crate::{
-    BoxConn, Connector, Endpoint, ListenerPolicy, OsUserId, ServerExpectation, ServerIdentity,
+    BoxConn, Connector, Endpoint, HostForm, ListenerPolicy, OsUserId, ServerExpectation,
+    ServerIdentity,
 };
 use std::{
     io,
@@ -35,11 +36,46 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
+/// Implement on the guard returned by HR's exclusive machine (service) or
+/// session (user host) lock. All publishers of its endpoint must participate
+/// in that lock. Hold it until after the listener is dropped.
+pub trait HeldHostLock {
+    fn form(&self) -> HostForm;
+    fn endpoint(&self) -> &Endpoint;
+
+    fn listener_claim(&self) -> ListenerClaim<'_>
+    where
+        Self: Sized,
+    {
+        ListenerClaim(self)
+    }
+}
+
+/// A borrow of the acquired lock which authorizes recovery of its endpoint.
+#[must_use]
+pub struct ListenerClaim<'a>(&'a dyn HeldHostLock);
+
 impl LocalListener {
+    /// Recover an abandoned endpoint under the host's exclusive lock. Only
+    /// a refused, owned Unix socket can be removed. Windows reclaims pipe
+    /// names in the kernel and uses its normal first-instance bind.
+    pub fn bind_replacing_stale(
+        claim: ListenerClaim<'_>,
+        policy: &ListenerPolicy,
+    ) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            Self::bind_locked(claim.0.form(), claim.0.endpoint(), policy)
+        }
+        #[cfg(windows)]
+        {
+            Self::bind(claim.0.form(), claim.0.endpoint(), policy)
+        }
+    }
     /// Publish an endpoint with its initial kernel access policy. An existing
     /// endpoint (including a stale Unix socket) is never claimed or unlinked.
-    pub fn bind(endpoint: &Endpoint, policy: &ListenerPolicy) -> io::Result<Self> {
-        Self::bind_native(endpoint, policy)
+    pub fn bind(form: HostForm, endpoint: &Endpoint, policy: &ListenerPolicy) -> io::Result<Self> {
+        Self::bind_native(form, endpoint, policy)
     }
 }
 

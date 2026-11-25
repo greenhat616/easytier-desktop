@@ -58,34 +58,6 @@ pub fn user_runtime_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(format!("/tmp/easytier-desk-{}", Uid::effective())))
 }
 
-pub(super) fn socket_identity(path: &Path, service: bool) -> io::Result<(u64, u64)> {
-    let uid = if service {
-        0
-    } else {
-        Uid::effective().as_raw()
-    };
-    directory_chain(path, uid, service)?;
-    if !service {
-        let runtime = user_runtime_dir();
-        if !runtime.is_absolute() || !path.starts_with(&runtime) {
-            return Err(denied("user socket outside the runtime directory"));
-        }
-        for dir in [runtime.as_path(), path.parent().unwrap()] {
-            let m = fs::symlink_metadata(dir)?;
-            if !m.is_dir() || m.uid() != uid || m.mode() & 0o7777 != 0o700 {
-                return Err(denied(
-                    "user socket requires a private 0700 runtime directory",
-                ));
-            }
-        }
-    }
-    let m = fs::symlink_metadata(path)?;
-    if m.uid() != uid || !m.file_type().is_socket() {
-        return Err(denied("unexpected local socket type or owner"));
-    }
-    Ok(inode(&m))
-}
-
 pub(super) fn pidfd(stream: &UnixStream) -> io::Result<OwnedFd> {
     let mut fd = -1i32;
     let mut len = size_of::<i32>() as libc::socklen_t;

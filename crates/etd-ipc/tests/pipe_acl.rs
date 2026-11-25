@@ -67,8 +67,8 @@ async fn first_instance_local_only_and_live_kernel_dacl() {
         allow_users: vec![OsUserId::WindowsSid(listed.into())],
         ..Default::default()
     };
-    let listener = LocalListener::bind(&f.ep, &policy).unwrap();
-    assert!(LocalListener::bind(&f.ep, &policy).is_err());
+    let listener = LocalListener::bind(etd_ipc::HostForm::User, &f.ep, &policy).unwrap();
+    assert!(LocalListener::bind(etd_ipc::HostForm::User, &f.ep, &policy).is_err());
     let remote = local
         .to_str()
         .unwrap()

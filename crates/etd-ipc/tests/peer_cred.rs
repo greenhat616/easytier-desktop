@@ -67,6 +67,9 @@ async fn kernel_identity_matches_process() {
 #[cfg(unix)]
 #[tokio::test]
 async fn socket_policy_replacement_and_exclusive_name() {
+    if !run_as_host("socket_policy_replacement_and_exclusive_name") {
+        return;
+    }
     use nix::unistd::{Gid, Group};
     use std::{fs, os::unix::fs::MetadataExt};
     let f = Fixture::new();
@@ -74,7 +77,14 @@ async fn socket_policy_replacement_and_exclusive_name() {
     let path = endpoint_arg(&f.ep);
     let old = fs::symlink_metadata(path).unwrap();
     assert_eq!(old.mode() & 0o777, 0o600);
-    assert!(etd_ipc::platform::LocalListener::bind(&f.ep, &ListenerPolicy::default()).is_err());
+    assert!(
+        etd_ipc::platform::LocalListener::bind(
+            etd_ipc::HostForm::User,
+            &f.ep,
+            &ListenerPolicy::default()
+        )
+        .is_err()
+    );
     let group = Group::from_gid(Gid::effective()).unwrap().unwrap();
     listener
         .policy_handle()

@@ -118,23 +118,35 @@ fn token_peer(token: &OwnedHandle, pid: u32) -> io::Result<PeerIdentity> {
     })
 }
 
-/// Obtain the effective security context on this pipe. A PID can outlive
-/// its process, and a connecting thread may be impersonating a different user.
-pub(super) fn client_peer(pipe: &NamedPipeServer) -> io::Result<PeerIdentity> {
-    let handle = HANDLE(pipe.as_raw_handle());
-    let mut pid = 0;
+/// Duplicate the pipe's effective thread token before restoring the host
+/// identity. No user code runs and no await is possible while impersonating.
+fn pipe_token(pipe: &NamedPipeServer) -> io::Result<OwnedHandle> {
     let mut token = HANDLE::default();
     unsafe {
-        GetNamedPipeClientProcessId(handle, &mut pid).map_err(win_error)?;
-        ImpersonateNamedPipeClient(handle).map_err(win_error)?;
-        // No await or fallible early return while impersonating.
+        ImpersonateNamedPipeClient(HANDLE(pipe.as_raw_handle())).map_err(win_error)?;
         let opened = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, true, &mut token);
         if RevertToSelf().is_err() {
             std::process::abort();
         }
         opened.map_err(win_error)?;
-        token_peer(&OwnedHandle::from_raw_handle(token.0), pid)
+        Ok(OwnedHandle::from_raw_handle(token.0))
     }
+}
+
+/// Our connector requests static identification at open time. The kernel
+/// can identify that account even while the connector verifies the server.
+pub(super) fn admission_user(pipe: &NamedPipeServer) -> io::Result<OsUserId> {
+    token_user(&pipe_token(pipe)?)
+}
+
+/// Read again after the marker to authenticate the actual writer, including
+/// impersonating clients. The process's primary token need not match.
+pub(super) fn client_peer(pipe: &NamedPipeServer) -> io::Result<PeerIdentity> {
+    let mut pid = 0;
+    unsafe {
+        GetNamedPipeClientProcessId(HANDLE(pipe.as_raw_handle()), &mut pid).map_err(win_error)?
+    };
+    token_peer(&pipe_token(pipe)?, pid)
 }
 
 fn pipe_owner(pipe: HANDLE) -> io::Result<String> {

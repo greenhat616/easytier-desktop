@@ -5,6 +5,7 @@ use futures_util::{
     stream::{FuturesUnordered, StreamExt},
 };
 use std::{
+    collections::HashMap,
     fs::OpenOptions,
     mem,
     os::windows::{
@@ -140,15 +141,51 @@ impl PolicyHandle {
 }
 
 type Accepted = io::Result<(BoxConn, PeerIdentity)>;
+const MAX_PENDING_PER_SID: usize = 8;
+const MAX_PENDING: usize = 64;
+const MARKER_TIMEOUT: Duration = Duration::from_secs(2);
+
+type Authentication = (OsUserId, Accepted);
+
+#[derive(Default)]
+struct PendingAccounts(HashMap<OsUserId, usize>);
+
+impl PendingAccounts {
+    fn reserve(&mut self, user: &OsUserId) -> io::Result<()> {
+        let count = self.0.entry(user.clone()).or_default();
+        if *count >= MAX_PENDING_PER_SID {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "too many pending pipes for account",
+            ));
+        }
+        *count += 1;
+        Ok(())
+    }
+
+    fn release(&mut self, user: &OsUserId) {
+        let count = self.0.get_mut(user).expect("pending authentication");
+        *count -= 1;
+        if *count == 0 {
+            self.0.remove(user);
+        }
+    }
+}
+
 pub struct LocalListener {
     name: String,
     pipe: NamedPipeServer,
     policy: Arc<Mutex<OwnedHandle>>,
-    authenticating: FuturesUnordered<BoxFuture<'static, Accepted>>,
+    authenticating: FuturesUnordered<BoxFuture<'static, Authentication>>,
+    pending: PendingAccounts,
 }
 
 impl LocalListener {
-    pub(super) fn bind_native(endpoint: &Endpoint, policy: &ListenerPolicy) -> io::Result<Self> {
+    pub(super) fn bind_native(
+        _form: HostForm,
+        endpoint: &Endpoint,
+        policy: &ListenerPolicy,
+    ) -> io::Result<Self> {
         let name = pipe_name(endpoint)?;
         let sd = descriptor(policy)?;
         let mut attrs = SECURITY_ATTRIBUTES {
@@ -167,6 +204,7 @@ impl LocalListener {
             pipe,
             policy,
             authenticating: FuturesUnordered::new(),
+            pending: PendingAccounts::default(),
         })
     }
     pub fn policy_handle(&self) -> PolicyHandle {
@@ -183,15 +221,24 @@ impl LocalListener {
         let next = options().create(&self.name)?;
         *handle = duplicate(&next)?;
         let mut pipe = mem::replace(&mut self.pipe, next);
+        drop(handle);
+        let user = identity::admission_user(&pipe)?;
+        self.pending.reserve(&user)?;
+        let deadline = tokio::time::Instant::now() + MARKER_TIMEOUT;
         self.authenticating.push(Box::pin(async move {
-            // ImpersonateNamedPipeClient identifies the writer of the last
-            // read. The connector writes this marker only after verification.
-            let byte = tokio::time::timeout(Duration::from_secs(5), pipe.read_u8()).await??;
-            if byte != 1 {
-                return Err(denied("invalid IPC identification marker"));
+            let outcome = async {
+                let byte = tokio::time::timeout_at(deadline, pipe.read_u8()).await??;
+                if byte != 1 {
+                    return Err(denied("invalid IPC identification marker"));
+                }
+                let peer = identity::client_peer(&pipe)?;
+                if peer.user != user {
+                    return Err(denied("pipe user changed during identification"));
+                }
+                Ok((Box::new(pipe) as BoxConn, peer))
             }
-            let peer = identity::client_peer(&pipe)?;
-            Ok((Box::new(pipe) as BoxConn, peer))
+            .await;
+            (user, outcome)
         }));
         Ok(())
     }
@@ -203,11 +250,16 @@ impl Listener for LocalListener {
         loop {
             if self.authenticating.is_empty() {
                 self.pipe.connect().await?;
-            } else if self.authenticating.len() >= 64 {
-                return self.authenticating.next().await.unwrap();
+            } else if self.authenticating.len() >= MAX_PENDING {
+                let (user, outcome) = self.authenticating.next().await.unwrap();
+                self.pending.release(&user);
+                return outcome;
             } else {
                 match select(self.authenticating.next(), Box::pin(self.pipe.connect())).await {
-                    Either::Left((Some(conn), _)) => return conn,
+                    Either::Left((Some((user, outcome)), _)) => {
+                        self.pending.release(&user);
+                        return outcome;
+                    }
                     Either::Left((None, _)) => unreachable!(),
                     Either::Right((result, _)) => result?,
                 }
@@ -262,4 +314,31 @@ pub(super) fn image_matches(image: &Path, host: &Path) -> io::Result<bool> {
         .unwrap_or(actual)
         .eq_ignore_ascii_case(expected.strip_prefix(prefix).unwrap_or(expected))
         && image.canonicalize().map_err(denied)? == host)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_slots_are_counted_and_released_per_account() {
+        let first = OsUserId::WindowsSid("S-1-5-18".into());
+        let second = OsUserId::WindowsSid("S-1-5-19".into());
+        let mut accounts = PendingAccounts::default();
+        for _ in 0..8 {
+            accounts.reserve(&first).unwrap();
+        }
+        assert_eq!(
+            accounts.reserve(&first).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        accounts.reserve(&second).unwrap();
+        accounts.release(&second);
+        accounts.release(&first);
+        accounts.reserve(&first).unwrap();
+        for _ in 0..8 {
+            accounts.release(&first);
+        }
+        assert!(accounts.0.is_empty());
+    }
 }

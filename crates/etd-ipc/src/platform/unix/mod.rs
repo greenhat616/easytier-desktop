@@ -1,5 +1,6 @@
 use super::*;
-use crate::{Listener, OsGroupId, PeerIdentity, SERVICE_SOCKET_PATH};
+mod recovery;
+use crate::{Listener, OsGroupId, PeerIdentity};
 use futures_util::future::{Either, select};
 use nix::unistd::{Gid, Group, Uid};
 use std::{
@@ -53,7 +54,7 @@ fn path(endpoint: &Endpoint) -> io::Result<&Path> {
 /// host may live below a sticky temporary directory, but its immediate
 /// parent must be its own unwritable-by-others directory. For a service
 /// even sticky ancestors are excluded.
-fn directory_chain(path: &Path, uid: u32, service: bool) -> io::Result<()> {
+fn directory_chain(path: &Path, uid: u32, form: HostForm) -> io::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| invalid("missing socket parent"))?;
@@ -61,18 +62,48 @@ fn directory_chain(path: &Path, uid: u32, service: bool) -> io::Result<()> {
     for component in dir.components() {
         current.push(component);
         let m = fs::symlink_metadata(&current)?;
-        let sticky_ancestor = !service && current != dir && m.mode() & 0o1000 != 0;
+        let sticky_ancestor = form == HostForm::User && current != dir && m.mode() & 0o1000 != 0;
         if !m.is_dir()
             || (m.uid() != 0 && m.uid() != uid)
             || (m.mode() & 0o022 != 0 && !sticky_ancestor)
         {
             return Err(denied("untrusted socket directory"));
         }
-        if current == dir && m.uid() != uid {
-            return Err(denied("unexpected socket directory owner"));
+        if current == dir {
+            if m.uid() != uid {
+                return Err(denied("unexpected socket directory owner"));
+            }
+            if form == HostForm::User && m.mode() & 0o7777 != 0o700 {
+                return Err(denied("user socket requires a private 0700 directory"));
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if form == HostForm::User {
+        let runtime = user_runtime_dir();
+        if !runtime.is_absolute() || !path.starts_with(&runtime) {
+            return Err(denied("user socket outside runtime directory"));
+        }
+        let m = fs::symlink_metadata(runtime)?;
+        if !m.is_dir() || m.uid() != uid || m.mode() & 0o7777 != 0o700 {
+            return Err(denied("invalid user runtime directory"));
         }
     }
     Ok(())
+}
+
+fn socket_identity(path: &Path, form: HostForm) -> io::Result<(u64, u64)> {
+    let uid = if form == HostForm::Service {
+        0
+    } else {
+        Uid::effective().as_raw()
+    };
+    directory_chain(path, uid, form)?;
+    let m = fs::symlink_metadata(path)?;
+    if m.uid() != uid || !m.file_type().is_socket() {
+        return Err(denied("unexpected socket type or owner"));
+    }
+    Ok(inode(&m))
 }
 
 fn inode(m: &Metadata) -> (u64, u64) {
@@ -171,7 +202,9 @@ struct State {
 pub struct PolicyHandle(Weak<Mutex<State>>);
 impl PolicyHandle {
     /// Atomically publish the new mode, owning group and named ACLs and
-    /// wake accept even when it is waiting on the previous socket.
+    /// wake accept even when it is waiting on the previous socket. Clients
+    /// must reconnect on ECONNRESET or ECONNREFUSED during the swap. An old
+    /// backlog can outlive publication but cannot guarantee request delivery.
     pub fn update(&self, policy: &ListenerPolicy) -> io::Result<()> {
         let state = self.0.upgrade().ok_or(io::ErrorKind::NotConnected)?;
         let mut state = state
@@ -189,27 +222,51 @@ impl PolicyHandle {
 }
 
 pub struct LocalListener {
+    active: Arc<UnixListener>,
     state: Arc<Mutex<State>>,
     change: watch::Receiver<Arc<UnixListener>>,
 }
 
 impl LocalListener {
-    pub(super) fn bind_native(endpoint: &Endpoint, policy: &ListenerPolicy) -> io::Result<Self> {
+    pub(super) fn bind_native(
+        form: HostForm,
+        endpoint: &Endpoint,
+        policy: &ListenerPolicy,
+    ) -> io::Result<Self> {
+        Self::publish(form, endpoint, policy, false)
+    }
+    pub(super) fn bind_locked(
+        form: HostForm,
+        endpoint: &Endpoint,
+        policy: &ListenerPolicy,
+    ) -> io::Result<Self> {
+        Self::publish(form, endpoint, policy, true)
+    }
+    fn publish(
+        form: HostForm,
+        endpoint: &Endpoint,
+        policy: &ListenerPolicy,
+        recover: bool,
+    ) -> io::Result<Self> {
         let path = path(endpoint)?;
         let uid = Uid::effective().as_raw();
-        let service = path == Path::new(SERVICE_SOCKET_PATH);
-        if service && uid != 0 {
+        if form == HostForm::Service && uid != 0 {
             return Err(denied("service socket requires root"));
         }
-        directory_chain(path, uid, service)?;
+        directory_chain(path, uid, form)?;
         let (staged, listener, id) = stage(path, policy)?;
+        if recover {
+            recovery::recover(path, uid)?;
+        }
         fs::hard_link(staged.0.join("s"), path)?;
         let endpoint = Published {
             path: path.to_owned(),
             id,
         };
-        let (sender, change) = watch::channel(Arc::new(listener));
+        let active = Arc::new(listener);
+        let (sender, change) = watch::channel(active.clone());
         Ok(Self {
+            active,
             state: Arc::new(Mutex::new(State {
                 endpoint,
                 change: sender,
@@ -226,14 +283,25 @@ impl LocalListener {
 impl Listener for LocalListener {
     async fn accept(&mut self) -> io::Result<(BoxConn, PeerIdentity)> {
         loop {
-            let socket = self.change.borrow_and_update().clone();
-            if let Either::Right((result, _)) =
-                select(Box::pin(self.change.changed()), Box::pin(socket.accept())).await
+            // Prioritize a ready accept, including the old listener's bounded
+            // backlog after rename. Once it would block, switch to the newest
+            // published listener without waiting for a connection on the old one.
+            match select(
+                Box::pin(self.active.accept()),
+                Box::pin(self.change.changed()),
+            )
+            .await
             {
-                let (stream, _) = result?;
-                let peer = os::peer(&stream)?;
-                return Ok((Box::new(stream), peer));
+                Either::Left((result, _)) => {
+                    let (stream, _) = result?;
+                    let peer = os::peer(&stream)?;
+                    return Ok((Box::new(stream), peer));
+                }
+                Either::Right((result, _)) => {
+                    result.map_err(|_| io::ErrorKind::NotConnected)?;
+                }
             }
+            self.active = self.change.borrow_and_update().clone();
         }
     }
 }
@@ -243,25 +311,38 @@ pub(super) async fn connect(
     expect: &ServerExpectation,
 ) -> io::Result<(BoxConn, ServerIdentity)> {
     let path = path(endpoint)?;
-    #[cfg(target_os = "linux")]
-    let id = os::socket_identity(path, expect.privileged).map_err(denied)?;
+    let form = if expect.privileged {
+        HostForm::Service
+    } else {
+        HostForm::User
+    };
+    let id = socket_identity(path, form).map_err(denied)?;
     let stream = UnixStream::connect(path).await?;
     let peer = os::peer(&stream).map_err(denied)?;
     verify_user(expect, &peer.user, current_user()?, OsUserId::UnixUid(0))?;
+    if id != socket_identity(path, form).map_err(denied)? {
+        return Err(denied("socket changed during connect"));
+    }
     #[cfg(target_os = "linux")]
     let exe = {
-        if id != os::socket_identity(path, expect.privileged).map_err(denied)? {
-            return Err(denied("socket changed during connect"));
-        }
         if !expect.privileged && peer.user != current_user()? {
             return Err(denied("user host must run as the current user"));
         }
         os::verified_image(expect, peer.pid, os::pidfd(&stream))?
     };
     #[cfg(target_os = "macos")]
-    let exe = verify_image(
-        &expect.exe_dir,
-        &os::image(&stream, peer.pid).map_err(denied)?,
-    )?;
+    let exe = match os::image(&stream, peer.pid) {
+        Ok(image) => verify_image(&expect.exe_dir, &image)?,
+        Err(e)
+            if expect.privileged
+                && matches!(
+                    e.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
+                ) =>
+        {
+            PathBuf::new()
+        }
+        Err(e) => return Err(denied(e)),
+    };
     Ok((Box::new(stream), ServerIdentity { peer, exe }))
 }

@@ -38,7 +38,12 @@ impl Fixture {
         Self { dir, ep }
     }
     pub fn listener(&self) -> LocalListener {
-        LocalListener::bind(&self.ep, &ListenerPolicy::default()).unwrap()
+        LocalListener::bind(
+            etd_ipc::HostForm::User,
+            &self.ep,
+            &ListenerPolicy::default(),
+        )
+        .unwrap()
     }
 }
 pub fn connector() -> LocalConnector {

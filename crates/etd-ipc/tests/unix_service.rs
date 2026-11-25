@@ -14,11 +14,15 @@ use std::{
 async fn privileged_second_account_denied_then_granted_then_revoked() {
     assert!(Uid::effective().is_root());
     let user = User::from_name("nobody").unwrap().unwrap();
-    // A per-user macOS TMPDIR can have a non-traversable ancestor.
-    let dir = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    #[cfg(target_os = "linux")]
+    let base = "/run";
+    #[cfg(target_os = "macos")]
+    let base = "/private/var/run";
+    let dir = tempfile::tempdir_in(base).unwrap();
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
     let socket = dir.path().join("host.sock");
     let listener = etd_ipc::platform::LocalListener::bind(
+        etd_ipc::HostForm::Service,
         &etd_ipc::Endpoint::UnixSocket(socket.clone()),
         &ListenerPolicy::default(),
     )
@@ -90,6 +94,9 @@ mod linux {
     }
     #[tokio::test]
     async fn writable_service_ancestor_refused() {
+        if !run_as_host("linux::writable_service_ancestor_refused") {
+            return;
+        }
         let f = Fixture::new();
         let _listener = f.listener();
         let mut c = connector();
@@ -106,7 +113,9 @@ mod linux {
         let dir = tempfile::tempdir_in("/run").unwrap();
         let socket = dir.path().join("host.sock");
         let ep = Endpoint::UnixSocket(socket.clone());
-        let listener = LocalListener::bind(&ep, &ListenerPolicy::default()).unwrap();
+        let listener =
+            LocalListener::bind(etd_ipc::HostForm::Service, &ep, &ListenerPolicy::default())
+                .unwrap();
         let mut c = connector();
         c.expectation.privileged = true;
         let alias = dir.path().join("alias");
@@ -173,6 +182,7 @@ mod linux {
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
         let socket = dir.path().join("service.sock");
         let mut listener = LocalListener::bind(
+            etd_ipc::HostForm::Service,
             &Endpoint::UnixSocket(socket.clone()),
             &ListenerPolicy {
                 allow_users: vec![OsUserId::UnixUid(user.uid.as_raw())],

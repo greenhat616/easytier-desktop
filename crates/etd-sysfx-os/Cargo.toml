@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Only enabled by the host's dev dependency on disposable CI runners.
+ci-test-fixtures = []
+
 [dependencies]
 etd-contract = { workspace = true }
 etd-sysfx = { workspace = true }

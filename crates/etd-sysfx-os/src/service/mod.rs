@@ -8,6 +8,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(all(windows, feature = "ci-test-fixtures"))]
+pub mod ci_fixture;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]

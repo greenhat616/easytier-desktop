@@ -81,7 +81,8 @@ pub(super) fn pidfd(stream: &UnixStream) -> io::Result<OwnedFd> {
 // current uid and its private runtime directory. Never substitute an expected
 // filename for an unavailable process image in ServerIdentity.
 pub(super) fn verified_image(
-    expect: &ServerExpectation,
+    exe_dir: &Path,
+    privileged: bool,
     pid: u32,
     pidfd: io::Result<OwnedFd>,
 ) -> io::Result<PathBuf> {
@@ -91,7 +92,7 @@ pub(super) fn verified_image(
             tracing::debug!(
                 "SO_PEERPIDFD unavailable; verified the socket owner, path and peer uid"
             );
-            if !expect.privileged {
+            if !privileged {
                 return Ok(PathBuf::new());
             }
             None
@@ -99,9 +100,9 @@ pub(super) fn verified_image(
         Err(e) => return Err(denied(e)),
     };
     let image = match fs::read_link(format!("/proc/{pid}/exe")) {
-        Ok(path) => verify_image(&expect.exe_dir, &path)?,
+        Ok(path) => verify_image(exe_dir, &path)?,
         Err(e)
-            if expect.privileged
+            if privileged
                 && matches!(
                     e.kind(),
                     io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
@@ -181,21 +182,18 @@ mod tests {
     use super::*;
     #[test]
     fn only_missing_peer_pidfd_uses_legacy_user_host_evidence() {
-        let expect = ServerExpectation {
-            exe_dir: PathBuf::new(),
-            user: None,
-            privileged: false,
-        };
+        let exe_dir = PathBuf::new();
         let old_kernel = io::Error::from_raw_os_error(libc::ENOPROTOOPT);
         assert!(
-            verified_image(&expect, std::process::id(), Err(old_kernel))
+            verified_image(&exe_dir, false, std::process::id(), Err(old_kernel))
                 .unwrap()
                 .as_os_str()
                 .is_empty()
         );
         assert!(
             verified_image(
-                &expect,
+                &exe_dir,
+                false,
                 std::process::id(),
                 Err(io::Error::from_raw_os_error(libc::EBADF))
             )

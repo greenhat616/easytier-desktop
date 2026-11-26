@@ -100,7 +100,7 @@ mod linux {
         let f = Fixture::new();
         let _listener = f.listener();
         let mut c = connector();
-        c.expectation.privileged = true;
+        c.expectation.requirement = etd_ipc::ServerRequirement::Service;
         assert_eq!(
             c.connect(&f.ep).await.err().unwrap().kind(),
             ErrorKind::PermissionDenied
@@ -117,7 +117,7 @@ mod linux {
             LocalListener::bind(etd_ipc::HostForm::Service, &ep, &ListenerPolicy::default())
                 .unwrap();
         let mut c = connector();
-        c.expectation.privileged = true;
+        c.expectation.requirement = etd_ipc::ServerRequirement::Service;
         let alias = dir.path().join("alias");
         symlink(dir.path(), &alias).unwrap();
         assert_eq!(
@@ -168,7 +168,7 @@ mod linux {
     async fn privileged_root_service_accepts_non_root_ui() {
         if let Some(path) = std::env::var_os("ETD_SERVICE_SOCKET") {
             let mut c = connector();
-            c.expectation.privileged = true;
+            c.expectation.requirement = etd_ipc::ServerRequirement::Service;
             let (_, host) = c.connect(&Endpoint::UnixSocket(path.into())).await.unwrap();
             assert_eq!(host.peer.user, OsUserId::UnixUid(0));
             return;

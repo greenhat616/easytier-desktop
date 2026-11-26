@@ -60,6 +60,11 @@ fn client_mask() -> u32 {
     (FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE).0
 }
 
+/// FILE_GENERIC_READ | FILE_GENERIC_WRITE minus [`client_mask`]:
+/// FILE_CREATE_PIPE_INSTANCE, FILE_READ_EA, FILE_WRITE_EA and
+/// FILE_WRITE_ATTRIBUTES. No data access and no WRITE_DAC.
+const SESSION_HOST_EXTRA: u32 = 0x0000011c;
+
 fn descriptor(form: HostForm, policy: &ListenerPolicy) -> io::Result<identity::Allocation> {
     if policy.unix_group.is_some() {
         return Err(invalid("Unix group on a Windows pipe"));
@@ -71,13 +76,30 @@ fn descriptor(form: HostForm, policy: &ListenerPolicy) -> io::Result<identity::A
     // host account needs that bit and WRITE_DAC for live policy updates.
     let host_mask = 0x0012019f | 0x00040000; // FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC
     let rw = client_mask();
-    let mut acl = format!("O:{host}D:P(A;;0x{host_mask:x};;;{host})");
+    let owner_only = policy.allow_users.is_empty() && policy.allow_groups.is_empty();
+    let mut acl = format!("O:{host}D:P");
     match form {
-        HostForm::Service => acl.push_str(&format!("(A;;0x{rw:x};;;SY)(A;;0x{rw:x};;;BA)")),
+        HostForm::Service => acl.push_str(&format!(
+            "(A;;0x{host_mask:x};;;{host})(A;;0x{rw:x};;;SY)(A;;0x{rw:x};;;BA)"
+        )),
         HostForm::User => {
-            if !policy.allow_users.is_empty() || !policy.allow_groups.is_empty() {
+            if !owner_only {
                 return Err(invalid("user host pipe policy must be owner-only"));
             }
+            acl.push_str(&format!("(A;;0x{host_mask:x};;;{host})"));
+        }
+        HostForm::ElevatedSession => {
+            if !owner_only {
+                return Err(invalid("elevated session pipe policy must be owner-only"));
+            }
+            // The host and its non-elevated clients share the user SID, so
+            // that SID gets client access only. OWNER RIGHTS replaces the
+            // owner's implicit READ_CONTROL | WRITE_DAC. The remaining bits
+            // the host needs to add instances go to Administrators, which is
+            // enabled only in elevated tokens (deny-only in a filtered one).
+            acl.push_str(&format!(
+                "(A;;0x{rw:x};;;{host})(A;;0x{rw:x};;;OW)(A;;0x{SESSION_HOST_EXTRA:x};;;BA)"
+            ));
         }
     }
     let mut add = |sid: &str| -> io::Result<()> {
@@ -101,6 +123,14 @@ fn descriptor(form: HostForm, policy: &ListenerPolicy) -> io::Result<identity::A
         };
         add(s)?;
     }
+    if form == HostForm::ElevatedSession {
+        // Medium, no-write-up and no-read-up: a non-elevated UI may open it,
+        // Low and AppContainer processes may not open it at all. No-read-up
+        // matters because a client open is not checked for FILE_APPEND_DATA
+        // yet is granted it, which makes the handle writable. A label at or
+        // below the creator's own integrity level needs no privilege.
+        acl.push_str("S:(ML;;NWNR;;;ME)");
+    }
     let mut sd = PSECURITY_DESCRIPTOR::default();
     unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -114,9 +144,11 @@ fn descriptor(form: HostForm, policy: &ListenerPolicy) -> io::Result<identity::A
     Ok(identity::Allocation(HLOCAL(sd.0)))
 }
 
-fn options() -> ServerOptions {
+fn options(form: HostForm) -> ServerOptions {
     let mut opts = ServerOptions::new();
-    opts.reject_remote_clients(true).write_dac(true);
+    // The session DACL is fixed and grants nobody WRITE_DAC.
+    opts.reject_remote_clients(true)
+        .write_dac(form != HostForm::ElevatedSession);
     opts
 }
 
@@ -132,6 +164,10 @@ impl PolicyHandle {
     pub fn update(&self, policy: &ListenerPolicy) -> io::Result<()> {
         let state = self.0.upgrade().ok_or(io::ErrorKind::NotConnected)?;
         let sd = descriptor(self.1, policy)?;
+        if self.1 == HostForm::ElevatedSession {
+            // Only the empty policy passes `descriptor`; the DACL is fixed.
+            return Ok(());
+        }
         let handle = state
             .lock()
             .map_err(|_| io::Error::other("pipe policy lock poisoned"))?;
@@ -186,6 +222,8 @@ pub struct LocalListener {
     policy: Arc<Mutex<OwnedHandle>>,
     authenticating: FuturesUnordered<BoxFuture<'static, Authentication>>,
     pending: PendingAccounts,
+    /// The elevated session host's own account and Windows session.
+    session_owner: Option<identity::SessionOwner>,
 }
 
 impl LocalListener {
@@ -196,13 +234,17 @@ impl LocalListener {
     ) -> io::Result<Self> {
         let name = pipe_name(endpoint)?;
         let sd = descriptor(form, policy)?;
+        let session_owner = match form {
+            HostForm::ElevatedSession => Some(identity::session_owner()?),
+            HostForm::Service | HostForm::User => None,
+        };
         let mut attrs = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: sd.0.0,
             bInheritHandle: false.into(),
         };
         let pipe = unsafe {
-            options()
+            options(form)
                 .first_pipe_instance(true)
                 .create_with_security_attributes_raw(name, (&raw mut attrs).cast())?
         };
@@ -214,6 +256,7 @@ impl LocalListener {
             policy,
             authenticating: FuturesUnordered::new(),
             pending: PendingAccounts::default(),
+            session_owner,
         })
     }
     pub fn policy_handle(&self) -> PolicyHandle {
@@ -227,20 +270,24 @@ impl LocalListener {
             .map_err(|_| io::Error::other("pipe policy lock poisoned"))?;
         // Hold the old instance until its successor owns the name. Additional
         // instances inherit the pipe object's current DACL.
-        let next = options().create(&self.name)?;
+        let next = options(self.form).create(&self.name)?;
         *handle = duplicate(&next)?;
         let mut pipe = mem::replace(&mut self.pipe, next);
         drop(handle);
         let user = identity::admission_user(&pipe)?;
         self.pending.reserve(&user)?;
         let deadline = tokio::time::Instant::now() + MARKER_TIMEOUT;
+        let session_owner = self.session_owner.clone();
         self.authenticating.push(Box::pin(async move {
             let outcome = async {
                 let byte = tokio::time::timeout_at(deadline, pipe.read_u8()).await??;
                 if byte != 1 {
                     return Err(denied("invalid IPC identification marker"));
                 }
-                let peer = identity::client_peer(&pipe)?;
+                let peer = match &session_owner {
+                    Some(owner) => identity::session_client_peer(&pipe, owner)?,
+                    None => identity::client_peer(&pipe)?,
+                };
                 if peer.user != user {
                     return Err(denied("pipe user changed during identification"));
                 }
@@ -282,6 +329,7 @@ pub(super) async fn connect(
     endpoint: &Endpoint,
     expect: &ServerExpectation,
 ) -> io::Result<(BoxConn, ServerIdentity)> {
+    let proof = proof(expect)?;
     let name = pipe_name(endpoint)?;
     let before = SystemTime::now();
     let file = OpenOptions::new()
@@ -292,7 +340,8 @@ pub(super) async fn connect(
         .security_qos_flags(SECURITY_IDENTIFICATION.0)
         .open(name)?;
     let mut pipe = unsafe { NamedPipeClient::from_raw_handle(file.into_raw_handle())? };
-    let server = identity::server_identity(&pipe, expect, before).map_err(denied)?;
+    let server =
+        identity::server_identity(&pipe, &expect.exe_dir, proof, before).map_err(denied)?;
     pipe.write_u8(1).await?;
     Ok((Box::new(pipe), server))
 }

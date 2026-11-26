@@ -8,7 +8,9 @@ use etd_contract::{
     },
     version_metadata_value,
 };
-use etd_ipc::{Endpoint, ServerExpectation, platform::LocalConnector, tonic_io::ClientIo};
+use etd_ipc::{
+    Endpoint, ServerExpectation, ServerRequirement, platform::LocalConnector, tonic_io::ClientIo,
+};
 use serde_json::json;
 use std::{env, fs, path::PathBuf, sync::Arc};
 
@@ -31,8 +33,7 @@ async fn peer() -> anyhow::Result<()> {
     let connector = Arc::new(LocalConnector {
         expectation: ServerExpectation {
             exe_dir: etd_sysfx_os::service::installed_host_dir()?,
-            user: None,
-            privileged: true,
+            requirement: ServerRequirement::Service,
         },
     });
     #[cfg(windows)]

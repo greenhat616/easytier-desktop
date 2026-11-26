@@ -12,17 +12,17 @@ use tokio::{
 #[cfg(windows)]
 #[tokio::test]
 async fn service_requires_both_installed_image_and_pipe_owner() {
-    use etd_ipc::{OsUserId, platform::current_user};
+    use etd_ipc::{OsUserId, ServerRequirement, platform::current_user};
     if !run_as_host("service_requires_both_installed_image_and_pipe_owner") {
         return;
     }
     let mut c = connector();
-    c.expectation.privileged = true;
-    c.expectation.user = Some(current_user().unwrap());
+    let user = current_user().unwrap();
+    c.expectation.requirement = ServerRequirement::ServiceAccount(user.clone());
     let f = Fixture::new();
     let _listener = f.listener();
     let (_, server) = c.connect(&f.ep).await.unwrap();
-    assert_eq!(Some(server.peer.user), c.expectation.user);
+    assert_eq!(server.peer.user, user);
 
     let f = Fixture::new();
     let _listener = f.listener();
@@ -36,7 +36,8 @@ async fn service_requires_both_installed_image_and_pipe_owner() {
     let f = Fixture::new();
     let _listener = f.listener();
     c.expectation.exe_dir = installed;
-    c.expectation.user = Some(OsUserId::WindowsSid("S-1-5-21-111-222-333-444".into()));
+    c.expectation.requirement =
+        ServerRequirement::ServiceAccount(OsUserId::WindowsSid("S-1-5-21-111-222-333-444".into()));
     assert_eq!(
         c.connect(&f.ep).await.err().unwrap().kind(),
         std::io::ErrorKind::PermissionDenied
@@ -120,7 +121,8 @@ async fn rejects_another_process_before_writing() {
     // On old Linux, a matching uid inside its 0700 runtime directory is
     // the full identity proof. Exercise the account mismatch on that kernel.
     if !verifies_user_image() {
-        expected.expectation.user = Some(etd_ipc::OsUserId::UnixUid(u32::MAX));
+        expected.expectation.requirement =
+            etd_ipc::ServerRequirement::UserAccount(etd_ipc::OsUserId::UnixUid(u32::MAX));
     }
     let result = expected.connect(&f.ep).await;
     assert_eq!(

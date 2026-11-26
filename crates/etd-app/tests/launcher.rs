@@ -8,6 +8,7 @@ use etd_app::{HostLauncher, LaunchError};
 use etd_contract::HostMode;
 use etd_ipc::{
     BoxConn, Connector, Endpoint, OsUserId, PeerIdentity, ServerExpectation, ServerIdentity,
+    ServerRequirement,
 };
 use std::{
     collections::HashMap,
@@ -139,8 +140,7 @@ fn user_config() -> UserHostConfig {
         endpoint: pipe("user"),
         expectation: ServerExpectation {
             exe_dir: "dir".into(),
-            user: None,
-            privileged: false,
+            requirement: ServerRequirement::CurrentUser,
         },
     }
 }
@@ -187,7 +187,7 @@ async fn probe_prefers_the_service_and_starts_nothing() {
     world.answer(&pipe("service"), Answer::Verified);
     let found = launcher(&world, false).probe().await.unwrap().unwrap();
     assert_eq!(found.mode, HostMode::Service);
-    assert!(found.expectation.privileged);
+    assert_eq!(found.expectation.requirement, ServerRequirement::Service);
     assert_eq!(world.spawns(), 0);
 }
 
@@ -342,13 +342,16 @@ fn the_standard_user_host_matches_the_host_command_line() {
     let program = std::env::current_exe().unwrap();
     let config = UserHostConfig::standard(program.clone()).unwrap();
     assert_eq!(config.args, ["run", "--mode", "user"]);
-    assert!(!config.expectation.privileged);
+    assert_eq!(
+        config.expectation.requirement,
+        ServerRequirement::CurrentUser
+    );
     assert_eq!(config.expectation.exe_dir, program.parent().unwrap());
-    match (&config.endpoint, &config.expectation.user) {
-        (Endpoint::NamedPipe(name), Some(OsUserId::WindowsSid(sid))) => {
+    match (&config.endpoint, etd_ipc::platform::current_user().unwrap()) {
+        (Endpoint::NamedPipe(name), OsUserId::WindowsSid(sid)) => {
             assert_eq!(*name, format!(r"\\.\pipe\easytier-desk-user-{sid}"));
         }
-        (Endpoint::UnixSocket(path), Some(OsUserId::UnixUid(_))) => {
+        (Endpoint::UnixSocket(path), OsUserId::UnixUid(_)) => {
             assert!(path.ends_with("host.sock"), "{path:?}");
         }
         other => panic!("{other:?}"),

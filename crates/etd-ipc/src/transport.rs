@@ -21,6 +21,8 @@ pub const SERVICE_SOCKET_GROUP: &str = "easytier-desk";
 pub enum HostForm {
     Service,
     User,
+    /// The current user's host started with an elevated token (Windows only).
+    ElevatedSession,
 }
 
 /// Where a host listens.
@@ -82,15 +84,33 @@ pub struct ListenerPolicy {
     pub unix_group: Option<String>,
 }
 
+/// Which account the server must run as, and how that is proven.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ServerRequirement {
+    /// The service host: SYSTEM (Windows) or root (Unix), proven by the
+    /// endpoint's owner.
+    Service,
+    /// A user host running as the current user.
+    CurrentUser,
+    /// The elevated session host: the current user with an elevated token.
+    /// Windows only; elsewhere a connect fails with `Unsupported`.
+    CurrentUserElevated,
+    /// The service-host proof, but for this account instead of SYSTEM /
+    /// root (on Unix only root can satisfy it).
+    ServiceAccount(OsUserId),
+    /// The user-host proof, but for this account instead of the current
+    /// user.
+    UserAccount(OsUserId),
+}
+
 /// What a client requires of the server before trusting it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerExpectation {
     /// The server executable must live under this directory.
     pub exe_dir: PathBuf,
-    /// The server must run as this user (`None`: any user in `privileged`).
-    pub user: Option<OsUserId>,
-    /// Require SYSTEM / root (service host) rather than the current user.
-    pub privileged: bool,
+    /// The account the server must run as.
+    pub requirement: ServerRequirement,
 }
 
 pub trait Connection: AsyncRead + AsyncWrite + Send + Unpin {}

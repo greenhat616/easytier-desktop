@@ -176,26 +176,33 @@ def darwin(inv):
 def windows(inv):
     data = json.loads(command("powershell.exe", "-NoProfile", "-NonInteractive", "-File",
                               Path(__file__).with_name("windows.ps1")).stdout)
+    # Win32_SystemDriver can omit a disabled SCM registration with no
+    # loadable image. SCM is authoritative for these two product-wide names.
+    for name in ("wintun", "windivert"):
+        result = command("sc.exe", "qc", name, check=False)
+        if result.returncode == 1060:  # ERROR_SERVICE_DOES_NOT_EXIST
+            data["service"].pop(name, None)
+        elif result.returncode:
+            raise RuntimeError(f"SCM query configuration for {name}: {result.returncode}")
+        else:
+            data["service"][name] = result.stdout.strip()
     for kind, entries in data.items():
         for key, value in entries.items():
             inv.put(kind, key, value)
     with tempfile.TemporaryDirectory() as directory:
-        state = Path(directory) / "wfp.xml"
-        command("netsh.exe", "wfp", "show", "state", f"file={state}")
-        # netsh can append IPsec diagnostics after the WFP document. Read
-        # the complete native filter table and validate its shape instead of
-        # interpreting that unrelated trailer as part of the XML document.
-        with state.open("rb") as stream:
-            items = next((node.findall("./item[filterKey]")
-                          for _, node in ElementTree.iterparse(stream)
-                          if node.tag == "filters" and node.find("./item/filterKey") is not None), None)
-        if not items:
-            raise ValueError("WFP state contains no native filter table")
-        for item in items:
-            label = item.findtext("displayData/name", "")
+        filters = Path(directory) / "filters.xml"
+        command("netsh.exe", "wfp", "show", "filters", "verbose=on", f"file={filters}")
+        count = 0
+        for _, item in ElementTree.iterparse(filters):
+            if item.tag != "item" or item.find("filterKey") is None:
+                continue
+            count += 1
+            label = item.findtext("displayData/name", "").strip()
             if label.startswith("etd-fence:"):
                 inv.put("firewall", "wfp/" + item.findtext("filterKey"),
                         [label, ElementTree.tostring(item, encoding="unicode")])
+            item.clear()
+        assert count, "WFP export contains no native filters"
 
 
 def capture(run_dir, images, other_run_dirs=()):

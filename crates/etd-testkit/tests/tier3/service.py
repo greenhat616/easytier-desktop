@@ -135,6 +135,17 @@ class Service:
             print(f"uninstall exited {result.returncode}; stdout={result.stdout.strip()} "
                   f"stderr={result.stderr.strip()}")
             self.report_uninstall_phase()
+            if os.name == "nt" and "service did not stop" in result.stderr:
+                # Observe the original STOP without retrying it. The product's
+                # wait can expire while a slow native shutdown is still draining.
+                end = time.monotonic() + 120
+                while time.monotonic() < end:
+                    status = command("sc.exe", "queryex", "easytier-desk-host", check=False)
+                    if status.returncode or "STOPPED" in status.stdout:
+                        break
+                    time.sleep(5)
+                self.report_windows_state(f"STOP follow-up at {time.monotonic() - started:.1f}s")
+                self.report_stop_logs(offsets)
         return result
 
     def report_uninstall_phase(self):
@@ -149,10 +160,13 @@ class Service:
         self.call(self.installer, "install")
         try:
             self.verify_bundle()
+            version = self.call(self.core, "--version").strip()
+            assert re.fullmatch(r"easytier-core 2\.7\.1-[^\s]*c97f36b8(?:-\S+)?", version), version
             status = eventually("installed service self-check", lambda: self.ctl("status"),
                                 lambda body: body["host"]["phase"] == "serving")
             assert status["host"]["mode"] == "service" and status["host"]["role"] == "admin"
             assert status["default_core_version"] == "2.7.1", status
+            print(f"installed service handshake: serving, admin; kernel probe: {version}", flush=True)
             yield self
         finally:
             # Shared driver candidates can legitimately prevent uninstall;

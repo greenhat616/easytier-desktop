@@ -1,4 +1,4 @@
-use super::WinError;
+use super::{WinError, registry::Key};
 use crate::OsError;
 use ::windows::{
     Win32::{
@@ -17,6 +17,9 @@ use ::windows::{
         },
         System::{
             ProcessStatus::{EnumDeviceDrivers, GetDeviceDriverFileNameW},
+            Registry::{
+                HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_READ, REG_DWORD, REG_EXPAND_SZ, REG_SZ,
+            },
             Services::*,
             SystemInformation::GetWindowsDirectoryW,
             Threading::{GetCurrentThread, OpenThreadToken},
@@ -180,6 +183,58 @@ fn registered_images() -> Result<Vec<(String, String)>, WinError> {
             return Err(error("incomplete SCM driver enumeration"));
         }
     }
+}
+
+// SCM silently omits services whose query-status ACL denies access. Check
+// the native Services registration inventory too; never treat that omission
+// as proof that no stopped driver points into the store.
+fn registry_images() -> Result<Vec<(String, String)>, WinError> {
+    let services = Key::open(
+        HKEY_LOCAL_MACHINE,
+        r"SYSTEM\CurrentControlSet\Services",
+        KEY_READ,
+    )?
+    .ok_or_else(|| error("SCM registry database unavailable"))?;
+    let mut images = Vec::new();
+    for name in services.children()? {
+        let key = Key::open(services.0, &name, KEY_QUERY_VALUE)?
+            .ok_or_else(|| error("service registration changed during enumeration"))?;
+        let Some(kind) = key.read("Type")? else {
+            continue;
+        };
+        if kind.ty != REG_DWORD || kind.bytes.len() != 4 {
+            return Err(error(format!("invalid service type for {name}")));
+        }
+        let kind = u32::from_le_bytes(kind.bytes.try_into().expect("checked size"));
+        if kind & SERVICE_DRIVER.0 == 0 {
+            continue;
+        }
+        let path = match key.read("ImagePath")? {
+            None => format!(r"System32\Drivers\{name}.sys"),
+            Some(value) => {
+                if !matches!(value.ty, REG_SZ | REG_EXPAND_SZ)
+                    || !value.bytes.len().is_multiple_of(2)
+                {
+                    return Err(error(format!("invalid driver ImagePath for {name}")));
+                }
+                let units: Vec<_> = value
+                    .bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|chunk| u16::from_le_bytes(*chunk))
+                    .collect();
+                let path = nul_string(&units)?;
+                if path.is_empty() {
+                    format!(r"System32\Drivers\{name}.sys")
+                } else {
+                    path
+                }
+            }
+        };
+        images.push((name, path));
+    }
+    Ok(images)
 }
 
 // Recent Windows releases require SeDebugPrivilege for non-null loaded-driver
@@ -374,7 +429,12 @@ fn inside(path: &str, dir: &str) -> bool {
 }
 
 fn identity(path: &Path) -> Result<(u32, u64), WinError> {
-    let file = fs::File::open(path).map_err(io_error)?;
+    use std::os::windows::fs::OpenOptionsExt;
+    // Query only metadata: reading another driver image is unnecessary.
+    let file = fs::OpenOptions::new()
+        .access_mode(0)
+        .open(path)
+        .map_err(io_error)?;
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: file owns the live handle and info is writable.
     unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }
@@ -426,6 +486,11 @@ fn collect_identities(dir: &Path, identities: &mut Vec<(u32, u64)>) -> Result<()
 }
 
 fn referenced(dir: &Path) -> Result<Option<String>, WinError> {
+    if !super::registry::elevated()? {
+        return Err(error(
+            "driver reference check requires an elevated administrator",
+        ));
+    }
     let mut identities = Vec::new();
     collect_identities(dir, &mut identities)?;
     let dir = fs::canonicalize(dir).map_err(io_error)?;
@@ -448,7 +513,9 @@ fn referenced(dir: &Path) -> Result<Option<String>, WinError> {
         }
     };
     let mut unresolved = None;
-    for (name, raw) in registered_images()? {
+    let mut registered = registered_images()?;
+    registered.extend(registry_images()?);
+    for (name, raw) in registered {
         match check(&raw) {
             Ok(true) => return Ok(Some(format!("driver service {name} references {raw}"))),
             Ok(false) => (),

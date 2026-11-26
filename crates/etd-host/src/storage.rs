@@ -122,6 +122,7 @@ pub async fn install_bundled_cores(bundle_root: &Path, target: &Path) -> Result<
         target,
         TRUSTED_CORES,
         &etd_core_easytier::EasyTierDriver,
+        etd_sysfx_os::driver_bundle_reference,
     )
     .await
 }
@@ -131,6 +132,7 @@ async fn install_bundles(
     target: &Path,
     table: &[TrustedCoreRow],
     driver: &dyn etd_core_api::CoreDriver,
+    driver_ref: impl Fn(&Path) -> Result<Option<String>, etd_sysfx_os::OsError>,
 ) -> Result<()> {
     use etd_host_core::core_store::manifest::{MANIFEST_FILE, Manifest, ManifestEntry};
     let manifest_path = target.join(MANIFEST_FILE);
@@ -174,25 +176,12 @@ async fn install_bundles(
             })?;
         }
         for dir in published.iter().rev() {
-            // --version should not register a driver. Still, never remove a
-            // newly published driver-bearing bundle if the OS cannot rule
-            // out a shared driver reference.
-            if fs::read_dir(dir)?.any(|item| {
-                item.map_or(true, |item| {
-                    item.file_name()
-                        .to_str()
-                        .is_none_or(|name| name.to_ascii_lowercase().ends_with(".sys"))
-                })
-            }) {
-                if let Some(reference) =
-                    etd_sysfx_os::driver_bundle_reference(dir).with_context(|| {
-                        format!(
-                            "bundle install failed: {error:#}; cannot determine driver references"
-                        )
-                    })?
-                {
-                    bail!("bundle install failed: {error:#}; bundle retained: {reference}");
-                }
+            // --version should not register a driver. Still, never remove
+            // a published bundle if the OS cannot rule out a shared reference.
+            if let Some(reference) = driver_ref(dir).with_context(|| {
+                format!("bundle install failed: {error:#}; cannot determine driver references")
+            })? {
+                bail!("bundle install failed: {error:#}; bundle retained: {reference}");
             }
             fs::remove_dir_all(dir).with_context(|| {
                 format!(
@@ -501,13 +490,13 @@ mod tests {
             &[],
         ));
         assert!(
-            install_bundles(&bundle_root, &target, &invalid, &driver)
+            install_bundles(&bundle_root, &target, &invalid, &driver, |_| Ok(None))
                 .await
                 .is_err()
         );
         assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
         assert!(
-            install_bundles(&bundle_root, &target, TABLE, &driver)
+            install_bundles(&bundle_root, &target, TABLE, &driver, |_| Ok(None))
                 .await
                 .is_ok()
         );

@@ -125,7 +125,7 @@ pub struct ManifestCoreStore {
     mode: HostMode,
     driver: Arc<dyn CoreDriver>,
     trusted: Arc<HashMap<String, TrustedBundle>>,
-    removal_guard: Arc<RemovalGuard>,
+    removal_guard: Option<Arc<RemovalGuard>>,
     // Short manifest/removal critical sections only: hashing and identify
     // never hold this lock during normal resolution or ListCores.
     operations: Mutex<()>,
@@ -152,11 +152,7 @@ impl ManifestCoreStore {
                     .map(|(version, bundle)| (version, bundle.into()))
                     .collect(),
             ),
-            removal_guard: Arc::new(|_| {
-                Err(StoreError::Manifest(
-                    "Driver reference check unavailable".into(),
-                ))
-            }),
+            removal_guard: None,
             operations: Mutex::new(()),
             cache: SyncMutex::new(HashMap::new()),
             list_verification: Mutex::new(()),
@@ -166,7 +162,7 @@ impl ManifestCoreStore {
         mut self,
         guard: impl Fn(&Path) -> Result<bool, StoreError> + Send + Sync + 'static,
     ) -> Self {
-        self.removal_guard = Arc::new(guard);
+        self.removal_guard = Some(Arc::new(guard));
         self
     }
     async fn manifest(&self) -> Result<Manifest, StoreError> {
@@ -322,7 +318,7 @@ impl CoreStore for ManifestCoreStore {
         let version = version.to_owned();
         let trusted = self.trusted.clone();
         let guard = self.removal_guard.clone();
-        blocking(move || remove_entry(&root, &version, &trusted, &*guard)).await
+        blocking(move || remove_entry(&root, &version, &trusted, guard.as_deref())).await
     }
 }
 async fn blocking<T: Send + 'static>(
@@ -498,7 +494,7 @@ fn remove_entry(
     root: &Path,
     version: &str,
     trusted: &HashMap<String, TrustedBundle>,
-    guard: &RemovalGuard,
+    guard: Option<&RemovalGuard>,
 ) -> Result<(), StoreError> {
     let mut manifest = read_trusted_manifest(root, trusted)?;
     let entry = manifest
@@ -515,15 +511,20 @@ fn remove_entry(
     match fs::symlink_metadata(&dir) {
         Ok(_) => {
             check_type(&dir, true)?;
-            if bundle
+            if let Some(guard) = guard {
+                if guard(&dir)? {
+                    return Err(StoreError::InUse {
+                        version: version.into(),
+                    });
+                }
+            } else if bundle
                 .companions
                 .keys()
                 .any(|name| name.to_ascii_lowercase().ends_with(".sys"))
-                && guard(&dir)?
             {
-                return Err(StoreError::InUse {
-                    version: version.into(),
-                });
+                return Err(StoreError::Manifest(
+                    "Driver reference check unavailable".into(),
+                ));
             }
             let expected: HashMap<_, _> = bundle.files().collect();
             let mut remaining = Vec::new();

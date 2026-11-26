@@ -20,14 +20,8 @@ INFO = security.SACL_SECURITY_INFORMATION
 REG = security.SE_REGISTRY_KEY
 UTC = datetime.timezone.utc
 
-def descriptor():
-    return security.GetNamedSecurityInfo(KEY, REG, INFO)
-
-def acl_text():
-    return security.ConvertSecurityDescriptorToStringSecurityDescriptor(descriptor(), 1, INFO)
-
-def set_sacl(value):
-    security.SetNamedSecurityInfo(KEY, REG, INFO, None, None, None, value)
+def acl_text(sd):
+    return security.ConvertSecurityDescriptorToStringSecurityDescriptor(sd, 1, INFO)
 
 def registry_writes(start, seen):
     query = ("*[System[(EventID=4657) and TimeCreated[@SystemTime >= '" + start + "']] "
@@ -76,8 +70,13 @@ def registry_audit():
     seen = set()
     with ExitStack() as cleanup:
         cleanup.callback(security.AdjustTokenPrivileges, token, False, prior)
-        old_acl = descriptor().GetSecurityDescriptorSacl()
-        old_sddl = acl_text()
+        key = win32api.RegOpenKeyEx(win32con.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\IKEEXT",
+                                    0, win32con.ACCESS_SYSTEM_SECURITY | win32con.READ_CONTROL)
+        cleanup.callback(key.Close)
+        def read_sd():
+            return win32api.RegGetKeySecurity(key, INFO)
+        original = read_sd()
+        old_sddl = acl_text(original)
         prior_policy = command("auditpol.exe", "/get", "/subcategory:Registry", "/r").stdout
         directory = cleanup.enter_context(tempfile.TemporaryDirectory())
         backup = "/file:" + str(Path(directory) / "policy.csv")
@@ -88,17 +87,22 @@ def registry_audit():
             print("restored Registry audit policy", flush=True)
         cleanup.callback(restore_policy)
         command("auditpol.exe", "/set", "/subcategory:Registry", "/success:enable")
-        acl = descriptor().GetSecurityDescriptorSacl()
+        modified = read_sd()
+        acl = modified.GetSecurityDescriptorSacl()
         if acl is None:
             acl = security.ACL()
         acl.AddAuditAccessAceEx(security.ACL_REVISION_DS, 0, winreg.KEY_SET_VALUE,
                                 security.ConvertStringSidToSid("S-1-1-0"), 1, 0)
         def restore_acl():
-            set_sacl(old_acl)
-            assert acl_text() == old_sddl
+            win32api.RegSetKeySecurity(key, INFO, original)
+            restored = read_sd()
+            print(f"SACL restore control old/new: {original.GetSecurityDescriptorControl()}/"
+                  f"{restored.GetSecurityDescriptorControl()}", flush=True)
+            assert acl_text(restored) == old_sddl, (old_sddl, acl_text(restored))
             print("restored original IKEEXT SACL", flush=True)
         cleanup.callback(restore_acl)
-        set_sacl(acl)
+        modified.SetSecurityDescriptorSacl(True, acl, False)
+        win32api.RegSetKeySecurity(key, INFO, modified)
         start = datetime.datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         def read():
             registry_writes(start, seen)

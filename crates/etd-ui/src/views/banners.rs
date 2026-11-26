@@ -102,7 +102,13 @@ pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
                 .px_2()
                 .py_1()
                 .rounded_sm()
-                .bg(warn.opacity(0.2))
+                // Keep the warning pill readable even over native Mica.
+                .bg(Hsla::from(
+                    cx.theme()
+                        .popover
+                        .to_rgb()
+                        .blend(warn.opacity(0.2).to_rgb()),
+                ))
                 .text_xs()
                 .text_color(warn)
                 .child(note),

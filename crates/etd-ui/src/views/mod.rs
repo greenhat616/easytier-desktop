@@ -171,6 +171,7 @@ fn render_section_content(
         .h_full()
         .overflow_hidden()
         .bg(cx.theme().popover)
+        .rounded_tl(px(8.))
         .child(inner)
         .into_any_element()
 }

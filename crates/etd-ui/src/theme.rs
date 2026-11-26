@@ -122,6 +122,10 @@ fn apply_accent(config: &mut ThemeConfig, ramp: AccentRamp, dark: bool) {
     c.link_active = active();
     c.drag_border = base();
     c.drop_target = Some(format!("#{:06X}33", ramp.base).into());
+    c.list_active = Some(format!("#{:06X}33", ramp.base).into());
+    c.table_active = Some(format!("#{:06X}33", ramp.base).into());
+    c.accent = Some(format!("#{:06X}1A", ramp.base).into());
+    c.sidebar_accent = c.accent.clone();
     c.list_active_border = base();
     c.list_highlight_foreground = base();
     c.table_active_border = base();
@@ -253,13 +257,16 @@ fn contrast(a: u32, b: u32) -> f64 {
 #[cfg(any(test, target_os = "windows"))]
 fn readable_accent(ramp: AccentRamp, dark: bool) -> Option<AccentRamp> {
     let text = if dark { 0x141414 } else { 0xFFFFFF };
-    let surface = if dark { 0x2B2B2B } else { 0xF3F3F3 };
-    // Use the built-in Fluent blue if a chosen OS palette is too faint for
-    // either a primary button label or a link on the content surface.
-    [ramp.base, ramp.hover, ramp.active]
-        .iter()
-        .all(|&c| contrast(c, text) >= 4.5 && contrast(c, surface) >= 4.5)
-        .then_some(ramp)
+    let surface = if dark { 0x2B2B2B } else { 0xFFFFFF };
+    // Base also serves as link text, so require AA on the content surface.
+    // Hover/active fills must keep their button labels readable; their
+    // distinction from the surrounding surface only needs 3:1.
+    (contrast(ramp.base, text) >= 4.5
+        && contrast(ramp.base, surface) >= 4.5
+        && [ramp.hover, ramp.active]
+            .iter()
+            .all(|&c| contrast(c, text) >= 4.5 && contrast(c, surface) >= 3.0))
+    .then_some(ramp)
 }
 
 #[cfg(target_os = "windows")]
@@ -393,6 +400,114 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    fn rgb24(color: gpui_kit::Rgba) -> u32 {
+        let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+        byte(color.r) << 16 | byte(color.g) << 8 | byte(color.b)
+    }
+
+    fn assert_readable(label: &str, text: Hsla, background: gpui_kit::Rgba) {
+        let ratio = contrast(rgb24(text.to_rgb()), rgb24(background));
+        assert!(
+            ratio >= 4.5,
+            "{label}: {ratio:.2}:1 is below AA (text {text:?}, background {background:?})"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn badge_and_input_text_pairs_meet_aa_in_both_modes(cx: &mut TestAppContext) {
+        use gpui_kit::component::Colorize as _;
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_palette(cx);
+            for appearance in [WindowAppearance::Light, WindowAppearance::Dark] {
+                apply_theme(appearance, cx);
+                let t = Theme::global(cx);
+                let surface = t.popover.to_rgb();
+                let normal_card = surface.blend(t.secondary.opacity(0.25).to_rgb());
+                let selected_card = surface.blend(t.primary.opacity(0.08).to_rgb());
+                // The selected card may use any readable OS accent. Include
+                // the worst luminance extreme, not just the default blue.
+                let extreme: Hsla = rgb(if t.is_dark() { 0xFFFFFF } else { 0x000000 }).into();
+                let extreme_card = surface.blend(extreme.opacity(0.08).to_rgb());
+                let base = t.background.to_rgb();
+                let editor_card = base.blend(t.secondary.opacity(0.25).to_rgb());
+                let parents = [
+                    base,
+                    surface,
+                    t.title_bar.to_rgb(),
+                    normal_card,
+                    selected_card,
+                    extreme_card,
+                    editor_card,
+                ];
+                // Neutral badge and tinted success/error/waiting badges are
+                // the exact pairs in render_instance_card/render_header.
+                assert_readable(
+                    "neutral badge",
+                    t.secondary_foreground,
+                    t.secondary.to_rgb(),
+                );
+                for parent in parents {
+                    for (name, semantic) in [
+                        ("success badge", t.success),
+                        ("danger badge", t.danger),
+                        ("warning badge", t.warning),
+                    ] {
+                        assert_readable(
+                            name,
+                            semantic,
+                            parent.blend(semantic.opacity(0.2).to_rgb()),
+                        );
+                    }
+                    // Match gpui-component 0.11 input::input_style: dark
+                    // enabled uses the input tint at 30%, disabled uses 80%.
+                    let enabled = parent.blend(t.input_background().to_rgb());
+                    let disabled = parent.blend(t.input.mix_oklab(t.transparent, 0.8).to_rgb());
+                    assert_readable("enabled input", t.foreground, enabled);
+                    assert_readable("input placeholder", t.muted_foreground, enabled);
+                    assert_readable("disabled input", t.muted_foreground, disabled);
+                    assert_readable(
+                        "selected input text",
+                        t.foreground,
+                        enabled.blend(t.selection.to_rgb()),
+                    );
+                }
+                assert_readable(
+                    "header warning pill",
+                    t.warning,
+                    surface.blend(t.warning.opacity(0.2).to_rgb()),
+                );
+                assert_readable("editor text", t.foreground, surface);
+                assert_readable("editor placeholder", t.muted_foreground, surface);
+            }
+        });
+    }
+
+    #[gpui_kit::test]
+    fn system_accent_tints_survive_kit_alpha_clamping(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_palette(cx);
+            let ramp = AccentRamp {
+                base: 0x006822,
+                hover: 0x006022,
+                active: 0x00551B,
+            };
+            cx.global_mut::<FluentChrome>().system.light_accent = Some(ramp);
+            apply_theme(WindowAppearance::Light, cx);
+            let t = Theme::global(cx);
+            assert_eq!(rgb24(t.primary.to_rgb()), ramp.base);
+            for fill in [t.list_active, t.table_active] {
+                assert_eq!(rgb24(fill.to_rgb()), ramp.base);
+                assert!(fill.a > 0.19 && fill.a <= 0.2);
+            }
+            for fill in [t.accent, t.sidebar_accent] {
+                assert_eq!(rgb24(fill.to_rgb()), ramp.base);
+                assert!(fill.a > 0.09 && fill.a < 0.12);
+            }
+        });
     }
 
     #[gpui_kit::test]

@@ -12,6 +12,7 @@ import uuid
 from service import Service, command, eventually, require_runner
 from consistency import check_closed, check_generation, installed_image
 from inventory import file_identity
+import foreign
 
 
 def spec():
@@ -71,15 +72,20 @@ def recovery():
     request = str(uuid.uuid4())
     with service.installed(), ExitStack() as stack:
         stack.enter_context(foreign_runtime(service))
-        keys = stack.enter_context(foreign_linux()) if sys.platform == "linux" else set()
-        baseline = service.inventory()
+        natives = {"linux": foreign_linux, "darwin": foreign.macos, "win32": foreign.windows}
+        keys = stack.enter_context(natives[sys.platform]())
+        foreign_image, process_key = stack.enter_context(foreign.idle_process())
+        keys.add(process_key)
+        def inventory():
+            return service.inventory([foreign_image])
+        baseline = inventory()
         keys.update(key for key in baseline.rows if key[0] == "runtime")
         revision = str(service.ctl("status")["revision"])
         receipt = service.apply(spec(), instance, request, revision)
         # The client is gone after the apply. The installed service keeps the
         # request and the live core, including beyond the user-host lease grace.
         first = service.ready(instance)
-        before = service.inventory()
+        before = inventory()
         check_generation(baseline, before, service.effects(), instance, first)
         assert_foreign(baseline, before, keys)
         time.sleep(31)
@@ -89,7 +95,7 @@ def recovery():
             old_dir = service.runtime / instance / str(old_epoch)
             old_pid = service.crash_installed(image)
             first = service.ready(instance, after=old_epoch)
-            after = service.inventory()
+            after = inventory()
             check_closed(service, instance, old_epoch)
             assert ("process", str(old_pid)) not in after.rows, "killed process remains"
             assert not old_dir.exists(), f"old generation directory remains: {old_dir}"
@@ -112,7 +118,7 @@ def recovery():
         eventually("stopped instance", lambda: service.view(instance),
                    lambda status: status.get("state") == "stopped")
         check_closed(service, instance, first["epoch"])
-        stopped = service.inventory()
+        stopped = inventory()
         assert_foreign(baseline, stopped, keys)
         remaining = baseline.delta(stopped)
         if os.name == "nt":

@@ -140,10 +140,10 @@ def darwin(inv, paths):
         for file in resolver.iterdir():
             if file.is_file():
                 inv.put("resolver", str(file), file_identity(file))
-    anchor = "com.apple/easytier-desk"
-    for line in output("/sbin/pfctl", "-a", anchor, "-sr").splitlines():
-        label = re.search(r' label "([^"]+)"', line)
-        inv.put("firewall", label[1] if label else line, line)
+    for anchor in ("com.apple/easytier-desk", "com.apple/easytier-desk-g2-foreign"):
+        for line in output("/sbin/pfctl", "-a", anchor, "-sr").splitlines():
+            label = re.search(r' label "([^"]+)"', line)
+            inv.put("firewall", label[1] if label else line, (anchor, line))
     for file in Path("/Library/LaunchDaemons").glob("*.plist"):
         inv.put("service", file.name, file_identity(file))
     processes(inv, output("ps", "-axww", "-o", "pid=,comm="), paths)

@@ -43,6 +43,15 @@ try {
 }
 $system = 'HKLM:\SYSTEM\CurrentControlSet\Services'
 $network = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles'
+$product = 'HKLM:\SOFTWARE\EasyTier'
+if (Test-Path -LiteralPath $product) {
+    foreach ($key in Get-ChildItem -Recurse -LiteralPath $product) {
+        foreach ($name in $key.GetValueNames()) {
+            $id = $key.Name.Replace('HKEY_LOCAL_MACHINE','HKLM') + '\' + $name
+            $inventory.registry[$id] = @([string]$key.GetValueKind($name), $key.GetValue($name))
+        }
+    }
+}
 foreach ($tree in @("$system\Tcpip\Parameters\Interfaces","$system\Tcpip6\Parameters\Interfaces",
                      "$system\NetBT\Parameters\Interfaces",$network)) {
     if (!(Test-Path -LiteralPath $tree)) { continue }

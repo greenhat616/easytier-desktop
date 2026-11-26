@@ -43,7 +43,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev libssl-dev nftables iproute2
+          sudo apt-get install -y libdbus-1-dev libssl-dev mold nftables iproute2
           sudo systemctl start systemd-resolved
       - name: Install pinned protoc
         shell: pwsh
@@ -61,9 +61,22 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.152
+      - name: Restore pinned upstream binary
+        id: core-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: upstream/target/debug/easytier-core${{ runner.os == 'Windows' && '.exe' || '' }}
+          key: g2-core-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('upstream/Cargo.lock','rust-toolchain.toml') }}-c97f36b8d40f3bde7a95cc9ec99fe95fe35a6ff0
       - name: Build pinned upstream source
+        if: steps.core-cache.outputs.cache-hit != 'true'
         working-directory: upstream
         run: cargo build --locked -p easytier --bin easytier-core
+      - name: Cache built upstream binary
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: upstream/target/debug/easytier-core${{ runner.os == 'Windows' && '.exe' || '' }}
+          key: ${{ steps.core-cache.outputs.cache-primary-key }}
       # Release packaging input: embed the digest in the host at build time,
       # and ship the *same bytes* beside the installer in cores/<version>/.
       # Generate the table in a temporary copy of the checked-out product.

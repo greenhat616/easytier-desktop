@@ -8,8 +8,8 @@
 
 use gpui_kit::gpui;
 use gpui_kit::{
-    AnyElement, App, ClickEvent, ElementId, Entity, FocusHandle, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement as _, RenderOnce, Role, SharedString,
+    AnyElement, App, ClickEvent, ElementId, Entity, FocusHandle, Focusable as _, Hsla,
+    InteractiveElement as _, IntoElement, ParentElement as _, RenderOnce, Role, SharedString,
     StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window,
     base::{
         Button as BaseButton, LayoutDirection, LogicalStyledExt as _, Switch as BaseSwitch,
@@ -546,6 +546,8 @@ impl RenderOnce for FluentSwitch {
     }
 }
 
+type NavClickHandler = std::rc::Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+
 /// Navigation row used by the Kit Sidebar. It owns only the appearance;
 /// Sidebar handles the expanded/icon-only transition, scrolling and layout.
 #[derive(Clone)]
@@ -556,7 +558,7 @@ pub struct FluentNavItem {
     filled_icon: &'static str,
     selected: bool,
     collapsed: bool,
-    handler: std::rc::Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>,
+    handler: NavClickHandler,
 }
 
 impl FluentNavItem {

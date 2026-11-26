@@ -33,6 +33,13 @@ def managed_service_changes(base, live):
     return set()
 
 
+def tun_created(base, live):
+    key = ("interface", "/dev/net/tun")
+    native = live.rows.get(key)
+    return {key} if (key not in base.rows and native and stat.S_ISCHR(native[0])
+                     and os.major(native[1]) == 10 and os.minor(native[1]) == 200) else set()
+
+
 def runner_noise(base, live):
     # Hosted-image noise, independent of product launch: the idle control in
     # run 45841944759 recorded services.exe changing BITS Start (4657 #582930).
@@ -115,12 +122,28 @@ def compare_generation(base, live, records, instance, view):
             if kind == "linux.fence_rule":
                 matches = {("firewall", "inet/" + key["container"])}
             elif kind == "macos.fence_rule":
-                matches = {("firewall", key["rule"] + suffix) for suffix in ("-v4", "-v6")}
+                anchor = ("firewall", "pf/anchor/com.apple/easytier-desk")
+                policy = live.rows[anchor]
+                before = base.rows.get(anchor, {"rules": [], "nat": [], "tables": {}})
+                remaining = policy["rules"].copy()
+                for suffix in ("-v4", "-v6"):
+                    label = key["rule"] + suffix
+                    own = [line for line in remaining if f' label "{label}"' in line]
+                    assert len(own) == 1, f"expected one native PF rule for {label}"
+                    remaining.remove(own[0])
+                assert {**policy, "rules": remaining} == before, "unexpected change within PF anchor"
+                matches = {anchor}
             else:
                 label = f"etd-fence:{key['rule']}:{key['port']}"
                 matches = {k for k, v in live.rows.items()
                            if k[0] == "firewall" and k[1].startswith("wfp/") and v[0] == label}
                 assert len(matches) == 4, f"expected four native WFP filters for {label}"
+                group = ("firewall", "wfp-group/51e7d001-7bc3-43b9-a795-7b80c196382f/"
+                         "51e7d002-7bc3-43b9-a795-7b80c196382f")
+                prior = set(base.rows.get(group, []))
+                ids = {k[1].removeprefix("wfp/") for k in matches}
+                assert not prior & ids and set(live.rows[group]) == prior | ids
+                matches.add(group)
         elif key["type"] == "service":
             matches = {("service", key["name"].lower())}
             if kind == "driver":
@@ -167,10 +190,7 @@ def compare_generation(base, live, records, instance, view):
         expected.update(matches)
     # These changes intentionally have no separate ownership record.
     # Match the precise object and transition, never a registry subtree.
-    exempt = managed_service_changes(base, live)
-    tun = ("interface", "/dev/net/tun")
-    if tun not in base.rows and tun in live.rows and stat.S_ISCHR(live.rows[tun][0]):
-        exempt.add(tun)
+    exempt = managed_service_changes(base, live) | tun_created(base, live)
     for kind, path in expected:
         if kind == "registry" and path.endswith("\\ProfileName"):
             category = ("registry", path.removesuffix("ProfileName") + "Category")

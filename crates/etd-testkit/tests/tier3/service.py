@@ -13,6 +13,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src" / "sysdiff"))
 from inventory import capture, command, digest, output
+from consistency import managed_service_changes, runner_noise, tun_created
 
 
 def require_runner():
@@ -54,7 +55,7 @@ class Service:
         self.cores = base / "cores"
         self.core = self.cores / os.environ["ETD_G2_SHA"] / ("easytier-core" + ext)
         self.runtime = self.state / "run"
-        self.retained_drivers = set()
+        self.retained_drivers = {}
 
     def verify_bundle(self):
         expected = {self.core.name: os.environ["ETD_G2_SHA"]}
@@ -155,8 +156,9 @@ class Service:
 
     @contextmanager
     def installed(self):
-        if self.state.exists() or self.host.exists():
+        if self.state.exists() or self.host.exists() or self.cores.exists():
             raise RuntimeError("test needs a fresh service installation")
+        before = self.inventory()
         self.call(self.installer, "install")
         try:
             self.verify_bundle()
@@ -172,13 +174,24 @@ class Service:
             # Shared driver candidates can legitimately prevent uninstall;
             # retain the native report, never delete drivers to pass cleanup.
             result = self.uninstall()
+            after = self.inventory()
+            delta = before.delta(after) - managed_service_changes(before, after)
+            delta -= runner_noise(before, after) | tun_created(before, after)
+            for name in self.retained_drivers:
+                key = ("service", name)
+                if key not in before.rows and after.rows.get(key) == self.retained_drivers[name]:
+                    delta.discard(key)
+            files = [str(p) for p in (self.cores, self.host) if p.exists()]
+            assert not (delta or files), (
+                f"pre-install to post-uninstall differences: native={sorted(delta)}, installed={files}"
+            )
             if result.returncode and sys.exc_info()[0] is None:
                 if "reclaim incomplete" not in result.stderr or not self.retained_drivers:
                     raise RuntimeError("test service uninstall incomplete")
                 pending = [r for r in self.effects() if r["state"] != "reclaimed"]
                 assert all(r["kind"] == "driver" and r["scope"] == "product"
                            and r["state"] in ("candidate", "conflict") for r in pending)
-                assert {r["key"]["name"].lower() for r in pending} == self.retained_drivers
+                assert {r["key"]["name"].lower() for r in pending} == set(self.retained_drivers)
 
     @staticmethod
     def call(*args):

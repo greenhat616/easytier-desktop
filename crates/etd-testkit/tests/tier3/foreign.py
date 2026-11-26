@@ -72,7 +72,7 @@ def macos():
         command("launchctl", "bootstrap", "system", file)
         stack.callback(command, "launchctl", "bootout", "system/" + label)
         yield {("interface", bridge), ("route", bridge), ("resolver", str(rule)),
-               ("firewall", "etd-g2-foreign"), ("service", file.name)}
+               ("firewall", "pf/anchor/" + anchor), ("service", file.name)}
         command("launchctl", "print", "system/" + label)
 
 

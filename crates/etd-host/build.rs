@@ -1,51 +1,32 @@
-use std::{collections::BTreeMap, env, fs, path::PathBuf};
+use std::{env, fs, path::PathBuf};
+
+mod core_lock;
 
 fn main() {
     println!("cargo:rerun-if-changed=cores.lock");
+    println!("cargo:rerun-if-changed=core_lock.rs");
     let target = env::var("TARGET").expect("Cargo target");
-    let mut table = BTreeMap::new();
-    let input = fs::read_to_string("cores.lock").expect("checked-in release hash table");
-    for (line_no, line) in input.lines().enumerate() {
-        let line = line.split('#').next().unwrap_or_default().trim();
-        if line.is_empty() {
-            continue;
-        }
-        let fields: Vec<_> = line.split_whitespace().collect();
-        assert_eq!(
-            fields.len(),
-            3,
-            "cores.lock line {}: expected target version sha256",
-            line_no + 1
-        );
-        let (platform, version, hash) = (fields[0], fields[1], fields[2]);
-        assert!(
-            !version.is_empty()
-                && version != "."
-                && version != ".."
-                && version
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')),
-            "invalid core version"
-        );
-        assert!(
-            hash.len() == 64
-                && hash
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-            "invalid core hash"
-        );
-        if platform == target {
-            assert!(
-                table.insert(version, hash).is_none(),
-                "duplicate version for build target"
-            );
-        }
+    if !core_lock::supported_target(&target) {
+        println!("cargo:warning=no trusted release kernels for unsupported build target {target}");
     }
+    let input = fs::read_to_string("cores.lock").expect("checked-in release hash table");
+    let table = core_lock::parse(&input).expect("valid release hash table");
     let entries = table
         .iter()
-        .map(|(version, hash)| format!("    ({version:?}, {hash:?}),\n"))
+        .filter(|((platform, _), _)| *platform == target)
+        .map(|((_, version), bundle)| {
+            let hash = bundle.exe.expect("validated executable hash");
+            let companions = bundle
+                .files
+                .iter()
+                .map(|(name, digest)| format!("({name:?}, {digest:?}),"))
+                .collect::<String>();
+            format!("    ({version:?}, {hash:?}, &[{companions}]),\n")
+        })
         .collect::<String>();
-    let output = format!("pub const TRUSTED_CORES: &[(&str, &str)] = &[\n{entries}];\n");
+    let output = format!(
+        "pub type TrustedCoreRow = (&'static str, &'static str, &'static [(&'static str, &'static str)]);\npub const TRUSTED_CORES: &[TrustedCoreRow] = &[\n{entries}];\n"
+    );
     fs::write(
         PathBuf::from(env::var_os("OUT_DIR").expect("Cargo output directory"))
             .join("trusted_cores.rs"),

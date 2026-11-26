@@ -143,6 +143,11 @@ async fn fence_stays_while_the_kernel_is_not_verified_dead() {
     h.apply("a", spec("net"), Desired::Running).await;
     h.wait_state("a", S::ReadyFull).await;
     let kernel = world.last_kernel();
+    // Its liveness cannot be established any more. Set before the exit:
+    // the host reclaims as soon as it sees the exit, on its own threads.
+    world
+        .engine
+        .set_liveness(&kernel, Some(Liveness::Uncertain));
     world.engine.exit(
         &kernel,
         Exit {
@@ -151,10 +156,6 @@ async fn fence_stays_while_the_kernel_is_not_verified_dead() {
             cause: ExitCause::Exited,
         },
     );
-    // Its liveness cannot be established any more.
-    world
-        .engine
-        .set_liveness(&kernel, Some(Liveness::Uncertain));
     h.wait_state("a", S::Quarantined).await;
     assert_eq!(
         fences(&world),

@@ -86,9 +86,14 @@ const IDLE: Duration = Duration::from_secs(3);
 /// Idle workers kept at most.
 const POOL_MAX: usize = 4;
 const MAX_OUTPUT: u64 = 64 * 1024 * 1024;
-/// How long [`shutdown`] waits for every worker process to be gone after
-/// terminating them.
+/// How long [`shutdown`] lets calls in progress finish.
+const DRAIN: Duration = Duration::from_secs(2);
+/// How long [`shutdown`] waits, after terminating the job, for every worker
+/// process to be gone.
 const CONFIRM: Duration = Duration::from_secs(5);
+/// The longest [`shutdown`] can take: one deadline for the whole wind-down.
+pub(crate) const SHUTDOWN_WORST: Duration =
+    Duration::from_secs(DRAIN.as_secs() + CONFIRM.as_secs());
 
 /// The host-owned job every worker runs in. KILL_ON_JOB_CLOSE: no worker
 /// outlives the host process, whatever way it ends.
@@ -128,7 +133,16 @@ impl Job {
                 ::windows::Win32::Foundation::HANDLE(child.as_raw_handle()),
             )
         }
-        .map_err(WinError::windows)
+        .map_err(|e| {
+            WinError::new(
+                e.code().0 as i64,
+                format!(
+                    "cannot place the management PowerShell in the host's job object \
+                     (is the host itself in a job that forbids nested jobs?): {}",
+                    e.message()
+                ),
+            )
+        })
     }
 
     fn active(&self) -> Result<u32, WinError> {
@@ -150,11 +164,11 @@ impl Job {
         Ok(info.ActiveProcesses)
     }
 
-    /// Terminate every process of the job and wait until none is left.
-    fn terminate(&self, confirm: Duration) -> Result<(), WinError> {
+    /// Terminate every process of the job and wait, until `until`, for
+    /// none to be left.
+    fn terminate(&self, until: Instant) -> Result<(), WinError> {
         unsafe { ::windows::Win32::System::JobObjects::TerminateJobObject(self.0, 1) }
             .map_err(WinError::windows)?;
-        let until = Instant::now() + confirm;
         loop {
             let active = self.active()?;
             if active == 0 {
@@ -181,6 +195,8 @@ enum Event {
     /// The request could not be written: it never reached the script.
     WriteFailed(WinError),
     ReadFailed(WinError),
+    /// stdout closed: the worker exited.
+    Eof,
 }
 
 /// A warm management PowerShell: the constant script in serve mode, one
@@ -215,9 +231,11 @@ struct Pool {
     idle: Vec<Worker>,
     /// Calls in progress.
     busy: usize,
-    /// The job new workers join; replaced after every [`shutdown`].
+    /// The job new workers join.
     job: Option<std::sync::Arc<Job>>,
     generation: u64,
+    /// Set first by [`shutdown`]: no worker or job is created any more.
+    closed: bool,
 }
 
 static POOL: std::sync::Mutex<Pool> = std::sync::Mutex::new(Pool {
@@ -225,6 +243,7 @@ static POOL: std::sync::Mutex<Pool> = std::sync::Mutex::new(Pool {
     busy: 0,
     job: None,
     generation: 0,
+    closed: false,
 });
 static CALLS_DONE: std::sync::Condvar = std::sync::Condvar::new();
 
@@ -276,6 +295,10 @@ impl Worker {
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr.try_clone().map_err(io_error)?));
         let mut child = cmd.spawn().map_err(io_error)?;
+        // Until it is in the job, the worker could outlive a host that dies
+        // right now. Nothing can be delivered to it in that window: its stdin
+        // is handed to the writer thread only below, so it would read EOF
+        // and exit without doing anything.
         if let Err(e) = job.assign(&child) {
             let _ = reap(&mut child);
             return Err(e);
@@ -316,7 +339,7 @@ impl Worker {
                         .take(MAX_OUTPUT + 1)
                         .read_until(b'\n', &mut line);
                     let event = match read {
-                        Ok(0) => break,
+                        Ok(0) => Event::Eof,
                         Ok(_) if line.len() as u64 > MAX_OUTPUT => {
                             Event::ReadFailed(WinError::invalid("management response too large"))
                         }
@@ -372,6 +395,12 @@ impl Worker {
             Ok(Event::Line(line)) => line,
             Ok(Event::WriteFailed(e)) => return Err(unhealthy(e, false)),
             Ok(Event::ReadFailed(e)) => return Err(unhealthy(e, true)),
+            Ok(Event::Eof) => {
+                return Err(unhealthy(
+                    WinError::invalid("management worker exited"),
+                    true,
+                ));
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(unhealthy(
                     WinError::invalid("management worker exited"),
@@ -472,6 +501,11 @@ fn ascii_json(request: &Value) -> String {
 fn checkout() -> Result<Worker, WinError> {
     let (job, generation) = {
         let mut pool = pool();
+        if pool.closed {
+            return Err(WinError::invalid(
+                "system management is shut down: the host is stopping",
+            ));
+        }
         pool.busy += 1;
         if let Some(mut worker) = pool.idle.pop() {
             worker.reused = true;
@@ -553,24 +587,30 @@ pub fn run(request: Value) -> Result<Vec<Value>, WinError> {
 }
 
 /// Host shutdown: end every management worker before the host gives up its
-/// singleton lock. Idle workers have stdin closed; calls in progress get
-/// `drain` to finish; then the whole job is terminated and the exit of its
-/// every process confirmed. `Err`: some may still run (the caller keeps the
-/// affected records open, as they are). Later requests start a new job.
-pub fn shutdown(drain: Duration) -> Result<(), WinError> {
+/// singleton lock, within [`SHUTDOWN_WORST`] in all. Admission closes first:
+/// no request starts a worker or a job afterwards, and none is retried.
+/// Idle workers have stdin closed and are killed; calls in progress get
+/// [`DRAIN`] to finish; then the job is terminated and the exit of every
+/// process in it confirmed. `Err`: some may still run (the caller keeps the
+/// affected records open, as they are).
+pub fn shutdown() -> Result<(), WinError> {
+    let started = Instant::now();
     let (idle, job) = {
         let mut pool = pool();
+        pool.closed = true;
         pool.generation += 1;
         (std::mem::take(&mut pool.idle), pool.job.take())
     };
+    // No waiting per worker: the job's termination below confirms them all
+    // under the one deadline.
     for mut worker in idle {
         worker.requests = None;
-        let _ = reap(&mut worker.child);
+        let _ = worker.child.kill();
     }
-    let until = Instant::now() + drain;
+    let drained = started + DRAIN;
     let mut pool = pool();
     while pool.busy > 0 {
-        let left = until.saturating_duration_since(Instant::now());
+        let left = drained.saturating_duration_since(Instant::now());
         if left.is_zero() {
             break;
         }
@@ -584,7 +624,7 @@ pub fn shutdown(drain: Duration) -> Result<(), WinError> {
     let Some(job) = job else {
         return Ok(());
     };
-    let result = job.terminate(CONFIRM);
+    let result = job.terminate(started + SHUTDOWN_WORST);
     match (&result, busy) {
         (Ok(()), 0) => {}
         (Ok(()), n) => tracing::warn!(
@@ -675,17 +715,37 @@ mod tests {
         assert!(!failure.healthy && !failure.delivered);
     }
 
+    // The only test of this binary using the process-wide pool: shutdown
+    // closes it for good.
     #[test]
-    fn shutdown_ends_every_worker_and_the_pool_recovers() {
+    fn shutdown_ends_every_worker_and_admits_no_more() {
         assert_eq!(run(serde_json::json!({"op":"magic"})).unwrap().len(), 1);
         let job = pool().job.clone().expect("a job for the first worker");
         assert!(job.active().unwrap() > 0, "the idle worker runs in the job");
-        shutdown(Duration::from_secs(5)).unwrap();
+        let started = Instant::now();
+        shutdown().unwrap();
+        assert!(started.elapsed() <= SHUTDOWN_WORST);
         assert_eq!(job.active().unwrap(), 0);
         assert!(pool().idle.is_empty());
-        // A later request starts a new job.
-        assert_eq!(run(serde_json::json!({"op":"magic"})).unwrap().len(), 1);
-        shutdown(Duration::from_secs(5)).unwrap();
+        // No new worker or job after shutdown.
+        let refused = run(serde_json::json!({"op":"magic"})).unwrap_err();
+        assert!(refused.message.contains("shut down"), "{}", refused.message);
+        assert!(pool().job.is_none());
+        shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_worker_that_exits_is_seen_at_once() {
+        let mut worker = fresh();
+        // Close stdin: the serve loop ends, stdout reaches EOF.
+        worker.requests = None;
+        let started = Instant::now();
+        assert!(matches!(
+            worker.events.recv_timeout(DEADLINE),
+            Ok(Event::Eof)
+        ));
+        assert!(started.elapsed() < DEADLINE);
+        worker.end();
     }
 
     #[test]

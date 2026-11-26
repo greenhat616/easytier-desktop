@@ -105,8 +105,10 @@ fn encoded_command(script: &str) -> String {
     out
 }
 /// See [`crate::shutdown_helpers`].
-pub(crate) fn shutdown_helpers(drain: Duration) -> Result<(), crate::OsError> {
-    execution::shutdown(drain).map_err(|e| crate::OsError::Os {
+pub(crate) const HELPERS_SHUTDOWN_WORST: Duration = execution::SHUTDOWN_WORST;
+/// See [`crate::shutdown_helpers`].
+pub(crate) fn shutdown_helpers() -> Result<(), crate::OsError> {
+    execution::shutdown().map_err(|e| crate::OsError::Os {
         code: e.code,
         message: e.message,
     })

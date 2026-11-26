@@ -629,6 +629,30 @@ pub(super) fn remove_install(layout: &HostLayout) -> io::Result<()> {
     })
 }
 
+// Upgrade (PK1). Files created in the install directory inherit its
+// protected DACL; accept exactly what `validate_service` accepts there.
+fn image_acl(path: &Path) -> io::Result<()> {
+    validate_acl(path, true, false)
+}
+fn image_paths(layout: &HostLayout) -> io::Result<super::image::ImagePaths> {
+    validate_acl(layout.executable.parent().ok_or_else(denied)?, true, true)?;
+    Ok(super::image::ImagePaths::of(&layout.executable))
+}
+pub(super) fn replace_host_image(layout: &HostLayout, source: &Path) -> io::Result<()> {
+    validate_service(layout)?;
+    super::image::replace(&image_paths(layout)?, source, image_acl, image_acl)?;
+    validate_service(layout)
+}
+pub(super) fn restore_host_image(layout: &HostLayout) -> io::Result<bool> {
+    super::image::restore(&image_paths(layout)?, image_acl)
+}
+pub(super) fn discard_host_backup(layout: &HostLayout) -> io::Result<()> {
+    super::image::discard(&image_paths(layout)?, image_acl)
+}
+pub(super) fn refresh_registration(_: &HostLayout) -> io::Result<()> {
+    Ok(())
+}
+
 pub(super) fn defer_install_removal(
     layout: &HostLayout,
     install_id: &str,

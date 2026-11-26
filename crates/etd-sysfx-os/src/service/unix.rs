@@ -560,6 +560,61 @@ pub(super) fn remove_state(layout: &HostLayout) -> io::Result<()> {
 pub(super) fn remove_install(layout: &HostLayout) -> io::Result<()> {
     remove_owned_tree(layout.executable.parent().ok_or_else(denied)?)
 }
+// Upgrade (PK1).
+fn image_check(path: &Path) -> io::Result<()> {
+    check(path, false)
+}
+fn image_seal(path: &Path) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+}
+fn image_paths(layout: &HostLayout) -> io::Result<super::image::ImagePaths> {
+    let install = layout.executable.parent().ok_or_else(denied)?;
+    verify_parent(install)?;
+    check(install, true)?;
+    Ok(super::image::ImagePaths::of(&layout.executable))
+}
+pub(super) fn replace_host_image(layout: &HostLayout, source: &Path) -> io::Result<()> {
+    validate_service(layout)?;
+    super::image::replace(&image_paths(layout)?, source, image_seal, image_check)?;
+    validate_service(layout)
+}
+pub(super) fn restore_host_image(layout: &HostLayout) -> io::Result<bool> {
+    super::image::restore(&image_paths(layout)?, image_check)
+}
+pub(super) fn discard_host_backup(layout: &HostLayout) -> io::Result<()> {
+    super::image::discard(&image_paths(layout)?, image_check)
+}
+/// The installed unit is ours: the maintenance journal records the
+/// installation. Replace it atomically only if this build's content differs.
+pub(super) fn refresh_registration(layout: &HostLayout) -> io::Result<()> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    validate_service(layout)?;
+    let path = Path::new(UNIT);
+    check(path, false)?;
+    if fs::read_to_string(path)? == UNIT_CONTENT {
+        return Ok(());
+    }
+    verify_parent(path)?;
+    let staging = path.with_extension("etd-new");
+    if fs::symlink_metadata(&staging).is_ok() {
+        check(&staging, false)?;
+        fs::remove_file(&staging)?;
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(&staging)?;
+    file.write_all(UNIT_CONTENT.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&staging, path)?;
+    File::open(path.parent().ok_or_else(denied)?)?.sync_all()?;
+    #[cfg(target_os = "linux")]
+    invoke("/usr/bin/systemctl", &["daemon-reload"])?;
+    Ok(())
+}
+
 pub(super) fn defer_install_removal(_: &HostLayout, _: &str) -> io::Result<Option<u32>> {
     Ok(None)
 }

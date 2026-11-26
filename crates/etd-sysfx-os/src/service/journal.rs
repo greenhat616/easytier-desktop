@@ -45,6 +45,11 @@ struct Record {
     group_gid: Option<u32>,
     #[serde(default)]
     deferred: Option<DeferredOutcome>,
+    /// An `etd-host upgrade` is between replacing the host image and
+    /// committing; its backups must be restored before anything else.
+    /// Omitted when false, so a host build without upgrade still reads it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    upgrading: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +97,7 @@ impl LifecycleJournal {
                 completed: vec![],
                 group_gid: None,
                 deferred: None,
+                upgrading: false,
             },
         };
         journal.save()?;
@@ -185,6 +191,26 @@ impl LifecycleJournal {
         }
         self.record.phase = phase;
         self.save()
+    }
+    pub fn upgrading(&self) -> bool {
+        self.record.upgrading
+    }
+    /// Mark the start (only on an installed service) or the end of an
+    /// upgrade.
+    pub fn set_upgrading(&mut self, upgrading: bool) -> io::Result<()> {
+        if upgrading && self.record.phase != Phase::Installed {
+            return Err(io::Error::other(
+                "only an installed service can be upgraded",
+            ));
+        }
+        if self.record.upgrading != upgrading {
+            self.record.upgrading = upgrading;
+            if let Err(error) = self.save() {
+                self.record.upgrading = !upgrading;
+                return Err(error);
+            }
+        }
+        Ok(())
     }
     pub fn resume_service(&mut self) -> io::Result<()> {
         if self.record.phase != Phase::Disabled {
@@ -347,6 +373,25 @@ mod tests {
         let mut new = LifecycleJournal::new_at(path).unwrap();
         new.advance(Phase::StateRemoved).unwrap();
         assert!(!new.can_finish_deferred(&id));
+    }
+    #[test]
+    fn upgrade_marker_is_durable_and_invisible_when_clear() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("journal");
+        let mut journal = LifecycleJournal::new_at(path.clone()).unwrap();
+        assert!(journal.set_upgrading(true).is_err(), "not installed yet");
+        journal.advance(Phase::Installed).unwrap();
+        let clear = fs::read_to_string(&path).unwrap();
+        assert!(!clear.contains("upgrading"), "{clear}");
+        journal.set_upgrading(true).unwrap();
+        let mut journal = LifecycleJournal::read(path.clone()).unwrap().unwrap();
+        assert!(journal.upgrading());
+        journal.set_upgrading(false).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), clear);
+        // A journal written before upgrade existed still reads.
+        let old = clear.replace(",\"deferred\":null", "");
+        fs::write(&path, old).unwrap();
+        assert!(!LifecycleJournal::read(path).unwrap().unwrap().upgrading());
     }
     #[test]
     fn every_uninstall_phase_can_retry_after_failure() {

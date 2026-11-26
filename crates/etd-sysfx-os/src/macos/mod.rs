@@ -135,9 +135,12 @@ pub(crate) fn adapters(config: &OsConfig) -> Result<OsAdapters, OsError> {
     let observer = Arc::new(observe::MacObserver {
         run_dir: config.run_dir.clone(),
     });
+    // The kernel runs with this host's effective UID: 0 for the service,
+    // the user's own UID for a user host.
+    let uid = nix::unistd::Uid::effective();
     let cores = Arc::new(holders::CoreIdentity {
         store: config.core_store_dir.clone(),
-        uid: 0,
+        uid: uid.as_raw(),
     });
     let reclaimers = [
         EffectKind::MacUtun,
@@ -158,7 +161,7 @@ pub(crate) fn adapters(config: &OsConfig) -> Result<OsAdapters, OsError> {
         observer,
         sweeper: Arc::new(reclaim::MacSweep),
         boot_id: Arc::new(MacBoot),
-        fence: nix::unistd::Uid::effective()
+        fence: uid
             .is_root()
             .then(|| Arc::new(fence::MacFence(cores)) as Arc<dyn PortFence>),
     })

@@ -360,9 +360,11 @@ async fn apply_ready_stop_and_reclaim_over_real_transport() {
     drop(events);
     drop(client);
     stop.send_replace(true);
-    tokio::time::timeout(Duration::from_secs(15), server)
+    let stopped = tokio::time::timeout(Duration::from_secs(15), server)
         .await
         .unwrap()
         .unwrap()
         .unwrap();
+    assert!(stopped.quiescent, "a clean stop is quiescent");
+    stopped.result.unwrap();
 }

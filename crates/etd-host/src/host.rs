@@ -47,6 +47,8 @@ use serving::policy;
 #[cfg(windows)]
 use serving::valid_sid;
 pub(crate) use serving::{LayoutLock, serve_with_deps};
+/// See [`serving::RUNTIME_SHUTDOWN`].
+pub(crate) const RUNTIME_SHUTDOWN: std::time::Duration = serving::RUNTIME_SHUTDOWN;
 const LEDGER: &str = "ledger.sqlite3";
 
 fn layout(mode: HostMode) -> Result<HostLayout> {
@@ -256,11 +258,70 @@ async fn dependencies(mode: HostMode, layout: &HostLayout) -> Result<Dependencie
     })
 }
 
-pub async fn run(mode: HostMode) -> Result<()> {
+pub async fn run(mode: HostMode) -> HostExit {
     run_until(mode, None).await
 }
 
-pub async fn run_until(mode: HostMode, managed_stop: Option<watch::Receiver<bool>>) -> Result<()> {
+/// How a host run ended. The singleton lock stays held until [`HostExit::finish`],
+/// which the caller runs only after shutting the runtime down, so no task or
+/// blocking call of this host can still act once another process takes it.
+pub struct HostExit {
+    lock: Option<LayoutLock>,
+    result: Result<()>,
+    /// Every task, helper process and the ledger's writer confirmed ended.
+    quiescent: bool,
+    _logging: Option<tracing_appender::non_blocking::WorkerGuard>,
+}
+
+impl HostExit {
+    /// `runtime_settled`: the runtime shut down before its timeout, so no
+    /// blocking task of this host still runs. Unless both that and the
+    /// host's own wind-down are confirmed, the lock is not released here:
+    /// only the process's exit releases it, so nothing of this host can
+    /// act once another process owns the ledger.
+    pub fn finish(self, runtime_settled: bool) -> Result<()> {
+        let quiescent = self.quiescent && runtime_settled;
+        if let Some(lock) = self.lock {
+            if !quiescent {
+                tracing::error!(
+                    stage = "shutdown.lock_kept",
+                    host_quiescent = self.quiescent,
+                    runtime_settled,
+                    "host shutdown: not confirmed quiescent; the singleton lock is released only when the process exits"
+                );
+            }
+            release(lock, quiescent);
+        }
+        self.result
+    }
+}
+
+/// Release `lock` now if `quiescent`; otherwise keep it until the process
+/// exits (the OS releases it then).
+fn release<L>(lock: L, quiescent: bool) {
+    if quiescent {
+        drop(lock);
+    } else {
+        std::mem::forget(lock);
+    }
+}
+
+pub async fn run_until(mode: HostMode, managed_stop: Option<watch::Receiver<bool>>) -> HostExit {
+    match serve_until(mode, managed_stop).await {
+        Ok(exit) => exit,
+        Err(error) => HostExit {
+            lock: None,
+            result: Err(error),
+            quiescent: true,
+            _logging: None,
+        },
+    }
+}
+
+async fn serve_until(
+    mode: HostMode,
+    managed_stop: Option<watch::Receiver<bool>>,
+) -> Result<HostExit> {
     let layout = layout(mode)?;
     prepare(mode, &layout)?;
     if mode == HostMode::Service {
@@ -296,9 +357,67 @@ pub async fn run_until(mode: HostMode, managed_stop: Option<watch::Receiver<bool
             "service installation is incomplete or disabled for uninstall; retry maintenance"
         );
     }
-    let _logging = logging(&layout)?;
-    let deps = dependencies(mode, &layout).await?;
-    serve_with_deps(mode, guard, deps.host, managed_stop, deps.missing).await
+    let logging = logging(&layout)?;
+    let Dependencies {
+        host,
+        missing,
+        sqlite,
+    } = dependencies(mode, &layout).await?;
+    let stopped = serve_with_deps(mode, guard, host, managed_stop, missing).await?;
+    // The ledger's writer thread is joined before the lock can go: no
+    // queued transition lands after another process owns the ledger.
+    let closed = tokio::time::timeout(serving::LEDGER_CLOSE, async {
+        sole_owner(sqlite)
+            .await
+            .close()
+            .await
+            .map_err(anyhow::Error::from)
+    })
+    .await;
+    let ledger_closed = match closed {
+        Ok(Ok(())) => {
+            tracing::info!(
+                stage = "shutdown.ledger_closed",
+                "host shutdown: ledger closed"
+            );
+            true
+        }
+        Ok(Err(error)) => {
+            tracing::error!(
+                stage = "shutdown.ledger_closed",
+                error = %error,
+                "host shutdown: ledger not closed; open records stay as they are"
+            );
+            false
+        }
+        Err(_) => {
+            tracing::error!(
+                stage = "shutdown.ledger_closed",
+                "host shutdown: ledger still shared or its close timed out; open records stay as they are"
+            );
+            false
+        }
+    };
+    Ok(HostExit {
+        lock: Some(stopped.lock),
+        result: stopped.result,
+        quiescent: stopped.quiescent && ledger_closed,
+        _logging: Some(logging),
+    })
+}
+
+/// Wait until `shared` has no other owner. A mutation that was committing
+/// when its client went away runs on in a detached task holding the
+/// service, so the ledger; it ends once the orchestrator is gone. The
+/// caller bounds the wait.
+async fn sole_owner<T>(mut shared: Arc<T>) -> T {
+    loop {
+        match Arc::try_unwrap(shared) {
+            Ok(owned) => return owned,
+            Err(still) => shared = still,
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 fn logging(layout: &HostLayout) -> Result<tracing_appender::non_blocking::WorkerGuard> {
@@ -696,10 +815,8 @@ async fn left_in_place(item: &LeftInPlace, observer: &dyn SystemObserver) -> Str
     // Informational only, a point-in-time observation: never authority
     // to delete anything (topic#40 msg#1450). The notice waits at most
     // IMAGE_LOOKUP_DEADLINE; an SCM read stuck in spawn_blocking keeps
-    // running after that and can still hold process exit when the runtime
-    // drops.
-    // TODO(topic#45): SH's bounded runtime shutdown in main.rs also bounds
-    // that exit; nothing here waits for it.
+    // running after that, and main's run_bounded shuts the runtime down
+    // within RUNTIME_SHUTDOWN regardless, so it cannot hold process exit.
     let image = match image_path(observation) {
         Some(image) => format!("{image} (as recorded)"),
         None => match tokio::time::timeout(
@@ -1705,5 +1822,42 @@ mod purge_flow_tests {
         );
         assert!(m.purge().await.is_err());
         m.untouched(&["wintun"]);
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::{release, sole_owner};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Lock<'a>(&'a AtomicBool);
+    impl Drop for Lock<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn the_lock_is_released_only_when_quiescent() {
+        let released = AtomicBool::new(false);
+        release(Lock(&released), true);
+        assert!(released.load(Ordering::SeqCst));
+        let released = AtomicBool::new(false);
+        release(Lock(&released), false);
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "kept until the process exits"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_ledger_closes_once_a_detached_owner_ends() {
+        let shared = std::sync::Arc::new(5);
+        let detached = shared.clone();
+        let (owned, ()) = tokio::join!(sole_owner(shared), async move {
+            tokio::task::yield_now().await;
+            drop(detached);
+        });
+        assert_eq!(owned, 5);
     }
 }

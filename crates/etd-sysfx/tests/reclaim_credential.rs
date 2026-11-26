@@ -75,6 +75,68 @@ async fn recorded_credential_mismatch_is_a_conflict() {
 }
 
 #[tokio::test]
+async fn a_foreign_utun_at_the_old_name_survives_reclaim_and_the_next_epoch() {
+    let w = World::new();
+    w.add_instance("a").await;
+    let instance = InstanceId::from("a");
+    let utun = |epoch| EffectIntent {
+        scope: EffectScope::Instance {
+            instance: instance.clone(),
+            epoch: Epoch(epoch),
+        },
+        kind: EffectKind::MacUtun,
+        key: ObjectKey::Interface {
+            name: None,
+            guid: None,
+        },
+        undo: Undo::EnsureAbsent,
+        persistence: Persistence::WithProcess,
+    };
+    let first = w.begin("a", vec![utun(1)]).await;
+    w.settle(&first[0], Fate::Applied).await;
+    let original = w.sys.ours().pop().unwrap();
+    let replacement = w
+        .sys
+        .replace_with_foreign(EffectKind::MacUtun, &original.key);
+    let foreign = w.sys.get(replacement).unwrap();
+    assert_eq!(original.key, foreign.key);
+    assert_ne!(original.credential, foreign.credential);
+
+    let engine = w.engine();
+    let report = engine.reclaim_all(ReclaimScope::Instances).await.unwrap();
+    let [conflict] = report.conflicts.as_slice() else {
+        panic!(
+            "expected one interface identity conflict: {:?}",
+            report.conflicts
+        );
+    };
+    assert_eq!(conflict.expected, original.credential);
+    assert_eq!(conflict.found, foreign.credential);
+    assert_eq!(w.sys.objects().as_slice(), std::slice::from_ref(&foreign));
+    engine
+        .resolve(&[CandidateDecision {
+            candidate_id: conflict.id.clone(),
+            action: CandidateAction::Keep as i32,
+        }])
+        .await
+        .unwrap();
+    assert!(w.open().await.is_empty());
+
+    let second = w.begin("a", vec![utun(2)]).await;
+    w.settle(&second[0], Fate::Applied).await;
+    let fresh = w.sys.ours().pop().unwrap();
+    assert_ne!(fresh.key, foreign.key);
+    assert_ne!(fresh.credential, foreign.credential);
+    let reclaimed = engine
+        .reclaim_generation(&instance, Epoch(2))
+        .await
+        .unwrap();
+    assert_eq!(reclaimed.outcome, GenerationOutcome::Closed);
+    assert_eq!(w.sys.objects(), [foreign]);
+    assert!(w.sys.foreign_deleted().is_empty());
+}
+
+#[tokio::test]
 async fn planned_record_with_foreign_object_is_a_candidate() {
     let w = World::new();
     w.add_instance("a").await;

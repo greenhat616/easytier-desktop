@@ -6,6 +6,10 @@ fn main() {
     println!("cargo:rerun-if-changed=cores.lock");
     println!("cargo:rerun-if-changed=core_lock.rs");
     let target = env::var("TARGET").expect("Cargo target");
+    assert!(
+        core_lock::supported_target(&target),
+        "unsupported kernel build target"
+    );
     let input = fs::read_to_string("cores.lock").expect("checked-in release hash table");
     let table = core_lock::parse(&input).expect("valid release hash table");
     let entries = table

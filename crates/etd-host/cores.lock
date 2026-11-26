@@ -1,4 +1,5 @@
 # Release packaging supplies one executable row per bundle:
+# Targets: x86_64/aarch64 for pc-windows-msvc, unknown-linux-gnu, apple-darwin.
 # target-triple version lowercase-sha256
 # Optional companion rows (before or after the executable row):
 # target-triple version file:<plain-name> lowercase-sha256

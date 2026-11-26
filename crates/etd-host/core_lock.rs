@@ -6,6 +6,18 @@ pub struct Bundle<'a> {
     pub files: BTreeMap<&'a str, &'a str>,
 }
 
+pub fn supported_target(target: &str) -> bool {
+    matches!(
+        target,
+        "x86_64-pc-windows-msvc"
+            | "aarch64-pc-windows-msvc"
+            | "x86_64-unknown-linux-gnu"
+            | "aarch64-unknown-linux-gnu"
+            | "x86_64-apple-darwin"
+            | "aarch64-apple-darwin"
+    )
+}
+
 pub type LockTable<'a> = BTreeMap<(&'a str, &'a str), Bundle<'a>>;
 
 pub fn parse(input: &str) -> Result<LockTable<'_>, String> {
@@ -30,8 +42,13 @@ pub fn parse(input: &str) -> Result<LockTable<'_>, String> {
             }
             _ => return Err(fail("expected target version [file:<name>] sha256")),
         };
+        if !supported_target(target) {
+            return Err(fail("unsupported core target"));
+        }
         if version == "."
             || version == ".."
+            || version.ends_with('.')
+            || reserved_device_name(version)
             || !version
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
@@ -89,13 +106,17 @@ fn valid_name(name: &str) -> bool {
     {
         return false;
     }
+    !reserved_device_name(name)
+}
+
+fn reserved_device_name(name: &str) -> bool {
     let stem = name
         .split('.')
         .next()
         .unwrap_or_default()
         .to_ascii_uppercase();
-    !matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        && !(stem.len() == 4
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
             && (stem.starts_with("COM") || stem.starts_with("LPT"))
             && stem.as_bytes()[3].is_ascii_digit())
 }

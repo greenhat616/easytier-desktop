@@ -589,15 +589,8 @@ fn check_install_driver_references(
         Err(e) => return Err(e),
         Ok(_) => (),
     }
-    // With no bundle directories there are no driver images to remove.
-    // Check every entry rather than silently ignoring a failed iteration.
-    let mut has_bundle = false;
-    for entry in fs::read_dir(core_dir)? {
-        has_bundle |= entry?.file_type()?.is_dir();
-    }
-    if !has_bundle {
-        return Ok(());
-    }
+    // Even an empty or irregular store must pass the same driver check.
+    // The adapter rejects links, reparse points and unknown file types.
     match query(core_dir) {
         Ok(None) => Ok(()),
         Ok(Some(reference)) => Err(io::Error::new(
@@ -914,6 +907,28 @@ fn run_service() -> io::Result<()> {
 #[cfg(test)]
 mod driver_removal_tests {
     use super::*;
+
+    #[test]
+    fn unexpected_flat_store_entry_still_requires_driver_guard() {
+        let root = tempfile::tempdir().unwrap();
+        let cores = root.path().join("cores");
+        fs::create_dir(&cores).unwrap();
+        fs::write(cores.join("manifest.json"), b"fixture").unwrap();
+        check_install_driver_references(&cores, |_| Ok(None)).unwrap();
+        let image = cores.join("bad.bin");
+        fs::write(&image, b"fixture").unwrap();
+        let err = guarded_install_removal(
+            &cores,
+            |_| Err(crate::OsError::Unsupported("no access".into())),
+            || panic!("must not delete"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot determine driver references")
+        );
+        assert!(image.exists());
+    }
 
     #[test]
     fn rollback_and_uninstall_keep_tree_for_driver_reference_or_query_failure() {

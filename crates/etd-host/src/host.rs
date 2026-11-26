@@ -179,6 +179,7 @@ async fn dependencies(mode: HostMode, layout: &HostLayout) -> Result<Dependencie
                 .parent()
                 .context("missing user host image directory")?,
             &layout.cores,
+            mode,
         )
         .await?;
     } else {
@@ -188,18 +189,20 @@ async fn dependencies(mode: HostMode, layout: &HostLayout) -> Result<Dependencie
         Some(reason) => Arc::new(BlockedDriver(reason.clone())),
         None => Arc::new(EasyTierDriver),
     };
-    let store = Arc::new(
-        ManifestCoreStore::new(
-            layout.cores.clone(),
-            mode,
-            driver.clone(),
-            storage::trusted_cores(),
-        )?
-        .with_removal_guard(|dir| {
+    let store = ManifestCoreStore::new(
+        layout.cores.clone(),
+        mode,
+        driver.clone(),
+        storage::trusted_cores(),
+    )?;
+    let store = Arc::new(if mode == HostMode::Service {
+        store.with_removal_guard(|dir| {
             etd_sysfx_os::driver_bundle_referenced(dir)
                 .map_err(|error| etd_host_core::core_store::StoreError::Io(error.to_string()))
-        }),
-    );
+        })
+    } else {
+        store
+    });
     let mut reclaimers = os.reclaimers;
     reclaimers.extend(host_reclaimers(
         process.clone(),
@@ -434,6 +437,7 @@ pub async fn install(users: &[String]) -> Result<()> {
         storage::install_bundled_cores(
             source.parent().context("missing installer directory")?,
             &layout.cores,
+            mode,
         )
         .await?;
         let deps = dependencies(mode, &layout).await?;

@@ -1836,10 +1836,11 @@ impl Supervisor {
         // msg#1237): the next start judges the rules as before.
         let _gate = match self.rule_gate(true).await {
             Ok(gate) => gate,
-            // Served after this pass; the read-back is dropped (the next
-            // start decides as before).
+            // Served first after this pass, ahead of anything deferred
+            // while waiting (it stops everything anyway); the read-back is
+            // dropped (the next start decides as before).
             Err(LaunchFail::Cut(reply)) => {
-                self.deferred.push_back(SupCmd::Cut { reply });
+                self.deferred.push_front(SupCmd::Cut { reply });
                 return;
             }
             Err(_) => return,

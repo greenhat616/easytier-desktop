@@ -240,6 +240,29 @@ pub(super) async fn sweep() -> io::Result<Vec<FoundObject>> {
     }
     Ok(found)
 }
+// Service-mode cores run as root. Keep this separate from the identity of
+// the caller so that a dedicated core account can be supplied in the future.
+const SERVICE_CORE_UID: u32 = 0;
+
+fn listeners_for_removal(
+    port: u16,
+    mut scan: impl FnMut() -> io::Result<Vec<network::ListenerImage>>,
+) -> Result<Vec<network::ListenerImage>, ReclaimError> {
+    let first = scan().map_err(uncertain)?;
+    if let Some(core) = first.iter().find(|l| l.protected) {
+        return Err(ReclaimError::Busy(format!(
+            "protected core PID {} still listens on {port}",
+            core.pid
+        )));
+    }
+    // A listener can survive exec or be inherited by another process without
+    // its socket inode changing. Reopen procfs and compare every holder.
+    if scan().map_err(uncertain)? != first {
+        return Err(uncertain("listener identity changed before fence removal"));
+    }
+    Ok(first)
+}
+
 impl Linux {
     pub(super) async fn remove_fence(
         &self,
@@ -254,15 +277,13 @@ impl Linux {
             return Ok(Reclaimed::AlreadyAbsent);
         };
         let store = self.core_store_dir.clone();
-        let listeners = blocking(move || network::listener_images(port, &store))
-            .await
-            .map_err(uncertain)?;
-        if let Some(core) = listeners.iter().find(|l| l.in_store) {
-            return Err(ReclaimError::Busy(format!(
-                "protected core PID {} still listens on {port}",
-                core.pid
-            )));
-        }
+        let listeners = tokio::task::spawn_blocking(move || {
+            listeners_for_removal(port, || {
+                network::listener_images(port, &store, SERVICE_CORE_UID)
+            })
+        })
+        .await
+        .map_err(uncertain)??;
         run(
             NFT,
             &["delete", "table", "inet", "handle", &t.handle.to_string()],
@@ -271,7 +292,7 @@ impl Linux {
         .map_err(uncertain)?;
         for listener in listeners {
             tracing::warn!(instance=generation.map(|(i,_)|i.as_str()),epoch=generation.map(|(_,e)|e.0),
-            port,pid=listener.pid,exe=%listener.exe.display(),table,"reclaimed fence; unrelated listener left running");
+            port,pid=listener.pid,euid=listener.euid,exe=%listener.exe.display(),table,"reclaimed fence; unrelated listener left running");
         }
         Ok(Reclaimed::Removed)
     }
@@ -426,6 +447,36 @@ add rule inet {name} output ip6 daddr ::1 tcp dport {port} meta skuid != 0 count
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removal_rechecks_holders_of_the_same_socket() {
+        use std::{net::TcpListener, os::fd::OwnedFd};
+        let store = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut child = None;
+        let result = listeners_for_removal(port, || {
+            let images = network::listener_images(port, store.path(), SERVICE_CORE_UID)?;
+            if child.is_none() {
+                // The parent retains its descriptor. Only the set of holders
+                // changes between the two independent procfs scans.
+                child = Some(
+                    std::process::Command::new("/bin/sleep")
+                        .arg("60")
+                        .stdin(OwnedFd::from(listener.try_clone()?))
+                        .spawn()?,
+                );
+            }
+            Ok(images)
+        });
+        let mut child = child.expect("completed initial scan");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            matches!(result, Err(ReclaimError::Indeterminate(ref why)) if why.contains("listener identity changed"))
+        );
+    }
+
     #[tokio::test]
     #[ignore = "populates the private CI network namespace for distro nft to enumerate"]
     async fn install_distribution_fixture() {

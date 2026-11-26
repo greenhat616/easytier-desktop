@@ -88,7 +88,7 @@ async fn output(program: &str, args: &[&str]) -> io::Result<std::process::Output
         let executable = std::path::Path::new(directory).join(program);
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            Command::new(executable)
+            Command::new(&executable)
                 .args(args)
                 .env_clear()
                 .env("LC_ALL", "C")
@@ -99,7 +99,19 @@ async fn output(program: &str, args: &[&str]) -> io::Result<std::process::Output
         .await
         .map_err(other)?;
         match result {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // execve also returns ENOENT for a missing interpreter.
+                match tokio::fs::symlink_metadata(&executable).await {
+                    Err(missing) if missing.kind() == io::ErrorKind::NotFound => continue,
+                    Err(inspect) => return Err(inspect),
+                    Ok(_) => {
+                        return Err(io::Error::new(
+                            e.kind(),
+                            format!("could not execute {}: {e}", executable.display()),
+                        ));
+                    }
+                }
+            }
             other => return other,
         }
     }

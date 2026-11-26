@@ -71,6 +71,51 @@ fn second(addr: SocketAddr, allowed: bool) {
             .success()
     );
 }
+
+#[tokio::test]
+#[ignore = "requires nftables and the disposable runner's second account"]
+async fn store_image_under_second_account_allows_removal() {
+    use std::os::{
+        fd::OwnedFd,
+        unix::{fs::PermissionsExt, process::CommandExt},
+    };
+    assert_eq!(std::env::var("ETD_O2_PRIVILEGED").as_deref(), Ok("1"));
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let image = dir.path().join("listener-fixture");
+    std::fs::copy("/bin/sleep", &image).unwrap();
+    let account = nix::unistd::User::from_name("etd_o2_probe")
+        .unwrap()
+        .unwrap();
+    assert_ne!(account.uid.as_raw(), 0);
+    let os = adapter(dir.path());
+    let f = os.fence.unwrap();
+    // Transfer the only descriptor to an inert fixture in the store. It
+    // holds the socket but never accepts a connection or handles RPC.
+    let socket = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = socket.local_addr().unwrap();
+    let mut child = Command::new(&image)
+        .arg("60")
+        .uid(account.uid.as_raw())
+        .gid(account.gid.as_raw())
+        .stdin(OwnedFd::from(socket))
+        .spawn()
+        .unwrap();
+    let spec = spec(address.port());
+    assert_eq!(
+        os.observer.listener(address).await.unwrap().unwrap().pid,
+        child.id()
+    );
+    f.install(&spec).await.unwrap();
+    assert_eq!(f.remove(&spec).await.unwrap(), Reclaimed::Removed);
+    // The unlinked inode is still observable through the running process.
+    std::fs::remove_file(&image).unwrap();
+    f.install(&spec).await.unwrap();
+    assert_eq!(f.remove(&spec).await.unwrap(), Reclaimed::Removed);
+    assert!(child.try_wait().unwrap().is_none());
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
 #[tokio::test]
 #[ignore = "changes nftables on a disposable runner with the CI probe account"]
 async fn fence_survives_host_death() {

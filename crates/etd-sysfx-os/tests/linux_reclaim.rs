@@ -203,7 +203,23 @@ async fn reclaim_real_link_route_and_dns() {
                 reclaim(dns_kind).reclaim(&old).await,
                 Err(ReclaimError::Indeterminate(_))
             ));
-            println!("Ownerless private bus: previously observed resolve1 effect held for retry");
+            let conn = zbus::Connection::system().await.unwrap();
+            let bus = zbus::fdo::DBusProxy::new(&conn).await.unwrap();
+            assert!(
+                bus.list_activatable_names()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|n| n.as_str() == "org.freedesktop.resolve1")
+            );
+            assert!(
+                !bus.name_has_owner("org.freedesktop.resolve1".try_into().unwrap())
+                    .await
+                    .unwrap()
+            );
+            println!(
+                "Activatable resolve1 stayed ownerless: DNS enumerated, previously observed effect held for retry"
+            );
         }
     } else {
         command("resolvectl", &["dns", &name, "192.0.2.53"]);

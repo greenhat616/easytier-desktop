@@ -48,14 +48,7 @@ async fn connect(previously_seen: bool) -> io::Result<Option<Proxy<'static>>> {
     let owner = match bus.get_name_owner(SERVICE.try_into().map_err(other)?).await {
         Ok(owner) => owner,
         Err(zbus::fdo::Error::NameHasNoOwner(_)) => {
-            if previously_seen
-                || bus
-                    .list_activatable_names()
-                    .await
-                    .map_err(other)?
-                    .iter()
-                    .any(|n| n.as_str() == SERVICE)
-            {
+            if previously_seen {
                 return Err(other("resolve1 has no current owner; retry after restart"));
             }
             return Ok(None);

@@ -153,6 +153,7 @@ fn sockets(address: SocketAddr, include_wildcard: bool) -> io::Result<BTreeSet<u
 struct Owner {
     pid: u32,
     proc_dir: fs::File,
+    sockets: BTreeSet<u64>,
 }
 fn owners(inodes: &BTreeSet<u64>) -> io::Result<Vec<Owner>> {
     use std::os::fd::AsRawFd;
@@ -181,7 +182,7 @@ fn owners(inodes: &BTreeSet<u64>) -> io::Result<Vec<Owner>> {
             }
             r => r?,
         };
-        let mut holds = false;
+        let mut held = BTreeSet::new();
         for fd in fds {
             let dest = match fs::read_link(fd?.path()) {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
@@ -195,11 +196,15 @@ fn owners(inodes: &BTreeSet<u64>) -> io::Result<Vec<Owner>> {
             };
             if let Some(index) = targets.get(&dest) {
                 seen.insert(*index);
-                holds = true;
+                held.insert(*index);
             }
         }
-        if holds {
-            owners.push(Owner { pid, proc_dir });
+        if !held.is_empty() {
+            owners.push(Owner {
+                pid,
+                proc_dir,
+                sockets: held,
+            });
         }
     }
     if &seen != inodes {
@@ -225,14 +230,21 @@ pub(super) fn listener(address: SocketAddr) -> io::Result<Option<ListenerInfo>> 
     }))
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub(super) struct ListenerImage {
     pub pid: u32,
+    pub euid: u32,
     pub exe: PathBuf,
-    pub in_store: bool,
+    pub protected: bool,
+    proc_inode: u64,
+    image_device: u64,
+    image_inode: u64,
+    sockets: BTreeSet<u64>,
 }
 pub(super) fn listener_images(
     port: u16,
     store: &std::path::Path,
+    core_uid: u32,
 ) -> io::Result<Vec<ListenerImage>> {
     use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
     let snapshot = || -> io::Result<_> {
@@ -247,16 +259,24 @@ pub(super) fn listener_images(
     let root = store.canonicalize()?;
     let mut images = Vec::new();
     for owner in owners(&inodes)? {
-        let magic = PathBuf::from(format!("/proc/self/fd/{}/exe", owner.proc_dir.as_raw_fd()));
+        let proc_path = PathBuf::from(format!("/proc/self/fd/{}", owner.proc_dir.as_raw_fd()));
+        let status = fs::read_to_string(proc_path.join("status"))?;
+        let euid = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:"))
+            .and_then(|uids| uids.split_whitespace().nth(1))
+            .ok_or_else(|| other("missing effective uid in process status"))?
+            .parse::<u32>()
+            .map_err(other)?;
         // Pin the running image and compare (device,inode) at its canonical
         // store path. argv[0], comm and the executable basename are irrelevant.
-        let image = fs::File::open(&magic)?;
+        let image = fs::File::open(proc_path.join("exe"))?;
         let exe = fs::read_link(format!("/proc/self/fd/{}", image.as_raw_fd()))?;
-        let in_store = exe.starts_with(&root);
-        if in_store {
+        let running = image.metadata()?;
+        let protected = euid == core_uid && exe.starts_with(&root);
+        if protected {
             let path = exe.canonicalize()?;
             let named = fs::metadata(&path)?;
-            let running = image.metadata()?;
             if !path.starts_with(&root)
                 || (named.dev(), named.ino()) != (running.dev(), running.ino())
             {
@@ -265,13 +285,19 @@ pub(super) fn listener_images(
         }
         images.push(ListenerImage {
             pid: owner.pid,
+            euid,
             exe,
-            in_store,
+            protected,
+            proc_inode: owner.proc_dir.metadata()?.ino(),
+            image_device: running.dev(),
+            image_inode: running.ino(),
+            sockets: owner.sockets,
         });
     }
     if snapshot()? != inodes {
         return Err(other("listening sockets changed during image lookup"));
     }
+    images.sort_unstable_by_key(|image| image.pid);
     Ok(images)
 }
 

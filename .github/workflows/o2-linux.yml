@@ -43,11 +43,14 @@ jobs:
           sudo systemctl start systemd-resolved
           mkdir -p evidence
           sudo -E env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" ETD_O2_PRIVILEGED=1 "$(command -v cargo)" nextest run --locked --profile privileged -p etd-sysfx-os --run-ignored only --test linux_reclaim --test linux_fence --success-output immediate |& tee evidence/privileged.txt
-      - name: Resolver without resolve1
+      - name: Activatable resolve1 without a current owner
         shell: bash
         run: |
           set -euo pipefail
-          sudo -E env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" ETD_O2_PRIVILEGED=1 ETD_O2_NO_RESOLVED=1 dbus-run-session -- bash -ec 'export DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS"; cargo nextest run --locked --profile privileged -p etd-sysfx-os --run-ignored only --test linux_reclaim --success-output immediate' |& tee evidence/other-resolver.txt
+          data="$RUNNER_TEMP/o2-dbus"
+          mkdir -p "$data/dbus-1/services"
+          printf '%s\n' '[D-BUS Service]' 'Name=org.freedesktop.resolve1' 'Exec=/bin/false' > "$data/dbus-1/services/org.freedesktop.resolve1.service"
+          sudo -E env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" XDG_DATA_HOME="$data" ETD_O2_PRIVILEGED=1 ETD_O2_NO_RESOLVED=1 dbus-run-session -- bash -ec 'export DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS"; cargo nextest run --locked --profile privileged -p etd-sysfx-os --run-ignored only --test linux_reclaim --success-output immediate' |& tee evidence/other-resolver.txt
       - name: Missing system bus socket
         run: |
           set -euo pipefail

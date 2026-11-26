@@ -62,9 +62,11 @@ def empty_pf_namespace(before, after):
     return set()
 
 
-def assert_driver_notice(stdout, retained):
-    notices = re.findall(r"^[ \t]*left in place: shared driver service (\S+) image (.+?); "
-                         r"remove it yourself if no other software uses it\s*$", stdout, re.M | re.I)
+def assert_driver_notice(stdout, retained, preexisting=False):
+    prefix = "pre-existing shared driver" if preexisting else "shared driver"
+    suffix = "it belongs to other software" if preexisting else "remove it yourself if no other software uses it"
+    notices = re.findall(rf"^[ \t]*left in place: {prefix} service (\S+) image (.+?); {suffix}\s*$",
+                         stdout, re.M | re.I)
     assert len(notices) == len(retained) and {name.lower() for name, _ in notices} == retained.keys()
     root = Path(os.environ["SystemRoot"])
     def driver_path(raw):
@@ -101,6 +103,7 @@ class Service:
         self.core = self.cores / os.environ["ETD_G2_SHA"] / ("easytier-core" + ext)
         self.runtime = self.state / "run"
         self.retained_drivers = {}
+        self.preexisting_drivers = {}
         self.adapter_indices = {}
 
     def verify_bundle(self):
@@ -241,6 +244,8 @@ class Service:
                            lambda status: status.startswith("No maintenance journal:"))
                 if self.retained_drivers:
                     assert_driver_notice(result.stdout, self.retained_drivers)
+                if self.preexisting_drivers:
+                    assert_driver_notice(result.stdout, self.preexisting_drivers, preexisting=True)
             after = self.inventory()
             delta = before.delta(after) - managed_service_changes(before, after)
             delta -= runner_noise(before, after) | tun_created(before, after)

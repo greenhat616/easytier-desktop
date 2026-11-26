@@ -2,6 +2,7 @@ use etd_proc::{
     Command, Containment, ExitCause, KillOutcome, Liveness, ProcessEngine, ProcessError,
     ProcessEvent, ProcessIdentity, ProcessMarker, processkit_engine::ProcessKitEngine,
 };
+use etd_testkit::no_window::NoWindow;
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
@@ -258,6 +259,7 @@ async fn marked_orphan_fixture() {
     let config = dir.path().join("config");
     std::fs::write(&config, "").unwrap();
     let mut child = tokio::process::Command::new(executable())
+        .no_window()
         .args(["--mode", "ignore", "--ready-file"])
         .arg(&ready)
         .arg("-c")
@@ -290,6 +292,7 @@ async fn orphan_with_uncontained_descendant_is_quarantined_before_root_kill() {
     let ready = dir.path().join("ready");
     let child_ready = dir.path().join("child");
     let mut root = tokio::process::Command::new(executable())
+        .no_window()
         .args(["--mode", "ignore", "--ready-file"])
         .arg(&ready)
         .arg("--spawn-child")
@@ -341,6 +344,7 @@ async fn fake_core_outlives_closed_output_pipes() {
     let (reader, writer) = std::io::pipe().unwrap();
     drop(reader);
     let mut child = tokio::process::Command::new(executable())
+        .no_window()
         .args([
             "--mode",
             "ignore",
@@ -367,6 +371,7 @@ async fn abrupt_parent_death_platform_guarantee() {
     let dir = tempfile::tempdir().unwrap();
     let record = dir.path().join("identity");
     let mut host = tokio::process::Command::new(executable())
+        .no_window()
         .arg("--host-probe")
         .arg(&record)
         .kill_on_drop(true)

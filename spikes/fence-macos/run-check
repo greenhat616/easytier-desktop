@@ -50,8 +50,9 @@ probe() {
 sysadminctl -addUser "$user" -fullName "S1 fence probe" -password "$(uuidgen)"
 created=1
 [[ $(id -u "$user") != 0 ]]
-# Apple ships an existing wildcard filter anchor. Use it for the spike only;
-# no changes to /etc/pf.conf or any other anchor.
+# Apple ships an existing wildcard filter anchor. Install one fixed
+# product-owned child under it, not a new anchor per instance/generation.
+# No changes to /etc/pf.conf or any other anchor.
 pfctl -sr | tee "$work/top-rules.txt"
 if ! grep -F 'anchor "com.apple/*"' "$work/top-rules.txt"; then
   echo "UNPROVEN: missing active wildcard anchor hook"; exit 1
@@ -60,30 +61,41 @@ pfctl -a com.apple -s Anchors > "$work/before.txt"
 if grep -F 'etd-s1-fence' "$work/before.txt"; then
   echo "unexpected pre-existing S1 anchor"; exit 1
 fi
-pfctl -E > "$work/enable.txt" 2>&1
-pf_token=$(awk '/Token *:/ {print $NF}' "$work/enable.txt")
-[[ -n $pf_token ]]
-echo "PF reference acquired"
+enable_pf() {
+  pfctl -E > "$work/enable.txt" 2>&1
+  pf_token=$(awk '/Token *:/ {print $NF}' "$work/enable.txt")
+  [[ -n $pf_token ]]
+  echo "PF reference acquired"
+}
+release_pf() {
+  pfctl -X "$pf_token"
+  pf_token=""
+  echo "Own PF reference released"
+}
+empty_anchor() {
+  # First independently enumerate the fixed parent. An absent name is clear;
+  # otherwise enumerate every rule category in the fixed private anchor.
+  pfctl -a com.apple -s Anchors | tee "$work/post-anchors.txt"
+  if grep -Fq 'etd-s1-fence' "$work/post-anchors.txt"; then
+    pfctl -a "$anchor" -sr | tee "$work/post-filter.txt"
+    [[ ! -s "$work/post-filter.txt" ]]
+    pfctl -a "$anchor" -sn | tee "$work/post-nat.txt"
+    [[ ! -s "$work/post-nat.txt" ]]
+    pfctl -a "$anchor" -s Tables | tee "$work/post-tables.txt"
+    [[ ! -s "$work/post-tables.txt" ]]
+    echo "EMPTY_ANCHOR_CONTENTS: fixed install-level anchor remains, zero filter/translation/table objects"
+  else
+    echo "ANCHOR_ABSENT: no private anchor objects"
+  fi
+}
+enable_pf
+# Installation-level namespace; the kernel may retain this empty name.
+pfctl -a "$anchor" -f /dev/null
+empty_anchor
 start_listener "127.0.0.1:$control" control4
 start_listener "[::1]:$control" control6
 probe second "127.0.0.1:$control" allowed
 probe second "[::1]:$control" allowed
-cat > "$work/rules.conf" <<RULES
-block return out quick on lo0 inet proto tcp from any to 127.0.0.1 port $port user != 0
-block return out quick on lo0 inet6 proto tcp from any to ::1 port $port user != 0
-RULES
-owned=1
-(
-  pfctl -a "$anchor" -f "$work/rules.conf"
-  exec "$fixture" hold "$work/host"
-) &
-host=$!
-pids+=("$host")
-wait_marker "$work/host"
-[[ $(cat "$work/host") == "$host" ]]
-pfctl -a "$anchor" -vvsr
-start_listener "127.0.0.1:$port" listener4
-start_listener "[::1]:$port" listener6
 check_both() {
   for endpoint in "127.0.0.1:$port" "[::1]:$port"; do
     probe root "$endpoint" allowed
@@ -92,32 +104,54 @@ check_both() {
   done
   pfctl -a "$anchor" -vvsr
 }
-check_both
-kill -KILL "$host"; wait "$host" || true
-! kill -0 "$host" 2>/dev/null
-echo "HOST_KILLED pid=$host; listeners remain"
-check_both
-for marker in listener4 listener6; do
-  pid=$(cat "$work/$marker")
-  kill -KILL "$pid"; wait "$pid" || true
-  ! kill -0 "$pid" 2>/dev/null
-done
-# Replace the entire private anchor atomically with an empty ruleset (not
-# a global flush). Darwin may keep an empty anchor while a reference exists.
-pfctl -a "$anchor" -f /dev/null
-owned=0
-# Enumerate its parent first so a direct query cannot create a placeholder.
-for _ in {1..20}; do
-  pfctl -a com.apple -s Anchors > "$work/post-anchors.txt"
-  if ! grep -Fq 'etd-s1-fence' "$work/post-anchors.txt"; then break; fi
-  sleep .5
-done
-cat "$work/post-anchors.txt"
-if grep -F 'etd-s1-fence' "$work/post-anchors.txt"; then
-  pfctl -a "$anchor" -sr | tee "$work/post-anchor.txt"
-  echo "UNPROVEN: empty anchor name still present after reclaim"
+run_generation() {
+  local generation=$1
+  echo "GENERATION $generation port=$port anchor=$anchor"
+  cat > "$work/rules.conf" <<RULES
+block return out quick on lo0 inet proto tcp from any to 127.0.0.1 port $port user != 0 label "etd-s1-g$generation-v4"
+block return out quick on lo0 inet6 proto tcp from any to ::1 port $port user != 0 label "etd-s1-g$generation-v6"
+RULES
+  owned=1
+  (
+    pfctl -a "$anchor" -f "$work/rules.conf"
+    exec "$fixture" hold "$work/host$generation"
+  ) &
+  local host=$!
+  wait_marker "$work/host$generation"
+  [[ $(cat "$work/host$generation") == "$host" ]]
+  pfctl -a "$anchor" -vvsr
+  start_listener "127.0.0.1:$port" "listener4-$generation"
+  start_listener "[::1]:$port" "listener6-$generation"
+  check_both
+  kill -KILL "$host"; wait "$host" || true
+  ! kill -0 "$host" 2>/dev/null
+  echo "HOST_KILLED pid=$host; listeners remain"
+  check_both
+  for marker in "listener4-$generation" "listener6-$generation"; do
+    pid=$(cat "$work/$marker")
+    kill -KILL "$pid"; wait "$pid" || true
+    ! kill -0 "$pid" 2>/dev/null
+  done
+  # Atomically replace only our private rules. This fixture has a single live
+  # generation; production must compose all still-live instances' rules.
+  pfctl -a "$anchor" -f /dev/null
+  owned=0
+  empty_anchor
+  echo "GENERATION $generation RECLAIMED"
+}
+run_generation 1
+# Simulate an installer/host restart: release the previous PF reference and
+# acquire a new one, then use the same empty fixed anchor with a fresh port.
+release_pf
+empty_anchor
+enable_pf
+port=$((control + 1))
+run_generation 2
+release_pf
+empty_anchor
+pfctl -a '*' -sr | tee "$work/post-rules.txt"
+if grep -F 'etd-s1-g' "$work/post-rules.txt"; then
+  echo "unexpected S1 rule label in global enumeration"
   exit 1
 fi
-pfctl -a '*' -sr | tee "$work/post-rules.txt"
-if grep -F "$anchor" "$work/post-rules.txt"; then exit 1; fi
-echo "PASS macOS IPv4 + IPv6: identity fence persists after host death; no S1 rules remain"
+echo "PASS macOS IPv4 + IPv6: fence persists after host death; zero rules across two generations (fixed install-level anchor allowed)"

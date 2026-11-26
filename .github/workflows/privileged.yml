@@ -170,8 +170,17 @@ jobs:
           service.verify_bundle()
           version = service.call(service.core, "--version").strip()
           assert re.fullmatch(r"easytier-core 2\.7\.1-[^\s]*c97f36b8(?:-\S+)?", version), version
-          status = service.ctl("status")
-          assert (status["host"]["mode"], status["host"]["phase"], status["host"]["role"]) == ("service", "serving", "admin")
+          from service import eventually
+          seen = set()
+          def handshake():
+              status = service.ctl("status")
+              fields = tuple(status["host"][field] for field in ("mode", "phase", "role"))
+              if fields not in seen:
+                  print(f"installed host mode/phase/role: {fields}", flush=True)
+                  seen.add(fields)
+              return fields, status
+          fields, status = eventually("service/serving/admin handshake", handshake,
+                                      lambda result: result[0] == ("service", "serving", "admin"))
           assert status["default_core_version"] == "2.7.1"
           instance = str(uuid.uuid4())
           service.apply(spec(), instance, str(uuid.uuid4()), str(status["revision"]))

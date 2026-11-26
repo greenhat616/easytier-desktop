@@ -401,7 +401,7 @@ pub(super) fn register(layout: &HostLayout) -> io::Result<()> {
         )
     }
     #[cfg(target_os = "macos")]
-    Ok(())
+    crate::macos::install_anchor(&layout.state)
 }
 
 fn service_loaded() -> io::Result<bool> {
@@ -496,6 +496,13 @@ pub(super) fn unregister(layout: &HostLayout, partial_install: bool) -> io::Resu
         verify_unit(partial_install)?;
         if fs::read_to_string(UNIT)? == UNIT_CONTENT {
             stop_and_disable(layout)?;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if service_loaded()? {
+                return Err(other("launchd service is still loaded"));
+            }
+            crate::macos::uninstall_anchor(&layout.state, partial_install)?;
         }
         fs::remove_file(UNIT)?;
     }

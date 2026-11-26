@@ -3,8 +3,9 @@
 //!
 //! This is a text check. A `Command::new(` must be followed, within a few lines
 //! and before the next one, by one of [`FLAGS`]. Files that never build for
-//! Windows are skipped. A single non-Windows site in a shared file says so with
-//! a `// no-window: <platform> only` comment on the line above.
+//! Windows are skipped. A single site that needs no flag where it is built
+//! says why in a `// no-window: <reason>` comment on the line above: it is not
+//! built on Windows, or a helper sets the flag.
 
 use std::fs;
 use std::path::{Path, PathBuf};

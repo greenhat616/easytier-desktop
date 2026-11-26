@@ -380,3 +380,96 @@ async fn install_connect_uninstall() {
         "racing installs serialized; uninstall waited for installing handoff; completion status and stable locks verified"
     );
 }
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires a disposable elevated CI runner and ETD_HOST_CI_INSTALL=1"]
+fn driver_reference_inventory_and_registered_fixture() {
+    use etd_sysfx_os::{driver_bundle_reference, windows::driver_refs::ci_short_path};
+    use std::{
+        ffi::OsStr,
+        os::windows::process::CommandExt,
+        path::{Path, PathBuf},
+    };
+
+    if std::env::var("ETD_HOST_CI_INSTALL").as_deref() != Ok("1")
+        || std::env::var("CI").as_deref() != Ok("true")
+    {
+        eprintln!("skipped: privileged driver registration is CI-only");
+        return;
+    }
+    assert!(NativeServiceManager.entry_is_elevated().unwrap());
+
+    fn sc(args: &[&OsStr]) -> std::process::Output {
+        let sc = PathBuf::from(std::env::var_os("SystemRoot").expect("Windows system root"))
+            .join("System32")
+            .join("sc.exe");
+        Command::new(sc)
+            .args(args)
+            .creation_flags(0x0800_0000)
+            .output()
+            .unwrap()
+    }
+
+    // RAII cleanup deletes only the randomly named, non-started fixture
+    // registration. The fixture is inert bytes, never a loadable driver.
+    struct Registration(String);
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            let result = sc(&[OsStr::new("delete"), OsStr::new(&self.0)]);
+            if !result.status.success() && !std::thread::panicking() {
+                panic!(
+                    "fixture registration cleanup failed: {}",
+                    String::from_utf8_lossy(&result.stdout)
+                );
+            }
+        }
+    }
+
+    fn assert_registered(bundle: &Path, image: &OsStr) {
+        let name = format!("etd-cb-ci-{}", uuid::Uuid::new_v4().simple());
+        let result = sc(&[
+            OsStr::new("create"),
+            OsStr::new(&name),
+            OsStr::new("type="),
+            OsStr::new("kernel"),
+            OsStr::new("start="),
+            OsStr::new("demand"),
+            OsStr::new("binPath="),
+            image,
+        ]);
+        assert!(
+            result.status.success(),
+            "inert driver registration: {}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        let guard = Registration(name.clone());
+        let reference = driver_bundle_reference(bundle)
+            .unwrap()
+            .expect("registered driver reference");
+        assert!(reference.contains(&name), "{reference}");
+        drop(guard);
+    }
+
+    let fixture = tempfile::Builder::new()
+        .prefix("etd-cb-driver-fixture-")
+        .tempdir()
+        .unwrap();
+    let image = fixture.path().join("fixture-driver-long-name.sys");
+    std::fs::write(&image, b"inert driver service fixture, never load").unwrap();
+    assert_eq!(driver_bundle_reference(fixture.path()).unwrap(), None);
+
+    assert_registered(fixture.path(), image.as_os_str());
+    let absolute = image.to_str().unwrap();
+    let nt = format!(r"\??\{absolute}");
+    assert_registered(fixture.path(), OsStr::new(&nt));
+    let short = ci_short_path(&image).unwrap();
+    if short != image {
+        assert_registered(fixture.path(), short.as_os_str());
+    } else {
+        eprintln!(
+            "8.3 alias not enabled for the fixture volume; short-path query returned the long name"
+        );
+    }
+    assert_eq!(driver_bundle_reference(fixture.path()).unwrap(), None);
+}

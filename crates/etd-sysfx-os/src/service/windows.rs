@@ -577,8 +577,56 @@ fn remove_owned_tree(path: &Path, readable: bool) -> io::Result<()> {
 pub(super) fn remove_state(layout: &HostLayout) -> io::Result<()> {
     remove_owned_tree(&layout.state, false)
 }
+// The final install-image deletion is shared by fresh-install rollback,
+// normal uninstall, and the deferred helper. Keep the tree and journal if
+// a driver references it, or if the query is inconclusive.
+fn check_install_driver_references(
+    core_dir: &Path,
+    query: impl FnOnce(&Path) -> Result<Option<String>, crate::OsError>,
+) -> io::Result<()> {
+    match fs::symlink_metadata(core_dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+        Ok(_) => (),
+    }
+    // Even an empty or irregular store must pass the same driver check.
+    // The adapter rejects links, reparse points and unknown file types.
+    match query(core_dir) {
+        Ok(None) => Ok(()),
+        Ok(Some(reference)) => Err(io::Error::new(
+            io::ErrorKind::ResourceBusy,
+            format!(
+                "kernel store retained: {reference}; remove the shared driver separately, then retry uninstall"
+            ),
+        )),
+        Err(error) => Err(io::Error::other(format!(
+            "kernel store retained: cannot determine driver references: {error}; retry uninstall"
+        ))),
+    }
+}
+
+fn guarded_install_removal(
+    core_dir: &Path,
+    query: impl FnOnce(&Path) -> Result<Option<String>, crate::OsError>,
+    remove: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    check_install_driver_references(core_dir, query)?;
+    remove()
+}
+
 pub(super) fn remove_install(layout: &HostLayout) -> io::Result<()> {
-    remove_owned_tree(layout.executable.parent().ok_or_else(denied)?, true)
+    let install = layout.executable.parent().ok_or_else(denied)?;
+    // Verify protected ownership before asking the adapter to inspect files.
+    match fs::symlink_metadata(install) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+        Ok(_) => (),
+    }
+    validate_acl(install, true, true)?;
+    verify_tree(install, true)?;
+    guarded_install_removal(&layout.cores, crate::driver_bundle_reference, || {
+        fs::remove_dir_all(install)
+    })
 }
 
 pub(super) fn defer_install_removal(
@@ -594,6 +642,11 @@ pub(super) fn defer_install_removal(
     {
         return Ok(None);
     }
+    // Report a driver reference synchronously instead of scheduling a known
+    // blocked helper. The actual deferred deletion checks again.
+    validate_acl(layout.executable.parent().ok_or_else(denied)?, true, true)?;
+    verify_tree(layout.executable.parent().ok_or_else(denied)?, true)?;
+    check_install_driver_references(&layout.cores, crate::driver_bundle_reference)?;
     // The copy is made inside the protected, persistent maintenance root,
     // never in the invoking user's temp directory.
     let dir = tempfile::Builder::new()
@@ -852,4 +905,71 @@ fn run_service() -> io::Result<()> {
         ))
         .map_err(other)?;
     result
+}
+
+#[cfg(test)]
+mod driver_removal_tests {
+    use super::*;
+
+    #[test]
+    fn unexpected_flat_store_entry_still_requires_driver_guard() {
+        let root = tempfile::tempdir().unwrap();
+        let cores = root.path().join("cores");
+        fs::create_dir(&cores).unwrap();
+        fs::write(cores.join("manifest.json"), b"fixture").unwrap();
+        check_install_driver_references(&cores, |_| Ok(None)).unwrap();
+        let image = cores.join("bad.bin");
+        fs::write(&image, b"fixture").unwrap();
+        let err = guarded_install_removal(
+            &cores,
+            |_| Err(crate::OsError::Unsupported("no access".into())),
+            || panic!("must not delete"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot determine driver references")
+        );
+        assert!(image.exists());
+    }
+
+    #[test]
+    fn rollback_and_uninstall_keep_tree_for_driver_reference_or_query_failure() {
+        // Both paths use guarded_install_removal. Use only a private fixture
+        // directory and fake query; never register/stop a system driver.
+        for rollback in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let cores = root.path().join("cores");
+            fs::create_dir_all(cores.join("bundle")).unwrap();
+            let image = cores.join("bundle").join("driver.sys");
+            fs::write(&image, b"fixture").unwrap();
+            let query = |_: &Path| {
+                Ok(Some(format!(
+                    "driver service fixture references {}",
+                    image.display()
+                )))
+            };
+            let remove = || fs::remove_dir_all(&cores);
+            let err = guarded_install_removal(&cores, query, remove).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::ResourceBusy);
+            assert!(err.to_string().contains("driver service fixture"));
+            assert!(image.exists(), "rollback={rollback}");
+            let err = guarded_install_removal(
+                &cores,
+                |_| Err(crate::OsError::Unsupported("unavailable".into())),
+                remove,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("cannot determine driver references")
+            );
+            assert!(image.exists());
+            guarded_install_removal(&cores, |_| Ok(None), remove).unwrap();
+            assert!(!cores.exists());
+            // Retry after successful removal remains idempotent.
+            guarded_install_removal(&cores, |_| panic!("missing tree needs no query"), || Ok(()))
+                .unwrap();
+        }
+    }
 }

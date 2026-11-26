@@ -44,7 +44,18 @@ function FirewallRows {
     try {
         Get-NetFirewallRule -PolicyStore PersistentStore | ForEach-Object {
             $raw = if ($store) { $store.GetValue($_.Name) } else { $null }
-            @{name=$_.DisplayName;group=$_.Group;id=$_.Name;description=if ($null -ne $raw) { [string]$raw } else { ($_ | Select-Object DisplayName,Group,Direction,Action,Enabled,Profile,Description | ConvertTo-Json -Compress) }}
+            if (!$q.name -or $_.DisplayName -eq $q.name) {
+                $program = $null
+                # Upstream program rules always have an absolute executable
+                # path embedded in their display name. Read the *actual*
+                # application condition independently, not from that name.
+                if ($_.DisplayName -match '^EasyTier (?:[A-Za-z]:\\|\\\\).+ \((Inbound|Outbound)\)$') {
+                    $a = @($_ | Get-NetFirewallApplicationFilter)
+                    if ($a.Count -ne 1) { throw 'Ambiguous firewall application condition' }
+                    $program = $a[0].Program
+                }
+                @{name=$_.DisplayName;group=$_.Group;id=$_.Name;program=$program;direction=$_.Direction.ToString();description=if ($null -ne $raw) { [string]$raw } else { ($_ | Select-Object DisplayName,Group,Direction,Action,Enabled,Profile,Description | ConvertTo-Json -Compress) }}
+            }
         }
     } finally { if ($store) { $store.Dispose() } }
 }
@@ -105,11 +116,18 @@ function Execute-Request {
         'delete_firewall' {
             $r = @(Get-NetFirewallRule -PolicyStore PersistentStore | Where-Object { $_.Name -eq $q.id -and $_.DisplayName -eq $q.name -and (!$q.group -or $_.Group -eq $q.group) })
             if ($r.Count -ne 1) { throw 'Credential changed before firewall deletion' }
+            if ($q.program) {
+                $a = @($r[0] | Get-NetFirewallApplicationFilter)
+                if ($a.Count -ne 1 -or ([string]$a[0].Program).Replace('\\?\','') -ine $q.program -or $r[0].Direction.ToString() -ine $q.direction) { throw 'Program firewall credential changed' }
+            }
             $r[0] | Remove-NetFirewallRule -ErrorAction Stop
             return 'removed'
         }
         'delete_nrpt' {
             if ((GuidText $q.id) -ine $q.name) { throw 'NRPT credential mismatch' }
+            $k = RegOpen "$nrpt\$($q.id)"
+            if (!$k) { return 'absent' }
+            try { if ($q.group -and $k.GetValue('Comment') -ine $q.group) { throw 'NRPT group mismatch' } } finally { $k.Dispose() }
             $hklm.DeleteSubKey("$nrpt\$($q.id)",$false); return 'removed'
         }
         'delete_profile' {

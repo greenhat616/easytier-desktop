@@ -337,7 +337,10 @@ async fn real_wintun_after_kill() {
             ));
         }
     }
-    let sha256 = format!("{:x}", Sha256::digest(std::fs::read(&exe).unwrap()));
+    let sha256: String = Sha256::digest(std::fs::read(&exe).unwrap())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     for direction in ["Inbound", "Outbound"] {
         let key = ObjectKey::Rule {
             name: format!(

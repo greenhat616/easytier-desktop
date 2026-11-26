@@ -236,20 +236,75 @@ fn rule_match(key: &ObjectKey, row: &Value) -> bool {
         _ => false,
     }
 }
+fn rule_name(key: &ObjectKey) -> Result<&str, WinError> {
+    match key {
+        ObjectKey::Rule { name, .. } => Ok(name),
+        ObjectKey::NetworkProfile { profile_name } => Ok(profile_name),
+        _ => Err(WinError::invalid("not a named rule")),
+    }
+}
+
+fn program_name(name: &str) -> Option<(&str, &str)> {
+    let body = name.strip_prefix("EasyTier ")?;
+    ["Inbound", "Outbound"].into_iter().find_map(|direction| {
+        let path = body.strip_suffix(&format!(" ({direction})"))?;
+        std::path::Path::new(path)
+            .is_absolute()
+            .then_some((path, direction))
+    })
+}
+fn normalize_program(path: &str) -> String {
+    path.strip_prefix(r"\\?\").unwrap_or(path).to_lowercase()
+}
+fn program_identity(row: &Value) -> Result<Credential, WinError> {
+    Ok(opaque(json!({"id":string(row,"id")?,"name":string(row,"name")?.to_lowercase(),"program":normalize_program(row["program"].as_str().unwrap_or("")),"direction":string(row,"direction")?.to_lowercase(),"group":row["group"].as_str().unwrap_or("").to_lowercase()}).to_string()))
+}
+fn program_credential_matches(key: &ObjectKey, observation: &Observation) -> bool {
+    let ObjectKey::Rule { name, group } = key else {
+        return false;
+    };
+    let Some((path, direction)) = program_name(name) else {
+        return false;
+    };
+    let Some(Credential::Opaque { value }) = &observation.credential else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(value) else {
+        return false;
+    };
+    v["name"].as_str() == Some(name.to_lowercase().as_str())
+        && v["program"].as_str() == Some(normalize_program(path).as_str())
+        && v["direction"].as_str() == Some(direction.to_lowercase().as_str())
+        && group
+            .as_ref()
+            .is_none_or(|g| v["group"].as_str() == Some(g.to_lowercase().as_str()))
+}
 async fn observe_kind(kind: EffectKind, key: &ObjectKey) -> Result<Option<Observation>, WinError> {
     if let Some(op) = rule_query(kind) {
-        let mut rows = query(json!({"op":op}))
+        let name = rule_name(key)?;
+        let mut rows = query(json!({"op":op,"name":name}))
             .await?
             .into_iter()
-            .filter(|v| rule_match(key, v));
+            .filter(|v| {
+                v["name"]
+                    .as_str()
+                    .is_some_and(|actual| actual.eq_ignore_ascii_case(name))
+            });
         let Some(row) = rows.next() else {
             return Ok(None);
         };
         if rows.next().is_some() {
             return Err(WinError::invalid("ambiguous same-name system objects"));
         }
+        let identity = if kind == EffectKind::WinProgramFirewallRule {
+            program_identity(&row)?
+        } else if rule_match(key, &row) {
+            opaque(string(&row, "id")?)
+        } else {
+            opaque(format!("foreign-group:{}", string(&row, "id")?))
+        };
         return Ok(Some(observation(
-            Some(opaque(string(&row, "id")?)),
+            Some(identity),
             key.clone(),
             string(&row, "description")?.into(),
         )));
@@ -379,13 +434,21 @@ impl Reclaimer for WindowsReclaimer {
             EffectKind::WinFirewallRule | EffectKind::WinProgramFirewallRule | EffectKind::WinNrptRule | EffectKind::WinNetworkProfile => {
                 if e.undo != Undo::EnsureAbsent { return Err(ReclaimError::CredentialMismatch); }
                 matching_credential(e,&found)?;
-                let Some(Credential::Opaque { value:id }) = found.credential else { return Err(ReclaimError::CredentialMismatch); };
+                let Some(Credential::Opaque { value:id }) = &found.credential else { return Err(ReclaimError::CredentialMismatch); };
                 let request = match (&e.kind,&e.key) {
-                    (EffectKind::WinFirewallRule | EffectKind::WinProgramFirewallRule,ObjectKey::Rule { name,group }) => {
-                        if e.kind == EffectKind::WinProgramFirewallRule && !matches!(e.scope, EffectScope::CoreBinary { .. }) { return Err(ReclaimError::CredentialMismatch); }
+                    (EffectKind::WinFirewallRule,ObjectKey::Rule { name,group }) => {
+                        if id.starts_with("foreign-group:") {return Err(ReclaimError::CredentialMismatch);}
                         json!({"op":"delete_firewall","name":name,"group":group,"id":id})
                     }
-                    (EffectKind::WinNrptRule,ObjectKey::Rule { name,.. }) => json!({"op":"delete_nrpt","name":name,"id":id}),
+                    (EffectKind::WinProgramFirewallRule,ObjectKey::Rule { name,group }) => {
+                        if !matches!(e.scope, EffectScope::CoreBinary { .. }) || !program_credential_matches(&e.key,&found) {return Err(ReclaimError::CredentialMismatch);}
+                        let v:Value=serde_json::from_str(id).map_err(|_|ReclaimError::CredentialMismatch)?;
+                        json!({"op":"delete_firewall","name":name,"group":group,"id":v["id"],"program":v["program"],"direction":v["direction"]})
+                    }
+                    (EffectKind::WinNrptRule,ObjectKey::Rule { name,group }) => {
+                        if id.starts_with("foreign-group:") {return Err(ReclaimError::CredentialMismatch);}
+                        json!({"op":"delete_nrpt","name":name,"group":group,"id":id})
+                    }
                     (EffectKind::WinNetworkProfile,ObjectKey::NetworkProfile { profile_name }) => json!({"op":"delete_profile","name":profile_name,"id":id}),
                     _ => return Err(ReclaimError::CredentialMismatch),
                 };
@@ -414,7 +477,17 @@ impl SystemObserver for WindowsObserver {
         kind: EffectKind,
         key: &ObjectKey,
     ) -> Result<Option<Observation>, ObserveError> {
-        observe_kind(kind, key).await.map_err(WinError::observe)
+        let found = observe_kind(kind, key).await.map_err(WinError::observe)?;
+        if let Some(o) = &found {
+            if kind == EffectKind::WinProgramFirewallRule && !program_credential_matches(key, o) {
+                return Err(WinError::invalid("same-name program rule has a different application condition, group or direction").observe());
+            }
+            if matches!(&o.credential,Some(Credential::Opaque{value}) if value.starts_with("foreign-group:"))
+            {
+                return Err(WinError::invalid("same-name rule has a different group").observe());
+            }
+        }
+        Ok(found)
     }
     async fn interface(&self, key: &ObjectKey) -> Result<Option<InterfaceInfo>, ObserveError> {
         interfaces::info(key).await.map_err(WinError::observe)
@@ -482,7 +555,11 @@ async fn enumerate(
                         name: string(&r, "name")?.into(),
                         group: r["group"].as_str().map(str::to_owned),
                     },
-                    Some(opaque(string(&r, "id")?)),
+                    Some(if program_name(string(&r, "name")?).is_some() {
+                        program_identity(&r)?
+                    } else {
+                        opaque(string(&r, "id")?)
+                    }),
                     string(&r, "description")?.into(),
                 );
             }
@@ -820,5 +897,33 @@ mod tests {
             &json!({"name":"rule2","group":"EasyTier"})
         ));
         assert!(!rule_match(&key, &json!({"name":"rule","group":"Foreign"})));
+    }
+    #[test]
+    fn program_identity_includes_real_application() {
+        let name = r"EasyTier C:\store\core.exe (Inbound)";
+        let key = ObjectKey::Rule {
+            name: name.into(),
+            group: Some("EasyTier".into()),
+        };
+        let row = json!({"id":"rule-guid","name":name,"group":"EasyTier","program":r"c:\store\core.exe","direction":"Inbound"});
+        let obs = observation(
+            Some(program_identity(&row).unwrap()),
+            key.clone(),
+            String::new(),
+        );
+        assert!(program_credential_matches(&key, &obs));
+        let mut foreign = row;
+        foreign["program"] = json!(r"C:\other\core.exe");
+        let other = observation(
+            Some(program_identity(&foreign).unwrap()),
+            key.clone(),
+            String::new(),
+        );
+        assert!(!program_credential_matches(&key, &other));
+        assert_ne!(obs.credential, other.credential);
+    }
+    #[test]
+    fn powershell_encoding() {
+        assert_eq!(encoded_command("abc"), "YQBiAGMA");
     }
 }

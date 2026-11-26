@@ -84,51 +84,6 @@ foreach ($rule in Get-NetFirewallRule -PolicyStore ActiveStore) {
     )
 }
 $ruleStore.Dispose()
-$system = 'HKLM:\SYSTEM\CurrentControlSet\Services'
-$network = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles'
-$product = 'HKLM:\SOFTWARE\EasyTier'
-$boot = 'HKLM:\SOFTWARE\EasyTierDesk\Volatile'
-if (Test-Path -LiteralPath $boot) {
-    $key = Get-Item -LiteralPath $boot
-    $inventory.registry['HKLM\SOFTWARE\EasyTierDesk\Volatile'] = @('key')
-    foreach ($name in $key.GetValueNames()) {
-        $inventory.registry["HKLM\SOFTWARE\EasyTierDesk\Volatile\$name"] = @(
-            [string]$key.GetValueKind($name), $key.GetValue($name)
-        )
-    }
-}
-if (Test-Path -LiteralPath $product) {
-    foreach ($key in Get-ChildItem -Recurse -LiteralPath $product) {
-        foreach ($name in $key.GetValueNames()) {
-            $id = $key.Name.Replace('HKEY_LOCAL_MACHINE','HKLM') + '\' + $name
-            $inventory.registry[$id] = @([string]$key.GetValueKind($name), $key.GetValue($name))
-        }
-    }
-}
-foreach ($tree in @("$system\Tcpip\Parameters\Interfaces","$system\Tcpip6\Parameters\Interfaces",
-                     "$system\NetBT\Parameters\Interfaces",$network)) {
-    if (!(Test-Path -LiteralPath $tree)) { continue }
-    foreach ($key in Get-ChildItem -LiteralPath $tree) {
-        foreach ($name in $key.GetValueNames()) {
-            $id = $key.Name.Replace('HKEY_LOCAL_MACHINE','HKLM') + '\' + $name
-            if ($name -in @('RegistrationEnabled','DisableDynamicUpdate',
-                'MaxNumberOfAddressesToRegister','NetbiosOptions','SearchList','ProfileName','Category',
-                'NameServer','Domain','EnableDHCP','Dhcpv6State','Dhcpv6Iaid')) {
-                $type = [string]$key.GetValueKind($name)
-                $value = $key.GetValue($name)
-                if ($name -eq 'Dhcpv6Iaid' -and $type -eq 'DWord') {
-                    $value = ([long]$value) -band 4294967295L
-                }
-                $inventory.registry[$id] = @($type,$value)
-            } elseif ($tree -eq "$system\Tcpip\Parameters\Interfaces" -or
-                      $tree -eq "$system\Tcpip6\Parameters\Interfaces") {
-                # Include every other per-interface value in the strict diff.
-                # Only a digest leaves this process for these opaque settings.
-                $inventory.registry[$id] = @([string]$key.GetValueKind($name), (StableHash $key.GetValue($name)))
-            }
-        }
-    }
-}
 # Read the installed configuration. CIM's live service view can change when
 # Windows spins up a service host independently of a registration change.
 $serviceStore = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SYSTEM\CurrentControlSet\Services')

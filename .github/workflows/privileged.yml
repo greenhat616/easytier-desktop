@@ -186,7 +186,7 @@ jobs:
         run: |
           cargo nextest archive --locked -p etd-testkit --test tier3 --archive-file "$RUNNER_TEMP/tier3.tar.zst"
           sudo env "PATH=$PATH" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
-            "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}" "RUNNER_TEMP=$RUNNER_TEMP" \
+            "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}" "RUNNER_TEMP=$RUNNER_TEMP" "GITHUB_WORKSPACE=$GITHUB_WORKSPACE" \
             "ETD_G2_CI=$ETD_G2_CI" "GITHUB_ACTIONS=$GITHUB_ACTIONS" "RUNNER_ENVIRONMENT=$RUNNER_ENVIRONMENT" \
             "ETD_G2_PYTHON=$ETD_G2_PYTHON" "ETD_G2_BIN=$ETD_G2_BIN" "ETD_G2_SHA=$ETD_G2_SHA" \
             "$(command -v cargo-nextest)" nextest run --profile privileged --run-ignored only --archive-file "$RUNNER_TEMP/tier3.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" --no-fail-fast --success-output immediate

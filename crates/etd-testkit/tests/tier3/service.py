@@ -12,14 +12,18 @@ import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src" / "sysdiff"))
-from inventory import capture, command, digest, output
-from consistency import adapter_defaults, managed_service_changes, runner_noise, system_policy_changes, tun_created
+from inventory import assert_exited, capture, command, digest, output
+from consistency import adapter_defaults, managed_service_changes, management_processes, runner_noise, system_policy_changes, tun_created
 
 
 def require_runner():
     required = {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted", "ETD_G2_CI": "1"}
     if any(os.environ.get(key) != value for key, value in required.items()):
         raise RuntimeError("tier 3 requires a disposable GitHub-hosted runner")
+    temp = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
+    workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve(strict=True)
+    if temp.name != "_temp" or temp.parent not in workspace.parents:
+        raise RuntimeError("tier 3 requires the hosted runner work and temp directories")
     if os.name != "nt" and os.geteuid() != 0:
         raise RuntimeError("tier 3 requires the elevated CI step")
 
@@ -111,6 +115,16 @@ class Service:
         self.preexisting_drivers = {}
         self.recorded_driver_images = set()
         self.adapter_indices = {}
+        self.workers_seen = set()
+
+    def settle_workers(self, baseline, snapshot):
+        # The SH pool can still be idle in this native sample. Remove only
+        # exact, verified identities after observing their exit within 15 s.
+        workers = management_processes(baseline, snapshot, self.host)
+        self.workers_seen.update(workers)
+        assert_exited(self.workers_seen, timeout=15)
+        for pid, _ in workers:
+            del snapshot.rows["process", str(pid)]
 
     def verify_bundle(self):
         expected = {self.core.name: os.environ["ETD_G2_SHA"]}
@@ -255,6 +269,7 @@ class Service:
                 if (self.state / "ledger.sqlite3").exists():
                     assert all(r["state"] == "reclaimed" for r in self.effects()), "open ledger effects after uninstall"
             after = self.inventory()
+            assert_exited(self.workers_seen, timeout=15)
             delta = before.delta(after) - managed_service_changes(before, after)
             delta -= runner_noise(before, after) | tun_created(before, after)
             delta -= adapter_defaults(before, after, self.adapter_indices)

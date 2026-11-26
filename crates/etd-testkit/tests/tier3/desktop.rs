@@ -27,11 +27,7 @@ async fn peer() -> anyhow::Result<()> {
     let Ok(action) = env::var("ETD_G2_DESKTOP") else {
         return Ok(());
     };
-    assert_eq!(
-        env::var("RUNNER_ENVIRONMENT").as_deref(),
-        Ok("github-hosted")
-    );
-    assert_eq!(env::var("ETD_G2_CI").as_deref(), Ok("1"));
+    super::require_runner();
     let connector = Arc::new(LocalConnector {
         expectation: ServerExpectation {
             exe_dir: etd_sysfx_os::service::installed_host_dir()?,

@@ -12,7 +12,7 @@ import uuid
 from service import Desktop, Service, command, eventually, require_runner
 from consistency import (
     FirewallReadbackPending, UnpredictedChanges, check_closed, check_generation, installed_image,
-    managed_service_changes, scope,
+    managed_service_changes, runner_noise, scope,
 )
 from inventory import capture, file_identity
 import foreign
@@ -194,6 +194,7 @@ def recovery():
         stopped = inventory()
         assert_foreign(baseline, stopped, keys)
         remaining = baseline.delta(stopped) - managed_service_changes(baseline, stopped)
+        remaining -= runner_noise(baseline, stopped)
         if os.name == "nt":
             records = service.effects()
             for key in remaining.copy():

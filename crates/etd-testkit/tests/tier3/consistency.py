@@ -33,6 +33,18 @@ def managed_service_changes(base, live):
     return set()
 
 
+def runner_noise(base, live):
+    # Hosted-image noise, independent of product launch: the idle control in
+    # run 45841944759 recorded services.exe changing BITS Start (4657 #582930).
+    key = ("service", "bits")
+    before, after = base.rows.get(key), live.rows.get(key)
+    if os.name == "nt" and isinstance(before, dict) and isinstance(after, dict):
+        transition = {before.get("Start"), after.get("Start")}
+        if transition == {2, 3} and after == {**before, "Start": after["Start"]}:
+            return {key}
+    return set()
+
+
 def check_generation(base, live, records, instance, view):
     try:
         return compare_generation(base, live, records, instance, view)
@@ -165,7 +177,7 @@ def compare_generation(base, live, records, instance, view):
             if live.rows.get(category) == ["DWord", 1]:
                 exempt.add(category)
     assert expected <= changed, f"predicted effects already present at baseline: {sorted(expected - changed)}"
-    unexpected = changed - expected - exempt
+    unexpected = changed - expected - exempt - runner_noise(base, live)
     if unexpected:
         raise UnpredictedChanges(f"unpredicted native changes: {sorted(unexpected)}")
     for kind in sorted({k[0] for k in live.rows}):

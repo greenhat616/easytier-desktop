@@ -176,6 +176,13 @@ pub(super) fn utun_holders(name: &str) -> io::Result<Vec<i32>> {
         .map(|(pid, _)| i32::try_from(pid).map_err(io::Error::other))
         .collect()
 }
+/// Every PID holding a utun control socket, whatever the utun.
+pub(super) fn utun_control_pids() -> io::Result<Vec<i32>> {
+    controls(None)?
+        .into_keys()
+        .map(|pid| i32::try_from(pid).map_err(io::Error::other))
+        .collect()
+}
 pub(super) fn owned(pid: u32) -> io::Result<Vec<InterfaceInfo>> {
     let names = controls(Some(pid))?.remove(&pid).unwrap_or_default();
     let mut all = interfaces()?;

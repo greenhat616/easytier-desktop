@@ -5,6 +5,7 @@
 //! F0 owns this file and `fakes/mod.rs`; every other file has its own owner
 //! (see doc#7's ownership table).
 pub mod fakes;
+pub mod no_window;
 /// Shared conformance suites run against every implementation of a trait.
 pub mod conformance {
     pub mod ledger;

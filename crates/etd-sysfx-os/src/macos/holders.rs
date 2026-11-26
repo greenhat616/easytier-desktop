@@ -78,7 +78,7 @@ fn sockets(port: u16) -> io::Result<BTreeMap<i32, BTreeSet<String>>> {
     Ok(owners)
 }
 
-fn image_path(pid: i32) -> io::Result<PathBuf> {
+pub(super) fn image_path(pid: i32) -> io::Result<PathBuf> {
     let mut path = [0; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     // SAFETY: libproc receives the length of the writable array.
     let got = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
@@ -282,7 +282,7 @@ impl CoreIdentity {
 
 // The launch planner passes an absolute configuration path with -c. Read
 // exactly argc arguments, never interpret environment strings as arguments.
-fn generation_config(pid: i32) -> io::Result<Option<PathBuf>> {
+pub(super) fn generation_config(pid: i32) -> io::Result<Option<PathBuf>> {
     let mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
     let mut size = 0usize;
     // SAFETY: read-only sysctl, first size then a buffer of that size.

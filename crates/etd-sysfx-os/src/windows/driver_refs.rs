@@ -880,6 +880,22 @@ pub fn driver_bundle_reference(dir: &Path) -> Result<Option<String>, OsError> {
     })
 }
 
+#[cfg(feature = "ci-test-fixtures")]
+pub fn ci_short_path(path: &Path) -> Result<PathBuf, OsError> {
+    use ::windows::{Win32::Storage::FileSystem::GetShortPathNameW, core::HSTRING};
+    let mut buffer = vec![0u16; 32768];
+    let n =
+        unsafe { GetShortPathNameW(&HSTRING::from(path.as_os_str()), Some(&mut buffer)) } as usize;
+    if n == 0 || n >= buffer.len() {
+        return Err(OsError::Os {
+            code: -1,
+            message: "cannot query fixture short path".into(),
+        });
+    }
+    use std::os::windows::ffi::OsStringExt;
+    Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer[..n])))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -936,20 +952,4 @@ mod tests {
         assert!(inside(r"C:\STORE\HASH\DRIVER.SYS", r"C:\STORE\HASH"));
         assert!(!inside(r"C:\STORE\HASH2\DRIVER.SYS", r"C:\STORE\HASH"));
     }
-}
-
-#[cfg(feature = "ci-test-fixtures")]
-pub fn ci_short_path(path: &Path) -> Result<PathBuf, OsError> {
-    use ::windows::{Win32::Storage::FileSystem::GetShortPathNameW, core::HSTRING};
-    let mut buffer = vec![0u16; 32768];
-    let n =
-        unsafe { GetShortPathNameW(&HSTRING::from(path.as_os_str()), Some(&mut buffer)) } as usize;
-    if n == 0 || n >= buffer.len() {
-        return Err(OsError::Os {
-            code: -1,
-            message: "cannot query fixture short path".into(),
-        });
-    }
-    use std::os::windows::ffi::OsStringExt;
-    Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer[..n])))
 }

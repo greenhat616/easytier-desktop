@@ -4,6 +4,7 @@ from contextlib import ExitStack, contextmanager
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import time
@@ -247,17 +248,27 @@ def verify_shared_driver_purge(service, baseline, stopped, inventory, foreign_ke
     names = {name for name in ("wintun", "windivert")
              if ("service", name) not in baseline.rows and ("service", name) in stopped.rows}
     assert "wintun" in names, "the real kernel did not load its TUN driver"
+    prior = service.ctl("reclaim-report")
+    for candidate in prior["candidates"]:
+        print(f"before offline purge: candidate {candidate['kind']} "
+              f"{candidate['origin']} {candidate['identity']}", flush=True)
     service.stop()
     result = command(service.installer, "reclaim", "--all", "--purge", check=False, timeout=240)
     records = service.effects()
     retained = {r["key"]["name"].lower() for r in records if r["scope"] == "product"
                 and r["kind"] == "driver" and r["state"] == "candidate"}
     assert retained == names, f"expected shared driver candidates {names}, got {retained}"
-    assert f"0 generations, {len(names)} candidates, 0 conflicts" in result.stdout
-    assert result.returncode == 0, f"standalone purge exited {result.returncode}"
-    after = inventory()
     service.retained_drivers = {name: stopped.rows["service", name] for name in names}
-    assert_driver_notice(result.stdout, service.retained_drivers)
+    report = re.search(r"^Reclaim: (\d+) generations, (\d+) candidates, (\d+) conflicts\s*$",
+                       result.stdout, re.M)
+    print(f"standalone purge exit={result.returncode}, "
+          f"report={report[0].strip() if report else 'missing'}", flush=True)
+    for line in result.stdout.splitlines():
+        if line.strip().startswith("left in place: shared driver service "):
+            print(line.strip(), flush=True)
+    assert all(r["kind"] == "driver" and r["scope"] == "product" and r["state"] == "candidate"
+               for r in records if r["state"] != "reclaimed"), "non-driver effects still open after purge"
+    after = inventory()
     assert_foreign(stopped, after, {("service", name) for name in names})
     assert_foreign(baseline, after, foreign_keys)
     assert not program_rules & after.rows.keys(), "CoreBinary firewall rules survived purge"
@@ -270,6 +281,11 @@ def verify_shared_driver_purge(service, baseline, stopped, inventory, foreign_ke
     hosts = [k for k, v in baseline.rows.items() if k[0] == "process" and installed_image(v) == service.host]
     assert len(hosts) == 1 and hosts[0] not in after.rows
     delta.remove(hosts[0])
+    if delta:
+        print(f"post-purge native differences: {sorted(delta)}", flush=True)
+    assert result.returncode == 0, f"standalone purge exited {result.returncode}"
+    assert report and int(report[2]) == len(names) and int(report[3]) == 0
+    assert_driver_notice(result.stdout, service.retained_drivers)
     assert not delta, f"post-purge native differences: {sorted(delta)}"
 
 

@@ -227,6 +227,34 @@ async fn ui_crash_lets_the_session_host_wind_down() {
 }
 
 #[tokio::test]
+async fn user_host_exits_when_no_client_ever_connects() {
+    use std::time::Duration;
+    let world = World::with_mode(etd_contract::HostMode::User, false);
+    let mut host = world.start();
+    host.wait_serving().await;
+    host.idle(Duration::from_secs(1), Duration::from_secs(20))
+        .await;
+    assert!(
+        host.finished().await.is_none(),
+        "initial lease grace must elapse first"
+    );
+    let mut outcome = None;
+    for _ in 0..100 {
+        host.idle(Duration::from_millis(500), Duration::from_millis(500))
+            .await;
+        if let Some(finished) = host.finished().await {
+            outcome = Some(finished);
+            break;
+        }
+    }
+    assert_eq!(
+        outcome,
+        Some(etd_host_core::lifecycle::RunOutcome::LeaseReleased)
+    );
+    assert!(open_generations(&world).await.is_empty());
+}
+
+#[tokio::test]
 async fn a_returning_ui_cancels_the_wind_down() {
     let world = World::with_mode(etd_contract::HostMode::User, false);
     let mut h = world.start();

@@ -44,6 +44,13 @@ impl CoreDriver for Driver {
     }
 }
 struct Root(PathBuf);
+fn trusted() -> std::collections::HashMap<String, String> {
+    let hash = Sha256::digest(b"test binary bytes")
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    std::collections::HashMap::from([("1.2.3".into(), hash)])
+}
 impl Root {
     fn new() -> (Self, PathBuf) {
         let root = std::env::temp_dir().join(format!("etd-h2-test-{}", uuid::Uuid::new_v4()));
@@ -85,6 +92,7 @@ async fn hash_is_checked_every_time() {
         root.0.clone(),
         HostMode::Service,
         Arc::new(Driver::new(true, "rev")),
+        trusted(),
     )
     .unwrap();
     assert!(matches!(
@@ -101,6 +109,36 @@ async fn hash_is_checked_every_time() {
         etd_contract::v1::CoreSupport::Rejected
     );
 }
+
+#[tokio::test]
+async fn edited_inventory_cannot_authorize_a_new_hash() {
+    use std::sync::atomic::Ordering;
+    let (root, _) = Root::new();
+    let path = root.0.join(MANIFEST_FILE);
+    let mut manifest: Manifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let bytes = b"not a bundled core";
+    let hash = Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let directory = root.0.join(&hash);
+    fs::create_dir(&directory).unwrap();
+    fs::write(directory.join(CORE_FILE), bytes).unwrap();
+    manifest.cores[0].sha256 = hash;
+    fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let driver = Arc::new(Driver::new(true, "rev"));
+    let store =
+        ManifestCoreStore::new(root.0.clone(), HostMode::Service, driver.clone(), trusted())
+            .unwrap();
+    assert!(matches!(
+        store.resolve(&CoreSelector::default()).await,
+        Err(StoreError::Manifest(_))
+    ));
+    assert!(store.list().await.is_err());
+    assert!(store.remove("1.2.3").await.is_err());
+    assert_eq!(driver.2.load(Ordering::SeqCst), 0);
+    assert!(directory.exists());
+}
 #[tokio::test]
 async fn profile_required_for_privileged_host() {
     let (root, _) = Root::new();
@@ -108,6 +146,7 @@ async fn profile_required_for_privileged_host() {
         root.0.clone(),
         HostMode::Service,
         Arc::new(Driver::new(false, "rev")),
+        trusted(),
     )
     .unwrap();
     assert!(matches!(
@@ -118,6 +157,7 @@ async fn profile_required_for_privileged_host() {
         root.0.clone(),
         HostMode::User,
         Arc::new(Driver::new(false, "rev")),
+        trusted(),
     )
     .unwrap();
     assert_eq!(
@@ -134,6 +174,7 @@ async fn remove_only_selected_hash_directory_and_clear_default() {
         root.0.clone(),
         HostMode::Service,
         Arc::new(Driver::new(true, "rev")),
+        trusted(),
     )
     .unwrap();
     store.remove("1.2.3").await.unwrap();
@@ -158,6 +199,7 @@ async fn gitless_core_is_user_lifecycle_only_and_privileged_refuses() {
         root.0.clone(),
         HostMode::User,
         Arc::new(Driver::new(false, "")),
+        trusted(),
     )
     .unwrap();
     assert_eq!(
@@ -168,6 +210,7 @@ async fn gitless_core_is_user_lifecycle_only_and_privileged_refuses() {
         root.0.clone(),
         HostMode::Service,
         Arc::new(Driver::new(false, "")),
+        trusted(),
     )
     .unwrap();
     assert!(matches!(
@@ -181,7 +224,9 @@ async fn list_caches_identity_and_resolve_returns_canonical_path() {
     use std::sync::atomic::Ordering;
     let (root, binary) = Root::new();
     let driver = Arc::new(Driver::new(true, "rev"));
-    let store = ManifestCoreStore::new(root.0.clone(), HostMode::Service, driver.clone()).unwrap();
+    let store =
+        ManifestCoreStore::new(root.0.clone(), HostMode::Service, driver.clone(), trusted())
+            .unwrap();
     assert_eq!(
         store.default_version().await.unwrap().as_deref(),
         Some("1.2.3")
@@ -233,7 +278,8 @@ async fn list_cores_rpc_never_resolves_default_for_each_call() {
     let (root, _) = Root::new();
     let driver = Arc::new(Driver::new(true, "rev"));
     let store = Arc::new(
-        ManifestCoreStore::new(root.0.clone(), HostMode::Service, driver.clone()).unwrap(),
+        ManifestCoreStore::new(root.0.clone(), HostMode::Service, driver.clone(), trusted())
+            .unwrap(),
     );
     let (handle, _port) = orchestrator_channel(
         8,

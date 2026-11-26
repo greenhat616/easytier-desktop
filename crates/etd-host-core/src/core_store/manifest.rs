@@ -96,6 +96,7 @@ pub struct ManifestCoreStore {
     root: PathBuf,
     mode: HostMode,
     driver: Arc<dyn CoreDriver>,
+    trusted: Arc<HashMap<String, String>>,
     // Short manifest/removal critical sections only: hashing and identify
     // never hold this lock during normal resolution or ListCores.
     operations: Mutex<()>,
@@ -107,6 +108,7 @@ impl ManifestCoreStore {
         root: PathBuf,
         mode: HostMode,
         driver: Arc<dyn CoreDriver>,
+        trusted: HashMap<String, String>,
     ) -> Result<Self, StoreError> {
         check_type(&root, true)?;
         let root = fs::canonicalize(root).map_err(io_error)?;
@@ -115,6 +117,7 @@ impl ManifestCoreStore {
             root,
             mode,
             driver,
+            trusted: Arc::new(trusted),
             operations: Mutex::new(()),
             cache: SyncMutex::new(HashMap::new()),
             list_verification: Mutex::new(()),
@@ -123,7 +126,8 @@ impl ManifestCoreStore {
     async fn manifest(&self) -> Result<Manifest, StoreError> {
         let _guard = self.operations.lock().await;
         let root = self.root.clone();
-        blocking(move || read_manifest(&root)).await
+        let trusted = self.trusted.clone();
+        blocking(move || read_trusted_manifest(&root, &trusted)).await
     }
     async fn open(&self, entry: &ManifestEntry) -> Result<OpenCore, StoreError> {
         let root = self.root.clone();
@@ -268,7 +272,8 @@ impl CoreStore for ManifestCoreStore {
         self.cache.lock().unwrap().clear();
         let root = self.root.clone();
         let version = version.to_owned();
-        blocking(move || remove_entry(&root, &version)).await
+        let trusted = self.trusted.clone();
+        blocking(move || remove_entry(&root, &version, &trusted)).await
     }
 }
 async fn blocking<T: Send + 'static>(
@@ -326,6 +331,24 @@ fn read_manifest(root: &Path) -> Result<Manifest, StoreError> {
     manifest.validate()?;
     Ok(manifest)
 }
+fn read_trusted_manifest(
+    root: &Path,
+    trusted: &HashMap<String, String>,
+) -> Result<Manifest, StoreError> {
+    let manifest = read_manifest(root)?;
+    // The on-disk manifest is only an installation inventory, never the
+    // source of trust. The composition root supplies the build-time table.
+    if manifest
+        .cores
+        .iter()
+        .any(|entry| trusted.get(&entry.version) != Some(&entry.sha256))
+    {
+        return Err(StoreError::Manifest(
+            "kernel inventory is not in the embedded release hash table".into(),
+        ));
+    }
+    Ok(manifest)
+}
 fn open_core(root: &Path, entry: &ManifestEntry) -> Result<OpenCore, StoreError> {
     if parse_hash(&entry.sha256).is_none() {
         return Err(StoreError::Manifest("Invalid SHA-256".into()));
@@ -372,8 +395,12 @@ fn hash_core(open: &OpenCore, entry: &ManifestEntry) -> Result<[u8; 32], StoreEr
     }
     Ok(actual)
 }
-fn remove_entry(root: &Path, version: &str) -> Result<(), StoreError> {
-    let mut manifest = read_manifest(root)?;
+fn remove_entry(
+    root: &Path,
+    version: &str,
+    trusted: &HashMap<String, String>,
+) -> Result<(), StoreError> {
+    let mut manifest = read_trusted_manifest(root, trusted)?;
     let entry = manifest
         .select(&CoreSelector {
             version: Some(version.into()),

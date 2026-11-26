@@ -23,7 +23,7 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            suite: recovery
+            suite: preflight
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:

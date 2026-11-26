@@ -71,9 +71,11 @@ owner and a protected DACL (`D:P`, nothing inherited):
   `BUILTIN\Administrators`, enabled only in elevated tokens, gets the remaining rights
   the host needs to add instances (`FILE_CREATE_PIPE_INSTANCE`, read/write EA, write
   attributes) and no data access. Nobody gets `WRITE_DAC` or `WRITE_OWNER`, and
-  instances are created without `WRITE_DAC`. The SACL holds an explicit Medium,
-  no-write-up mandatory label (`S:(ML;;NW;;;ME)`): a Medium UI can write, Low and
-  AppContainer processes cannot. Allow entries are refused (`InvalidInput`).
+  instances are created without `WRITE_DAC`. The SACL holds an explicit Medium
+  mandatory label with no-write-up and no-read-up (`S:(ML;;NWNR;;;ME)`): a Medium UI
+  can open the pipe, Low and AppContainer processes cannot open it at all. No-read-up
+  is needed because the pipe file system does not check `FILE_APPEND_DATA` on a client
+  open but grants it, and it makes the handle writable. Allow entries are refused (`InvalidInput`).
 
 `PolicyHandle::update` replaces the DACL of the live pipe object. Existing connections
 keep their handles, and new instances inherit the current DACL. On the elevated session

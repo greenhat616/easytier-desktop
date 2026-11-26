@@ -124,10 +124,12 @@ fn descriptor(form: HostForm, policy: &ListenerPolicy) -> io::Result<identity::A
         add(s)?;
     }
     if form == HostForm::ElevatedSession {
-        // Medium, no-write-up: a non-elevated UI may write, Low and
-        // AppContainer processes may not. A label at or below the creator's
-        // own integrity level needs no privilege.
-        acl.push_str("S:(ML;;NW;;;ME)");
+        // Medium, no-write-up and no-read-up: a non-elevated UI may open it,
+        // Low and AppContainer processes may not open it at all. No-read-up
+        // matters because a client open is not checked for FILE_APPEND_DATA
+        // yet is granted it, which makes the handle writable. A label at or
+        // below the creator's own integrity level needs no privilege.
+        acl.push_str("S:(ML;;NWNR;;;ME)");
     }
     let mut sd = PSECURITY_DESCRIPTOR::default();
     unsafe {

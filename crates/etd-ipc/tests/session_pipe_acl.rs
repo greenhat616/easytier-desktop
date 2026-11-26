@@ -15,7 +15,9 @@ use windows::{
     Win32::{
         Foundation::{HANDLE, HLOCAL, LocalFree},
         Security::{Authorization::*, *},
-        Storage::FileSystem::{FILE_APPEND_DATA, READ_CONTROL, WRITE_DAC, WRITE_OWNER},
+        Storage::FileSystem::{
+            FILE_APPEND_DATA, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
+        },
     },
     core::PWSTR,
 };
@@ -84,7 +86,7 @@ fn security(f: &File) -> (String, Vec<Allowed>, Vec<Label>) {
 
 #[tokio::test]
 #[ignore = "Windows administrator CI runner: restricted and low-box token copies"]
-async fn session_pipe_is_owner_only_medium_no_write_up_and_first_instance() {
+async fn session_pipe_is_owner_only_medium_labelled_and_first_instance() {
     let f = Fixture::new();
     let pipe = endpoint_arg(&f.ep);
     let name = pipe.to_str().unwrap();
@@ -150,10 +152,10 @@ async fn session_pipe_is_owner_only_medium_no_write_up_and_first_instance() {
     expected.sort();
     assert_eq!(entries, expected, "{shown}");
     // SYSTEM_MANDATORY_LABEL_ACE_TYPE, no inheritance flags, Medium,
-    // SYSTEM_MANDATORY_LABEL_NO_WRITE_UP.
+    // SYSTEM_MANDATORY_LABEL_NO_WRITE_UP | SYSTEM_MANDATORY_LABEL_NO_READ_UP.
     assert_eq!(
         sacl,
-        vec![(0x11, 0, "S-1-16-8192".to_owned(), 0x1)],
+        vec![(0x11, 0, "S-1-16-8192".to_owned(), 0x3)],
         "{shown}"
     );
 
@@ -172,12 +174,13 @@ async fn session_pipe_is_owner_only_medium_no_write_up_and_first_instance() {
         }
     }
     assert!(granted.is_empty(), "Medium copy was granted {granted:?}");
-    // A client open asking for FILE_APPEND_DATA (the FILE_CREATE_PIPE_INSTANCE
-    // bit) succeeds, but the pipe file system leaves that bit out of the
-    // access check and of the granted access: the handle carries none of it.
+    // The pipe file system leaves FILE_APPEND_DATA (FILE_CREATE_PIPE_INSTANCE
+    // to CreateNamedPipe) out of a client's access check yet grants it, and
+    // it makes the handle writable. Here that adds nothing: a Medium client
+    // may write anyway, and the label below keeps lower levels out.
     let file = impersonating(&medium, || open(pipe, FILE_APPEND_DATA.0 | READ_CONTROL.0)).unwrap();
     let access = granted_access(&file);
-    assert_eq!(access & FILE_APPEND_DATA.0, 0, "granted {access:#x}");
+    assert_ne!(access & FILE_APPEND_DATA.0, 0, "granted {access:#x}");
     assert_eq!(
         access & (WRITE_DAC.0 | WRITE_OWNER.0),
         0,
@@ -192,10 +195,18 @@ async fn session_pipe_is_owner_only_medium_no_write_up_and_first_instance() {
     });
     assert!(squat.is_err());
 
-    // Low integrity and AppContainer tokens cannot open it for writing.
+    // Low integrity and AppContainer tokens cannot open it at all: no-read-up
+    // also refuses READ_CONTROL and SYNCHRONIZE, so they cannot reach the
+    // unchecked FILE_APPEND_DATA either.
     for token in [restricted_token(LOW), app_container_token()] {
-        let error = impersonating(&token, || open(pipe, client_mask())).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        for access in [
+            client_mask(),
+            FILE_APPEND_DATA.0 | READ_CONTROL.0,
+            FILE_APPEND_DATA.0 | SYNCHRONIZE.0,
+        ] {
+            let error = impersonating(&token, || open(pipe, access)).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::PermissionDenied, "{access:#x}");
+        }
     }
 
     // The Medium copy can open it as a client.

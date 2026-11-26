@@ -70,7 +70,7 @@ checks every workflow for this.
 | `etd-sysfx-os --test macos_reclaim`, `macos_fence`, `macos_resolver` | utun ownership, PF anchor fence against a second account, foreign resolver files untouched | `o3-macos.yml` |
 | `etd-ipc --test unix_service`, `stale_endpoint` | Root-owned service sockets, second-account rejection, stale endpoint recovery | Root runner; not yet wired into a workflow |
 | `etd-ipc --test pipe_acl` | Windows pipe ACL with a temporary second account. Not `#[ignore]`: the account case runs only with `ETD_IPC_CI_ACCOUNTS=1` and an elevated token. Never set that variable on a desktop | `ci.yml` `check` job on Windows |
-| `etd-ipc --test session_pipe_acl`, `session_clients`, `session_server_verify` | Elevated session pipe: DACL and Medium label, client admission (restricted Medium, Low, AppContainer and second-account tokens), server elevation check against a non-elevated squatter | `ci.yml` `privileged-install` on Windows |
+| `etd-ipc --test session_pipe_acl`, `session_clients`, `session_server_verify` | Elevated session pipe: DACL and Medium no-write-up/no-read-up label, client admission (restricted Medium, Low, AppContainer and second-account tokens), server elevation check against a non-elevated squatter | `ci.yml` `privileged-install` on Windows |
 | `etd-testkit --test tier2` (ignored case) | UI crash against a service-form test host | Root / LocalSystem with `ETD_G1_SERVICE_RUNTIME`; not yet wired into a workflow |
 | `etd-core-easytier --test session_real` | Identify, start, readiness and queries against the pinned native kernel | Needs `ETD_EASYTIER_CORE`; not yet wired into a workflow |
 

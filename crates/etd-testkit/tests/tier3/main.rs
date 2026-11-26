@@ -91,3 +91,9 @@ fn preexisting_program_rule_blocks_start() {
 fn service_stop_with_a_running_network_is_bounded() {
     run_case("stop_running");
 }
+
+#[test]
+#[ignore = "installs and upgrades the privileged service on a disposable hosted runner"]
+fn installed_network_survives_upgrade() {
+    run_case("upgrade_running");
+}

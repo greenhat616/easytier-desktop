@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,7 +18,7 @@ from consistency import (
     FirewallReadbackPending, UnpredictedChanges, adapter_defaults, check_closed, check_generation, installed_image,
     managed_service_changes, management_processes, record_windows_adapter, runner_noise, scope, system_policy_changes, tun_created,
 )
-from inventory import assert_exited, capture, file_identity, native_application_id, native_interface_guid
+from inventory import assert_exited, capture, digest, file_identity, native_application_id, native_interface_guid
 import foreign
 
 
@@ -591,9 +592,81 @@ def stop_running():
         # Teardown verifies uninstall with the network running again.
 
 
+def upgrade_payload(service, directory):
+    """This build as a new installation payload: a distinct image (appended
+    bytes; on macOS an ad-hoc re-signature, since appended bytes break the
+    code signature) and the bundled kernels beside it."""
+    image = directory / service.installer.name
+    shutil.copy2(service.installer, image)
+    if sys.platform == "darwin":
+        service.call("/usr/bin/codesign", "--force", "--sign", "-", "--identifier", "etd-upgrade-ci", str(image))
+    else:
+        with image.open("ab") as data:
+            data.write(b"\0etd-upgrade-ci-payload")
+    if os.name != "nt":
+        image.chmod(0o755)
+    shutil.copytree(service.installer.parent / "cores", directory / "cores")
+    return image
+
+
+def upgrade_running():
+    """etd-host upgrade with a network running (PK1): stopping the old host
+    closes its generation, the new host image replays the instance as a new
+    generation, and the machine matches that generation's records."""
+    service = Service()
+    instance = str(uuid.uuid4())
+    with service.installed(), tempfile.TemporaryDirectory() as payload:
+        baseline = service.inventory()
+        service.settle_workers(baseline, baseline)
+        service.apply(spec(), instance, str(uuid.uuid4()), str(service.ctl("status")["revision"]))
+        first = service.ready(instance)
+        print(f"running before upgrade: {first['state']} epoch={first['epoch']}", flush=True)
+        image = upgrade_payload(service, Path(payload))
+        assert digest(image) != digest(service.host), "the payload image must differ from the installed one"
+        started = time.monotonic()
+        output = service.call(image, "upgrade")
+        print(f"upgrade took {time.monotonic() - started:.1f}s: {output.strip()}", flush=True)
+        assert "service upgraded" in output, output
+        assert digest(service.host) == digest(image), "installed image is not the payload's"
+        for leftover in (service.host.with_suffix(".prev"), service.host.with_suffix(".new")):
+            assert not leftover.exists(), f"upgrade left {leftover}"
+        status = eventually("upgraded service self-check", lambda: service.ctl("status"),
+                            lambda body: body["host"]["phase"] == "serving")
+        assert status["host"]["mode"] == "service", status
+        view = service.ready(instance, after=first["epoch"])
+        check_closed(service, instance, first["epoch"])
+        print(f"after upgrade: {view['state']} epoch={view['epoch']}", flush=True)
+        # The host process is a new one, from the replaced image.
+        snapshot = service.inventory()
+        prior = [k for k, v in baseline.rows.items() if k[0] == "process" and installed_image(v) == service.host]
+        current = [k for k, v in snapshot.rows.items() if k[0] == "process" and installed_image(v) == service.host]
+        assert len(prior) == len(current) == 1 and prior != current, (prior, current)
+        del baseline.rows[prior[0]]
+        baseline.rows[current[0]] = snapshot.rows[current[0]]
+        wait_for_firewall_readback(service, instance, view["epoch"])
+        end = time.monotonic() + 240
+        while True:
+            snapshot = service.inventory()
+            workers = management_processes(baseline, snapshot, service.host)
+            service.workers_seen.update(workers)
+            try:
+                check_generation(baseline, snapshot, service.effects(), instance, view, service.adapter_indices,
+                                 {("process", str(pid)) for pid, _ in workers})
+            except FirewallReadbackPending:
+                if time.monotonic() >= end:
+                    raise
+                time.sleep(2)
+                continue
+            break
+        print("upgrade with a running network: old generation closed, new generation matches its records",
+              flush=True)
+        # Teardown uninstalls the upgraded service with the network running.
+
+
 if __name__ == "__main__":
     require_runner()
     {"recovery": recovery, "clean_install": lambda: recovery(with_fixtures=False),
      "magic_dns": magic_dns, "inventory": inventory_case,
      "driver_conflict": driver_conflict, "driver_uninstall": lambda: driver_conflict(through_uninstall=True),
-     "program_rule_conflict": program_rule_conflict, "stop_running": stop_running}[sys.argv[1]]()
+     "program_rule_conflict": program_rule_conflict, "stop_running": stop_running,
+     "upgrade_running": upgrade_running}[sys.argv[1]]()

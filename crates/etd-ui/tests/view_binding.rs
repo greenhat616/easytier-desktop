@@ -295,6 +295,41 @@ fn make_entry(
 }
 
 #[gpui_kit::test]
+fn navigation_selection_and_collapse_are_live(cx: &mut TestAppContext) {
+    let (tray, _, _) = FakeTray::available();
+    let (installer, _) = FakeInstaller::ok();
+    let harness = TestHarness::new(cx, Box::new(tray), installer, false);
+    harness.push_store(connected_store(&[capability::INSTANCES]), cx);
+    cx.update_window(harness.window, |_, window, cx| {
+        assert_eq!(window.find("nav-instances").selected(), Some(true));
+        assert_eq!(window.find("nav-reclaim").selected(), Some(false));
+        let pill = window.within("nav-instances").find("fluent-nav-pill");
+        assert_eq!(pill.bounds().size, size(px(3.), px(16.)));
+        window.click("nav-reclaim", cx);
+        assert_eq!(window.find("nav-reclaim").selected(), Some(true));
+        assert!(
+            window
+                .within("nav-reclaim")
+                .find("fluent-nav-pill")
+                .visible()
+        );
+        assert!(
+            window
+                .within("nav-instances")
+                .try_find("fluent-nav-pill")
+                .is_none()
+        );
+        window.click("collapse", cx);
+        assert_eq!(window.find("collapse").label(), Some("Expand navigation"));
+        assert!(window.find("nav-instances").visible());
+        window.click("collapse", cx);
+        assert_eq!(window.find("collapse").label(), Some("Collapse navigation"));
+        assert!(window.find("theme-follow-system").visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn theme_menu_switches_live_without_reopening_window(cx: &mut TestAppContext) {
     use gpui_kit::component::{Theme, ThemeMode};
     let (tray, _, _) = FakeTray::available();

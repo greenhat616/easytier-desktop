@@ -169,7 +169,10 @@ fn apply_theme(appearance: WindowAppearance, cx: &mut App) {
     if let Some(ramp) = accent {
         apply_accent(&mut config, ramp, dark);
     }
-    Theme::update(cx, |theme| theme.apply_config(&Rc::new(config)));
+    Theme::update(cx, |theme| {
+        theme.apply_config(&Rc::new(config));
+        theme.focus_ring = false;
+    });
 }
 
 fn apply_accent(config: &mut ThemeConfig, ramp: AccentRamp, dark: bool) {
@@ -338,7 +341,7 @@ fn luminance(color: u32) -> f64 {
 }
 
 #[cfg(any(test, target_os = "windows"))]
-fn contrast(a: u32, b: u32) -> f64 {
+pub(crate) fn contrast(a: u32, b: u32) -> f64 {
     let a = luminance(a);
     let b = luminance(b);
     (a.max(b) + 0.05) / (a.min(b) + 0.05)

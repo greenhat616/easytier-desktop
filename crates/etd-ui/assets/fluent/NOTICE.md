@@ -2,7 +2,7 @@
 
 Source: https://github.com/microsoft/fluentui-system-icons/tree/a3de63245b4fa49c30e20d9838593a105affe774
 
-Copyright (c) 2020 Microsoft Corporation; MIT license in `LICENSE.txt`. The files below are unmodified upstream 24px regular SVGs.
+Copyright (c) 2020 Microsoft Corporation; MIT license in `LICENSE.txt`. The files below are unmodified upstream 24px SVGs (regular except where marked filled).
 
 - `eye.svg` — `assets/Eye/SVG/ic_fluent_eye_24_regular.svg`
 - `eye-off.svg` — `assets/Eye Off/SVG/ic_fluent_eye_off_24_regular.svg`
@@ -43,3 +43,6 @@ Copyright (c) 2020 Microsoft Corporation; MIT license in `LICENSE.txt`. The file
 - `arrow-sync.svg` — `assets/Arrow Sync/SVG/ic_fluent_arrow_sync_24_regular.svg`
 - `play.svg` — `assets/Play/SVG/ic_fluent_play_24_regular.svg`
 - `stop.svg` — `assets/Stop/SVG/ic_fluent_stop_24_regular.svg`
+
+- `globe-filled.svg` — `assets/Globe/SVG/ic_fluent_globe_24_filled.svg`
+- `shield-filled.svg` — `assets/Shield/SVG/ic_fluent_shield_24_filled.svg`

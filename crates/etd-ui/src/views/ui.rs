@@ -6,16 +6,24 @@
 //! main thread stack is 1 MiB) keep every chained component temporary alive for the
 //! entire enclosing render function, causing stack frames of 500–700 KiB.
 
+use gpui_kit::gpui;
 use gpui_kit::{
-    AnyElement, App, ClickEvent, ElementId, Entity, IntoElement as _, ParentElement as _,
-    SharedString, Styled as _, Window,
+    AnyElement, App, ClickEvent, ElementId, Entity, FocusHandle, Hsla, InteractiveElement as _,
+    IntoElement, ParentElement as _, RenderOnce, Role, SharedString,
+    StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window,
+    base::{
+        Button as BaseButton, LayoutDirection, LogicalStyledExt as _, Switch as BaseSwitch,
+        SwitchThumb, SwitchTrack, spring,
+    },
     component::{
-        ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, Size,
+        ActiveTheme as _, Collapsible, Disableable as _, FocusableExt as _, Icon, Selectable as _,
+        Sizable as _, Size,
         button::{Button, ButtonVariant, ButtonVariants as _},
         input::{Input, InputContentType, InputState},
-        switch::Switch,
+        progress::ProgressCircle,
+        sidebar::SidebarItem,
     },
-    div,
+    div, px, rgb,
 };
 
 #[derive(Clone, Copy)]
@@ -26,6 +34,7 @@ pub struct BtnStyle {
     pub disabled: bool,
     pub loading: bool,
     pub icon: Option<&'static str>,
+    selected: bool,
 }
 
 impl BtnStyle {
@@ -37,6 +46,7 @@ impl BtnStyle {
             disabled: false,
             loading: false,
             icon: None,
+            selected: false,
         }
     }
 
@@ -52,6 +62,11 @@ impl BtnStyle {
 
     pub const fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        self
+    }
+
+    pub const fn selected(mut self, selected: bool) -> Self {
+        self.selected = selected;
         self
     }
 
@@ -81,20 +96,140 @@ fn action_button_inner(
     style: BtnStyle,
     on_click: ClickHandler,
 ) -> AnyElement {
-    let mut btn = Button::new(id)
-        .with_size(style.size)
-        .with_variant(style.variant)
-        .label(label)
-        .disabled(style.disabled)
-        .loading(style.loading)
-        .on_click(move |ev, window, cx| on_click(ev, window, cx));
-    if let Some(path) = style.icon {
-        btn = btn.icon(Icon::default().path(path));
+    FluentButton {
+        id,
+        label,
+        style,
+        on_click,
     }
-    if style.outline {
-        btn = btn.outline();
+    .into_any_element()
+}
+
+/// App-owned, keyboard-only WinUI focus treatment. The outer 2px line
+/// contrasts with the surface; the inner 1px reverses its polarity. Both
+/// are overlays, so focus never changes layout or intercepts activation.
+fn focus_visual(focused: bool, window: &Window, cx: &App) -> Option<AnyElement> {
+    if !focused || !window.last_input_was_keyboard() {
+        return None;
     }
-    btn.into_any_element()
+    let (outer, inner) = focus_colors(cx.theme().is_dark());
+    Some(
+        div()
+            .id("fluent-focus-visual")
+            .test_support()
+            .absolute()
+            .top(-px(3.))
+            .bottom(-px(3.))
+            .left(-px(3.))
+            .right(-px(3.))
+            .rounded(px(7.))
+            .border_2()
+            .border_color(outer)
+            .child(
+                div()
+                    .size_full()
+                    .rounded(px(5.))
+                    .border_1()
+                    .border_color(inner),
+            )
+            .into_any_element(),
+    )
+}
+
+fn focus_colors(dark: bool) -> (Hsla, Hsla) {
+    if dark {
+        (rgb(0xFFFFFF).into(), rgb(0x000000).into())
+    } else {
+        (rgb(0x000000).into(), rgb(0xFFFFFF).into())
+    }
+}
+
+#[derive(IntoElement)]
+struct FluentButton {
+    id: ElementId,
+    label: SharedString,
+    style: BtnStyle,
+    on_click: ClickHandler,
+}
+
+impl gpui::RenderOnce for FluentButton {
+    #[inline(never)]
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        // The Kit button still owns disabled, loading and keyboard behavior,
+        // variant contrast, and the existing hover/press fills.
+        let id = self.id;
+        let style = self.style;
+        let focus = focus_for(&id, window, cx);
+        let group = SharedString::from(format!("fluent-button:{id:?}"));
+        let mut btn = Button::new(id.clone())
+            .with_size(style.size)
+            .with_variant(style.variant)
+            .accessibility_label(if style.selected {
+                format!("{} (selected)", self.label).into()
+            } else {
+                self.label.clone()
+            })
+            .selected(style.selected)
+            .track_focus(&focus)
+            .focus_ring(false)
+            .disabled(style.disabled || style.loading)
+            .on_click(move |ev, window, cx| (self.on_click)(ev, window, cx));
+        if !matches!(
+            style.variant,
+            ButtonVariant::Ghost | ButtonVariant::Link | ButtonVariant::Text
+        ) {
+            btn = btn.border_b_2();
+        }
+        if style.outline {
+            btn = btn.outline();
+        }
+        if style.loading {
+            btn = btn.child(progress_ring("button-progress", "Working", Size::XSmall));
+        } else if let Some(path) = style.icon {
+            btn = btn.icon(Icon::default().path(path));
+        }
+        // The content fades slightly during a pointer press; the toolkit's
+        // own active color remains the background feedback. Don't scale
+        // layout or make disabled targets respond.
+        btn = btn.child(
+            div()
+                .id("fluent-button-label")
+                .group_active(group.clone(), move |s| {
+                    s.opacity(if style.disabled || style.loading {
+                        1.
+                    } else {
+                        0.86
+                    })
+                })
+                .child(self.label),
+        );
+        div()
+            .relative()
+            .group(group)
+            .child(btn)
+            .children(focus_visual(focus.is_focused(window), window, cx))
+    }
+}
+
+fn focus_for(id: &ElementId, window: &mut Window, cx: &mut App) -> FocusHandle {
+    window
+        .use_keyed_state((id.clone(), "fluent-focus"), cx, |_, cx| cx.focus_handle())
+        .read(cx)
+        .clone()
+}
+
+/// Generic indeterminate Fluent progress ring (Kit owns animation and a11y).
+#[inline(never)]
+pub fn progress_ring(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    size: Size,
+) -> AnyElement {
+    ProgressCircle::new(id)
+        .loading(true)
+        .with_size(size)
+        .accessibility_label(label)
+        .into_any_element()
 }
 
 /// The appearance section of the sidebar menu, with all choices visible.
@@ -141,19 +276,13 @@ fn theme_choice_button(
     choice: crate::preferences::ThemePreference,
     selected: bool,
 ) -> AnyElement {
-    let label = choice.label();
-    let mut button = Button::new(id)
-        .with_size(Size::Small)
-        .with_variant(ButtonVariant::Ghost)
-        .label(label)
-        .selected(selected)
-        .on_click(move |_, window, cx| crate::theme::set_preference(choice, window, cx));
+    let mut style = BtnStyle::new(ButtonVariant::Ghost, Size::Small).selected(selected);
     if selected {
-        button = button
-            .icon(Icon::default().path("fluent/checkmark.svg"))
-            .accessibility_label(format!("{label} (selected)"));
+        style = style.icon("fluent/checkmark.svg");
     }
-    button.into_any_element()
+    action_button(id, choice.label(), style, move |_, window, cx| {
+        crate::theme::set_preference(choice, window, cx)
+    })
 }
 
 /// Builds a labeled single-line [`Input`] in its own stack frame.
@@ -167,11 +296,14 @@ pub fn text_field(
     cx: &App,
 ) -> AnyElement {
     let fg = cx.theme().foreground;
-    let input = Input::new(state)
-        .id(id)
-        .aria_label(aria_label)
-        .disabled(disabled)
-        .into_any_element();
+    let input = FluentInput {
+        id,
+        aria_label,
+        state: state.clone(),
+        disabled,
+        password: false,
+    }
+    .into_any_element();
     div()
         .flex()
         .flex_col()
@@ -189,16 +321,48 @@ pub fn password_input(
     state: &Entity<InputState>,
     disabled: bool,
 ) -> AnyElement {
-    Input::new(state)
-        .id(id)
-        .aria_label(aria_label)
-        .content_type(InputContentType::Password)
-        .mask_toggle()
-        .disabled(disabled)
-        .into_any_element()
+    FluentInput {
+        id,
+        aria_label,
+        state: state.clone(),
+        disabled,
+        password: true,
+    }
+    .into_any_element()
 }
 
-/// Builds a [`Switch`] in its own stack frame.
+#[derive(IntoElement)]
+struct FluentInput {
+    id: &'static str,
+    aria_label: &'static str,
+    state: Entity<InputState>,
+    disabled: bool,
+    password: bool,
+}
+
+impl RenderOnce for FluentInput {
+    #[inline(never)]
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let focus = self.state.read(cx).focus_handle(cx);
+        let mut input = Input::new(&self.state)
+            .id(self.id)
+            .aria_label(self.aria_label)
+            .disabled(self.disabled)
+            .focus_ring(false);
+        if self.password {
+            input = input.content_type(InputContentType::Password).mask_toggle();
+        }
+        div()
+            .relative()
+            .w_full()
+            .child(input)
+            .children(focus_visual(focus.is_focused(window), window, cx))
+    }
+}
+
+/// Controlled Fluent switch: gpui-base retains keyboard activation, focus,
+/// ARIA checked state and disabled behavior. The 40×20 track uses a spring
+/// for thumb travel and renders from logical start to end in RTL.
 #[inline(never)]
 pub fn switch_control(
     id: &'static str,
@@ -206,9 +370,594 @@ pub fn switch_control(
     checked: bool,
     on_change: impl Fn(&bool, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    Switch::new(id)
-        .checked(checked)
-        .label(label.into())
-        .on_change(on_change)
-        .into_any_element()
+    fluent_switch(id, label, checked, false, on_change)
+}
+
+#[inline(never)]
+pub fn fluent_switch(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    checked: bool,
+    disabled: bool,
+    on_change: impl Fn(&bool, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    FluentSwitch {
+        id: id.into(),
+        label: label.into(),
+        checked,
+        disabled,
+        on_change: Box::new(on_change),
+    }
+    .into_any_element()
+}
+
+type SwitchHandler = Box<dyn Fn(&bool, &mut Window, &mut App)>;
+
+#[derive(IntoElement)]
+struct FluentSwitch {
+    id: ElementId,
+    label: SharedString,
+    checked: bool,
+    disabled: bool,
+    on_change: SwitchHandler,
+}
+
+#[derive(Clone, Copy)]
+struct SwitchPaint {
+    track: Hsla,
+    border: Hsla,
+    thumb: Hsla,
+}
+
+fn switch_paint(checked: bool, disabled: bool, cx: &App) -> SwitchPaint {
+    let t = cx.theme();
+    if disabled {
+        return SwitchPaint {
+            track: t.secondary,
+            border: t.border,
+            thumb: t.muted_foreground,
+        };
+    }
+    if checked {
+        SwitchPaint {
+            track: t.primary,
+            border: t.primary,
+            thumb: t.primary_foreground,
+        }
+    } else {
+        SwitchPaint {
+            track: t.background,
+            border: t.muted_foreground,
+            thumb: t.muted_foreground,
+        }
+    }
+}
+
+impl RenderOnce for FluentSwitch {
+    #[inline(never)]
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let id = self.id;
+        let checked = self.checked;
+        let disabled = self.disabled;
+        let focus = focus_for(&id, window, cx);
+        let paint = switch_paint(checked, disabled, cx);
+        let thumb_size = px(if checked { 14. } else { 12. });
+        let thumb_x = spring(
+            (id.clone(), "fluent-thumb"),
+            if checked {
+                px(40.) - thumb_size - px(6.)
+            } else {
+                px(0.)
+            },
+            cx.theme().motion_tokens().spring_move,
+            window,
+            cx,
+        );
+        let group = SharedString::from(format!("fluent-switch:{id:?}"));
+        let rtl = LayoutDirection::global(cx).is_rtl();
+        let mut thumb = div()
+            .id("fluent-switch-thumb")
+            .test_support()
+            .relative()
+            .rounded_full()
+            .size(thumb_size)
+            .bg(paint.thumb);
+        if !disabled {
+            thumb = thumb
+                .group_hover(group.clone(), move |s| {
+                    let s = s.size(thumb_size + px(2.));
+                    if checked {
+                        if rtl {
+                            s.right(-px(2.))
+                        } else {
+                            s.left(-px(2.))
+                        }
+                    } else {
+                        s
+                    }
+                })
+                .group_active(group.clone(), move |s| {
+                    let s = s.w(thumb_size + px(4.));
+                    if checked {
+                        if rtl {
+                            s.right(-px(4.))
+                        } else {
+                            s.left(-px(4.))
+                        }
+                    } else {
+                        s
+                    }
+                });
+        }
+        let track = SwitchTrack::new((id.clone(), "track"))
+            .checked(checked)
+            .disabled(disabled)
+            .w(px(40.))
+            .h(px(20.))
+            .flex_shrink_0()
+            .rounded_full()
+            .border_1()
+            .border_color(paint.border)
+            .bg(paint.track)
+            .p(px(2.))
+            .flex_row_dir(cx)
+            .items_center()
+            .child(
+                SwitchThumb::new(checked)
+                    .disabled(disabled)
+                    .inset_s(thumb_x, cx)
+                    .child(thumb),
+            );
+        let label = self.label;
+        let mut switch = BaseSwitch::new(id)
+            .track_focus(&focus)
+            .checked(checked)
+            .disabled(disabled)
+            .accessibility_label(label.clone())
+            .group(group)
+            .on_change(move |next, _, window, cx| (self.on_change)(&next, window, cx))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .text_sm();
+        if rtl {
+            switch = switch.flex_row_reverse();
+        }
+        switch
+            .child(
+                div()
+                    .id("fluent-switch-track")
+                    .test_support()
+                    .relative()
+                    .flex_shrink_0()
+                    .child(track)
+                    .children(focus_visual(focus.is_focused(window), window, cx)),
+            )
+            .child(
+                div()
+                    .text_color(if disabled {
+                        cx.theme().muted_foreground
+                    } else {
+                        cx.theme().foreground
+                    })
+                    .child(label),
+            )
+    }
+}
+
+/// Navigation row used by the Kit Sidebar. It owns only the appearance;
+/// Sidebar handles the expanded/icon-only transition, scrolling and layout.
+#[derive(Clone)]
+pub struct FluentNavItem {
+    id: ElementId,
+    label: SharedString,
+    regular_icon: &'static str,
+    filled_icon: &'static str,
+    selected: bool,
+    collapsed: bool,
+    handler: std::rc::Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>,
+}
+
+impl FluentNavItem {
+    pub fn new(
+        id: impl Into<ElementId>,
+        label: impl Into<SharedString>,
+        regular_icon: &'static str,
+        filled_icon: &'static str,
+        selected: bool,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            regular_icon,
+            filled_icon,
+            selected,
+            collapsed: false,
+            handler: std::rc::Rc::new(handler),
+        }
+    }
+}
+
+impl Collapsible for FluentNavItem {
+    fn is_collapsed(&self) -> bool {
+        self.collapsed
+    }
+    fn collapsed(mut self, collapsed: bool) -> Self {
+        self.collapsed = collapsed;
+        self
+    }
+}
+
+impl SidebarItem for FluentNavItem {
+    #[inline(never)]
+    fn render(
+        self,
+        _id: impl Into<ElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> impl IntoElement {
+        let focus = focus_for(&self.id, window, cx);
+        let t = cx.theme();
+        let selected = self.selected;
+        let collapsed = self.collapsed;
+        let bg = if selected {
+            t.secondary.opacity(0.55)
+        } else {
+            t.transparent
+        };
+        let icon = if selected {
+            self.filled_icon
+        } else {
+            self.regular_icon
+        };
+        let handler = self.handler;
+        let rtl = LayoutDirection::global(cx).is_rtl();
+        let pill = div()
+            .id("fluent-nav-pill")
+            .test_support()
+            .absolute()
+            .top(px(8.))
+            .w(px(3.))
+            .h(px(16.))
+            .rounded_full()
+            .bg(t.primary);
+        let pill = if rtl { pill.right_0() } else { pill.left_0() };
+        let mut btn = BaseButton::new(self.id)
+            .track_focus(&focus)
+            .accessibility_label(self.label.clone())
+            .selected(selected)
+            .aria_selected(selected)
+            .relative()
+            .w_full()
+            .h(px(32.))
+            .rounded(px(4.))
+            .bg(bg)
+            .text_sm()
+            .text_color(t.sidebar_foreground)
+            .flex_row_dir(cx)
+            .items_center()
+            .gap_2()
+            .hover(|s| s.bg(t.secondary.opacity(0.65)))
+            .active(|s| s.bg(t.secondary_active))
+            .on_click(move |event, window, cx| handler(event, window, cx));
+        btn = if collapsed {
+            btn.justify_center()
+        } else {
+            btn.px_3()
+        };
+        btn = btn.child(Icon::default().path(icon).with_size(Size::Small));
+        if !collapsed {
+            btn = btn.child(div().min_w_0().truncate().child(self.label));
+        }
+        if selected {
+            btn = btn.child(pill);
+        }
+        div().relative().w_full().child(btn).children(focus_visual(
+            focus.is_focused(window),
+            window,
+            cx,
+        ))
+    }
+}
+
+/// Semantic InfoBar presentation, with neutral text on an opaque composited
+/// tint. The badge's icon matches severity without relying on color alone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InfoSeverity {
+    Informational,
+    Success,
+    Warning,
+    Error,
+}
+
+fn info_colors(severity: InfoSeverity, cx: &App) -> (Hsla, Hsla, Hsla) {
+    let t = cx.theme();
+    let color = match severity {
+        InfoSeverity::Informational => t.info,
+        InfoSeverity::Success => t.success,
+        InfoSeverity::Warning => t.warning,
+        InfoSeverity::Error => t.danger,
+    };
+    let bg = Hsla::from(t.popover.to_rgb().blend(color.opacity(0.10).to_rgb()));
+    let badge_ink = if t.is_dark() {
+        rgb(0x141414).into()
+    } else {
+        rgb(0xFFFFFF).into()
+    };
+    (bg, color, badge_ink)
+}
+
+pub struct FluentInfoBar {
+    id: ElementId,
+    message: SharedString,
+    severity: InfoSeverity,
+    role: Role,
+    actions: Vec<AnyElement>,
+    close: Option<AnyElement>,
+}
+
+impl FluentInfoBar {
+    pub fn new(
+        id: impl Into<ElementId>,
+        severity: InfoSeverity,
+        message: impl Into<SharedString>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            message: message.into(),
+            severity,
+            role: Role::Alert,
+            actions: Vec::new(),
+            close: None,
+        }
+    }
+    pub fn status(mut self) -> Self {
+        self.role = Role::Status;
+        self
+    }
+    pub fn actions(mut self, actions: impl IntoIterator<Item = AnyElement>) -> Self {
+        self.actions.extend(actions);
+        self
+    }
+    pub fn close(mut self, close: AnyElement) -> Self {
+        self.close = Some(close);
+        self
+    }
+
+    #[inline(never)]
+    pub fn render(self, cx: &App) -> AnyElement {
+        let (bg, semantic, ink) = info_colors(self.severity, cx);
+        let icon = match self.severity {
+            InfoSeverity::Informational => "fluent/info.svg",
+            InfoSeverity::Success => "fluent/checkmark.svg",
+            InfoSeverity::Warning => "fluent/warning.svg",
+            InfoSeverity::Error => "fluent/error-circle.svg",
+        };
+        let badge = div()
+            .id("infobar-severity")
+            .test_support()
+            .size(px(20.))
+            .rounded_full()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(semantic)
+            .child(
+                Icon::default()
+                    .path(icon)
+                    .with_size(Size::XSmall)
+                    .text_color(ink),
+            );
+        div()
+            .id(self.id)
+            .role(self.role)
+            .test_support()
+            .aria_label(self.message.clone())
+            .mx_3()
+            .my_1()
+            .px_3()
+            .py_2()
+            .rounded(px(4.))
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(bg)
+            .text_sm()
+            .text_color(cx.theme().foreground)
+            .flex_row_dir(cx)
+            .items_center()
+            .gap_3()
+            .child(badge)
+            .child(div().min_w_0().flex_1().child(self.message))
+            .child(
+                div()
+                    .flex_row_dir(cx)
+                    .flex_shrink_0()
+                    .gap_2()
+                    .children(self.actions),
+            )
+            .children(self.close)
+            .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::{
+        AppContext as _, Context, Render, TestAppContext, WindowOptions, size,
+        test::{TestAppContextExt as _, TestWindowExt as _},
+    };
+
+    struct ControlDemo {
+        checked: bool,
+        activated: usize,
+        closed: bool,
+    }
+
+    impl Render for ControlDemo {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let button = action_button(
+                "demo-button",
+                "Activate",
+                BtnStyle::new(ButtonVariant::Primary, Size::Small),
+                cx.listener(|this, _, _, cx| {
+                    this.activated += 1;
+                    cx.notify();
+                }),
+            );
+            let switch = fluent_switch(
+                "demo-switch",
+                "Toggle",
+                self.checked,
+                false,
+                cx.listener(|this, next, _, cx| {
+                    this.checked = *next;
+                    cx.notify();
+                }),
+            );
+            let disabled = fluent_switch("demo-disabled", "Disabled", false, true, |_, _, _| {
+                panic!("disabled switch activated")
+            });
+            let loading = action_button(
+                "demo-loading",
+                "Busy",
+                BtnStyle::new(ButtonVariant::Primary, Size::Small).loading(true),
+                |_, _, _| panic!("loading button activated"),
+            );
+            let close = action_button(
+                "demo-close",
+                "Dismiss",
+                BtnStyle::new(ButtonVariant::Ghost, Size::Small),
+                cx.listener(|this, _, _, cx| {
+                    this.closed = true;
+                    cx.notify();
+                }),
+            );
+            div()
+                .size_full()
+                .tab_group()
+                .flex()
+                .flex_col()
+                .items_start()
+                .gap_3()
+                .p_4()
+                .child(button)
+                .child(switch)
+                .child(disabled)
+                .child(loading)
+                .children((!self.closed).then(|| {
+                    FluentInfoBar::new("demo-info", InfoSeverity::Warning, "Warning body")
+                        .close(close)
+                        .render(cx)
+                }))
+        }
+    }
+
+    #[gpui_kit::test]
+    fn fluent_controls_preserve_click_checked_focus_loading_and_close(cx: &mut TestAppContext) {
+        let (window, view) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::install_palette(cx);
+            gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
+                cx.new(|_| ControlDemo {
+                    checked: false,
+                    activated: 0,
+                    closed: false,
+                })
+            })
+            .unwrap()
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("demo-switch").role(), Some(Role::Switch));
+            assert_eq!(window.find("demo-switch").checked(), Some(false));
+            assert_eq!(
+                window
+                    .within("demo-switch")
+                    .find("fluent-switch-track")
+                    .bounds()
+                    .size,
+                size(px(40.), px(20.))
+            );
+            assert_eq!(window.find("demo-disabled").disabled(), Some(true));
+            assert_eq!(window.find("demo-loading").disabled(), Some(true));
+            let progress = window.find("button-progress");
+            assert_eq!(progress.role(), Some(Role::ProgressIndicator));
+            assert_eq!(progress.label(), Some("Working"));
+            assert_eq!(progress.indeterminate(), Some(true));
+            assert!(window.try_find("fluent-focus-visual").is_none());
+            window.press("tab", cx);
+            window.render_frame(cx);
+            assert!(window.find("fluent-focus-visual").visible());
+            window.click("demo-button", cx);
+            assert_eq!(view.read(cx).activated, 1);
+            assert!(window.try_find("fluent-focus-visual").is_none());
+            window.click("demo-switch", cx);
+            assert_eq!(window.find("demo-switch").checked(), Some(true));
+            window.click("demo-disabled", cx);
+            assert_eq!(window.find("demo-disabled").checked(), Some(false));
+            window.click("demo-loading", cx);
+            assert_eq!(window.find("demo-info").role(), Some(Role::Alert));
+            assert!(
+                window
+                    .within("demo-info")
+                    .find("infobar-severity")
+                    .visible()
+            );
+            window.click("demo-close", cx);
+            assert!(window.try_find("demo-info").is_none());
+        })
+        .unwrap();
+    }
+
+    fn rgb24(color: Hsla) -> u32 {
+        let c = color.to_rgb();
+        let b = |v: f32| (v.clamp(0., 1.) * 255.).round() as u32;
+        b(c.r) << 16 | b(c.g) << 8 | b(c.b)
+    }
+
+    #[gpui_kit::test]
+    fn info_bar_and_switch_colors_are_readable_in_both_themes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::install_palette(cx);
+            for mode in [
+                gpui_kit::component::ThemeMode::Light,
+                gpui_kit::component::ThemeMode::Dark,
+            ] {
+                gpui_kit::component::Theme::change(mode, None, cx);
+                let t = cx.theme();
+                let contrast = |a, b| crate::theme::contrast(rgb24(a), rgb24(b));
+                for severity in [
+                    InfoSeverity::Informational,
+                    InfoSeverity::Success,
+                    InfoSeverity::Warning,
+                    InfoSeverity::Error,
+                ] {
+                    let (bg, badge, ink) = info_colors(severity, cx);
+                    assert!(
+                        contrast(t.foreground, bg) >= 4.5,
+                        "InfoBar body {mode:?} {severity:?}"
+                    );
+                    assert!(
+                        contrast(badge, ink) >= 4.5,
+                        "InfoBar badge {mode:?} {severity:?}"
+                    );
+                }
+                for checked in [false, true] {
+                    let paint = switch_paint(checked, false, cx);
+                    assert!(
+                        contrast(paint.track, paint.thumb) >= 3.,
+                        "switch thumb {mode:?} {checked}"
+                    );
+                }
+                let (outer, inner) = focus_colors(t.is_dark());
+                assert!(contrast(outer, inner) >= 4.5);
+                assert!(contrast(outer, t.background) >= 3.);
+            }
+        });
+    }
 }

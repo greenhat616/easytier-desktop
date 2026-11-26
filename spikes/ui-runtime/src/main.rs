@@ -4,9 +4,14 @@ mod tray;
 
 use std::{
     cell::RefCell,
+    io::Write as _,
     net::SocketAddr,
+    path::PathBuf,
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -19,7 +24,7 @@ use gpui_kit::{
 };
 
 use crate::{
-    exit_gate::{ExitGate, ExitPhase},
+    exit_gate::{ExitGate, ExitPhase, ExitTrace},
     grpc_backend::{BridgeEvent, TokioBridge},
     tray::{TrayAction, TrayAdapter},
 };
@@ -30,6 +35,9 @@ struct CliArgs {
     cycle_delay_ms: u64,
     hold_ms: u64,
     interactive: bool,
+    expect_compositor: Option<String>,
+    require_tray: bool,
+    ready_file: Option<PathBuf>,
 }
 
 impl Default for CliArgs {
@@ -39,6 +47,9 @@ impl Default for CliArgs {
             cycle_delay_ms: 15,
             hold_ms: 0,
             interactive: false,
+            expect_compositor: None,
+            require_tray: false,
+            ready_file: None,
         }
     }
 }
@@ -69,9 +80,24 @@ fn parse_args() -> Result<CliArgs> {
             "--interactive" => {
                 cfg.interactive = true;
             }
+            "--expect-compositor" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--expect-compositor requires a value"))?;
+                cfg.expect_compositor = Some(val);
+            }
+            "--require-tray" => {
+                cfg.require_tray = true;
+            }
+            "--ready-file" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--ready-file requires a path"))?;
+                cfg.ready_file = Some(PathBuf::from(val));
+            }
             "--help" | "-h" => {
                 println!(
-                    "Usage: ui-runtime-spike [--cycles N] [--cycle-delay-ms MS] [--hold-ms MS] [--interactive]"
+                    "Usage: ui-runtime-spike [--cycles N] [--cycle-delay-ms MS] [--hold-ms MS] [--interactive] [--expect-compositor NAME] [--require-tray] [--ready-file PATH]"
                 );
                 std::process::exit(0);
             }
@@ -83,9 +109,14 @@ fn parse_args() -> Result<CliArgs> {
 
 #[derive(Debug, Default)]
 struct RunMetrics {
+    compositor_name: String,
+    display_count: usize,
     server_addr: Option<SocketAddr>,
+    tray_id: String,
     tray_created: bool,
     tray_shell_registered: bool,
+    ns_status_item_exists: Option<bool>,
+    tray_rect_raw: Option<(f64, f64, u32, u32)>,
     tray_rect: Option<String>,
     cycles_completed: usize,
     events_while_visible: u64,
@@ -195,10 +226,10 @@ impl Controller {
         let mut seq = self.ping_seq.borrow_mut();
         *seq += 1;
         let next = *seq;
-        if let Some(bridge) = self.bridge.borrow().as_ref() {
-            if let Err(err) = bridge.try_send_ping(next) {
-                eprintln!("[ui] send_ping failed: {err:#}");
-            }
+        if let Some(bridge) = self.bridge.borrow().as_ref()
+            && let Err(err) = bridge.try_send_ping(next)
+        {
+            eprintln!("[ui] send_ping failed: {err:#}");
         }
     }
 
@@ -212,7 +243,7 @@ impl Controller {
 
     async fn run_exit(&self, cx: &mut AsyncApp) {
         // Close any visible window first so UI teardown is deterministic.
-        let _ = cx.update(|cx| {
+        cx.update(|cx| {
             self.hide_to_tray(cx);
         });
         let bridge = self.bridge.borrow_mut().take();
@@ -333,45 +364,215 @@ impl Render for SpikeView {
     }
 }
 
+fn finalize_and_verify(
+    run_started: Instant,
+    cfg: &CliArgs,
+    metrics: &Arc<Mutex<RunMetrics>>,
+    exit_trace: &Arc<Mutex<ExitTrace>>,
+) -> Result<()> {
+    let total_elapsed = run_started.elapsed();
+    let m = metrics.lock().expect("metrics lock");
+    let trace = exit_trace.lock().expect("exit trace lock");
+    let exit_elapsed = trace
+        .started_at
+        .map(|s| s.elapsed())
+        .unwrap_or(Duration::ZERO);
+    let phase_order: Vec<ExitPhase> = trace.phases.iter().map(|(p, _)| *p).collect();
+
+    println!("=== S3 UI Runtime Coexistence Summary ===");
+    println!("os                   : {}", std::env::consts::OS);
+    println!("compositor_name      : {}", m.compositor_name);
+    println!("display_count        : {}", m.display_count);
+    println!("total_elapsed        : {total_elapsed:?}");
+    println!("exit_elapsed         : {exit_elapsed:?} (limit: 5s)");
+    println!("fake_tonic_server    : {:?}", m.server_addr);
+    println!("tray_id              : {}", m.tray_id);
+    println!("tray_created         : {}", m.tray_created);
+    println!("tray_shell_registered: {}", m.tray_shell_registered);
+    println!("ns_status_item_exists: {:?}", m.ns_status_item_exists);
+    println!(
+        "tray_rect            : {}",
+        m.tray_rect.as_deref().unwrap_or("none")
+    );
+    println!(
+        "cycles_completed     : {}/{}",
+        m.cycles_completed, cfg.cycles
+    );
+    println!("events_visible       : {}", m.events_while_visible);
+    println!("events_hidden        : {}", m.events_while_hidden);
+    println!("last_event_seq       : {}", m.last_event_seq);
+    println!("pongs_received       : {}", m.pongs_received);
+    println!(
+        "exit_phases          : {:?}",
+        trace
+            .phases
+            .iter()
+            .map(|(p, d)| format!("{} (+{d:?})", p.as_str()))
+            .collect::<Vec<_>>()
+    );
+
+    if let Some(expected) = cfg.expect_compositor.as_deref()
+        && m.compositor_name != expected
+    {
+        bail!(
+            "unexpected compositor: got {:?}, expected {:?}",
+            m.compositor_name,
+            expected
+        );
+    }
+
+    if cfg.require_tray && !m.tray_shell_registered {
+        bail!(
+            "tray icon was not registered with the platform shell/host (detail: {})",
+            m.tray_rect.as_deref().unwrap_or("none")
+        );
+    }
+
+    if !m.errors.is_empty() || !trace.errors.is_empty() {
+        bail!(
+            "runtime errors recorded: metrics={:?}, exit={:?}",
+            m.errors,
+            trace.errors
+        );
+    }
+
+    let expected_order = vec![
+        ExitPhase::StopSubscription,
+        ExitPhase::StopTokio,
+        ExitPhase::QuitGpui,
+    ];
+    if phase_order != expected_order {
+        bail!("unexpected exit order: got {phase_order:?}, expected {expected_order:?}");
+    }
+    if exit_elapsed >= Duration::from_secs(5) {
+        bail!("exit exceeded 5s budget: {exit_elapsed:?}");
+    }
+    if !cfg.interactive && cfg.cycles > 0 {
+        if m.cycles_completed != cfg.cycles {
+            bail!(
+                "expected {} cycles, completed {}",
+                cfg.cycles,
+                m.cycles_completed
+            );
+        }
+        if m.events_while_hidden == 0 {
+            bail!("received 0 tonic stream events while window was hidden in tray");
+        }
+        if m.pongs_received == 0 {
+            bail!("received 0 tonic Ping/Pong responses");
+        }
+    }
+
+    println!("VERDICT: PASS");
+    let _ = std::io::stdout().flush();
+    Ok(())
+}
+
+fn write_ready_file(path: &std::path::Path, metrics: &RunMetrics) -> Result<()> {
+    let mut body = String::new();
+    body.push_str(&format!("pid={}\n", std::process::id()));
+    body.push_str(&format!("os={}\n", std::env::consts::OS));
+    body.push_str(&format!("compositor={}\n", metrics.compositor_name));
+    body.push_str(&format!("display_count={}\n", metrics.display_count));
+    body.push_str(&format!("tray_id={}\n", metrics.tray_id));
+    body.push_str(&format!(
+        "tray_shell_registered={}\n",
+        metrics.tray_shell_registered
+    ));
+    if let Some(exists) = metrics.ns_status_item_exists {
+        body.push_str(&format!("ns_status_item_exists={exists}\n"));
+    }
+    if let Some((x, y, w, h)) = metrics.tray_rect_raw {
+        body.push_str(&format!("tray_rect_raw={x:.1},{y:.1},{w},{h}\n"));
+    }
+    if let Some(label) = metrics.tray_rect.as_deref() {
+        body.push_str(&format!("tray_rect={label}\n"));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cfg = parse_args()?;
     let run_started = Instant::now();
     let metrics = Arc::new(Mutex::new(RunMetrics::default()));
     let exit_gate = ExitGate::new();
     let exit_trace = exit_gate.trace();
+    let verified = Arc::new(AtomicBool::new(false));
 
     let metrics_app = metrics.clone();
     let cfg_app = cfg.clone();
+    let trace_quit = exit_trace.clone();
+    let verified_quit = verified.clone();
 
     gpui_kit::application()
         .with_quit_mode(QuitMode::Explicit)
         .run(move |cx| {
             gpui_kit::init(cx);
 
+            let compositor_name = cx.compositor_name().to_owned();
+            let display_count = cx.displays().len();
+            eprintln!(
+                "[platform] os={} compositor={compositor_name:?} displays={display_count}",
+                std::env::consts::OS
+            );
+
+            // On macOS, `[NSApplication terminate:]` invokes `applicationWillTerminate:` and
+            // exits the process without returning from `application().run(...)`. Run summary
+            // printing and invariant verification inside `on_app_quit` so macOS produces the
+            // exact same verified verdict (and non-zero exit code on failure) as Windows/Linux.
+            let quit_metrics = metrics_app.clone();
+            let quit_cfg = cfg_app.clone();
+            let quit_trace = trace_quit.clone();
+            let quit_verified = verified_quit.clone();
+            cx.on_app_quit(move |_| {
+                let metrics = quit_metrics.clone();
+                let cfg = quit_cfg.clone();
+                let trace = quit_trace.clone();
+                let verified = quit_verified.clone();
+                async move {
+                    if !verified.swap(true, Ordering::SeqCst)
+                        && let Err(err) = finalize_and_verify(run_started, &cfg, &metrics, &trace)
+                    {
+                        eprintln!("VERDICT: FAIL: {err:#}");
+                        let _ = std::io::stderr().flush();
+                        std::process::exit(1);
+                    }
+                }
+            })
+            .detach();
+
             let bridge = TokioBridge::start().expect("start background tokio + fake tonic server");
             let evt_rx = bridge.events();
 
             let initial_tooltip = "EasyTier S3 UI Runtime Spike";
-            let tray = TrayAdapter::new(initial_tooltip).expect("create Windows tray icon");
+            let tray = TrayAdapter::new(initial_tooltip).expect("create system tray icon");
             let tray_rx = tray.actions();
-            let tray_shell_registered = tray.probe_shell_registered(initial_tooltip);
-            let tray_rect = tray.rect();
-            let tray_rect_label = match (tray_shell_registered, tray_rect) {
-                (true, Some(rect)) => format!(
-                    "visible in shell at ({:.0}, {:.0}) {}x{}",
-                    rect.position.x, rect.position.y, rect.size.width, rect.size.height
-                ),
-                (true, None) => "registered in shell (rect unavailable)".to_owned(),
-                (false, _) => {
-                    "HWND alive, waiting for TaskbarCreated (no Shell_TrayWnd on this desktop)"
-                        .to_owned()
-                }
-            };
-            eprintln!("[tray] shell_registered={tray_shell_registered} | {tray_rect_label}");
+            let tray_id = tray.tray_id().to_owned();
+            let ns_status_item_exists = tray.has_ns_status_item();
+            let (tray_shell_registered, tray_rect_label) =
+                tray.describe_registration(initial_tooltip);
+            let tray_rect_raw = tray
+                .rect()
+                .map(|r| (r.position.x, r.position.y, r.size.width, r.size.height));
+            eprintln!(
+                "[tray] pid={} id={tray_id} shell_registered={tray_shell_registered} ns_status_item={ns_status_item_exists:?} | {tray_rect_label}",
+                std::process::id()
+            );
             {
                 let mut m = metrics_app.lock().expect("metrics lock");
+                m.compositor_name = compositor_name;
+                m.display_count = display_count;
+                m.tray_id = tray_id;
                 m.tray_created = true;
                 m.tray_shell_registered = tray_shell_registered;
+                m.ns_status_item_exists = ns_status_item_exists;
+                m.tray_rect_raw = tray_rect_raw;
                 m.tray_rect = Some(tray_rect_label.clone());
             }
 
@@ -406,7 +607,7 @@ fn main() -> Result<()> {
             let evt_ctrl = controller.clone();
             cx.spawn(async move |cx| {
                 while let Ok(event) = evt_rx.recv().await {
-                    let _ = cx.update(|cx| {
+                    cx.update(|cx| {
                         let visible = evt_ctrl.window.borrow().is_some();
                         match event {
                             BridgeEvent::Connected { addr } => {
@@ -481,7 +682,7 @@ fn main() -> Result<()> {
             let tray_ctrl = controller.clone();
             cx.spawn(async move |cx| {
                 while let Ok(action) = tray_rx.recv().await {
-                    let _ = cx.update(|cx| match action {
+                    cx.update(|cx| match action {
                         TrayAction::ToggleWindow => tray_ctrl.toggle_window(cx),
                         TrayAction::ShowWindow => {
                             let _ = tray_ctrl.open_or_focus_window(cx);
@@ -500,22 +701,58 @@ fn main() -> Result<()> {
                 let cycles = cfg_app.cycles;
                 let step_delay = Duration::from_millis(cfg_app.cycle_delay_ms);
                 let hold_duration = Duration::from_millis(cfg_app.hold_ms);
+                let ready_file = cfg_app.ready_file.clone();
 
                 cx.spawn(async move |cx| {
-                    // Initial ping + wait briefly for tonic stream to deliver first ticks.
-                    let _ = cx.update(|_| driver_ctrl.send_ping());
+                    // Initial ping + wait briefly for tonic stream, AppKit menu bar layout,
+                    // and D-Bus SNI watcher registration to settle.
+                    cx.update(|_| driver_ctrl.send_ping());
                     cx.background_executor()
-                        .timer(Duration::from_millis(120))
+                        .timer(Duration::from_millis(200))
                         .await;
 
+                    let mut registered_now = tray_shell_registered;
+                    cx.update(|cx| {
+                        if let Some(tray) = driver_ctrl.tray.borrow().as_ref() {
+                            let (reg, label) = tray.describe_registration(initial_tooltip);
+                            let raw = tray.rect().map(|r| {
+                                (r.position.x, r.position.y, r.size.width, r.size.height)
+                            });
+                            let ns_exists = tray.has_ns_status_item();
+                            registered_now = reg;
+                            eprintln!(
+                                "[tray] settled shell_registered={reg} ns_status_item={ns_exists:?} | {label}"
+                            );
+                            {
+                                let mut m = driver_ctrl.metrics.lock().expect("metrics lock");
+                                m.tray_shell_registered = reg;
+                                m.ns_status_item_exists = ns_exists;
+                                m.tray_rect_raw = raw;
+                                m.tray_rect = Some(label.clone());
+                            }
+                            driver_ctrl.model.update(cx, |m, cx| {
+                                m.tray_rect_label = label;
+                                cx.notify();
+                            });
+                        }
+                        if let Some(ref ready_path) = ready_file {
+                            let m = driver_ctrl.metrics.lock().expect("metrics lock");
+                            if let Err(err) = write_ready_file(ready_path, &m) {
+                                eprintln!("[driver] failed to write ready file: {err:#}");
+                            }
+                        }
+                    });
+
                     if !hold_duration.is_zero() {
-                        eprintln!("[driver] holding visible window + tray for {hold_duration:?}...");
+                        eprintln!(
+                            "[driver] holding visible window + tray for {hold_duration:?}..."
+                        );
                         cx.background_executor().timer(hold_duration).await;
                     }
 
                     for cycle in 1..=cycles {
                         // Hide to tray (0 open GPUI windows; tray + tokio + tonic stay live).
-                        let _ = cx.update(|cx| {
+                        cx.update(|cx| {
                             driver_ctrl.model.update(cx, |m, cx| {
                                 m.current_cycle = cycle;
                                 cx.notify();
@@ -526,7 +763,7 @@ fn main() -> Result<()> {
 
                         // Exercise tonic unary RPC while window is hidden in tray on every 10th cycle.
                         if cycle % 10 == 0 || cycle == 1 {
-                            let _ = cx.update(|cx| {
+                            cx.update(|cx| {
                                 if !cx.windows().is_empty() {
                                     driver_ctrl
                                         .metrics
@@ -543,7 +780,7 @@ fn main() -> Result<()> {
                         }
 
                         // Restore from tray (re-open GPUI window attached to live SpikeModel).
-                        let _ = cx.update(|cx| {
+                        cx.update(|cx| {
                             if let Err(err) = driver_ctrl.open_or_focus_window(cx) {
                                 eprintln!("[driver] restore failed on cycle {cycle}: {err:#}");
                                 driver_ctrl
@@ -553,12 +790,12 @@ fn main() -> Result<()> {
                                     .errors
                                     .push(format!("cycle {cycle} restore: {err:#}"));
                             }
-                            if tray_shell_registered {
-                                if let Some(tray) = driver_ctrl.tray.borrow().as_ref() {
-                                    let _ = tray.set_tooltip(&format!(
-                                        "EasyTier S3 Spike — cycle {cycle}/{cycles}"
-                                    ));
-                                }
+                            if registered_now
+                                && let Some(tray) = driver_ctrl.tray.borrow().as_ref()
+                            {
+                                let _ = tray.set_tooltip(&format!(
+                                    "EasyTier S3 Spike — cycle {cycle}/{cycles}"
+                                ));
                             }
                             driver_ctrl
                                 .metrics
@@ -570,7 +807,7 @@ fn main() -> Result<()> {
                     }
 
                     // Final ping after all cycles to verify tonic client is still healthy.
-                    let _ = cx.update(|_| driver_ctrl.send_ping());
+                    cx.update(|_| driver_ctrl.send_ping());
                     cx.background_executor()
                         .timer(Duration::from_millis(60))
                         .await;
@@ -584,78 +821,20 @@ fn main() -> Result<()> {
             }
         });
 
-    // GPUI application().run(...) has returned cleanly. Verify invariants.
-    let total_elapsed = run_started.elapsed();
-    let m = metrics.lock().expect("metrics lock");
-    let trace = exit_trace.lock().expect("exit trace lock");
-    let exit_elapsed = trace
-        .started_at
-        .map(|s| s.elapsed())
-        .unwrap_or(Duration::ZERO);
-    let phase_order: Vec<ExitPhase> = trace.phases.iter().map(|(p, _)| *p).collect();
-
-    println!("=== S3 UI Runtime Coexistence Summary ===");
-    println!("total_elapsed        : {total_elapsed:?}");
-    println!("exit_elapsed         : {exit_elapsed:?} (limit: 5s)");
-    println!("fake_tonic_server    : {:?}", m.server_addr);
-    println!("tray_created         : {}", m.tray_created);
-    println!("tray_shell_registered: {}", m.tray_shell_registered);
-    println!(
-        "tray_rect            : {}",
-        m.tray_rect.as_deref().unwrap_or("none")
-    );
-    println!(
-        "cycles_completed     : {}/{}",
-        m.cycles_completed, cfg.cycles
-    );
-    println!("events_visible       : {}", m.events_while_visible);
-    println!("events_hidden        : {}", m.events_while_hidden);
-    println!("last_event_seq       : {}", m.last_event_seq);
-    println!("pongs_received       : {}", m.pongs_received);
-    println!(
-        "exit_phases          : {:?}",
-        trace
-            .phases
-            .iter()
-            .map(|(p, d)| format!("{} (+{d:?})", p.as_str()))
-            .collect::<Vec<_>>()
-    );
-
-    if !m.errors.is_empty() || !trace.errors.is_empty() {
-        bail!(
-            "runtime errors recorded: metrics={:?}, exit={:?}",
-            m.errors,
-            trace.errors
-        );
-    }
-
-    let expected_order = vec![
-        ExitPhase::StopSubscription,
-        ExitPhase::StopTokio,
-        ExitPhase::QuitGpui,
-    ];
-    if phase_order != expected_order {
-        bail!("unexpected exit order: got {phase_order:?}, expected {expected_order:?}");
-    }
-    if exit_elapsed >= Duration::from_secs(5) {
-        bail!("exit exceeded 5s budget: {exit_elapsed:?}");
-    }
-    if !cfg.interactive && cfg.cycles > 0 {
-        if m.cycles_completed != cfg.cycles {
-            bail!(
-                "expected {} cycles, completed {}",
-                cfg.cycles,
-                m.cycles_completed
-            );
+    // GPUI application().run(...) returned cleanly (Windows/Linux; macOS exits inside
+    // `[NSApplication terminate:]` after `on_app_quit`).
+    if !verified.swap(true, Ordering::SeqCst) {
+        finalize_and_verify(run_started, &cfg, &metrics, &exit_trace)?;
+    } else {
+        let trace = exit_trace.lock().expect("exit trace lock");
+        let post_run_exit_elapsed = trace
+            .started_at
+            .map(|s| s.elapsed())
+            .unwrap_or(Duration::ZERO);
+        if post_run_exit_elapsed >= Duration::from_secs(5) {
+            bail!("post-run exit exceeded 5s budget: {post_run_exit_elapsed:?}");
         }
-        if m.events_while_hidden == 0 {
-            bail!("received 0 tonic stream events while window was hidden in tray");
-        }
-        if m.pongs_received == 0 {
-            bail!("received 0 tonic Ping/Pong responses");
-        }
+        eprintln!("[exit] gpui run() returned cleanly ({post_run_exit_elapsed:?})");
     }
-
-    println!("VERDICT: PASS");
     Ok(())
 }

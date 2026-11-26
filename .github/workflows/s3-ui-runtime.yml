@@ -1,0 +1,550 @@
+name: S3 UI Runtime Coexistence
+
+on:
+  push:
+    branches:
+      - wbs/S3-ui-runtime
+    paths:
+      - 'spikes/ui-runtime/**'
+      - '.github/workflows/s3-ui-runtime.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-x11:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install Linux build, X11, SNI panel, and Vulkan software renderer deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang cmake pkg-config libssl-dev \
+            libfontconfig1-dev libfreetype6-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev libxcb-dri3-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libdbus-1-dev \
+            mesa-vulkan-drivers vulkan-tools \
+            xvfb openbox xfce4-panel dbus-x11 libglib2.0-bin \
+            imagemagick x11-utils fonts-dejavu-core
+      - name: Install pinned protoc
+        shell: pwsh
+        run: ./.github/scripts/setup-protoc.ps1
+      - name: Format, clippy, test, and build ui-runtime-spike
+        working-directory: spikes/ui-runtime
+        run: |
+          rustc --version
+          protoc --version
+          cargo fmt -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          cargo build --locked
+      - name: Run S3 coexistence spike on Xvfb + xfce4-panel (X11)
+        working-directory: spikes/ui-runtime
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/linux-x11
+          mkdir -p "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml"
+          cat > "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfce4-panel" version="1.0">
+            <property name="configver" type="int" value="2"/>
+            <property name="panels" type="array">
+              <value type="int" value="1"/>
+              <property name="dark-mode" type="bool" value="true"/>
+              <property name="panel-1" type="empty">
+                <property name="position" type="string" value="p=6;x=640;y=18"/>
+                <property name="length" type="double" value="100"/>
+                <property name="position-locked" type="bool" value="true"/>
+                <property name="icon-size" type="uint" value="24"/>
+                <property name="size" type="uint" value="36"/>
+                <property name="plugin-ids" type="array">
+                  <value type="int" value="1"/>
+                  <value type="int" value="2"/>
+                </property>
+              </property>
+            </property>
+            <property name="plugins" type="empty">
+              <property name="plugin-1" type="string" value="separator">
+                <property name="expand" type="bool" value="true"/>
+                <property name="style" type="uint" value="0"/>
+              </property>
+              <property name="plugin-2" type="string" value="systray">
+                <property name="square-icons" type="bool" value="true"/>
+                <property name="icon-size" type="int" value="24"/>
+                <property name="symbolic-icons" type="bool" value="false"/>
+              </property>
+            </property>
+          </channel>
+          EOF
+
+          xvfb-run -a -s "-screen 0 1280x720x24" dbus-run-session -- bash -euo pipefail -c '
+            unset WAYLAND_DISPLAY
+            export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/xdg-x11}"
+            mkdir -p "$XDG_RUNTIME_DIR"
+            chmod 700 "$XDG_RUNTIME_DIR"
+
+            echo "=== Vulkan summary ==="
+            vulkaninfo --summary || true
+
+            openbox > artifacts/linux-x11/openbox.log 2>&1 &
+            OB_PID=$!
+            sleep 0.5
+
+            xfce4-panel --disable-wm-check > artifacts/linux-x11/xfce4-panel.log 2>&1 &
+            PANEL_PID=$!
+
+            echo "=== Waiting for org.kde.StatusNotifierWatcher ==="
+            for i in $(seq 1 40); do
+              if gdbus call --session \
+                --dest org.freedesktop.DBus \
+                --object-path /org/freedesktop/DBus \
+                --method org.freedesktop.DBus.GetNameOwner \
+                org.kde.StatusNotifierWatcher >/dev/null 2>&1; then
+                break
+              fi
+              sleep 0.25
+            done
+
+            {
+              echo "=== Watcher owner ==="
+              gdbus call --session \
+                --dest org.freedesktop.DBus \
+                --object-path /org/freedesktop/DBus \
+                --method org.freedesktop.DBus.GetNameOwner \
+                org.kde.StatusNotifierWatcher
+              echo "=== Host registered (pre-run) ==="
+              gdbus call --session \
+                --dest org.kde.StatusNotifierWatcher \
+                --object-path /StatusNotifierWatcher \
+                --method org.freedesktop.DBus.Properties.Get \
+                org.kde.StatusNotifierWatcher IsStatusNotifierHostRegistered
+            } | tee artifacts/linux-x11/dbus-evidence.txt
+
+            echo "=== Step A: 50 cycles with hold for programmatic D-Bus + screenshot evidence ==="
+            READY_FILE="$PWD/artifacts/linux-x11/ready.txt"
+            rm -f "$READY_FILE"
+            cargo run --locked -p ui-runtime-spike -- \
+              --cycles 50 --hold-ms 4000 \
+              --expect-compositor X11 --require-tray \
+              --ready-file "$READY_FILE" \
+              > artifacts/linux-x11/spike-hold.log 2>&1 &
+            SPIKE_PID=$!
+
+            for i in $(seq 1 120); do
+              if [ -f "$READY_FILE" ]; then
+                break
+              fi
+              if ! kill -0 "$SPIKE_PID" 2>/dev/null; then
+                cat artifacts/linux-x11/spike-hold.log
+                exit 1
+              fi
+              sleep 0.25
+            done
+            test -f "$READY_FILE"
+            sleep 0.8
+
+            REAL_PID=$(grep "^pid=" "$READY_FILE" | cut -d= -f2)
+            ITEM_BUS="org.kde.StatusNotifierItem-${REAL_PID}-1"
+            {
+              echo "=== Ready file ==="
+              cat "$READY_FILE"
+              echo "=== RegisteredStatusNotifierItems (while running) ==="
+              ITEMS=$(gdbus call --session \
+                --dest org.kde.StatusNotifierWatcher \
+                --object-path /StatusNotifierWatcher \
+                --method org.freedesktop.DBus.Properties.Get \
+                org.kde.StatusNotifierWatcher RegisteredStatusNotifierItems)
+              echo "$ITEMS"
+              echo "$ITEMS" | grep -q "$ITEM_BUS"
+              echo "=== StatusNotifierItem properties ($ITEM_BUS) ==="
+              gdbus call --session \
+                --dest "$ITEM_BUS" \
+                --object-path /StatusNotifierItem \
+                --method org.freedesktop.DBus.Properties.Get \
+                org.kde.StatusNotifierItem Id
+              gdbus call --session \
+                --dest "$ITEM_BUS" \
+                --object-path /StatusNotifierItem \
+                --method org.freedesktop.DBus.Properties.Get \
+                org.kde.StatusNotifierItem Title
+              gdbus call --session \
+                --dest "$ITEM_BUS" \
+                --object-path /StatusNotifierItem \
+                --method org.freedesktop.DBus.Properties.Get \
+                org.kde.StatusNotifierItem Status
+              echo "=== DBusMenu GetLayout (/MenuBar) ==="
+              gdbus call --session \
+                --dest "$ITEM_BUS" \
+                --object-path /MenuBar \
+                --method com.canonical.dbusmenu.GetLayout \
+                0 -1 "[]"
+            } | tee -a artifacts/linux-x11/dbus-evidence.txt
+
+            import -window root artifacts/linux-x11/linux-x11-desktop.png
+            convert artifacts/linux-x11/linux-x11-desktop.png -crop 1280x64+0+0 +repage artifacts/linux-x11/linux-x11-panel.png
+            convert artifacts/linux-x11/linux-x11-desktop.png -crop 240x64+1040+0 +repage -scale 300% artifacts/linux-x11/linux-x11-tray-zoom.png
+
+            wait "$SPIKE_PID"
+            cat artifacts/linux-x11/spike-hold.log
+
+            echo "=== RegisteredStatusNotifierItems (post-exit) ===" | tee -a artifacts/linux-x11/dbus-evidence.txt
+            POST_ITEMS=$(gdbus call --session \
+              --dest org.kde.StatusNotifierWatcher \
+              --object-path /StatusNotifierWatcher \
+              --method org.freedesktop.DBus.Properties.Get \
+              org.kde.StatusNotifierWatcher RegisteredStatusNotifierItems)
+            echo "$POST_ITEMS" | tee -a artifacts/linux-x11/dbus-evidence.txt
+            if echo "$POST_ITEMS" | grep -q "$ITEM_BUS"; then
+              echo "ERROR: ghost SNI item remained after exit: $ITEM_BUS" >&2
+              exit 1
+            fi
+
+            echo "=== Step B: Exact acceptance command (cargo run -p ui-runtime-spike -- --cycles 50) ==="
+            timeout 90 cargo run --locked -p ui-runtime-spike -- --cycles 50 | tee artifacts/linux-x11/spike-exact.log
+            grep -q "compositor_name      : X11" artifacts/linux-x11/spike-exact.log
+            grep -q "tray_shell_registered: true" artifacts/linux-x11/spike-exact.log
+            grep -q "VERDICT: PASS" artifacts/linux-x11/spike-exact.log
+
+            kill "$PANEL_PID" "$OB_PID" 2>/dev/null || true
+          '
+      - name: Upload Linux X11 evidence artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3-linux-x11-evidence
+          path: spikes/ui-runtime/artifacts/linux-x11/
+          if-no-files-found: warn
+
+  linux-wayland:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install Linux build, Wayland headless compositor, SNI bar, and Vulkan software renderer deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang cmake pkg-config libssl-dev \
+            libfontconfig1-dev libfreetype6-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev libxcb-dri3-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libdbus-1-dev \
+            mesa-vulkan-drivers vulkan-tools \
+            sway waybar grim dbus-x11 libglib2.0-bin \
+            imagemagick fonts-dejavu-core
+      - name: Install pinned protoc
+        shell: pwsh
+        run: ./.github/scripts/setup-protoc.ps1
+      - name: Format, clippy, test, and build ui-runtime-spike
+        working-directory: spikes/ui-runtime
+        run: |
+          rustc --version
+          protoc --version
+          cargo fmt -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          cargo build --locked
+      - name: Run S3 coexistence spike on headless sway + waybar (Wayland)
+        working-directory: spikes/ui-runtime
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/linux-wayland
+          mkdir -p "$HOME/.config/sway" "$HOME/.config/waybar"
+
+          cat > "$HOME/.config/waybar/config" <<'EOF'
+          {
+            "layer": "top",
+            "position": "top",
+            "height": 36,
+            "modules-left": ["custom/label"],
+            "modules-right": ["tray"],
+            "custom/label": {
+              "exec": "echo 'EasyTier S3 Wayland CI'",
+              "interval": "once"
+            },
+            "tray": {
+              "icon-size": 24,
+              "spacing": 8
+            }
+          }
+          EOF
+
+          cat > "$HOME/.config/waybar/style.css" <<'EOF'
+          * {
+            font-family: "DejaVu Sans", sans-serif;
+            font-size: 13px;
+          }
+          window#waybar {
+            background-color: #1f2937;
+            color: #f3f4f6;
+          }
+          #tray {
+            padding: 0 10px;
+          }
+          EOF
+
+          cat > "$HOME/.config/sway/config" <<'EOF'
+          xwayland disable
+          output HEADLESS-1 resolution 1280x720
+          exec waybar
+          EOF
+
+          dbus-run-session -- bash -euo pipefail -c '
+            unset DISPLAY
+            export XDG_RUNTIME_DIR="/tmp/xdg-wayland"
+            mkdir -p "$XDG_RUNTIME_DIR"
+            chmod 700 "$XDG_RUNTIME_DIR"
+            export WLR_BACKENDS=headless
+            export WLR_LIBINPUT_NO_DEVICES=1
+            export WLR_RENDERER=pixman
+            export SWAYSOCK="$XDG_RUNTIME_DIR/sway-ipc.sock"
+
+            echo "=== Vulkan summary ==="
+            vulkaninfo --summary || true
+
+            sway -c "$HOME/.config/sway/config" > artifacts/linux-wayland/sway.log 2>&1 &
+            SWAY_PID=$!
+
+            echo "=== Waiting for Wayland socket ==="
+            for i in $(seq 1 40); do
+              SOCK=$(ls "$XDG_RUNTIME_DIR"/wayland-* 2>/dev/null | grep -v "\.lock$" | head -n 1 || true)
+              if [ -n "$SOCK" ]; then
+                export WAYLAND_DISPLAY=$(basename "$SOCK")
+                break
+              fi
+              sleep 0.25
+            done
+            echo "WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-UNSET}"
+            test -n "${WAYLAND_DISPLAY:-}"
+
+            echo "=== Waiting for org.kde.StatusNotifierWatcher (waybar) ==="
+            for i in $(seq 1 40); do
+              if gdbus call --session \
+                --dest org.freedesktop.DBus \
+                --object-path /org/freedesktop/DBus \
+                --method org.freedesktop.DBus.GetNameOwner \
+                org.kde.StatusNotifierWatcher >/dev/null 2>&1; then
+                break
+              fi
+              sleep 0.25
+            done
+
+            {
+              echo "=== WAYLAND_DISPLAY=$WAYLAND_DISPLAY ==="
+              echo "=== Watcher owner ==="
+              gdbus call --session \
+                --dest org.freedesktop.DBus \
+                --object-path /org/freedesktop/DBus \
+                --method org.freedesktop.DBus.GetNameOwner \
+                org.kde.StatusNotifierWatcher
+              echo "=== Host registered (pre-run) ==="
+              gdbus call --session \
+                --dest org.kde.StatusNotifierWatcher \
+                --object-path /StatusNotifierWatcher \
+                --method org.freedesktop.DBus.Properties.Get \
+                org.kde.StatusNotifierWatcher IsStatusNotifierHostRegistered
+            } | tee artifacts/linux-wayland/dbus-evidence.txt
+
+            echo "=== Step A: 50 cycles with hold for programmatic D-Bus + grim screenshot evidence ==="
+            READY_FILE="$PWD/artifacts/linux-wayland/ready.txt"
+            rm -f "$READY_FILE"
+            cargo run --locked -p ui-runtime-spike -- \
+              --cycles 50 --hold-ms 4000 \
+              --expect-compositor Wayland --require-tray \
+              --ready-file "$READY_FILE" \
+              > artifacts/linux-wayland/spike-hold.log 2>&1 &
+            SPIKE_PID=$!
+
+            for i in $(seq 1 120); do
+              if [ -f "$READY_FILE" ]; then
+                break
+              fi
+              if ! kill -0 "$SPIKE_PID" 2>/dev/null; then
+                cat artifacts/linux-wayland/spike-hold.log
+                exit 1
+              fi
+              sleep 0.25
+            done
+            test -f "$READY_FILE"
+            sleep 0.8
+
+            REAL_PID=$(grep "^pid=" "$READY_FILE" | cut -d= -f2)
+            ITEM_BUS="org.kde.StatusNotifierItem-${REAL_PID}-1"
+            {
+              echo "=== Ready file ==="
+              cat "$READY_FILE"
+              echo "=== RegisteredStatusNotifierItems (while running) ==="
+              ITEMS=$(gdbus call --session \
+                --dest org.kde.StatusNotifierWatcher \
+                --object-path /StatusNotifierWatcher \
+                --method org.freedesktop.DBus.Properties.Get \
+                org.kde.StatusNotifierWatcher RegisteredStatusNotifierItems)
+              echo "$ITEMS"
+              echo "$ITEMS" | grep -q "$ITEM_BUS"
+              echo "=== StatusNotifierItem properties ($ITEM_BUS) ==="
+              gdbus call --session \
+                --dest "$ITEM_BUS" \
+                --object-path /StatusNotifierItem \
+                --method org.freedesktop.DBus.Properties.Get \
+                org.kde.StatusNotifierItem Id
+              gdbus call --session \
+                --dest "$ITEM_BUS" \
+                --object-path /StatusNotifierItem \
+                --method org.freedesktop.DBus.Properties.Get \
+                org.kde.StatusNotifierItem Title
+              gdbus call --session \
+                --dest "$ITEM_BUS" \
+                --object-path /StatusNotifierItem \
+                --method org.freedesktop.DBus.Properties.Get \
+                org.kde.StatusNotifierItem Status
+              echo "=== DBusMenu GetLayout (/MenuBar) ==="
+              gdbus call --session \
+                --dest "$ITEM_BUS" \
+                --object-path /MenuBar \
+                --method com.canonical.dbusmenu.GetLayout \
+                0 -1 "[]"
+            } | tee -a artifacts/linux-wayland/dbus-evidence.txt
+
+            grim artifacts/linux-wayland/linux-wayland-desktop.png
+            convert artifacts/linux-wayland/linux-wayland-desktop.png -crop 1280x64+0+0 +repage artifacts/linux-wayland/linux-wayland-panel.png
+            convert artifacts/linux-wayland/linux-wayland-desktop.png -crop 240x64+1040+0 +repage -scale 300% artifacts/linux-wayland/linux-wayland-tray-zoom.png
+
+            wait "$SPIKE_PID"
+            cat artifacts/linux-wayland/spike-hold.log
+
+            echo "=== RegisteredStatusNotifierItems (post-exit) ===" | tee -a artifacts/linux-wayland/dbus-evidence.txt
+            POST_ITEMS=$(gdbus call --session \
+              --dest org.kde.StatusNotifierWatcher \
+              --object-path /StatusNotifierWatcher \
+              --method org.freedesktop.DBus.Properties.Get \
+              org.kde.StatusNotifierWatcher RegisteredStatusNotifierItems)
+            echo "$POST_ITEMS" | tee -a artifacts/linux-wayland/dbus-evidence.txt
+            if echo "$POST_ITEMS" | grep -q "$ITEM_BUS"; then
+              echo "ERROR: ghost SNI item remained after exit: $ITEM_BUS" >&2
+              exit 1
+            fi
+
+            echo "=== Step B: Exact acceptance command (cargo run -p ui-runtime-spike -- --cycles 50) ==="
+            timeout 90 cargo run --locked -p ui-runtime-spike -- --cycles 50 | tee artifacts/linux-wayland/spike-exact.log
+            grep -q "compositor_name      : Wayland" artifacts/linux-wayland/spike-exact.log
+            grep -q "tray_shell_registered: true" artifacts/linux-wayland/spike-exact.log
+            grep -q "VERDICT: PASS" artifacts/linux-wayland/spike-exact.log
+
+            kill "$SWAY_PID" 2>/dev/null || true
+          '
+      - name: Upload Linux Wayland evidence artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3-linux-wayland-evidence
+          path: spikes/ui-runtime/artifacts/linux-wayland/
+          if-no-files-found: warn
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned protoc
+        shell: pwsh
+        run: ./.github/scripts/setup-protoc.ps1
+      - name: Format, clippy, test, and build ui-runtime-spike
+        working-directory: spikes/ui-runtime
+        run: |
+          rustc --version
+          protoc --version
+          cargo fmt -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          cargo build --locked
+      - name: Run S3 coexistence spike on macOS GUI session
+        working-directory: spikes/ui-runtime
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/macos
+
+          echo "=== Step A: 50 cycles with hold for NSStatusItem + CGWindowList + screencapture evidence ==="
+          READY_FILE="$PWD/artifacts/macos/ready.txt"
+          rm -f "$READY_FILE"
+          cargo run --locked -p ui-runtime-spike -- \
+            --cycles 50 --hold-ms 4000 --require-tray \
+            --ready-file "$READY_FILE" \
+            > artifacts/macos/spike-hold.log 2>&1 &
+          SPIKE_PID=$!
+
+          for i in $(seq 1 120); do
+            if [ -f "$READY_FILE" ]; then
+              break
+            fi
+            if ! kill -0 "$SPIKE_PID" 2>/dev/null; then
+              cat artifacts/macos/spike-hold.log
+              exit 1
+            fi
+            sleep 0.25
+          done
+          test -f "$READY_FILE"
+          sleep 0.8
+
+          REAL_PID=$(grep "^pid=" "$READY_FILE" | cut -d= -f2)
+          {
+            echo "=== Ready file ==="
+            cat "$READY_FILE"
+            echo "=== CGWindowListCopyWindowInfo for PID $REAL_PID ==="
+            swift -e "
+              import CoreGraphics
+              import Foundation
+              let pid = Int32(${REAL_PID})
+              if let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] {
+                for w in list {
+                  if let ownerPid = w[kCGWindowOwnerPID as String] as? Int32, ownerPid == pid {
+                    let layer = w[kCGWindowLayer as String] ?? -1
+                    let name = w[kCGWindowName as String] ?? \"\"
+                    let bounds = w[kCGWindowBounds as String] ?? [:]
+                    let onScreen = w[kCGWindowIsOnscreen as String] ?? false
+                    print(\"pid=\(ownerPid) layer=\(layer) onScreen=\(onScreen) name=\(name) bounds=\(bounds)\")
+                  }
+                }
+              }
+            "
+          } | tee artifacts/macos/macos-evidence.txt
+
+          screencapture -x artifacts/macos/macos-desktop.png || echo "screencapture full failed" >&2
+          if [ -f artifacts/macos/macos-desktop.png ]; then
+            sips -g pixelWidth -g pixelHeight artifacts/macos/macos-desktop.png | tee -a artifacts/macos/macos-evidence.txt
+            # Capture top menu bar strip directly via screencapture -R
+            WIDTH=$(sips -g pixelWidth artifacts/macos/macos-desktop.png | awk '/pixelWidth/{print $2}')
+            screencapture -x -R "0,0,${WIDTH},60" artifacts/macos/macos-menubar.png || true
+          fi
+
+          # Also capture a tight crop around tray_rect_raw if reported
+          RECT_LINE=$(grep "^tray_rect_raw=" "$READY_FILE" || true)
+          if [ -n "$RECT_LINE" ]; then
+            IFS=',' read -r RX RY RW RH <<< "${RECT_LINE#tray_rect_raw=}"
+            echo "Detected tray_rect_raw: x=$RX y=$RY w=$RW h=$RH" | tee -a artifacts/macos/macos-evidence.txt
+            CX=$(python3 -c "print(max(0, int(float('$RX')) - 120))")
+            CY=$(python3 -c "print(max(0, int(float('$RY'))))")
+            screencapture -x -R "${CX},${CY},260,60" artifacts/macos/macos-tray-crop.png || true
+          fi
+
+          wait "$SPIKE_PID"
+          cat artifacts/macos/spike-hold.log
+          grep -q "ns_status_item_exists: Some(true)" artifacts/macos/spike-hold.log
+          grep -q "tray_shell_registered: true" artifacts/macos/spike-hold.log
+          grep -q "VERDICT: PASS" artifacts/macos/spike-hold.log
+
+          echo "=== Step B: Exact acceptance command (cargo run -p ui-runtime-spike -- --cycles 50) ==="
+          cargo run --locked -p ui-runtime-spike -- --cycles 50 | tee artifacts/macos/spike-exact.log
+          grep -q "ns_status_item_exists: Some(true)" artifacts/macos/spike-exact.log
+          grep -q "tray_shell_registered: true" artifacts/macos/spike-exact.log
+          grep -q "VERDICT: PASS" artifacts/macos/spike-exact.log
+      - name: Upload macOS evidence artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3-macos-evidence
+          path: spikes/ui-runtime/artifacts/macos/
+          if-no-files-found: warn

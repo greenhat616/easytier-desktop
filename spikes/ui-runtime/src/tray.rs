@@ -39,32 +39,31 @@ fn ensure_global_handlers_installed() {
                     ..
                 }
             );
-            if should_toggle {
-                if let Ok(guard) = dispatch_slot().lock() {
-                    if let Some(dispatch) = guard.as_ref() {
-                        let _ = dispatch.action_tx.try_send(TrayAction::ToggleWindow);
-                    }
-                }
+            if should_toggle
+                && let Ok(guard) = dispatch_slot().lock()
+                && let Some(dispatch) = guard.as_ref()
+            {
+                let _ = dispatch.action_tx.try_send(TrayAction::ToggleWindow);
             }
         }));
 
         MenuEvent::set_event_handler(Some(|event: MenuEvent| {
-            if let Ok(guard) = dispatch_slot().lock() {
-                if let Some(dispatch) = guard.as_ref() {
-                    let action = if event.id == dispatch.show_id {
-                        Some(TrayAction::ShowWindow)
-                    } else if event.id == dispatch.hide_id {
-                        Some(TrayAction::HideWindow)
-                    } else if event.id == dispatch.ping_id {
-                        Some(TrayAction::PingServer)
-                    } else if event.id == dispatch.quit_id {
-                        Some(TrayAction::Quit)
-                    } else {
-                        None
-                    };
-                    if let Some(action) = action {
-                        let _ = dispatch.action_tx.try_send(action);
-                    }
+            if let Ok(guard) = dispatch_slot().lock()
+                && let Some(dispatch) = guard.as_ref()
+            {
+                let action = if event.id == dispatch.show_id {
+                    Some(TrayAction::ShowWindow)
+                } else if event.id == dispatch.hide_id {
+                    Some(TrayAction::HideWindow)
+                } else if event.id == dispatch.ping_id {
+                    Some(TrayAction::PingServer)
+                } else if event.id == dispatch.quit_id {
+                    Some(TrayAction::Quit)
+                } else {
+                    None
+                };
+                if let Some(action) = action {
+                    let _ = dispatch.action_tx.try_send(action);
                 }
             }
         }));
@@ -81,11 +80,16 @@ pub enum TrayAction {
     Quit,
 }
 
+const TRAY_ID: &str = "easytier-s3-spike";
+#[cfg(target_os = "linux")]
+const TRAY_TITLE: &str = "EasyTier S3 Spike";
+
 /// Main-thread tray adapter combining `tray-icon 0.26.1` and `muda 0.21.2`.
 ///
 /// U1 reuse note: `TrayIcon` is `!Send` on Windows (`Rc<RefCell<...>>`) and creates a hidden
-/// Win32 `HWND` on the calling thread. Always construct and drop it on GPUI's main thread
-/// inside `application().run(...)` so GPUI's `GetMessageW` loop pumps `tray_proc`.
+/// Win32 `HWND` on the calling thread; on macOS it creates an `NSStatusItem` on the main thread;
+/// on Linux (`ksni`) it publishes a `StatusNotifierItem` over session D-Bus without requiring GTK.
+/// Always construct and drop it on GPUI's main thread inside `application().run(...)`.
 pub struct TrayAdapter {
     tray: TrayIcon,
     // Keep menu items alive if dynamic label/enabled updates are needed later.
@@ -123,12 +127,17 @@ impl TrayAdapter {
         });
 
         let icon = build_spike_icon().context("failed to build RGBA tray icon")?;
-        let tray = TrayIconBuilder::new()
+        let builder = TrayIconBuilder::new()
+            .with_id(TRAY_ID)
             .with_tooltip(tooltip)
             .with_icon(icon)
             .with_menu(Box::new(menu))
             .with_menu_on_left_click(false)
-            .with_menu_on_right_click(true)
+            .with_menu_on_right_click(true);
+        #[cfg(target_os = "linux")]
+        let builder = builder.with_title(TRAY_TITLE);
+
+        let tray = builder
             .build()
             .context("failed to register system tray icon")?;
 
@@ -146,17 +155,83 @@ impl TrayAdapter {
         self.action_rx.clone()
     }
 
+    pub fn tray_id(&self) -> &str {
+        &self.tray.id().0
+    }
+
     pub fn rect(&self) -> Option<Rect> {
         self.tray.rect()
     }
 
-    /// Probes whether the Windows Shell (`Shell_TrayWnd`) actually accepted `NIM_ADD`.
+    /// Returns `Some(true)` on macOS when `NSStatusItem` is allocated and retained,
+    /// `Some(false)` if missing, and `None` on non-macOS platforms.
+    pub fn has_ns_status_item(&self) -> Option<bool> {
+        #[cfg(target_os = "macos")]
+        {
+            Some(self.tray.ns_status_item().is_some())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
+    /// Probes whether the platform shell / tray host actually registered our icon.
     ///
-    /// `tray-icon 0.26.1` swallows `Shell_NotifyIconW(NIM_ADD)` failures so the hidden HWND can
-    /// re-register later on `TaskbarCreated`; `set_tooltip` calls `NIM_MODIFY`, which returns
-    /// `Ok(())` iff the icon is currently registered with Explorer (pinned or in overflow).
-    pub fn probe_shell_registered(&self, tooltip: &str) -> bool {
-        self.tray.set_tooltip(Some(tooltip)).is_ok()
+    /// - Windows: `tray-icon` swallows `NIM_ADD` failure to wait for `TaskbarCreated`;
+    ///   `set_tooltip` (`NIM_MODIFY`) or `rect()` (`Shell_NotifyIconGetRect`) confirms registration.
+    /// - macOS: verifies `ns_status_item().is_some()` and that its status bar button has a layout `rect()`.
+    /// - Linux (`ksni`): `tray-icon` passes `assume_sni_available(true)` and `set_tooltip` always returns `Ok`,
+    ///   so we query `org.kde.StatusNotifierWatcher` over session D-Bus (`gdbus`) for our PID's item.
+    pub fn describe_registration(&self, tooltip: &str) -> (bool, String) {
+        #[cfg(windows)]
+        {
+            let registered =
+                self.tray.set_tooltip(Some(tooltip)).is_ok() || self.tray.rect().is_some();
+            let label = match (registered, self.tray.rect()) {
+                (true, Some(rect)) => format!(
+                    "visible in shell at ({:.0}, {:.0}) {}x{}",
+                    rect.position.x, rect.position.y, rect.size.width, rect.size.height
+                ),
+                (true, None) => "registered in shell (rect unavailable)".to_owned(),
+                (false, _) => {
+                    "HWND alive, waiting for TaskbarCreated (no Shell_TrayWnd on this desktop)"
+                        .to_owned()
+                }
+            };
+            (registered, label)
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let _ = tooltip;
+            let has_item = self.tray.ns_status_item().is_some();
+            let rect = self.tray.rect();
+            let registered = has_item && rect.is_some();
+            let label = match (has_item, rect) {
+                (true, Some(rect)) => format!(
+                    "NSStatusItem visible at ({:.0}, {:.0}) {}x{}",
+                    rect.position.x, rect.position.y, rect.size.width, rect.size.height
+                ),
+                (true, None) => {
+                    "NSStatusItem allocated (status bar window rect pending)".to_owned()
+                }
+                (false, _) => "NSStatusItem missing".to_owned(),
+            };
+            (registered, label)
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let _ = tooltip;
+            probe_linux_sni_registration()
+        }
+
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+        {
+            let registered = self.tray.set_tooltip(Some(tooltip)).is_ok();
+            (registered, format!("registered={registered}"))
+        }
     }
 
     pub fn set_tooltip(&self, tooltip: &str) -> Result<()> {
@@ -165,13 +240,57 @@ impl TrayAdapter {
             .context("failed to update tray tooltip")
     }
 
-    /// Cleanly detaches event dispatch and removes the tray icon (`NIM_DELETE` + `DestroyWindow`)
-    /// before GPUI posts `WM_QUIT`, avoiding ghost icons in the Windows notification area.
+    /// Cleanly detaches event dispatch and removes the tray icon before GPUI quits,
+    /// avoiding ghost icons in the system tray / status bar.
     pub fn shutdown(self) {
         if let Ok(mut guard) = dispatch_slot().lock() {
             *guard = None;
         }
         drop(self.tray);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn probe_linux_sni_registration() -> (bool, String) {
+    let pid = std::process::id();
+    let expected = format!("org.kde.StatusNotifierItem-{pid}-");
+    let output = std::process::Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.kde.StatusNotifierWatcher",
+            "--object-path",
+            "/StatusNotifierWatcher",
+            "--method",
+            "org.freedesktop.DBus.Properties.Get",
+            "org.kde.StatusNotifierWatcher",
+            "RegisteredStatusNotifierItems",
+        ])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            let registered = stdout.contains(&expected);
+            let label = if registered {
+                format!("SNI registered with org.kde.StatusNotifierWatcher: {stdout}")
+            } else {
+                format!("SNI watcher reachable but item {expected}* not listed: {stdout}")
+            };
+            (registered, label)
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+            (
+                false,
+                format!("org.kde.StatusNotifierWatcher unavailable ({stderr})"),
+            )
+        }
+        Err(err) => (
+            false,
+            format!("unable to run gdbus for SNI registration probe ({err})"),
+        ),
     }
 }
 

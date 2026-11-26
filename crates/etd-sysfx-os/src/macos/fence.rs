@@ -104,7 +104,9 @@ fn verify(spec: FenceSpec, pid: u32) -> Result<FenceVerification, FenceError> {
         DirectionResult::Connected
     } else if probe.status.code() == Some(1)
         && packets(&rule, address.is_ipv6()).map_err(os)? > before
-        && (message.contains("timed out") || message.contains("Connection refused"))
+        && (message.contains("timed out")
+            || message.contains("Connection refused")
+            || message.contains("Operation not permitted"))
     {
         DirectionResult::Refused
     } else {

@@ -52,6 +52,16 @@ impl Reclaimer for MacReclaimer {
             let key = concrete(e);
             let rule =
                 pf::Rule::from_key(key).map_err(|e| ReclaimError::Indeterminate(e.to_string()))?;
+            if let EffectScope::Instance { instance, epoch } = &e.scope {
+                let spec = FenceSpec {
+                    instance: instance.clone(),
+                    epoch: *epoch,
+                    address: ([127, 0, 0, 1], rule.port).into(),
+                };
+                if pf::Rule::for_spec(&spec) != rule {
+                    return Err(ReclaimError::CredentialMismatch);
+                }
+            }
             if e.key != *key
                 || current.credential
                     != Some(Credential::ExclusiveContainer {

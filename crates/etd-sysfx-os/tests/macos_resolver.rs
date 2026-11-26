@@ -24,13 +24,15 @@ async fn rejected_magic_dns_preserves_foreign_resolvers() {
     let mut files = vec![];
     for (prefix, content) in [
         (
-            "etd-o3-foreign-marked-",
+            "etd-o3-foreign-marked",
             "# Added by easytier\nnameserver 192.0.2.18\n",
         ),
-        ("etd-o3-foreign-domain-", "nameserver 192.0.2.19\n"),
+        // Default Magic DNS zone used by the tested adapter profile.
+        ("et.net", "nameserver 192.0.2.19\n"),
     ] {
         let mut file = tempfile::Builder::new()
             .prefix(prefix)
+            .rand_bytes(0)
             .tempfile_in(dir)
             .unwrap();
         file.write_all(content.as_bytes()).unwrap();

@@ -1,6 +1,6 @@
 //! The kernel anchor is the source of truth across writer and host restarts.
 //! Mutate only its filter rules and read them back before returning.
-use super::{boot, command, output};
+use super::{boot, command, observe::listener, output};
 use crate::service::{HostFilesystem, NativeHostFilesystem};
 use etd_sysfx::{FenceSpec, ObjectKey};
 use nix::unistd::Uid;
@@ -254,6 +254,15 @@ fn active() -> io::Result<()> {
     {
         return Err(io::Error::other("PF is disabled"));
     }
+    let interfaces = output(command(PF).args(["-v", "-s", "Interfaces"]))?;
+    if !interfaces
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some("lo0") && !line.contains("skip"))
+    {
+        return Err(io::Error::other(
+            "PF loopback filtering is skipped or unavailable",
+        ));
+    }
     Ok(())
 }
 
@@ -313,7 +322,7 @@ pub(crate) fn uninstall_anchor(state: &std::path::Path, rollback: bool) -> io::R
         && reference_live(&t)?
     {
         // Do not surface an enable token in diagnostics.
-        if !writer.pf()?.args(["-X", &t]).output()?.status.success() {
+        if !writer.pf()?.args(["-X", &t]).output()?.status.success() || reference_live(&t)? {
             return Err(io::Error::other("PF reference release failed"));
         }
     }
@@ -337,6 +346,25 @@ pub(super) fn change(rule: Rule, install: bool) -> io::Result<bool> {
         return Err(io::Error::other(
             "PF generation label or management port already in use",
         ));
+    }
+    // A ledger-loss sweep has no process record. A remaining listener in
+    // either family is positive evidence that removing the fence is unsafe.
+    if !install && all.contains(&rule) {
+        let own =
+            token(&writer.1)?.ok_or_else(|| io::Error::other("missing product PF reference"))?;
+        if !reference_live(&own)? {
+            return Err(io::Error::other("unconfirmed product PF reference"));
+        }
+        for ip in [
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        ] {
+            if listener(std::net::SocketAddr::new(ip, rule.port))?.is_some() {
+                return Err(io::Error::other(
+                    "management listener still present; keeping its PF rules",
+                ));
+            }
+        }
     }
     let changed = if install {
         all.insert(rule)

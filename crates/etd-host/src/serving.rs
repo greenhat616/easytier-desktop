@@ -100,6 +100,11 @@ async fn abort_join<T>(
     task: &mut tokio::task::JoinHandle<T>,
     deadline: tokio::time::Instant,
 ) -> bool {
+    // A finished task is not awaited again: its handle may already have
+    // been polled to completion.
+    if task.is_finished() {
+        return true;
+    }
     task.abort();
     tokio::time::timeout_at(deadline, task).await.is_ok()
 }
@@ -183,9 +188,10 @@ where
     // Give the final ReleaseLease/Shutdown reply time to reach the client
     // after the orchestrator exits. Long-lived subscriptions must not pin
     // the listener or singleton lock indefinitely.
-    if tokio::time::timeout_at(served_by, &mut server)
-        .await
-        .is_err()
+    if !server.is_finished()
+        && tokio::time::timeout_at(served_by, &mut server)
+            .await
+            .is_err()
         && !abort_join(&mut server, supervised_by).await
     {
         quiescent = abandoned("server");
@@ -684,6 +690,31 @@ mod stop_bound_tests {
             .await
         });
         assert!(result.is_ok() && quiescent);
+    }
+
+    /// The orchestrator or the server ended first: its handle was already
+    /// polled to completion and must not be awaited again.
+    #[test]
+    fn handles_already_joined_are_not_awaited_again() {
+        let runtime = runtime();
+        let (_, quiescent) = runtime.block_on(async {
+            let mut orchestration = tokio::spawn(async {});
+            let mut server = tokio::spawn(async {});
+            (&mut orchestration).await.unwrap();
+            (&mut server).await.unwrap();
+            let (stop_server, _) = oneshot::channel::<()>();
+            wind_down(
+                short(),
+                None::<std::future::Ready<()>>,
+                orchestration,
+                stop_server,
+                server,
+                |_| async { Ok(0) },
+                || -> std::result::Result<(), String> { Ok(()) },
+            )
+            .await
+        });
+        assert!(quiescent);
     }
 
     #[test]

@@ -320,16 +320,6 @@ def verify_shared_driver_purge(service, baseline, stopped, inventory, foreign_ke
         assert result.returncode == 0, f"standalone purge exited {result.returncode}"
         assert_driver_notice(result.stdout, service.retained_drivers)
     assert not delta, f"post-purge native differences: {sorted(delta)}"
-    if not interfaces:
-        # Diagnostic run only. Restart to read the public live report after
-        # the offline KEEP. The canonical test calls uninstall directly.
-        service.start()
-        eventually("SCM running after purge", lambda: service.call("sc.exe", "query", "easytier-desk-host"),
-                   lambda status: "RUNNING" in status)
-        report = service.ctl("reclaim-report")
-        for c in report["candidates"]:
-            print(f"after standalone KEEP: candidate {c['kind']} {c['origin']} {c['identity']} scope={c.get('scope')}", flush=True)
-        service.stop()
 
 
 @contextmanager

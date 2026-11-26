@@ -108,7 +108,6 @@ class Service:
         self.core = self.cores / os.environ["ETD_G2_SHA"] / ("easytier-core" + ext)
         self.runtime = self.state / "run"
         self.retained_drivers = {}
-        self.purged_drivers = False
         self.preexisting_drivers = {}
         self.recorded_driver_images = set()
         self.adapter_indices = {}
@@ -249,7 +248,7 @@ class Service:
                 eventually("uninstall journal closed",
                            lambda: self.call(self.installer, "uninstall", "--status"),
                            lambda status: status.startswith("No maintenance journal:"))
-                if self.retained_drivers and (not self.purged_drivers or "left in place:" in result.stdout):
+                if self.retained_drivers:
                     assert_driver_notice(result.stdout, self.retained_drivers)
                 if self.preexisting_drivers:
                     assert_driver_notice(result.stdout, self.preexisting_drivers, recorded=self.recorded_driver_images)

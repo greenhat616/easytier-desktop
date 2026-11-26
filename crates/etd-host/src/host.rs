@@ -47,6 +47,8 @@ use serving::policy;
 #[cfg(windows)]
 use serving::valid_sid;
 pub(crate) use serving::{LayoutLock, serve_with_deps};
+#[path = "upgrade.rs"]
+pub(crate) mod upgrade;
 /// See [`serving::RUNTIME_SHUTDOWN`].
 pub(crate) const RUNTIME_SHUTDOWN: std::time::Duration = serving::RUNTIME_SHUTDOWN;
 const LEDGER: &str = "ledger.sqlite3";
@@ -1018,6 +1020,10 @@ async fn uninstall_locked(layout: &HostLayout, expected_id: Option<&str>) -> Res
     );
     if journal.phase() == Phase::Installing {
         return rollback_install(layout, &guard, journal);
+    }
+    if journal.upgrading() {
+        upgrade::roll_back(layout, &mut journal, &[])
+            .context("cannot restore an interrupted upgrade before uninstall")?;
     }
     journal.step(Phase::Disabled, || {
         NativeServiceManager.stop_and_disable(layout)

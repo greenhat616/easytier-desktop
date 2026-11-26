@@ -12,7 +12,7 @@ deleted (deleting a lock file while someone waits on it would allow a second loc
 | Lock | File | Kind | Held by |
 | --- | --- | --- | --- |
 | Singleton (host lifetime) | `host.lock` | non-blocking; a second holder gets "host already running; stop it before maintenance" | a running host, and every maintenance command that opens the ledger |
-| Maintenance command | `maintenance-command.lock` | blocking | `install`, `uninstall`, `resume-service`, and `reclaim` / `remove-core` in service mode |
+| Maintenance command | `maintenance-command.lock` | blocking | `install`, `upgrade`, `uninstall`, `resume-service`, and `reclaim` / `remove-core` in service mode |
 
 For the service both live in a separate maintenance directory (table below) that
 install and uninstall never remove. A user host locks its state directory, and also
@@ -107,6 +107,37 @@ becomes an admin allow-list entry.
 
 Any failure before `Installed` rolls back the journaled resources; if the rollback
 itself fails the message says to retry `uninstall`.
+
+## `upgrade`
+
+Administrator only. Run it from the new installation payload (the new `etd-host`
+with its bundled `cores/` beside it), never from the installed image, which it
+refuses. Under the maintenance lock, with the journal at `Installed`:
+
+1. If the installed image already has this build's bytes, every bundled kernel is
+   present and verifies, and the manifest is current, it only starts and verifies
+   the service, so a repeated upgrade is harmless.
+2. Stop and disable the service, take the singleton lock and mark the journal
+   `upgrading`. A marker left by a crashed attempt is first undone (below).
+3. Copy the new image beside the installed one as `etd-host.new`, apply the install
+   tree's permissions, check its ownership and hash, then rename the installed image
+   to `etd-host.prev` and the copy into place.
+4. Merge kernels: bundles this build trusts that are missing are verified and
+   published as new version directories; the old manifest is saved as
+   `upgrade-manifest.json` in the maintenance directory and the new one lists only
+   versions the new table trusts. Kernel directories are never deleted: ledger
+   records may name them, and `remove-core` or uninstall reclaims them.
+5. Rewrite the Linux unit if its content changed (`daemon-reload`), validate the
+   install tree, release the lock, start the service and wait for a verified
+   endpoint as in `install`.
+6. Commit: clear the marker, then delete `.prev` and the saved manifest.
+
+The ledger, the allow list, the repair index with its install key, and the state
+and maintenance directories are never touched. Any failure in steps 3 to 5 restores
+the previous image and manifest, removes only the kernel directories this attempt
+published, clears the marker and restarts the previous service. A crash leaves the
+marker; the next `upgrade` or `uninstall` restores the previous image and manifest
+first.
 
 ## `uninstall`
 

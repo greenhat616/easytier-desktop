@@ -10,7 +10,9 @@ import time
 import uuid
 
 from service import Desktop, Service, command, eventually, require_runner
-from consistency import UnpredictedChanges, check_closed, check_generation, installed_image
+from consistency import (
+    UnpredictedChanges, check_closed, check_generation, installed_image, managed_service_changes, scope,
+)
 from inventory import capture, file_identity
 import foreign
 
@@ -71,6 +73,24 @@ def assert_foreign(base, other, keys):
         assert other.rows.get(key) == base.rows[key], f"foreign fixture changed: {key}"
 
 
+def wait_for_firewall_readback(service, instance, epoch):
+    if os.name != "nt":
+        return
+    # Program rules are read back asynchronously after basic readiness.
+    # Wait for the ledger, then check each credential against the native rule.
+    expected_scopes = (scope(instance, epoch), {"core_binary": {"sha256": os.environ["ETD_G2_SHA"]}})
+    kinds = {"win.firewall_rule", "win.program_firewall_rule"}
+    def read():
+        return [(r["kind"], r["state"], bool((r.get("observation") or {}).get("credential")))
+                for r in service.effects() if r["scope"] in expected_scopes and r["kind"] in kinds]
+    def settled(rows):
+        if any(state in ("conflict", "candidate", "quarantined") for _, state, _ in rows):
+            raise AssertionError(f"firewall credential readback stopped: {rows}")
+        return {kind for kind, _, _ in rows} == kinds and all(
+            state == "applied" and credential for _, state, credential in rows)
+    eventually("firewall rule credentials", read, settled, timeout=240)
+
+
 def inventory_case():
     with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
         root = Path(directory)
@@ -119,6 +139,7 @@ def recovery():
         # Abrupt desktop exit after the durable request does not cancel launch.
         first = service.ready(instance)
         print(f"installed kernel ready: {first['state']} epoch={first['epoch']}", flush=True)
+        wait_for_firewall_readback(service, instance, first["epoch"])
         before = inventory()
         verify_generation(before, first)
         assert_foreign(baseline, before, keys)
@@ -132,6 +153,7 @@ def recovery():
             old_pid = service.crash_installed(image)
             first = service.ready(instance, after=old_epoch)
             service.verify_bundle()
+            wait_for_firewall_readback(service, instance, first["epoch"])
             after = inventory()
             check_closed(service, instance, old_epoch)
             assert ("process", str(old_pid)) not in after.rows, "killed process remains"
@@ -159,7 +181,7 @@ def recovery():
         check_closed(service, instance, first["epoch"])
         stopped = inventory()
         assert_foreign(baseline, stopped, keys)
-        remaining = baseline.delta(stopped)
+        remaining = baseline.delta(stopped) - managed_service_changes(baseline, stopped)
         if os.name == "nt":
             records = service.effects()
             for key in remaining.copy():

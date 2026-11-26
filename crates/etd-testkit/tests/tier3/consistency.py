@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import json
+import os
 import stat
 
 
@@ -15,6 +16,17 @@ def scope(instance, epoch):
 
 def installed_image(value):
     return Path(value[0] if isinstance(value, list) else value)
+
+
+def managed_service_changes(base, live):
+    # Windows SCM changed only IKEEXT Start from demand to automatic.
+    # Run 45834730897, Security 4657 record 583086, ruling in msg#1186.
+    key = ("service", "ikeext")
+    before = base.rows.get(key)
+    if (os.name == "nt" and isinstance(before, dict) and before.get("Start") == 3
+            and live.rows.get(key) == {**before, "Start": 2}):
+        return {key}
+    return set()
 
 
 def check_generation(base, live, records, instance, view):
@@ -130,9 +142,9 @@ def compare_generation(base, live, records, instance, view):
             raise AssertionError(f"unmapped local launch effect {kind}")
         assert matches <= live.rows.keys(), f"predicted but absent: {matches - live.rows.keys()}"
         expected.update(matches)
-    # Two upstream changes intentionally have no separate ownership record.
+    # These changes intentionally have no separate ownership record.
     # Match the precise object and transition, never a registry subtree.
-    exempt = set()
+    exempt = managed_service_changes(base, live)
     tun = ("interface", "/dev/net/tun")
     if tun not in base.rows and tun in live.rows and stat.S_ISCHR(live.rows[tun][0]):
         exempt.add(tun)

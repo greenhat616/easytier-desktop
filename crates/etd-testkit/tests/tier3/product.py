@@ -103,6 +103,25 @@ def recovery():
         baseline = inventory()
         differences = []
         def verify_generation(snapshot, view):
+            import re
+            entries = service.call(service.client, "--json", "logs", instance, "--tail", "1000")
+            sources = {"core_stdout": 0, "core_stderr": 0}
+            hits = 0
+            errors = 0
+            for raw in entries.splitlines():
+                line = json.loads(raw)
+                if line["epoch"] != view["epoch"] or line["source"] not in sources:
+                    continue
+                sources[line["source"]] += 1
+                message = line["text"]
+                if re.search(r"\b(?:HOME|TMPDIR|TEMPDIR|temp(?:orary)?(?:[ _-]?director(?:y|ies))?)\b|/tmp/", message, re.I):
+                    hits += 1
+                    errors += bool(re.search(r"\berror\b|\bfailed\b|not found|denied|unavailable", message, re.I))
+                    if not re.search(r"secret|password|bearer|token|authorization|g2-log-probe|private[ _-]?key", message, re.I):
+                        print(f"MF kernel {line['source']} epoch={view['epoch']}: {message[:360]}", flush=True)
+            print(f"MF actual kernel log epoch={view['epoch']} streams={sources} "
+                  f"HOME/TMPDIR/temp matches={hits} error matches={errors}", flush=True)
+            assert sum(sources.values()), "no actual kernel log entries available in this epoch"
             try:
                 check_generation(baseline, snapshot, service.effects(), instance, view)
             except UnpredictedChanges as err:

@@ -354,6 +354,40 @@ async fn planned_generation(os: &OsAdapters) -> Arc<MemoryLedger> {
     ledger
 }
 
+/// The unnamed MacUtun and route records as the engine hands them over.
+fn unnamed_utun_effects(os: &OsAdapters) -> Vec<Effect> {
+    unnamed_utun_intents()
+        .into_iter()
+        .map(|i| Effect {
+            id: EffectId(i.kind.to_string()),
+            kind: i.kind,
+            key: i.key,
+            scope: i.scope,
+            undo: i.undo,
+            persistence: i.persistence,
+            state: EffectState::Reclaiming,
+            boot: os.boot_id.current().unwrap(),
+            observation: None,
+            failures: 0,
+            last_error: None,
+            recorded_at: jiff::Timestamp::now(),
+        })
+        .collect()
+}
+
+/// Wait until every record probes absent, then reclaim reports it absent.
+async fn eventually_absent(os: &OsAdapters, effects: &[Effect]) {
+    for e in effects {
+        let r = os.reclaimers.iter().find(|r| r.kind() == e.kind).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while !matches!(r.probe(e).await, Probe::Absent) {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(r.reclaim(e).await.unwrap(), Reclaimed::AlreadyAbsent);
+    }
+}
+
 fn engine(os: OsAdapters, ledger: Arc<MemoryLedger>, kernel: Probe) -> ReclaimEngineImpl {
     let mut reclaimers = os.reclaimers;
     reclaimers.push(Arc::new(KernelProcess(kernel)));
@@ -367,9 +401,13 @@ fn engine(os: OsAdapters, ledger: Arc<MemoryLedger>, kernel: Probe) -> ReclaimEn
 }
 
 fn os_adapters(dir: &tempfile::TempDir) -> OsAdapters {
+    adapters_with_run(dir, dir.path().join("run"))
+}
+
+fn adapters_with_run(dir: &tempfile::TempDir, run_dir: std::path::PathBuf) -> OsAdapters {
     adapters(&OsConfig {
         state_dir: dir.path().into(),
-        run_dir: dir.path().join("run"),
+        run_dir,
         core_store_dir: std::env::current_exe().unwrap().parent().unwrap().into(),
     })
     .unwrap()
@@ -451,8 +489,17 @@ async fn unnamed_utun_held_by_a_live_generation_process_is_indeterminate() {
         }
     }
     let dir = tempfile::tempdir().unwrap();
-    let os = os_adapters(&dir);
-    let epoch_dir = dir.path().join("run").join(INSTANCE).join("1");
+    // The host's run directory is reached through a symlink; the kernel's
+    // -c names the same directory by its real path.
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
+    let os = adapters_with_run(&dir, dir.path().join("link").join("run"));
+    let epoch_dir = std::fs::canonicalize(&real)
+        .unwrap()
+        .join("run")
+        .join(INSTANCE)
+        .join("1");
     std::fs::create_dir_all(&epoch_dir).unwrap();
     let marker = dir.path().join("holder-ready");
     struct Fixture(std::process::Child);
@@ -485,28 +532,12 @@ async fn unnamed_utun_held_by_a_live_generation_process_is_indeterminate() {
     }
     let name = std::fs::read_to_string(&marker).unwrap();
     let pid = holder.0.id().to_string();
-    let effects: Vec<Effect> = unnamed_utun_intents()
-        .into_iter()
-        .map(|i| Effect {
-            id: EffectId(i.kind.to_string()),
-            kind: i.kind,
-            key: i.key,
-            scope: i.scope,
-            undo: i.undo,
-            persistence: i.persistence,
-            state: EffectState::Reclaiming,
-            boot: os.boot_id.current().unwrap(),
-            observation: None,
-            failures: 0,
-            last_error: None,
-            recorded_at: jiff::Timestamp::now(),
-        })
-        .collect();
+    let effects = unnamed_utun_effects(&os);
     for e in &effects {
         let r = os.reclaimers.iter().find(|r| r.kind() == e.kind).unwrap();
         let probe = r.probe(e).await;
         assert!(
-            matches!(&probe, Probe::Indeterminate(m) if m.contains(&pid)),
+            matches!(&probe, Probe::Indeterminate(m) if m.contains(&format!("PID {pid} "))),
             "{} while PID {pid} holds {name}: {probe:?}",
             e.kind
         );
@@ -517,16 +548,55 @@ async fn unnamed_utun_held_by_a_live_generation_process_is_indeterminate() {
     }
     holder.0.kill().unwrap();
     holder.0.wait().unwrap();
-    for e in &effects {
-        let r = os.reclaimers.iter().find(|r| r.kind() == e.kind).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(8);
-        while !matches!(r.probe(e).await, Probe::Absent) {
-            assert!(std::time::Instant::now() < deadline);
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert_eq!(r.reclaim(e).await.unwrap(), Reclaimed::AlreadyAbsent);
-    }
+    eventually_absent(&os, &effects).await;
     println!(
         "Live generation holder of {name} kept unnamed records indeterminate; absent after it exited"
+    );
+}
+
+/// The pinned kernel's utun socket is not close-on-exec, so a helper it was
+/// running (`sh -c "ifconfig ..."`) can outlive it holding the utun. While
+/// such a helper holds a utun, unnamed records stay indeterminate.
+#[tokio::test]
+#[ignore = "disposable macOS runner with allocated utun"]
+async fn unnamed_utun_inherited_by_a_kernel_helper_is_indeterminate() {
+    use std::os::unix::process::CommandExt;
+    assert_eq!(std::env::var("ETD_O3_CI").as_deref(), Ok("1"));
+    let dir = tempfile::tempdir().unwrap();
+    let os = os_adapters(&dir);
+    let effects = unnamed_utun_effects(&os);
+    let (socket, name) = utun(0);
+    struct Group(std::process::Child);
+    impl Drop for Group {
+        fn drop(&mut self) {
+            // SAFETY: signals the fixture's own process group.
+            unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
+            let _ = self.0.wait();
+        }
+    }
+    // Like upstream's run_shell_cmd: the shell inherits the open utun fd.
+    // The trailing `; true` keeps sh itself alive instead of exec'ing sleep.
+    let helper = Group(
+        Command::new("/bin/sh")
+            .args(["-c", "sleep 60; true"])
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    drop(socket);
+    for e in &effects {
+        let r = os.reclaimers.iter().find(|r| r.kind() == e.kind).unwrap();
+        let probe = r.probe(e).await;
+        assert!(
+            matches!(&probe, Probe::Indeterminate(m) if m.contains("may have inherited it")),
+            "{} while sh {} holds {name}: {probe:?}",
+            e.kind,
+            helper.0.id()
+        );
+    }
+    drop(helper);
+    eventually_absent(&os, &effects).await;
+    println!(
+        "Kernel helper sh holding inherited {name} kept unnamed records indeterminate; absent after it exited"
     );
 }

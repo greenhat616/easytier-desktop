@@ -979,6 +979,35 @@ pub async fn uninstall() -> Result<()> {
 
 /// Caller holds the maintenance-command mutex until this returns, including
 /// if this is the rollback of install's start/verification handoff.
+/// How long the uninstaller waits for the host lock after the service
+/// reported STOPPED.
+const STOPPED_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Take the host lock right after the service reported STOPPED. A host that
+/// could not confirm its wind-down keeps the lock until its process exits,
+/// which comes just after STOPPED: a held lock then means the service is
+/// still exiting. Wait up to `wait` for it, then fail with a retryable
+/// message.
+async fn lock_after_stop<T>(
+    wait: std::time::Duration,
+    mut lock: impl FnMut() -> std::io::Result<T>,
+) -> Result<T> {
+    let until = tokio::time::Instant::now() + wait;
+    loop {
+        match lock() {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if tokio::time::Instant::now() >= until {
+                    bail!(
+                        "the service reported STOPPED but its process is still exiting and holds the host lock; retry etd-host uninstall in a moment"
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            other => return Ok(other?),
+        }
+    }
+}
+
 async fn uninstall_locked(layout: &HostLayout, expected_id: Option<&str>) -> Result<()> {
     let mode = HostMode::Service;
     let first = LifecycleJournal::open(layout)?;
@@ -992,17 +1021,16 @@ async fn uninstall_locked(layout: &HostLayout, expected_id: Option<&str>) -> Res
     }
     // The running service itself holds the machine lock. Stopping and
     // disabling it is the only step that must precede acquiring that lock.
-    if let Some(journal) = &first
+    let lock = if let Some(journal) = &first
         && journal.phase() == Phase::Installed
     {
         require_journal(layout, journal.install_id())?;
         NativeServiceManager.stop_and_disable(layout)?;
-    }
-    let guard = LayoutLock::new(
-        NativeHostFilesystem.lock(layout)?,
-        endpoint(mode, layout)?,
-        HostForm::Service,
-    );
+        lock_after_stop(STOPPED_LOCK_WAIT, || NativeHostFilesystem.lock(layout)).await?
+    } else {
+        NativeHostFilesystem.lock(layout)?
+    };
+    let guard = LayoutLock::new(lock, endpoint(mode, layout)?, HostForm::Service);
     let Some(mut journal) = LifecycleJournal::open(layout)? else {
         ensure!(first.is_none(), "maintenance journal disappeared");
         // A second uninstall is success only if there are no foreign or
@@ -1859,5 +1887,54 @@ mod release_tests {
             drop(detached);
         });
         assert_eq!(owned, 5);
+    }
+}
+
+#[cfg(test)]
+mod lock_after_stop_tests {
+    use super::lock_after_stop;
+    use std::{io, time::Duration};
+
+    fn held() -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::WouldBlock, "held"))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lock_freed_by_the_exiting_service_is_taken() {
+        let mut tries = 0;
+        lock_after_stop(Duration::from_secs(10), || {
+            tries += 1;
+            if tries < 5 { held() } else { Ok(()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(tries, 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lock_still_held_after_the_wait_is_a_retryable_error() {
+        let started = tokio::time::Instant::now();
+        let error = lock_after_stop(Duration::from_secs(10), held)
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() >= Duration::from_secs(10));
+        assert!(started.elapsed() < Duration::from_secs(11));
+        assert!(
+            error.to_string().contains("retry etd-host uninstall"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn other_lock_errors_are_not_retried() {
+        let mut tries = 0;
+        let error = lock_after_stop(Duration::from_secs(10), || -> io::Result<()> {
+            tries += 1;
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(tries, 1);
+        assert!(error.to_string().contains("denied"));
     }
 }

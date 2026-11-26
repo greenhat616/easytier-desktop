@@ -477,7 +477,7 @@ pub(super) fn change(rule: Rule, install: bool, cores: &CoreIdentity) -> io::Res
         })?;
     }
     for h in remaining {
-        tracing::warn!(anchor=ANCHOR,port,pid=h.pid,euid=h.uid,image=%h.image.display(),"reclaimed fence; unrelated listener left running");
+        tracing::warn!(anchor=ANCHOR,port,pid=h.pid,euid=h.uid,image=?h.image,"reclaimed fence; unrelated listener left running");
     }
     Ok(changed)
 }

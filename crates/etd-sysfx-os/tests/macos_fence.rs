@@ -136,6 +136,19 @@ async fn fence_survives_host_death_and_reclaims_only_one_generation() {
     let (b, c) = tokio::join!(fence.install(&second), fence.install(&third));
     b.unwrap();
     c.unwrap();
+    for generation in [&second, &third] {
+        let etd_sysfx::ObjectKey::Fence {
+            container, rule, ..
+        } = fence.plan(generation).key
+        else {
+            panic!("expected a PF fence key")
+        };
+        let loaded = pf(&["-a", &container, "-sr"]);
+        for family in ["v4", "v6"] {
+            assert!(loaded.contains(&format!("label \"{rule}-{family}\"")));
+        }
+    }
+    println!("Both concurrent installs retained their IPv4 and IPv6 rules");
     assert_eq!(fence.remove(&third).await.unwrap(), Reclaimed::Removed);
     let other = TcpListener::bind(second.address).unwrap();
     let mut ipv6 = first.clone();

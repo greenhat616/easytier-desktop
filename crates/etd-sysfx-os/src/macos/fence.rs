@@ -59,9 +59,9 @@ fn verify(spec: FenceSpec, pid: u32) -> Result<FenceVerification, FenceError> {
             None => ListenerCheck::NotListening,
         })
     };
-    let writer = pf::Writer::lock().map_err(os)?;
     let rule = Rule::for_spec(&spec);
-    writer.confirm(&rule).map_err(os)?;
+    let confirm = || pf::Writer::lock()?.confirm(&rule);
+    confirm().map_err(os)?;
     let initial = listener()?;
     let mut result = FenceVerification {
         listener: initial,
@@ -111,7 +111,7 @@ fn verify(spec: FenceSpec, pid: u32) -> Result<FenceVerification, FenceError> {
     };
     result.host = host(address);
     result.listener = listener()?;
-    writer.confirm(&rule).map_err(os)?;
+    confirm().map_err(os)?;
     Ok(result)
 }
 #[async_trait]

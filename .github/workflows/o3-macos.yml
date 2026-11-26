@@ -54,6 +54,7 @@ jobs:
           set -euo pipefail
           root=(sudo -E env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "$(command -v cargo)")
           failed=0
+          "${root[@]}" nextest run --locked -p etd-sysfx-os --profile privileged --run-ignored only --lib -E 'test(missing_image_preserves_foreign_identity)' 2>&1 | tee "$RUNNER_TEMP/macos_holder_identity.log" || failed=1
           for target in macos_resolver macos_reclaim macos_fence; do
             "${root[@]}" nextest run --locked -p etd-sysfx-os --profile privileged --run-ignored only --test "$target" --no-fail-fast --success-output immediate 2>&1 | tee "$RUNNER_TEMP/$target.log" || failed=1
           done

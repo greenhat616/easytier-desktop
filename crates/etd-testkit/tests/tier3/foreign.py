@@ -97,8 +97,12 @@ def windows():
         nic = "etd-" + tag[:8]
         import ipaddress
         local = ipaddress.IPv4Address(ps(
-            "Start-Service iphlpsvc; (Get-NetIPConfiguration | Where-Object IPv4DefaultGateway "
-            "| Select-Object -First 1).IPv4Address[0].IPAddress"
+            "Start-Service iphlpsvc; "
+            "$route = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' "
+            "| Sort-Object RouteMetric,InterfaceIndex | Select-Object -First 1; "
+            "Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $route.InterfaceIndex "
+            "| Where-Object { $_.AddressState -eq 'Preferred' -and !$_.SkipAsSource } "
+            "| Select-Object -First 1 -ExpandProperty IPAddress"
         ))
         if local.is_loopback or local.is_unspecified:
             raise ValueError("no configured IPv4 endpoint for the foreign interface")

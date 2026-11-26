@@ -24,6 +24,19 @@ pub(super) struct Holder {
     pub protected: bool,
 }
 
+// Both scans are ordered by PID. Only core-UID listeners require a stable
+// executable identity; other users can change their own executable paths.
+fn same_listeners(before: &[Holder], after: &[Holder], core_uid: u32) -> bool {
+    before.len() == after.len()
+        && before.iter().zip(after).all(|(a, b)| {
+            if a.uid == core_uid {
+                a == b
+            } else {
+                a.pid == b.pid && a.uid == b.uid && a.started == b.started && a.sockets == b.sockets
+            }
+        })
+}
+
 // Include wildcard sockets in either family and retain every owner of a
 // shared socket. Strict listener verification has a separate exact-bind rule.
 fn sockets(port: u16) -> io::Result<BTreeMap<i32, BTreeSet<String>>> {
@@ -145,7 +158,7 @@ fn holder(
     let core_user = info.pbi_uid == core_uid;
     let required = core_user || matches!(check, ImageCheck::UtunOwner);
     // Only a process with the core's effective UID can own a protected listener.
-    // Keep every available image field in the snapshot for the precommit rescan.
+    // Other listeners' image fields are best-effort diagnostics.
     let image = image_field(required, image_path(pid))?;
     let vnode = match &image {
         Some(path) => image_field(required, fs::metadata(path).map(|m| (m.dev(), m.ino())))?,
@@ -237,7 +250,7 @@ impl CoreIdentity {
         }
         Ok(true)
     }
-    pub(super) fn scan(&self, port: u16) -> io::Result<Vec<Holder>> {
+    fn scan(&self, port: u16) -> io::Result<Vec<Holder>> {
         let owners = sockets(port)?;
         if owners.is_empty() {
             return Ok(vec![]);
@@ -246,6 +259,14 @@ impl CoreIdentity {
             .into_iter()
             .map(|(pid, sockets)| holder(pid, sockets, &self.store, self.uid, ImageCheck::Listener))
             .collect()
+    }
+    pub(super) fn confirm_removal(&self, port: u16, before: &[Holder]) -> io::Result<()> {
+        if !same_listeners(before, &self.scan(port)?, self.uid) {
+            return Err(io::Error::other(
+                "listener identity changed before fence removal",
+            ));
+        }
+        Ok(())
     }
     pub(super) fn before_removal(&self, port: u16) -> io::Result<Vec<Holder>> {
         let first = self.scan(port)?;
@@ -315,6 +336,45 @@ fn generation_config(pid: i32) -> io::Result<Option<PathBuf>> {
 mod tests {
     use super::*;
     use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+
+    #[test]
+    fn listener_rescan_requires_stable_image_only_for_core_uid() {
+        let core_uid = 501;
+        let snapshot = |uid| Holder {
+            pid: 42,
+            uid,
+            started: (1000, 3),
+            image: Some("listener".into()),
+            vnode: Some((4, 12)),
+            mapped: true,
+            sockets: BTreeSet::from(["127.0.0.1:8080".into()]),
+            protected: false,
+        };
+        let before = [snapshot(502)];
+        let mut after = [snapshot(502)];
+        after[0].image = None;
+        after[0].vnode = None;
+        after[0].mapped = false;
+        assert!(same_listeners(&before, &after, core_uid));
+        after[0].pid += 1;
+        assert!(!same_listeners(&before, &after, core_uid));
+        after[0].pid = before[0].pid;
+        after[0].started.1 += 1;
+        assert!(!same_listeners(&before, &after, core_uid));
+        after[0].started = before[0].started;
+        after[0].uid = core_uid;
+        assert!(!same_listeners(&before, &after, core_uid));
+        after[0].uid = 502;
+        after[0].sockets.clear();
+        assert!(!same_listeners(&before, &after, core_uid));
+        assert!(!same_listeners(&before, &[], core_uid));
+
+        let before = [snapshot(core_uid)];
+        let mut after = [snapshot(core_uid)];
+        assert!(same_listeners(&before, &after, core_uid));
+        after[0].mapped = false;
+        assert!(!same_listeners(&before, &after, core_uid));
+    }
 
     #[test]
     #[ignore = "disposable macOS runner with a second account"]

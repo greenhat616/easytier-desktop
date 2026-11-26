@@ -468,10 +468,8 @@ pub(super) fn change(rule: Rule, install: bool, cores: &CoreIdentity) -> io::Res
     };
     if changed {
         writer.load(&all, || {
-            if !install && cores.scan(port)? != remaining {
-                return Err(io::Error::other(
-                    "listener identity changed before fence removal",
-                ));
+            if !install {
+                cores.confirm_removal(port, &remaining)?;
             }
             Ok(())
         })?;

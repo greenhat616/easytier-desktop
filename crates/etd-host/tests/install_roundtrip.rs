@@ -13,6 +13,67 @@ use etd_sysfx_os::service::{
 };
 use std::{process::Command, sync::Arc, time::Duration};
 
+// Reuse the existing CI-only temporary-account fixture. Its password is
+// generated in memory and immediately erased; no credential is logged.
+#[cfg(windows)]
+#[path = "../../etd-ipc/tests/common/windows_account.rs"]
+mod windows_account;
+
+#[cfg(windows)]
+fn standard_user_handshake(
+    token: std::os::windows::io::OwnedHandle,
+    connector: Arc<LocalConnector>,
+    endpoint: Endpoint,
+) -> anyhow::Result<(etd_ipc::ServerIdentity, etd_contract::v1::Welcome)> {
+    // Isolate impersonation to a dedicated thread with a current-thread
+    // runtime so no unrelated operation can inherit the test account token.
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Security::{ImpersonateLoggedOnUser, RevertToSelf},
+    };
+    struct Revert;
+    impl Drop for Revert {
+        fn drop(&mut self) {
+            if unsafe { RevertToSelf() }.is_err() {
+                std::process::abort();
+            }
+        }
+    }
+    std::thread::spawn(move || -> anyhow::Result<_> {
+        unsafe {
+            ImpersonateLoggedOnUser(HANDLE(token.as_raw_handle()))?;
+        }
+        let _revert = Revert;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(15), async {
+                let (_, identity) = connector.connect(&endpoint).await?;
+                let channel = tonic::transport::Endpoint::from_static("http://localhost")
+                    .connect_with_connector(ClientIo::new(connector, endpoint))
+                    .await?;
+                let mut client = HostServiceClient::new(channel);
+                let mut request = tonic::Request::new(Hello {
+                    major: VERSION_MAJOR,
+                    minor: VERSION_MINOR,
+                    ..Default::default()
+                });
+                request.metadata_mut().insert(
+                    VERSION_METADATA_KEY,
+                    version_metadata_value().parse().unwrap(),
+                );
+                let welcome = client.handshake(request).await?.into_inner();
+                Ok::<_, anyhow::Error>((identity, welcome))
+            })
+            .await?
+        })
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("standard-user handshake thread panicked"))?
+}
+
 #[tokio::test]
 #[ignore = "requires a disposable elevated CI runner and ETD_HOST_CI_INSTALL=1"]
 async fn install_connect_uninstall() {
@@ -27,7 +88,17 @@ async fn install_connect_uninstall() {
     let layout = NativeHostFilesystem.service_layout().unwrap();
     assert!(!layout.state.exists());
     assert!(!layout.executable.exists());
-    let result = Command::new(binary).arg("install").output().unwrap();
+    let mut install = Command::new(binary);
+    install.arg("install");
+    #[cfg(windows)]
+    let token = {
+        let (token, etd_ipc::OsUserId::WindowsSid(sid)) = windows_account::logon() else {
+            panic!("expected Windows SID")
+        };
+        install.args(["--allow-user", &sid]);
+        token
+    };
+    let result = install.output().unwrap();
     assert!(
         result.status.success(),
         "{}",
@@ -61,7 +132,7 @@ async fn install_connect_uninstall() {
     });
     let handshake = tokio::time::timeout(Duration::from_secs(30), async {
         let channel = tonic::transport::Endpoint::from_static("http://localhost")
-            .connect_with_connector(ClientIo::new(connector, endpoint.clone()))
+            .connect_with_connector(ClientIo::new(connector.clone(), endpoint.clone()))
             .await?;
         let mut client = HostServiceClient::new(channel);
         let mut request = tonic::Request::new(Hello {
@@ -89,6 +160,8 @@ async fn install_connect_uninstall() {
         Ok::<_, Box<dyn std::error::Error>>(welcome)
     })
     .await;
+    #[cfg(windows)]
+    let standard = standard_user_handshake(token, connector.clone(), endpoint.clone());
     let cleanup = Command::new(binary).arg("uninstall").output().unwrap();
     assert!(
         cleanup.status.success(),
@@ -111,6 +184,24 @@ async fn install_connect_uninstall() {
         identity.peer.user,
         etd_ipc::OsUserId::WindowsSid("S-1-5-18".into())
     );
+    #[cfg(windows)]
+    {
+        let (server, welcome) =
+            standard.expect("standard account must authenticate using the enrolled SID");
+        assert_eq!(server.exe, installed_image);
+        assert_eq!(
+            server.peer.user,
+            etd_ipc::OsUserId::WindowsSid("S-1-5-18".into())
+        );
+        assert_eq!(
+            welcome.role(),
+            Role::Control,
+            "a non-elevated enrolled SID is not Admin"
+        );
+        println!(
+            "standard user verified LocalSystem pipe and protected image; role Control while elevated admin role Admin"
+        );
+    }
     assert!(!layout.state.exists());
     assert!(!layout.executable.parent().unwrap().exists());
     #[cfg(unix)]

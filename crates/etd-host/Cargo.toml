@@ -38,5 +38,8 @@ etd-testkit = { workspace = true }
 predicates = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
+[target.'cfg(windows)'.dev-dependencies]
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization"] }
+
 [lints]
 workspace = true

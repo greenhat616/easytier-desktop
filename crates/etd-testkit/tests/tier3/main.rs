@@ -1,4 +1,5 @@
 //! Each case uses the installed product service on a fresh hosted runner.
+use etd_testkit::no_window::NoWindow;
 use std::{path::Path, process::Command};
 mod desktop;
 
@@ -20,12 +21,9 @@ fn require_runner() {
 fn run_case(case: &str) {
     require_runner();
     let mut command = Command::new(std::env::var_os("ETD_G2_PYTHON").expect("CI Python"));
-    command.env("ETD_G2_TEST_IMAGE", std::env::current_exe().unwrap());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
+    command
+        .no_window()
+        .env("ETD_G2_TEST_IMAGE", std::env::current_exe().unwrap());
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/tier3/product.py");
     let status = command.args(["-B", "-u"]).arg(script).arg(case).status();
     assert!(status.expect("launch tier 3 case").success(), "{case}");
@@ -73,7 +71,7 @@ fn installed_network_uninstall_restores_machine() {
 
 #[cfg(windows)]
 #[test]
-#[ignore = "pending topic 40: H1 must reject a foreign same-name program firewall rule before spawn"]
+#[ignore = "requires a disposable Windows runner with an independent program firewall rule"]
 fn preexisting_program_rule_blocks_start() {
     run_case("program_rule_conflict");
 }

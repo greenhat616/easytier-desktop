@@ -11,10 +11,12 @@ use std::{
 #[cfg(all(windows, feature = "ci-test-fixtures"))]
 pub mod ci_fixture;
 mod image;
+mod running;
+pub use running::running_image_matches;
 mod journal;
 #[cfg(unix)]
 mod unix;
-pub use journal::{DeferredOutcome, LifecycleJournal, Phase, Resource};
+pub use journal::{DeferredOutcome, LifecycleJournal, Phase, Resource, UpgradeStage};
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
@@ -155,23 +157,32 @@ pub trait ServiceManager {
     ) -> io::Result<Option<u32>>;
     fn deferred_worker_alive(&self, pid: u32) -> io::Result<bool>;
     fn entry_is_elevated(&self) -> io::Result<bool>;
-    /// `etd-host upgrade`: verify a copy of `source` beside the installed
-    /// host image, then swap it in, keeping the previous image as a backup
-    /// until [`Self::discard_host_backup`]. The service must be stopped.
-    fn replace_host_image(&self, _layout: &HostLayout, _source: &Path) -> io::Result<()> {
+    /// `etd-host upgrade`: copy the running image (bound to the running
+    /// process, not to its path) beside the installed host image, verify
+    /// it, then swap it in, keeping the previous image as a backup until
+    /// [`Self::discard_host_backup`]. The service must be stopped.
+    fn replace_host_image(&self, _layout: &HostLayout) -> io::Result<()> {
         Err(io::ErrorKind::Unsupported.into())
     }
     /// Put the backed-up host image back; `Ok(false)` if there is none.
     fn restore_host_image(&self, _layout: &HostLayout) -> io::Result<bool> {
         Err(io::ErrorKind::Unsupported.into())
     }
-    /// Remove the backup and leftovers of a committed upgrade.
+    /// Remove the image and registration backups and leftovers of a
+    /// committed upgrade.
     fn discard_host_backup(&self, _layout: &HostLayout) -> io::Result<()> {
         Err(io::ErrorKind::Unsupported.into())
     }
-    /// Rewrite the service unit if this build's differs. Windows needs
-    /// nothing: [`Self::start`] rewrites the SCM configuration.
+    /// Rewrite the service registration if this build's differs, saving
+    /// the previous one in the maintenance directory first. On Windows the
+    /// SCM configuration this build writes ([`Self::start`]) is the same
+    /// for every build, so there is nothing to save.
     fn refresh_registration(&self, _layout: &HostLayout) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// Put a registration saved by [`Self::refresh_registration`] back;
+    /// `Ok(false)` if none was saved.
+    fn restore_registration(&self, _layout: &HostLayout) -> io::Result<bool> {
         Err(io::ErrorKind::Unsupported.into())
     }
 }
@@ -231,8 +242,8 @@ impl ServiceManager for NativeServiceManager {
     fn entry_is_elevated(&self) -> io::Result<bool> {
         native::elevated()
     }
-    fn replace_host_image(&self, layout: &HostLayout, source: &Path) -> io::Result<()> {
-        native::replace_host_image(layout, source)
+    fn replace_host_image(&self, layout: &HostLayout) -> io::Result<()> {
+        native::replace_host_image(layout)
     }
     fn restore_host_image(&self, layout: &HostLayout) -> io::Result<bool> {
         native::restore_host_image(layout)
@@ -243,6 +254,23 @@ impl ServiceManager for NativeServiceManager {
     fn refresh_registration(&self, layout: &HostLayout) -> io::Result<()> {
         native::refresh_registration(layout)
     }
+    fn restore_registration(&self, layout: &HostLayout) -> io::Result<bool> {
+        native::restore_registration(layout)
+    }
+}
+
+/// CI fault injection for the privileged upgrade tests. Compiled only with
+/// the `ci-test-fixtures` feature (never in a product build): true when
+/// the protected maintenance directory holds `ci-upgrade-fault` naming
+/// `point`. Only an administrator can create that file.
+#[cfg(feature = "ci-test-fixtures")]
+pub fn ci_upgrade_fault(layout: &HostLayout, point: &str) -> bool {
+    fs::read_to_string(layout.maintenance.join("ci-upgrade-fault"))
+        .is_ok_and(|fault| fault.trim() == point)
+}
+#[cfg(not(feature = "ci-test-fixtures"))]
+pub fn ci_upgrade_fault(_: &HostLayout, _: &str) -> bool {
+    false
 }
 
 pub fn current_exe() -> io::Result<PathBuf> {

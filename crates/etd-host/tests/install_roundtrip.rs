@@ -546,34 +546,202 @@ async fn admin_allow_list(
     Ok(client.get_allow_list(request).await?.into_inner())
 }
 
-/// Wait for the installed service to answer, then read its allow list.
-async fn served_allow_list(
-    connector: &Arc<LocalConnector>,
-    endpoint: &Endpoint,
-) -> (
-    etd_ipc::ServerIdentity,
-    etd_contract::v1::GetAllowListResponse,
-) {
-    tokio::time::timeout(Duration::from_secs(45), async {
-        loop {
-            if let Ok((connection, identity)) = connector.connect(endpoint).await {
-                drop(connection);
-                if let Ok(list) = admin_allow_list(connector.clone(), endpoint.clone()).await {
-                    break (identity, list);
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    })
-    .await
-    .expect("installed service never answered GetAllowList")
+fn ci_install_enabled() -> bool {
+    let enabled = std::env::var("ETD_HOST_CI_INSTALL").as_deref() == Ok("1")
+        && std::env::var("CI").as_deref() == Ok("true");
+    if !enabled {
+        eprintln!("skipped: privileged service upgrade is CI-only");
+    }
+    enabled
 }
 
-fn install_key(layout: &etd_sysfx_os::service::HostLayout) -> serde_json::Value {
-    let index: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(layout.state.join("repair-index.json")).unwrap())
+/// What an upgrade must keep, as the running service and its state show it.
+#[derive(Debug, PartialEq)]
+struct Kept {
+    allow_list: etd_contract::v1::GetAllowListResponse,
+    install_id: String,
+    install_key: serde_json::Value,
+}
+
+/// An installed service under test.
+struct Installed {
+    binary: std::path::PathBuf,
+    layout: etd_sysfx_os::service::HostLayout,
+    connector: Arc<LocalConnector>,
+    endpoint: Endpoint,
+    /// The installed image path and its bytes right after install.
+    image: std::path::PathBuf,
+    original: Vec<u8>,
+}
+
+impl Installed {
+    fn install() -> Self {
+        assert!(NativeServiceManager.entry_is_elevated().unwrap());
+        let binary = std::path::PathBuf::from(env!("CARGO_BIN_EXE_etd-host"));
+        let layout = NativeHostFilesystem.service_layout().unwrap();
+        assert!(!layout.state.exists() && !layout.executable.exists());
+        let installed = command(&binary).arg("install").output().unwrap();
+        assert!(
+            installed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        #[cfg(windows)]
+        let endpoint = Endpoint::NamedPipe(etd_ipc::SERVICE_PIPE_NAME.into());
+        #[cfg(unix)]
+        let endpoint = Endpoint::UnixSocket(etd_ipc::SERVICE_SOCKET_PATH.into());
+        let connector = Arc::new(LocalConnector {
+            expectation: ServerExpectation {
+                exe_dir: layout.executable.parent().unwrap().to_owned(),
+                user: None,
+                privileged: true,
+            },
+        });
+        let image = layout.executable.canonicalize().unwrap();
+        let original = std::fs::read(&image).unwrap();
+        Self {
+            binary,
+            layout,
+            connector,
+            endpoint,
+            image,
+            original,
+        }
+    }
+
+    /// Wait for the service to answer, then read what must be kept.
+    async fn served(&self) -> (etd_ipc::ServerIdentity, Kept) {
+        let (identity, allow_list) = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if let Ok((connection, identity)) = self.connector.connect(&self.endpoint).await {
+                    drop(connection);
+                    if let Ok(list) =
+                        admin_allow_list(self.connector.clone(), self.endpoint.clone()).await
+                    {
+                        break (identity, list);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .expect("installed service never answered GetAllowList");
+        let index: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(self.layout.state.join("repair-index.json")).unwrap(),
+        )
+        .unwrap();
+        let kept = Kept {
+            allow_list,
+            install_id: self.journal().install_id().to_owned(),
+            install_key: index["install_key"].clone(),
+        };
+        (identity, kept)
+    }
+
+    fn journal(&self) -> etd_sysfx_os::service::LifecycleJournal {
+        etd_sysfx_os::service::LifecycleJournal::open(&self.layout)
+            .unwrap()
+            .unwrap()
+    }
+
+    /// The CI fault the next upgrade or host start reads (`ci-test-fixtures`).
+    fn fault(&self, point: Option<&str>) {
+        let path = self.layout.maintenance.join("ci-upgrade-fault");
+        match point {
+            Some(point) => std::fs::write(path, point).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    fn leftovers(&self) -> Vec<std::path::PathBuf> {
+        ["prev", "new", "failed"]
+            .into_iter()
+            .map(|extension| self.layout.executable.with_extension(extension))
+            .chain([
+                self.layout.maintenance.join("upgrade-manifest.json"),
+                self.layout.maintenance.join("upgrade-registration"),
+            ])
+            .filter(|path| path.exists())
+            .collect()
+    }
+
+    /// Uninstall with `program` and wait until nothing is left.
+    async fn uninstall(&self, program: &std::path::Path) {
+        self.fault(None);
+        let result = command(program).arg("uninstall").output().unwrap();
+        let layout = &self.layout;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while layout.state.exists()
+                || layout.executable.parent().unwrap().exists()
+                || etd_sysfx_os::service::LifecycleJournal::open(layout)
+                    .unwrap()
+                    .is_some()
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("uninstall did not finish");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
+
+/// This build as a new installation payload in its own directory: a
+/// distinct image (appended bytes; on macOS an ad-hoc re-signature, since
+/// appended bytes break the code signature) and the bundled kernels.
+fn payload(
+    binary: &std::path::Path,
+    tag: &str,
+) -> (tempfile::TempDir, std::path::PathBuf, Vec<u8>) {
+    let directory = tempfile::Builder::new()
+        .prefix("etd-upgrade-payload-")
+        .tempdir()
+        .unwrap();
+    let image = directory.path().join(binary.file_name().unwrap());
+    std::fs::copy(binary, &image).unwrap();
+    if cfg!(target_os = "macos") {
+        let signed = command("/usr/bin/codesign")
+            .args(["--force", "--sign", "-", "--identifier"])
+            .arg(format!("etd-upgrade-ci-{tag}"))
+            .arg(&image)
+            .output()
             .unwrap();
-    index["install_key"].clone()
+        assert!(
+            signed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&signed.stderr)
+        );
+    } else {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&image)
+            .unwrap();
+        file.write_all(format!("\0etd-upgrade-ci-{tag}").as_bytes())
+            .unwrap();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let cores = binary.parent().unwrap().join("cores");
+    if cores.is_dir() {
+        copy_tree(&cores, &directory.path().join("cores"));
+    }
+    let bytes = std::fs::read(&image).unwrap();
+    assert_ne!(
+        bytes,
+        std::fs::read(binary).unwrap(),
+        "payload image must differ"
+    );
+    (directory, image, bytes)
 }
 
 fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
@@ -589,145 +757,181 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
     }
 }
 
+fn text(output: &std::process::Output) -> String {
+    format!(
+        "exit {:?}\nstdout: {}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
 #[tokio::test]
 #[ignore = "requires a disposable elevated CI runner and ETD_HOST_CI_INSTALL=1"]
 async fn upgrade_replaces_the_image_and_keeps_state() {
-    use etd_sysfx_os::service::LifecycleJournal;
-    use std::path::Path;
-    if std::env::var("ETD_HOST_CI_INSTALL").as_deref() != Ok("1")
-        || std::env::var("CI").as_deref() != Ok("true")
-    {
-        eprintln!("skipped: privileged service upgrade is CI-only");
+    if !ci_install_enabled() {
         return;
     }
-    assert!(NativeServiceManager.entry_is_elevated().unwrap());
-    let binary = Path::new(env!("CARGO_BIN_EXE_etd-host"));
-    let layout = NativeHostFilesystem.service_layout().unwrap();
-    assert!(!layout.state.exists() && !layout.executable.exists());
-    let installed = command(binary).arg("install").output().unwrap();
-    assert!(
-        installed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&installed.stderr)
-    );
-    #[cfg(windows)]
-    let endpoint = Endpoint::NamedPipe(etd_ipc::SERVICE_PIPE_NAME.into());
-    #[cfg(unix)]
-    let endpoint = Endpoint::UnixSocket(etd_ipc::SERVICE_SOCKET_PATH.into());
-    let connector = Arc::new(LocalConnector {
-        expectation: ServerExpectation {
-            exe_dir: layout.executable.parent().unwrap().to_owned(),
-            user: None,
-            privileged: true,
-        },
-    });
-    let (_, allow_before) = served_allow_list(&connector, &endpoint).await;
-    let install_id = LifecycleJournal::open(&layout)
-        .unwrap()
-        .unwrap()
-        .install_id()
-        .to_owned();
-    let key_before = install_key(&layout);
-    let image = layout.executable.canonicalize().unwrap();
+    let service = Installed::install();
+    let (_, before) = service.served().await;
+    let (_payload, new_image, bytes) = payload(&service.binary, "a");
 
-    // A payload directory like the MSI / package one: this build, with a
-    // distinct image (loaders ignore appended bytes; macOS would reject
-    // them as a broken code signature) and its bundled kernels.
-    let payload = tempfile::Builder::new()
-        .prefix("etd-upgrade-payload-")
-        .tempdir()
-        .unwrap();
-    let new_image = payload.path().join(binary.file_name().unwrap());
-    let mut bytes = std::fs::read(binary).unwrap();
-    let distinct = cfg!(not(target_os = "macos"));
-    if distinct {
-        bytes.extend_from_slice(b"\0etd-upgrade-ci-payload");
-    }
-    std::fs::write(&new_image, &bytes).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&new_image, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    let cores = binary.parent().unwrap().join("cores");
-    if cores.is_dir() {
-        copy_tree(&cores, &payload.path().join("cores"));
-    }
-
-    let refused = command(&image).arg("upgrade").output().unwrap();
+    let refused = command(&service.image).arg("upgrade").output().unwrap();
     let upgraded = command(&new_image).arg("upgrade").output().unwrap();
     let again = command(&new_image).arg("upgrade").output().unwrap();
-    let (identity, allow_after) = served_allow_list(&connector, &endpoint).await;
-    let image_after = std::fs::read(&layout.executable).unwrap();
-    let journal = LifecycleJournal::open(&layout).unwrap().unwrap();
-    let key_after = install_key(&layout);
-    let leftovers: Vec<_> = ["prev", "new", "failed"]
-        .into_iter()
-        .map(|extension| layout.executable.with_extension(extension))
-        .chain([layout.maintenance.join("upgrade-manifest.json")])
-        .filter(|path| path.exists())
-        .collect();
+    let (identity, after) = service.served().await;
+    let image_after = std::fs::read(&service.layout.executable).unwrap();
+    let stage = service.journal().upgrade_stage();
+    let leftovers = service.leftovers();
 
-    // Clean up before asserting.
+    // Windows: uninstall from the upgraded installed image (deferred removal).
     #[cfg(windows)]
-    let cleanup = command(&image).arg("uninstall").output().unwrap();
+    service.uninstall(&service.image).await;
     #[cfg(unix)]
-    let cleanup = command(binary).arg("uninstall").output().unwrap();
-    tokio::time::timeout(Duration::from_secs(45), async {
-        while layout.state.exists()
-            || layout.executable.parent().unwrap().exists()
-            || LifecycleJournal::open(&layout).unwrap().is_some()
-        {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .expect("uninstall after upgrade did not finish");
-    assert!(
-        cleanup.status.success(),
-        "{}",
-        String::from_utf8_lossy(&cleanup.stderr)
-    );
+    service.uninstall(&service.binary).await;
 
-    assert!(
-        !refused.status.success(),
-        "upgrade from the installed image"
-    );
+    assert!(!refused.status.success(), "{}", text(&refused));
     assert!(
         String::from_utf8_lossy(&refused.stderr).contains("payload"),
         "{}",
-        String::from_utf8_lossy(&refused.stderr)
+        text(&refused)
     );
-    assert!(
-        upgraded.status.success(),
-        "{}{}",
-        String::from_utf8_lossy(&upgraded.stdout),
-        String::from_utf8_lossy(&upgraded.stderr)
-    );
+    assert!(upgraded.status.success(), "{}", text(&upgraded));
     println!("{}", String::from_utf8_lossy(&upgraded.stdout).trim());
-    assert!(
-        again.status.success(),
-        "{}",
-        String::from_utf8_lossy(&again.stderr)
-    );
+    assert!(again.status.success(), "{}", text(&again));
     assert!(
         String::from_utf8_lossy(&again.stdout).contains("already up to date"),
         "{}",
-        String::from_utf8_lossy(&again.stdout)
+        text(&again)
     );
     assert!(image_after == bytes, "installed image is not the payload's");
-    assert_eq!(identity.exe, image, "service runs the installed image");
+    assert_eq!(
+        identity.exe, service.image,
+        "service runs the installed image"
+    );
     assert!(leftovers.is_empty(), "upgrade left {leftovers:?}");
-    assert_eq!(journal.install_id(), install_id);
-    assert!(!journal.upgrading());
-    assert_eq!(key_after, key_before, "install key changed");
-    assert_eq!(allow_after, allow_before, "allow list changed");
+    assert_eq!(stage, None);
+    assert_eq!(
+        after, before,
+        "upgrade changed install id, install key or allow list"
+    );
     println!(
-        "upgrade {} the image, kept install id, install key and allow list; the second run was a no-op; uninstall clean",
-        if distinct {
-            "replaced"
-        } else {
-            "kept (identical on macOS)"
-        }
+        "upgrade replaced the image, kept install id, install key and allow list; the second run was a no-op; uninstall clean"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable elevated CI runner and ETD_HOST_CI_INSTALL=1"]
+async fn upgrade_rolls_back_when_the_new_host_is_not_ready() {
+    if !ci_install_enabled() {
+        return;
+    }
+    let service = Installed::install();
+    let (_, before) = service.served().await;
+    let (_payload, new_image, _) = payload(&service.binary, "unready");
+    // The new host refuses to serve; the upgrade must restore the old one.
+    service.fault(Some("new-host-unready"));
+    let upgraded = command(&new_image).arg("upgrade").output().unwrap();
+    service.fault(None);
+    let (identity, after) = service.served().await;
+    let image_after = std::fs::read(&service.layout.executable).unwrap();
+    let stage = service.journal().upgrade_stage();
+    let leftovers = service.leftovers();
+    service.uninstall(&service.binary).await;
+
+    assert!(!upgraded.status.success(), "{}", text(&upgraded));
+    assert!(
+        String::from_utf8_lossy(&upgraded.stderr).contains("upgrade rolled back"),
+        "{}",
+        text(&upgraded)
+    );
+    println!("{}", String::from_utf8_lossy(&upgraded.stderr).trim());
+    assert!(
+        image_after == service.original,
+        "the previous image was not restored"
+    );
+    assert_eq!(
+        identity.exe, service.image,
+        "the previous service runs again"
+    );
+    assert!(leftovers.is_empty(), "rollback left {leftovers:?}");
+    assert_eq!(stage, None);
+    assert_eq!(
+        after, before,
+        "rollback changed install id, install key or allow list"
+    );
+    println!("a new host that never served was rolled back; the previous service runs; state kept");
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable elevated CI runner and ETD_HOST_CI_INSTALL=1"]
+async fn an_interrupted_upgrade_is_restored_by_upgrade_and_by_uninstall() {
+    use etd_sysfx_os::service::UpgradeStage;
+    if !ci_install_enabled() {
+        return;
+    }
+    let service = Installed::install();
+    let (_, before) = service.served().await;
+    let (_first, first_image, first_bytes) = payload(&service.binary, "first");
+    let (_second, second_image, _) = payload(&service.binary, "second");
+
+    // Crash with the new image in place and the service disabled.
+    service.fault(Some("crash-after-replace"));
+    let crashed = command(&first_image).arg("upgrade").output().unwrap();
+    service.fault(None);
+    let crashed_stage = service.journal().upgrade_stage();
+    let backup_kept = service.layout.executable.with_extension("prev").exists();
+    let resume = command(&service.binary)
+        .arg("resume-service")
+        .output()
+        .unwrap();
+    // The next upgrade restores the old state first, then completes.
+    let recovered = command(&first_image).arg("upgrade").output().unwrap();
+    let (identity, after) = service.served().await;
+    let image_after = std::fs::read(&service.layout.executable).unwrap();
+    let stage_after = service.journal().upgrade_stage();
+    let leftovers = service.leftovers();
+    // Crash again; this time uninstall restores and removes everything.
+    service.fault(Some("crash-after-replace"));
+    let crashed_again = command(&second_image).arg("upgrade").output().unwrap();
+    service.fault(None);
+    let crashed_again_stage = service.journal().upgrade_stage();
+    service.uninstall(&service.binary).await;
+
+    assert_eq!(crashed.status.code(), Some(86), "{}", text(&crashed));
+    assert_eq!(crashed_stage, Some(UpgradeStage::Replacing));
+    assert!(backup_kept, "the previous image must be kept until commit");
+    assert!(!resume.status.success(), "{}", text(&resume));
+    assert!(
+        String::from_utf8_lossy(&resume.stderr).contains("upgrade of this service is incomplete"),
+        "{}",
+        text(&resume)
+    );
+    assert!(recovered.status.success(), "{}", text(&recovered));
+    assert!(
+        String::from_utf8_lossy(&recovered.stdout).contains("restoring an interrupted upgrade"),
+        "{}",
+        text(&recovered)
+    );
+    assert!(
+        image_after == first_bytes,
+        "installed image is not the payload's"
+    );
+    assert_eq!(identity.exe, service.image);
+    assert_eq!(stage_after, None);
+    assert!(leftovers.is_empty(), "upgrade left {leftovers:?}");
+    assert_eq!(
+        after, before,
+        "recovery changed install id, install key or allow list"
+    );
+    assert_eq!(
+        crashed_again.status.code(),
+        Some(86),
+        "{}",
+        text(&crashed_again)
+    );
+    assert_eq!(crashed_again_stage, Some(UpgradeStage::Replacing));
+    println!(
+        "an upgrade interrupted at Replacing was refused by resume-service, restored by the next upgrade, and by uninstall"
     );
 }

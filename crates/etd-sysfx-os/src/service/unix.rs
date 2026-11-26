@@ -305,10 +305,7 @@ pub(super) fn prepare_install(
 ) -> io::Result<()> {
     preflight_install(layout)?;
     protect_creation();
-    #[cfg(target_os = "linux")]
-    let mut source = File::open("/proc/self/exe")?;
-    #[cfg(target_os = "macos")]
-    let mut source = File::open(super::current_exe()?)?;
+    let mut source = super::running::RunningImage::open()?;
     let install = layout.executable.parent().ok_or_else(denied)?;
     let socket = layout.socket_dir.as_ref().ok_or_else(denied)?;
     journal.create(Resource::InstallDir, || make(install, 0o755))?;
@@ -323,10 +320,17 @@ pub(super) fn prepare_install(
             .create_new(true)
             .mode(0o700)
             .open(&layout.executable)?;
-        io::copy(&mut source, &mut target)?;
+        let digest = source.copy_to(&mut target)?;
         target.sync_all()?;
         drop(target);
-        fs::set_permissions(&layout.executable, fs::Permissions::from_mode(0o755))
+        fs::set_permissions(&layout.executable, fs::Permissions::from_mode(0o755))?;
+        if super::running::sha256_file(&layout.executable)? != digest {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the installed host image differs from the bytes copied",
+            ));
+        }
+        Ok(())
     })?;
     // Reserve a concrete unused gid before group creation. A crash in the
     // create/record window can be rolled back only if both name and gid match.
@@ -444,6 +448,12 @@ pub(super) fn start(layout: &HostLayout) -> io::Result<()> {
     verify_unit(false)?;
     #[cfg(target_os = "linux")]
     {
+        // A host that kept failing (a new image rolled back by upgrade)
+        // can leave the unit start-limited; clear that before starting.
+        invoke(
+            "/usr/bin/systemctl",
+            &["reset-failed", "easytier-desk-host.service"],
+        )?;
         invoke(
             "/usr/bin/systemctl",
             &["enable", "--now", "easytier-desk-host.service"],
@@ -573,27 +583,39 @@ fn image_paths(layout: &HostLayout) -> io::Result<super::image::ImagePaths> {
     check(install, true)?;
     Ok(super::image::ImagePaths::of(&layout.executable))
 }
-pub(super) fn replace_host_image(layout: &HostLayout, source: &Path) -> io::Result<()> {
+pub(super) fn replace_host_image(layout: &HostLayout) -> io::Result<()> {
     validate_service(layout)?;
-    super::image::replace(&image_paths(layout)?, source, image_seal, image_check)?;
+    let mut source = super::running::RunningImage::open()?;
+    super::image::replace(
+        &image_paths(layout)?,
+        |out| source.copy_to(out),
+        image_seal,
+        image_check,
+    )?;
     validate_service(layout)
 }
 pub(super) fn restore_host_image(layout: &HostLayout) -> io::Result<bool> {
     super::image::restore(&image_paths(layout)?, image_check)
 }
 pub(super) fn discard_host_backup(layout: &HostLayout) -> io::Result<()> {
-    super::image::discard(&image_paths(layout)?, image_check)
-}
-/// The installed unit is ours: the maintenance journal records the
-/// installation. Replace it atomically only if this build's content differs.
-pub(super) fn refresh_registration(layout: &HostLayout) -> io::Result<()> {
-    use std::{io::Write, os::unix::fs::OpenOptionsExt};
-    validate_service(layout)?;
-    let path = Path::new(UNIT);
-    check(path, false)?;
-    if fs::read_to_string(path)? == UNIT_CONTENT {
-        return Ok(());
+    super::image::discard(&image_paths(layout)?, image_check)?;
+    let saved = registration_backup(layout)?;
+    if fs::symlink_metadata(&saved).is_ok() {
+        check(&saved, false)?;
+        fs::remove_file(&saved)?;
     }
+    Ok(())
+}
+/// The unit or plist an uncommitted upgrade replaced.
+fn registration_backup(layout: &HostLayout) -> io::Result<PathBuf> {
+    verify_parent(&layout.maintenance)?;
+    check(&layout.maintenance, true)?;
+    Ok(layout.maintenance.join("upgrade-registration"))
+}
+/// Atomically replace the unit with `content`, then reload systemd.
+fn write_unit(content: &[u8]) -> io::Result<()> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let path = Path::new(UNIT);
     verify_parent(path)?;
     let staging = path.with_extension("etd-new");
     if fs::symlink_metadata(&staging).is_ok() {
@@ -605,7 +627,7 @@ pub(super) fn refresh_registration(layout: &HostLayout) -> io::Result<()> {
         .create_new(true)
         .mode(0o644)
         .open(&staging)?;
-    file.write_all(UNIT_CONTENT.as_bytes())?;
+    file.write_all(content)?;
     file.sync_all()?;
     drop(file);
     fs::rename(&staging, path)?;
@@ -613,6 +635,40 @@ pub(super) fn refresh_registration(layout: &HostLayout) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     invoke("/usr/bin/systemctl", &["daemon-reload"])?;
     Ok(())
+}
+/// The installed unit is ours: the maintenance journal records the
+/// installation. Replace it only if this build's content differs, saving
+/// the installed one for rollback first.
+pub(super) fn refresh_registration(layout: &HostLayout) -> io::Result<()> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    validate_service(layout)?;
+    let path = Path::new(UNIT);
+    check(path, false)?;
+    let installed = fs::read(path)?;
+    if installed == UNIT_CONTENT.as_bytes() {
+        return Ok(());
+    }
+    let saved = registration_backup(layout)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&saved)?;
+    file.write_all(&installed)?;
+    file.sync_all()?;
+    drop(file);
+    File::open(&layout.maintenance)?.sync_all()?;
+    write_unit(UNIT_CONTENT.as_bytes())
+}
+pub(super) fn restore_registration(layout: &HostLayout) -> io::Result<bool> {
+    let saved = registration_backup(layout)?;
+    if fs::symlink_metadata(&saved).is_err() {
+        return Ok(false);
+    }
+    check(&saved, false)?;
+    write_unit(&fs::read(&saved)?)?;
+    fs::remove_file(&saved)?;
+    Ok(true)
 }
 
 pub(super) fn defer_install_removal(_: &HostLayout, _: &str) -> io::Result<Option<u32>> {

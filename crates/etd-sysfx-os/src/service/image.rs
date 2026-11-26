@@ -1,8 +1,10 @@
 //! Host image replacement for `etd-host upgrade` (PK1). The new image is
 //! copied beside the installed one and verified before two renames swap it
 //! in; the old image stays as `<image>.prev` until the upgrade commits.
-//! The platform adapters supply `seal` (final permissions) and `check`
-//! (protected ownership) so the sequence itself is testable without root.
+//! The platform adapters supply the copy (from the running image, see
+//! `running`), `seal` (final permissions) and `check` (protected
+//! ownership), so the sequence itself is testable without root.
+use super::running::sha256_file;
 use super::*;
 
 pub(super) struct ImagePaths {
@@ -72,30 +74,13 @@ fn sync_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn same_bytes(left: &Path, right: &Path) -> io::Result<bool> {
-    use sha2::{Digest, Sha256};
-    fn hash(path: &Path) -> io::Result<[u8; 32]> {
-        use std::io::Read;
-        let mut file = File::open(path)?;
-        let mut hash = Sha256::new();
-        let mut buffer = [0u8; 65536];
-        loop {
-            let n = file.read(&mut buffer)?;
-            if n == 0 {
-                break;
-            }
-            hash.update(&buffer[..n]);
-        }
-        Ok(hash.finalize().into())
-    }
-    Ok(hash(left)? == hash(right)?)
-}
-
-/// Swap `source` in as the executable. Refuses while a backup exists: the
-/// caller restores or discards an earlier attempt first.
+/// Swap a new image in as the executable. `copy` writes the new image into
+/// the staging file and returns the SHA-256 of the bytes it wrote; the
+/// sealed staging file must read back with that digest. Refuses while a
+/// backup exists: the caller restores or discards an earlier attempt first.
 pub(super) fn replace(
     paths: &ImagePaths,
-    source: &Path,
+    copy: impl FnOnce(&mut File) -> io::Result<[u8; 32]>,
     seal: impl Fn(&Path) -> io::Result<()>,
     check: impl Fn(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
@@ -107,30 +92,28 @@ pub(super) fn replace(
     }
     check(&paths.executable)?;
     remove_checked(&paths.staging, &check)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
     {
-        let mut input = File::open(source)?;
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o700);
-        }
-        let mut output = options.open(&paths.staging)?;
-        io::copy(&mut input, &mut output)?;
-        output.sync_all()?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o700);
     }
+    let mut output = options.open(&paths.staging)?;
     let staged = (|| {
+        let digest = copy(&mut output)?;
+        output.sync_all()?;
         seal(&paths.staging)?;
         check(&paths.staging)?;
-        if !same_bytes(source, &paths.staging)? {
+        if sha256_file(&paths.staging)? != digest {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "copied host image differs from its source",
+                "the staged host image differs from the bytes copied",
             ));
         }
         Ok(())
     })();
+    drop(output);
     if let Err(error) = staged {
         let _ = fs::remove_file(&paths.staging);
         return Err(error);
@@ -196,17 +179,23 @@ mod tests {
     fn ok(_: &Path) -> io::Result<()> {
         Ok(())
     }
+    /// The copy as the adapters make it: one read of the source, hashed
+    /// while written.
+    fn from(source: &Path) -> impl FnOnce(&mut File) -> io::Result<[u8; 32]> {
+        let source = source.to_owned();
+        move |out| super::super::running::copy_hashing(File::open(source)?, out)
+    }
 
     #[test]
     fn replace_keeps_the_old_image_until_discarded() {
         let (_root, paths, source) = fixture();
         fs::write(&paths.staging, b"partial copy of a crashed attempt").unwrap();
-        replace(&paths, &source, ok, ok).unwrap();
+        replace(&paths, from(&source), ok, ok).unwrap();
         assert_eq!(fs::read(&paths.executable).unwrap(), b"new image");
         assert_eq!(fs::read(&paths.backup).unwrap(), b"old image");
         assert!(!paths.staging.exists());
         // A second swap would lose the only good copy.
-        let error = replace(&paths, &source, ok, ok).unwrap_err();
+        let error = replace(&paths, from(&source), ok, ok).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read(&paths.backup).unwrap(), b"old image");
         discard(&paths, ok).unwrap();
@@ -218,7 +207,7 @@ mod tests {
     fn restore_brings_back_the_old_image_after_any_interruption() {
         // After both renames.
         let (_root, paths, source) = fixture();
-        replace(&paths, &source, ok, ok).unwrap();
+        replace(&paths, from(&source), ok, ok).unwrap();
         assert!(restore(&paths, ok).unwrap());
         assert_eq!(fs::read(&paths.executable).unwrap(), b"old image");
         assert!(!paths.backup.exists() && !paths.failed.exists());
@@ -241,13 +230,30 @@ mod tests {
     fn a_failed_check_or_seal_changes_nothing() {
         let (_root, paths, source) = fixture();
         let refuse = |_: &Path| Err(io::Error::from(io::ErrorKind::PermissionDenied));
-        assert!(replace(&paths, &source, refuse, ok).is_err());
-        assert!(replace(&paths, &source, ok, refuse).is_err());
+        assert!(replace(&paths, from(&source), refuse, ok).is_err());
+        assert!(replace(&paths, from(&source), ok, refuse).is_err());
         assert_eq!(fs::read(&paths.executable).unwrap(), b"old image");
         assert!(!paths.staging.exists() && !paths.backup.exists());
-        replace(&paths, &source, ok, ok).unwrap();
+        replace(&paths, from(&source), ok, ok).unwrap();
         assert!(restore(&paths, refuse).is_err());
         assert!(discard(&paths, refuse).is_err());
         assert_eq!(fs::read(&paths.backup).unwrap(), b"old image");
+    }
+
+    #[test]
+    fn a_copy_that_does_not_match_its_digest_changes_nothing() {
+        // The digest is of the bytes read; a staged file that reads back
+        // differently (here: a copy that lies) is never swapped in.
+        use sha2::Digest;
+        let (_root, paths, _) = fixture();
+        let lying = |out: &mut File| {
+            use std::io::Write;
+            out.write_all(b"attacker image")?;
+            Ok(<[u8; 32]>::from(sha2::Sha256::digest(b"new image")))
+        };
+        let error = replace(&paths, lying, ok, ok).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&paths.executable).unwrap(), b"old image");
+        assert!(!paths.staging.exists() && !paths.backup.exists());
     }
 }

@@ -391,6 +391,102 @@ pub fn discard_manifest_backup(backup: &Path) -> Result<()> {
     }
 }
 
+/// The SQLite header fields of the ledger that tell whether a host
+/// migrated it: `user_version` is the schema version, and a non-empty WAL
+/// means the main file's header may not be current yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LedgerHeader {
+    pub user_version: u32,
+    pub wal_pending: bool,
+}
+
+/// Read without opening the database, so no migration can run. `None` if
+/// there is no readable SQLite ledger.
+pub fn ledger_header(state: &Path) -> Option<LedgerHeader> {
+    use std::io::Read;
+    let path = state.join("ledger.sqlite3");
+    let mut header = [0u8; 64];
+    fs::File::open(&path).ok()?.read_exact(&mut header).ok()?;
+    if &header[..16] != b"SQLite format 3\0" {
+        return None;
+    }
+    let user_version = u32::from_be_bytes([header[60], header[61], header[62], header[63]]);
+    let wal_pending = fs::metadata(state.join("ledger.sqlite3-wal")).is_ok_and(|m| m.len() > 0);
+    Some(LedgerHeader {
+        user_version,
+        wal_pending,
+    })
+}
+
+/// What an upgrade that dropped `dropped` kernels must tell the user about
+/// the host's kernel selection. Reads the ledger read-only (never migrates
+/// it); if that is not possible the notice names no instances.
+pub async fn kernel_selection_notice(state: &Path, dropped: &[String]) -> Option<String> {
+    use etd_sysfx::{
+        BootId, Ledger,
+        sqlite::{OpenOptions, SqliteLedger},
+    };
+    if dropped.is_empty() {
+        return None;
+    }
+    let generic = format!(
+        "if the selected kernel was {}, instances will not start until another kernel is selected",
+        dropped.join(" or ")
+    );
+    if !ledger_exists(state).unwrap_or(false) {
+        return None;
+    }
+    let Ok(ledger) = SqliteLedger::open_with_options(
+        state.join("ledger.sqlite3"),
+        BootId("upgrade-diagnosis".into()),
+        OpenOptions {
+            read_only: true,
+            ..Default::default()
+        },
+    )
+    .await
+    else {
+        return Some(generic);
+    };
+    let read = async {
+        let settings = ledger.settings().await?;
+        let (_, desired) = ledger.desired().await?;
+        Ok::<_, LedgerError>((settings.selected_core, desired))
+    }
+    .await;
+    let _ = ledger.close().await;
+    let Ok((selected, desired)) = read else {
+        return Some(generic);
+    };
+    let selected = selected.filter(|version| dropped.contains(version))?;
+    let running: Vec<String> = desired
+        .iter()
+        .filter(|instance| instance.desired == etd_contract::v1::Desired::Running as i32)
+        .map(|instance| {
+            let name = instance
+                .spec
+                .as_ref()
+                .map(|spec| spec.display_name.as_str())
+                .unwrap_or_default();
+            if name.is_empty() {
+                instance.instance_id.clone()
+            } else {
+                format!("{name} ({})", instance.instance_id)
+            }
+        })
+        .collect();
+    Some(if running.is_empty() {
+        format!(
+            "the selected kernel {selected} is no longer trusted; select another kernel before starting an instance"
+        )
+    } else {
+        format!(
+            "the selected kernel {selected} is no longer trusted; these instances will not start until another kernel is selected: {}",
+            running.join(", ")
+        )
+    })
+}
+
 /// Remove SHA directories an upgrade created, newest first. A directory the
 /// OS cannot rule out as a driver image source is kept and reported.
 pub fn remove_published(
@@ -898,5 +994,24 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         assert!(!super::native_history(state.path(), false, false).unwrap());
         assert!(!super::native_history(state.path(), false, true).unwrap());
+    }
+
+    #[test]
+    fn the_ledger_header_shows_a_migration_without_opening_the_database() {
+        let state = tempfile::tempdir().unwrap();
+        assert_eq!(super::ledger_header(state.path()), None);
+        let mut page = b"SQLite format 3\0".to_vec();
+        page.resize(100, 0);
+        page[60..64].copy_from_slice(&7u32.to_be_bytes());
+        std::fs::write(state.path().join("ledger.sqlite3"), &page).unwrap();
+        let header = super::ledger_header(state.path()).unwrap();
+        assert_eq!(header.user_version, 7);
+        assert!(!header.wal_pending);
+        std::fs::write(state.path().join("ledger.sqlite3-wal"), b"").unwrap();
+        assert!(!super::ledger_header(state.path()).unwrap().wal_pending);
+        std::fs::write(state.path().join("ledger.sqlite3-wal"), b"frames").unwrap();
+        assert!(super::ledger_header(state.path()).unwrap().wal_pending);
+        std::fs::write(state.path().join("ledger.sqlite3"), b"not a database").unwrap();
+        assert_eq!(super::ledger_header(state.path()), None);
     }
 }

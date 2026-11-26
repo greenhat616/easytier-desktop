@@ -77,13 +77,15 @@ becomes an admin allow-list entry.
 3. Begin the journal. Every resource is recorded as planned before it is created, so
    a rollback removes only what this installation created.
 4. Create the directories and copy the running executable into the install
-   directory (registration never points at a download directory).
+   directory (registration never points at a download directory). The copy is
+   read from the running image itself, not from its path (see
+   [The running image](#the-running-image)), hashed while it is copied, and the
+   installed file must read back with that hash.
    - Windows: install dir with a protected DACL (SYSTEM and Administrators full,
      Users read/execute), state dir for SYSTEM and Administrators only, then `run`
      and `cores`.
-   - Unix: install 0755, state 0700, run 0700, cores 0755, socket dir 0755; the image
-     is copied from `/proc/self/exe` (Linux) or the canonical current executable
-     (macOS). A free GID in 60000..65000 is reserved in the journal, then the
+   - Unix: install 0755, state 0700, run 0700, cores 0755, socket dir 0755. A free
+     GID in 60000..65000 is reserved in the journal, then the
      `easytier-desk` group is created (`groupadd --system` / `dseditgroup`).
 5. Install the bundled kernels: for each row of the embedded table, copy
    `<installer dir>/cores/<version>/` into `<cores>/<sha256>/`, hashing inside the
@@ -112,32 +114,85 @@ itself fails the message says to retry `uninstall`.
 
 Administrator only. Run it from the new installation payload (the new `etd-host`
 with its bundled `cores/` beside it), never from the installed image, which it
-refuses. Under the maintenance lock, with the journal at `Installed`:
+refuses (also when that cannot be determined). The new image is the running image,
+read as described in [The running image](#the-running-image); its embedded kernel
+table is the authority for the kernels it brings.
 
-1. If the installed image already has this build's bytes, every bundled kernel is
-   present and verifies, and the manifest is current, it only starts and verifies
-   the service, so a repeated upgrade is harmless.
-2. Stop and disable the service, take the singleton lock and mark the journal
-   `upgrading`. A marker left by a crashed attempt is first undone (below).
-3. Copy the new image beside the installed one as `etd-host.new`, apply the install
-   tree's permissions, check its ownership and hash, then rename the installed image
-   to `etd-host.prev` and the copy into place.
+The journal records the upgrade's stage, each written before its step: `Disabling`,
+`Replacing`, `Starting`. Under the maintenance lock, with the journal at `Installed`:
+
+1. If no stage is recorded, the installed image already has the running image's
+   bytes, every bundled kernel is present and verifies, and the manifest is current,
+   it removes leftover backups of an earlier upgrade and only starts and verifies the
+   service, so a repeated upgrade is harmless.
+2. Record `Disabling`, stop and disable the service, and take the singleton lock with
+   the same bounded wait as `uninstall`. A `Replacing` or `Starting` stage left by a
+   crashed attempt is restored first (below).
+3. Record `Replacing`. Copy the image beside the installed one as `etd-host.new`,
+   apply the install tree's permissions, check its ownership and that it reads back
+   with the hash taken while copying, then rename the installed image to
+   `etd-host.prev` and the copy into place.
 4. Merge kernels: bundles this build trusts that are missing are verified and
    published as new version directories; the old manifest is saved as
    `upgrade-manifest.json` in the maintenance directory and the new one lists only
    versions the new table trusts. Kernel directories are never deleted: ledger
    records may name them, and `remove-core` or uninstall reclaims them.
-5. Rewrite the Linux unit if its content changed (`daemon-reload`), validate the
-   install tree, release the lock, start the service and wait for a verified
-   endpoint as in `install`.
-6. Commit: clear the marker, then delete `.prev` and the saved manifest.
+5. Refresh the registration: on Unix, if the unit or plist differs from this build's,
+   save the installed one as `upgrade-registration` in the maintenance directory and
+   replace it (`daemon-reload` on Linux). The Windows SCM configuration is the same
+   for every build. Validate the install tree.
+6. Record `Starting`, release the lock and start the service. The new host clears
+   the stage itself once its self-check reaches Serving (not diagnostics-only); that
+   commits the upgrade. `upgrade` waits for the verified endpoint (30 s) and then for
+   the commit (90 s).
+7. Delete `.prev`, the saved manifest and the saved registration.
 
 The ledger, the allow list, the repair index with its install key, and the state
-and maintenance directories are never touched. Any failure in steps 3 to 5 restores
-the previous image and manifest, removes only the kernel directories this attempt
-published, clears the marker and restarts the previous service. A crash leaves the
-marker; the next `upgrade` or `uninstall` restores the previous image and manifest
-first.
+and maintenance directories are never touched; the ledger is never rolled back.
+
+- **Failure before the start** (steps 2 to 5): restore the previous image, manifest
+  and registration, remove the kernel directories this attempt published, clear the
+  stage and restart the previous service. If the singleton lock cannot be taken
+  after the stop, the previous service is restarted as well.
+- **The new host does not commit** (step 6): stop it, restore image, manifest and
+  registration, keep every kernel directory (the new host may have recorded them),
+  clear the stage and restart the previous service. If the new host migrated the
+  ledger (its SQLite `user_version` changed, or a write-ahead log is left), the
+  previous host can only run diagnostics-only: the error says so and asks to run the
+  new upgrade again. If the new host committed after the wait ended, the upgrade
+  stands.
+- **A crash**: the stage stays. A host does not start while `Replacing` is recorded,
+  and `resume-service`, `reclaim` and `remove-core` refuse while any stage is
+  recorded. The next `upgrade` or `uninstall` restores the previous image, manifest
+  and registration first (keeping kernel directories). With `Disabling` nothing was
+  replaced; the previous host still starts.
+- If a restore itself fails, the service stays disabled and the error says to retry
+  `upgrade` or `uninstall`.
+
+If the upgrade drops the selected kernel version, it says so and names the instances
+set to run. Planning then fails with "selected kernel ... is not in this host's
+trusted kernel store; select another kernel" until another kernel is selected.
+
+### The running image
+
+`install` and `upgrade` copy the host image from a handle bound to the executable
+the process is running, not from its path, which a process of the user who started
+the payload could swap after the elevation prompt verified it:
+
+- Linux: `/proc/self/exe`, the executing inode itself; the kernel refuses writes to an
+  executing file.
+- macOS: the path opened without following a final symlink; its device and inode
+  must equal those of the vnode mapped for the host's code
+  (`proc_pidinfo(PROC_PIDREGIONPATHINFO)`).
+- Windows: the path opened sharing only reads (it cannot be renamed, written or
+  deleted while open), not a reparse point, and with the volume serial and file id of
+  the file mapped for the host's code (`GetMappedFileNameW`).
+- Unix: the file must not be writable by group or others, and its change time and
+  size must be unchanged after the copy.
+
+The residual trust is in the payload as the elevating user started it: a payload in
+a directory that user owns is theirs to replace before they start it. Installer
+packages place the payload in a protected location.
 
 ## `uninstall`
 

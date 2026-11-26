@@ -1,0 +1,51 @@
+name: S2 wintun kill spike
+
+on:
+  push:
+    branches: [wbs/S2-wintun-kill]
+    paths:
+      - 'spikes/wintun-kill/**'
+      - '.github/workflows/s2-wintun.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wintun-kill:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      # The x86_64 Windows build that EasyTier's own "EasyTier Core" workflow
+      # (run 45469202508) produced for commit c97f36b8. No release carries that
+      # commit. GitHub expires the artifact on 2027-02-22.
+      ARTIFACT_ID: '14959009694'
+      ARTIFACT_SHA256: 7fbabdaa80e37d32add40bd8933056dcb7bd6c7b83c35f01f09fd84da4a167c3
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Fetch easytier-core c97f36b with its bundled wintun.dll
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $zip = Join-Path $env:RUNNER_TEMP 'core.zip'
+          $dir = Join-Path $env:RUNNER_TEMP 'core'
+          cmd /c "gh api repos/EasyTier/EasyTier/actions/artifacts/$env:ARTIFACT_ID/zip > `"$zip`""
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "artifact sha256 $hash"
+          if ($hash -ne $env:ARTIFACT_SHA256) { throw 'artifact digest mismatch' }
+          Expand-Archive $zip $dir
+          $exe = Get-ChildItem $dir -Recurse -Filter easytier-core.exe | Select-Object -First 1
+          if (-not $exe) { throw 'easytier-core.exe not found in the artifact' }
+          Get-ChildItem $exe.DirectoryName | ForEach-Object { "$($_.Name) $((Get-FileHash $_.FullName).Hash)" }
+          "CORE_DIR=$($exe.DirectoryName)" >> $env:GITHUB_ENV
+      - name: Kill and enumerate
+        shell: pwsh
+        run: ./spikes/wintun-kill/run.ps1 -CoreDir $env:CORE_DIR -OutDir "$env:RUNNER_TEMP/s2-out"
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: s2-wintun-kill
+          path: ${{ runner.temp }}/s2-out

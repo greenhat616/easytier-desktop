@@ -7,12 +7,17 @@ use std::{
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 /// Fresh snapshot; do not reuse cached path, owner, or argv data after PID reuse.
+///
+/// Processes only: on Linux sysinfo would also list every thread as a process
+/// of its own, and a thread exiting mid-scan (its `/proc/<tid>` gone while
+/// its process lives) cannot be verified like a process.
 pub(crate) fn snapshot(pids: ProcessesToUpdate<'_>) -> Result<System, ProcessError> {
     let mut system = System::new().map_err(|e| ProcessError::Enumeration(e.to_string()))?;
     system.refresh_processes_specifics(
         pids,
         true,
         ProcessRefreshKind::nothing()
+            .without_tasks()
             .with_exe(UpdateKind::Always)
             .with_cmd(UpdateKind::Always)
             .with_user(UpdateKind::Always),
@@ -91,6 +96,19 @@ pub(crate) fn query_access_denied(pid: u32) -> bool {
         }
         Err(error) => error.code() == ERROR_ACCESS_DENIED.to_hresult(),
     }
+}
+
+/// Linux: a zombie thread-group leader whose other threads still run (it
+/// left with `pthread_exit`). The process is not gone, and the snapshot lists
+/// no threads, so it must stay a candidate.
+#[cfg(target_os = "linux")]
+pub(crate) fn leader_outlived(pid: u32) -> bool {
+    std::fs::read_dir(format!("/proc/{pid}/task")).is_ok_and(|tasks| tasks.count() > 1)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn leader_outlived(_pid: u32) -> bool {
+    false
 }
 
 pub(crate) fn minimal_process(process: &sysinfo::Process) -> bool {
@@ -597,5 +615,30 @@ mod minimal_snapshot_tests {
             Path::new("/user.slice/processkit-12-abcd-1")
         );
         assert!(processkit_cgroup(Path::new("/user.slice/app.scope")).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn snapshots_list_processes_not_threads() {
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            // SAFETY: gettid has no preconditions and only reads the caller's id.
+            let tid = unsafe { libc::gettid() };
+            tid_tx.send(u32::try_from(tid).unwrap()).unwrap();
+            let _ = done_rx.recv();
+        });
+        let tid = tid_rx.recv().unwrap();
+        let system = snapshot(ProcessesToUpdate::All).unwrap();
+        // The worker runs beside the main thread: more than one task.
+        assert!(leader_outlived(std::process::id()));
+        done_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert_ne!(tid, std::process::id());
+        assert!(system.process(pid(std::process::id())).is_some());
+        assert!(
+            system.process(pid(tid)).is_none(),
+            "thread {tid} listed as a process"
+        );
     }
 }

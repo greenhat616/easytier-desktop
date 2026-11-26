@@ -55,7 +55,9 @@ Not frozen:
   verify-to-signal window on that platform only. Other platforms answer `Uncertain`.
 - **Marker sweep.** `find_marked` matches processes of the host's user whose image is
   under `exe_root` and whose arguments reference a path under `cmdline_root`. A live
-  candidate whose fields cannot be observed is an error, not a skip.
+  candidate whose fields cannot be observed is an error, not a skip. It walks
+  processes, not threads (on Linux a thread is never a candidate of its own); a
+  zombie is skipped unless it is a thread-group leader whose other threads still run.
 - **Exit and cleanup.** Each handle emits output chunks (at most 16 KiB each; dropped
   with a warning if the consumer lags) and exactly one terminal event: `Exited` or
   `CleanupUncertain`. After any root exit the containment is killed and must be

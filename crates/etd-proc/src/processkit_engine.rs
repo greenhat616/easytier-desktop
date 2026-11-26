@@ -274,7 +274,8 @@ fn candidate_matches(
     if matches!(
         process.status(),
         ProcessStatus::Zombie | ProcessStatus::Dead
-    ) {
+    ) && !identity::leader_outlived(process.pid().as_u32())
+    {
         return Ok(false);
     }
     let owner = process.user_id().map(|user| user == own);

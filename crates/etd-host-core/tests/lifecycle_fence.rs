@@ -267,3 +267,45 @@ async fn a_single_missed_fence_check_is_retried_without_action() {
     assert_eq!(h.status("a").unwrap().epoch, 1);
     assert_eq!(notices(&mut h, "fence.lost"), 0);
 }
+
+#[tokio::test]
+async fn unverifiable_fence_checks_never_kill_and_are_reported_once() {
+    let world = World::new();
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.apply("a", spec("net"), Desired::Running).await;
+    h.wait_state("a", S::ReadyFull).await;
+    let kernel = world.last_kernel();
+
+    // Every re-verification from now on proves nothing either way (e.g. the
+    // firewall is busy): retried every 10 s, never a kill.
+    world.sys.inject(
+        etd_testkit::fakes::system::Fault::on(etd_testkit::fakes::system::Step::FenceVerify).fail(
+            etd_sysfx::ReclaimError::Os {
+                code: 16,
+                message: "PF writer is busy".into(),
+            },
+        ),
+    );
+    // 30 s to the first re-check, then 10 s apart: well past five in a row.
+    h.idle(
+        std::time::Duration::from_millis(500),
+        std::time::Duration::from_secs(150),
+    )
+    .await;
+    assert_eq!(world.engine.liveness(&kernel).await, Liveness::Same);
+    assert_eq!(world.spawned().len(), 1);
+    assert_eq!(h.state("a"), S::ReadyFull);
+    assert_eq!(notices(&mut h, "fence.lost"), 0);
+    assert_eq!(notices(&mut h, "fence.unverifiable"), 1, "reported once");
+
+    // Verifiable again: nothing else happens.
+    world.sys.clear_faults();
+    h.idle(
+        std::time::Duration::from_millis(500),
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    assert_eq!(world.engine.liveness(&kernel).await, Liveness::Same);
+    assert_eq!(notices(&mut h, "fence.unverifiable"), 1);
+}

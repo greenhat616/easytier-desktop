@@ -58,9 +58,13 @@ pub struct LifecycleConfig {
     /// While a fenced kernel runs, its fence is verified again this often
     /// (a firewall reload can drop the rule under a running kernel).
     pub fence_recheck: Duration,
-    /// After one failed or indeterminate re-verification, the retry comes
-    /// this much later; a second miss in a row kills the kernel.
+    /// After a definite loss of the fence, the retry comes this much later;
+    /// a second definite loss in a row kills the kernel.
     pub fence_retry: Duration,
+    /// After a re-verification that proved nothing either way (observer
+    /// error, firewall busy, timeout), the retry comes this much later; it
+    /// never kills the kernel.
+    pub fence_unverifiable_retry: Duration,
 }
 
 impl Default for LifecycleConfig {
@@ -75,6 +79,7 @@ impl Default for LifecycleConfig {
             lease_grace: Duration::from_secs(30),
             fence_recheck: Duration::from_secs(30),
             fence_retry: Duration::from_secs(2),
+            fence_unverifiable_retry: Duration::from_secs(10),
         }
     }
 }

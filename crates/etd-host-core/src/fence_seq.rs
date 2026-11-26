@@ -12,11 +12,14 @@
 //!    readiness of a fenced instance waits for [`FenceCheck::Verified`];
 //!    management (the RPC session) is opened only after it. Any mismatch is
 //!    [`FenceCheck::Failed`]: the supervisor kills the kernel and reclaims.
-//!    While the kernel runs, the supervisor repeats [`check`] every
-//!    `LifecycleConfig::fence_recheck` (a firewall reload can drop the
-//!    rule); two misses in a row (failed or not verifiable) end the
-//!    management session, kill the kernel and reclaim, and the restart
-//!    policy brings a new generation with a new fence.
+//!    While the kernel runs, the supervisor runs [`recheck`] in a
+//!    background task every `LifecycleConfig::fence_recheck` (a firewall
+//!    reload can drop the rule), so commands never wait behind a verify.
+//!    Two definite losses in a row ([`Recheck::Lost`]) end the management
+//!    session, kill the kernel and reclaim, and the restart policy brings a
+//!    new generation with a new fence. An unverifiable result is retried
+//!    every `fence_unverifiable_retry` and never kills; a run of them is
+//!    reported (`fence.unverifiable`).
 //! 4. The fallback is a new generation planned with
 //!    `ManagementGuard::DenyAll`; the kernel driver accepts it only when the
 //!    adapter profile marks its deny-all configuration verified, otherwise
@@ -93,5 +96,55 @@ pub(crate) async fn check(
         Ok(v) => FenceCheck::Failed(format!("fence verification failed: {v:?}")),
         Err(FenceError::Probe(m)) => FenceCheck::Failed(format!("fence probe failed: {m}")),
         Err(e) => FenceCheck::Failed(format!("fence verification failed: {e}")),
+    }
+}
+
+/// Outcome of a re-verification while the kernel runs (ruling topic#40
+/// msg#1150 item 5): only a definite loss counts toward a kill.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Recheck {
+    Verified,
+    /// Definite: the unprivileged probe actually connected (rule missing,
+    /// firewall disabled), or another process holds the port.
+    Lost(String),
+    /// Nothing proven either way: observer error, firewall writer busy,
+    /// timeout, no listener, a probe that could not run.
+    Unverifiable(String),
+}
+
+/// Steps 2-3 again against the running kernel `pid`.
+pub(crate) async fn recheck(
+    observer: &dyn SystemObserver,
+    fence: &dyn PortFence,
+    spec: &FenceSpec,
+    pid: u32,
+) -> Recheck {
+    match observer.listener(spec.address).await {
+        Err(e) => return Recheck::Unverifiable(format!("listener not observable: {e}")),
+        Ok(None) => {
+            return Recheck::Unverifiable(format!("nothing listens on {}", spec.address));
+        }
+        Ok(Some(l)) if l.pid != pid => {
+            return Recheck::Lost(format!(
+                "management port {} is held by pid {}, not the kernel (pid {pid})",
+                spec.address, l.pid
+            ));
+        }
+        Ok(Some(_)) => {}
+    }
+    match fence.verify(spec, pid).await {
+        Ok(v) if v.passed() => Recheck::Verified,
+        Ok(v) if v.unprivileged == DirectionResult::Connected => {
+            Recheck::Lost(format!("an unprivileged connection got through: {v:?}"))
+        }
+        Ok(v) => match v.listener {
+            ListenerCheck::Other { pid: other } => Recheck::Lost(format!(
+                "management port {} is held by pid {other}, not the kernel (pid {pid})",
+                spec.address
+            )),
+            _ => Recheck::Unverifiable(format!("fence verification inconclusive: {v:?}")),
+        },
+        Err(FenceError::Unsupported(m)) => Recheck::Lost(format!("fencing unsupported: {m}")),
+        Err(e) => Recheck::Unverifiable(format!("fence verification failed: {e}")),
     }
 }

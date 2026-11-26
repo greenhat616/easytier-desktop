@@ -16,6 +16,7 @@ use etd_sysfx::{
 };
 use etd_testkit::fakes::system::{Fault, Owner, Step};
 use lifecycle_common::*;
+use std::time::Duration;
 
 const RULE: EffectKind = EffectKind::WinProgramFirewallRule;
 
@@ -88,6 +89,46 @@ async fn assert_records_current(world: &World) {
         assert_eq!(e.state, EffectState::Applied, "{key:?}");
         assert_eq!(credential(e), found[0].credential, "{key:?}");
     }
+}
+
+/// The program-rule records once `done` holds for all of them (fake time
+/// moves on meanwhile).
+async fn until_records(
+    world: &World,
+    h: &mut Host<'_>,
+    done: impl Fn(&Effect) -> bool,
+) -> Vec<Effect> {
+    for _ in 0..200 {
+        let now = records(world).await;
+        if now.iter().all(&done) {
+            return now;
+        }
+        h.idle(Duration::from_millis(100), Duration::from_millis(100))
+            .await;
+    }
+    panic!(
+        "program rule records never settled: {:?}",
+        records(world).await
+    );
+}
+
+/// The observer fails for program rules (transiently: `times`, or until
+/// cleared) from right after the next spawn on.
+fn observer_fails_after_spawn(world: &World, times: Option<u32>) {
+    let fault = Fault::on(Step::Observe).kind(RULE);
+    let fault = match times {
+        Some(n) => fault.times(n),
+        None => fault,
+    };
+    world
+        .kernel
+        .faults_after_spawn
+        .lock()
+        .unwrap()
+        .push(fault.fail(ReclaimError::Os {
+            code: 1460,
+            message: "timeout".into(),
+        }));
 }
 
 fn host_deleted_a_rule(world: &World) -> bool {
@@ -207,7 +248,9 @@ async fn several_rules_of_the_name_after_readiness_are_a_conflict() {
     h.apply("a", spec("net"), Desired::Running).await;
     h.wait_state("a", S::ReadyFull).await;
 
-    for (e, key) in records(&world).await.iter().zip(keys(&world)) {
+    // Foreign only once a second snapshot, `reclaim_retry` later, agrees.
+    let settled = until_records(&world, &mut h, |e| e.state != EffectState::Planned).await;
+    for (e, key) in settled.iter().zip(keys(&world)) {
         assert_eq!(e.state, EffectState::Conflict, "{key:?}");
         assert_eq!(credential(e), None, "nothing of theirs is recorded as ours");
         assert_eq!(rules_named(&world, &key).len(), 2, "both rules stay");
@@ -320,4 +363,159 @@ async fn routes_of_an_assigned_interface_carry_its_credential() {
         obs.credential, utun.credential,
         "the interface's credential"
     );
+}
+
+#[tokio::test]
+async fn a_read_back_that_errs_once_is_retried_not_a_conflict() {
+    let world = with_rules();
+    observer_fails_after_spawn(&world, Some(1));
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.apply("a", spec("net"), Desired::Running).await;
+    h.wait_state("a", S::ReadyFull).await;
+
+    until_records(&world, &mut h, |e| e.state == EffectState::Applied).await;
+    assert_records_current(&world).await;
+    assert!(notices(&mut h, "program_rule.conflict").is_empty());
+}
+
+#[tokio::test]
+async fn our_rule_that_errs_once_before_the_start_backs_off_then_starts() {
+    let world = with_rules();
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.apply("a", spec("net"), Desired::Running).await;
+    h.wait_state("a", S::ReadyFull).await;
+    until_records(&world, &mut h, |e| e.state == EffectState::Applied).await;
+    h.set_desired("a", Desired::Stopped).await.unwrap();
+    h.wait_state("a", S::Stopped).await;
+
+    // Our rules are there; the observer fails once on the way.
+    world.sys.inject(
+        Fault::on(Step::Observe)
+            .kind(RULE)
+            .once()
+            .fail(ReclaimError::Os {
+                code: 1460,
+                message: "timeout".into(),
+            }),
+    );
+    h.set_desired("a", Desired::Running).await.unwrap();
+    h.until("ready after a backoff", |h| {
+        h.status("a")
+            .is_some_and(|s| s.epoch >= 3 && s.state() == S::ReadyFull)
+    })
+    .await;
+    assert_eq!(
+        world.spawned().len(),
+        2,
+        "the failed attempt spawned nothing"
+    );
+    assert!(notices(&mut h, "start.refused").is_empty());
+    assert!(notices(&mut h, "program_rule.conflict").is_empty());
+    until_records(&world, &mut h, |e| e.state == EffectState::Applied).await;
+    assert_records_current(&world).await;
+}
+
+#[tokio::test]
+async fn another_start_waits_while_rules_are_unsettled() {
+    let world = with_rules();
+    observer_fails_after_spawn(&world, None);
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.apply("a", spec("net-a"), Desired::Running).await;
+    h.wait_state("a", S::ReadyFull).await;
+
+    // a cannot read its rules back yet: b's start waits for the gate.
+    h.apply("b", spec("net-b"), Desired::Running).await;
+    h.idle(Duration::from_millis(250), Duration::from_secs(3))
+        .await;
+    assert_eq!(world.spawned().len(), 1, "b waits");
+    assert!(
+        h.status("b")
+            .is_some_and(|s| s.message.contains("waiting for another start")),
+        "{:?}",
+        h.status("b")
+    );
+
+    // Once a's rules are read back, b goes ahead.
+    world.sys.clear_faults();
+    h.until("both ready", |h| {
+        ["a", "b"].iter().all(|i| h.state(i) == S::ReadyFull)
+    })
+    .await;
+    until_records(&world, &mut h, |e| e.state == EffectState::Applied).await;
+    assert_records_current(&world).await;
+    assert!(notices(&mut h, "start.refused").is_empty());
+    assert!(notices(&mut h, "program_rule.conflict").is_empty());
+}
+
+#[tokio::test]
+async fn rules_still_unknown_at_the_deadline_are_left_as_they_were() {
+    let world = with_rules();
+    observer_fails_after_spawn(&world, None);
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.apply("a", spec("net-a"), Desired::Running).await;
+    h.wait_state("a", S::ReadyFull).await;
+    // start_timeout (10 s) after basic readiness.
+    h.idle(Duration::from_millis(500), Duration::from_secs(12))
+        .await;
+
+    assert_eq!(notices(&mut h, "program_rule.unsettled").len(), 1);
+    assert!(notices(&mut h, "program_rule.conflict").is_empty());
+    assert!(
+        records(&world)
+            .await
+            .iter()
+            .all(|e| e.state == EffectState::Planned),
+        "nothing claimed, nothing refreshed"
+    );
+    assert_eq!(h.state("a"), S::ReadyFull, "the kernel keeps running");
+
+    // The gate is free again: the next start is decided, not kept waiting
+    // (refused: the rules there are not the ones recorded).
+    world.sys.clear_faults();
+    h.apply("b", spec("net-b"), Desired::Running).await;
+    h.wait_state("b", S::GaveUp).await;
+    assert!(!notices(&mut h, "start.refused").is_empty());
+    assert_eq!(world.spawned().len(), 1);
+    assert!(!host_deleted_a_rule(&world));
+}
+
+#[tokio::test]
+async fn a_cut_while_waiting_for_the_gate_spawns_nothing() {
+    let world = with_rules();
+    observer_fails_after_spawn(&world, None);
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.apply("a", spec("net-a"), Desired::Running).await;
+    h.wait_state("a", S::ReadyFull).await;
+    h.apply("b", spec("net-b"), Desired::Running).await;
+    h.idle(Duration::from_millis(250), Duration::from_secs(1))
+        .await;
+
+    h.cut("b").await.unwrap();
+    world.sys.clear_faults();
+    h.idle(Duration::from_millis(250), Duration::from_secs(3))
+        .await;
+    assert_eq!(world.spawned().len(), 1, "b never spawned");
+    until_records(&world, &mut h, |e| e.state == EffectState::Applied).await;
+    assert_records_current(&world).await;
+}
+
+#[tokio::test]
+async fn a_shutdown_while_waiting_for_the_gate_completes() {
+    let world = with_rules();
+    observer_fails_after_spawn(&world, None);
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.apply("a", spec("net-a"), Desired::Running).await;
+    h.wait_state("a", S::ReadyFull).await;
+    h.apply("b", spec("net-b"), Desired::Running).await;
+    h.idle(Duration::from_millis(250), Duration::from_secs(1))
+        .await;
+
+    h.shutdown().await;
+    assert_eq!(world.spawned().len(), 1, "b never spawned");
 }

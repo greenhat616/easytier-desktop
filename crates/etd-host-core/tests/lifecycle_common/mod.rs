@@ -317,6 +317,9 @@ pub struct KernelSim {
     pub spawned: Mutex<Vec<(ProcessIdentity, ProcCommand)>>,
     /// The system's objects as each spawn saw them.
     pub objects_at_spawn: Mutex<Vec<Vec<etd_testkit::fakes::system::FakeObject>>>,
+    /// Injected into the system right after the next spawn (after the
+    /// host's checks before it).
+    pub faults_after_spawn: Mutex<Vec<etd_testkit::fakes::system::Fault>>,
 }
 
 impl KernelSim {
@@ -385,6 +388,9 @@ impl ProcessEngine for KernelSim {
             } else if b.listen {
                 self.sys.set_listener(plan.endpoint.0, id.pid);
             }
+        }
+        for fault in self.faults_after_spawn.lock().unwrap().drain(..) {
+            self.sys.inject(fault);
         }
         Ok(handle)
     }
@@ -612,6 +618,7 @@ impl World {
             behaviour: Mutex::new(KernelBehaviour::default()),
             spawned: Mutex::new(Vec::new()),
             objects_at_spawn: Mutex::new(Vec::new()),
+            faults_after_spawn: Mutex::new(Vec::new()),
         });
         let ledger = Arc::new(TestLedger {
             inner: Arc::new(MemoryLedger::new(sys.boot())),
@@ -638,6 +645,7 @@ impl World {
             lease_grace: Duration::from_secs(30),
             fence_recheck: Duration::from_secs(30),
             fence_retry: Duration::from_secs(2),
+            fence_unverifiable_retry: Duration::from_secs(10),
         };
         Self {
             scratch,

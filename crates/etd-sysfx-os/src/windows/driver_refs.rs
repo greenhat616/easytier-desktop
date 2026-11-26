@@ -219,8 +219,10 @@ fn registry_images() -> Result<Vec<(String, String)>, WinError> {
                 }
                 let units: Vec<_> = value
                     .bytes
-                    .chunks_exact(2)
-                    .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|chunk| u16::from_le_bytes(*chunk))
                     .collect();
                 let path = nul_string(&units)?;
                 if path.is_empty() {
@@ -427,7 +429,12 @@ fn inside(path: &str, dir: &str) -> bool {
 }
 
 fn identity(path: &Path) -> Result<(u32, u64), WinError> {
-    let file = fs::File::open(path).map_err(io_error)?;
+    use std::os::windows::fs::OpenOptionsExt;
+    // Query only metadata: reading another driver image is unnecessary.
+    let file = fs::OpenOptions::new()
+        .access_mode(0)
+        .open(path)
+        .map_err(io_error)?;
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: file owns the live handle and info is writable.
     unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }

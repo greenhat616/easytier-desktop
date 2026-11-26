@@ -259,30 +259,63 @@ pub(crate) fn group_absent(group: i32) -> io::Result<bool> {
 /// image and argv it cannot read, so the marker sweep reconciles against it.
 #[cfg(target_os = "macos")]
 pub(crate) fn all_pids() -> io::Result<Vec<u32>> {
-    // SAFETY: a null buffer only asks for the current PID count estimate.
-    let mut capacity = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-    if capacity < 1 {
-        return Err(io::Error::last_os_error());
+    list_pids_with(
+        |buffer| match buffer {
+            // SAFETY: a null buffer only asks for the current PID count estimate.
+            None => unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) },
+            Some(pids) => {
+                let Ok(bytes) = libc::c_int::try_from(std::mem::size_of_val(pids)) else {
+                    return -1;
+                };
+                // SAFETY: the kernel writes at most `bytes` bytes into `pids`.
+                unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) }
+            }
+        },
+        std::process::id(),
+    )
+}
+
+/// Seam over libproc's `proc_listallpids` (`None` = sizing call). libproc
+/// turns a failed `__proc_info` into 0, so a count <= 0 from either call is an
+/// enumeration failure, never an empty system; a list without our own PID is
+/// equally not a full list.
+#[cfg(any(target_os = "macos", test))]
+fn list_pids_with(
+    mut list: impl FnMut(Option<&mut [i32]>) -> i32,
+    own: u32,
+) -> io::Result<Vec<u32>> {
+    let failed = |call: &str, count: i32| {
+        io::Error::other(format!(
+            "proc_listallpids {call} returned {count}: {}",
+            io::Error::last_os_error()
+        ))
+    };
+    let mut capacity = list(None);
+    if capacity <= 0 {
+        return Err(failed("sizing", capacity));
     }
     loop {
-        let mut pids: Vec<libc::pid_t> = vec![0; usize::try_from(capacity).unwrap_or(0) + 64];
-        let bytes = libc::c_int::try_from(std::mem::size_of_val(pids.as_slice()))
-            .map_err(io::Error::other)?;
-        // SAFETY: the kernel writes at most `bytes` bytes into `pids`.
-        let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
-        if count < 0 {
-            return Err(io::Error::last_os_error());
+        let mut pids = vec![0i32; usize::try_from(capacity).unwrap_or(0) + 64];
+        let count = list(Some(&mut pids));
+        if count <= 0 {
+            return Err(failed("fill", count));
         }
         let count = usize::try_from(count).map_err(io::Error::other)?;
         // A full buffer may be truncated; never return a short list.
         if count < pids.len() {
             pids.truncate(count);
-            return Ok(pids
+            let pids: Vec<u32> = pids
                 .into_iter()
                 .filter_map(|pid| u32::try_from(pid).ok())
-                .collect());
+                .collect();
+            if !pids.contains(&own) {
+                return Err(io::Error::other(
+                    "kernel PID list does not contain the host process",
+                ));
+            }
+            return Ok(pids);
         }
-        capacity = libc::c_int::try_from(count.saturating_mul(2)).map_err(io::Error::other)?;
+        capacity = i32::try_from(count.saturating_mul(2)).map_err(io::Error::other)?;
     }
 }
 
@@ -291,6 +324,8 @@ pub(crate) fn all_pids() -> io::Result<Vec<u32>> {
 pub(crate) struct BsdState {
     pub(crate) zombie: bool,
     pub(crate) ruid: libc::uid_t,
+    /// Kernel short name (`pbsi_comm`), for diagnostics only.
+    pub(crate) name: String,
 }
 
 /// `Ok(None)` only for ESRCH; any other failure is "cannot look", not absence.
@@ -320,6 +355,12 @@ pub(crate) fn bsd_state(pid: u32) -> io::Result<Option<BsdState>> {
         return Ok(Some(BsdState {
             zombie: info.pbsi_status == libc::SZOMB,
             ruid: info.pbsi_ruid,
+            name: info
+                .pbsi_comm
+                .iter()
+                .take_while(|&&c| c != 0)
+                .map(|&c| char::from(c as u8))
+                .collect(),
         }));
     }
     let error = io::Error::last_os_error();
@@ -487,6 +528,46 @@ mod minimal_snapshot_tests {
     fn query_denial_is_not_inferred_from_own_process_or_absent_pid() {
         assert!(!query_access_denied(std::process::id()));
         assert!(!query_access_denied(2_000_000_000));
+    }
+
+    /// Scripted libproc: the sizing answer, then one answer per fill call.
+    fn scripted(
+        sizing: i32,
+        fills: Vec<Vec<i32>>,
+        fill_counts: Vec<i32>,
+    ) -> impl FnMut(Option<&mut [i32]>) -> i32 {
+        let mut call = 0;
+        move |buffer| match buffer {
+            None => sizing,
+            Some(buffer) => {
+                let pids = &fills[call];
+                let n = pids.len().min(buffer.len());
+                buffer[..n].copy_from_slice(&pids[..n]);
+                call += 1;
+                fill_counts[call - 1]
+            }
+        }
+    }
+
+    #[test]
+    fn failed_or_empty_kernel_pid_list_is_an_error_not_an_empty_system() {
+        // libproc reports a failed __proc_info as 0, not -1.
+        for sizing in [0, -1] {
+            assert!(list_pids_with(scripted(sizing, vec![], vec![]), 7).is_err());
+        }
+        for count in [0, -1] {
+            assert!(list_pids_with(scripted(3, vec![vec![]], vec![count]), 7).is_err());
+        }
+        // A list that lacks the host itself is not a full list.
+        assert!(list_pids_with(scripted(3, vec![vec![1, 5]], vec![2]), 7).is_err());
+    }
+
+    #[test]
+    fn kernel_pid_list_retries_a_full_buffer_and_keeps_every_pid() {
+        // The first buffer (3 + 64 slots) comes back full: possibly truncated.
+        let full: Vec<i32> = (1..=67).collect();
+        let pids = list_pids_with(scripted(3, vec![full, vec![1, 7, 99]], vec![67, 3]), 7).unwrap();
+        assert_eq!(pids, vec![1, 7, 99]);
     }
 
     #[test]

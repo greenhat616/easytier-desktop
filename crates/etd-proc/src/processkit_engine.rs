@@ -415,12 +415,9 @@ fn unlisted_candidate(
     marker: &ProcessMarker,
 ) -> Result<Option<ProcessIdentity>, ProcessError> {
     const ATTEMPTS: usize = 20;
-    let unobservable = |reason: String| {
-        ProcessError::Enumeration(format!(
-            "PID {pid} is missing from the process snapshot: {reason}"
-        ))
-    };
-    let mut reason = String::new();
+    // Name the process so H1's notice tells the user what blocks the sweep.
+    let mut name = String::from("name unavailable");
+    let mut reason = String::from("not observed");
     for attempt in 0..ATTEMPTS {
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(10));
@@ -428,7 +425,7 @@ fn unlisted_candidate(
         match identity::bsd_state(pid) {
             Ok(None) => return Ok(None),
             Ok(Some(state)) if state.zombie || state.ruid != **own => return Ok(None),
-            Ok(Some(_)) => {}
+            Ok(Some(state)) => name = state.name,
             Err(error) => {
                 reason = error.to_string();
                 continue;
@@ -439,9 +436,11 @@ fn unlisted_candidate(
         if let Some(process) = fresh.process(pids[0]) {
             return marked_candidate(process, own, marker);
         }
-        reason = "live same-user process stays uninspectable".into();
+        reason = "live same-user process whose image and argv stay unreadable".into();
     }
-    Err(unobservable(reason))
+    Err(ProcessError::Enumeration(format!(
+        "PID {pid} ({name}) is missing from the process snapshot: {reason}"
+    )))
 }
 /// A stale Windows PPID is not ancestry: a real child cannot predate
 /// its parent. Unreadable candidate metadata is an uncertainty, not absence.

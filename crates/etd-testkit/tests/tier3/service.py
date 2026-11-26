@@ -67,16 +67,16 @@ def assert_driver_notice(stdout, retained):
                          r"remove it yourself if no other software uses it\s*$", stdout, re.M | re.I)
     assert len(notices) == len(retained) and {name.lower() for name, _ in notices} == retained.keys()
     root = Path(os.environ["SystemRoot"])
+    def driver_path(raw):
+        path = os.path.expandvars(raw.strip().strip('"')).removeprefix("\\??\\")
+        if path.lower().startswith("\\systemroot\\"):
+            return root / path[len("\\systemroot\\"):]
+        return root / path if not Path(path).is_absolute() else Path(path)
     for name, image in notices:
         config = retained[name.lower()]
         match = re.search(r"^\s*BINARY_PATH_NAME\s*:\s*(.+)$", config, re.M)
-        assert match and image != "unknown", f"missing shared driver image for {name}"
-        native = os.path.expandvars(match[1].strip().strip('"')).removeprefix("\\??\\")
-        if native.lower().startswith("\\systemroot\\"):
-            native = root / native[len("\\systemroot\\"):]
-        elif not Path(native).is_absolute():
-            native = root / native
-        assert Path(image).samefile(native), f"shared driver report differs from SCM for {name}"
+        assert match and not image.lower().startswith("unknown"), f"missing shared driver image for {name}"
+        assert driver_path(image).samefile(driver_path(match[1])), f"shared driver report differs from SCM for {name}"
     print(f"native shared driver notices verified: {sorted(retained)}", flush=True)
 
 

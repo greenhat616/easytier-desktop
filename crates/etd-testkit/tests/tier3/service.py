@@ -171,9 +171,12 @@ class Service:
             print(f"installed service handshake: serving, admin; kernel probe: {version}", flush=True)
             yield self
         finally:
-            # Shared driver candidates can legitimately prevent uninstall;
-            # retain the native report, never delete drivers to pass cleanup.
+            # Inventory the result even when a failed uninstall retains files.
             result = self.uninstall()
+            if not result.returncode:
+                eventually("uninstall journal closed",
+                           lambda: self.call(self.installer, "uninstall", "--status"),
+                           lambda status: status.startswith("No maintenance journal:"))
             after = self.inventory()
             delta = before.delta(after) - managed_service_changes(before, after)
             delta -= runner_noise(before, after) | tun_created(before, after)
@@ -185,13 +188,7 @@ class Service:
             assert not (delta or files), (
                 f"pre-install to post-uninstall differences: native={sorted(delta)}, installed={files}"
             )
-            if result.returncode and sys.exc_info()[0] is None:
-                if "reclaim incomplete" not in result.stderr or not self.retained_drivers:
-                    raise RuntimeError("test service uninstall incomplete")
-                pending = [r for r in self.effects() if r["state"] != "reclaimed"]
-                assert all(r["kind"] == "driver" and r["scope"] == "product"
-                           and r["state"] in ("candidate", "conflict") for r in pending)
-                assert {r["key"]["name"].lower() for r in pending} == set(self.retained_drivers)
+            assert result.returncode == 0, f"service uninstall exited {result.returncode}"
 
     @staticmethod
     def call(*args):

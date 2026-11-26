@@ -87,7 +87,7 @@ def processes(inv, paths):
     for parent, row in table.items():
         if not row["exe"]:
             continue
-        path = Path(row["exe"])
+        path = Path(row["exe"]).resolve()
         if not any(path == root or root in path.parents for root in roots):
             continue
         seen = set()
@@ -160,9 +160,11 @@ def linux(inv):
         config = output("systemctl", "cat", unit) if unit.startswith("easytier-desk") else None
         inv.put("service", unit, (state, hashlib.sha256(config.encode()).hexdigest() if config else None))
     tun = Path("/dev/net/tun")
-    if tun.exists():
-        st = tun.stat()
-        inv.put("interface", str(tun), (st.st_mode, st.st_rdev, st.st_ino))
+    try:
+        st = tun.lstat()
+    except FileNotFoundError:
+        return
+    inv.put("interface", str(tun), (st.st_mode, st.st_rdev, st.st_ino))
 
 
 def darwin(inv):

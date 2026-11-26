@@ -240,7 +240,12 @@ def verify_shared_driver_purge(service, baseline, stopped, inventory, foreign_ke
     retained = {r["key"]["name"].lower() for r in records if r["scope"] == "product"
                 and r["kind"] == "driver" and r["state"] == "candidate"}
     assert retained == names, f"expected shared driver candidates {names}, got {retained}"
-    assert result.returncode and "candidates" in result.stdout and "reclaim incomplete" in result.stderr
+    assert f"0 generations, {len(names)} candidates, 0 conflicts" in result.stdout
+    if result.returncode:
+        assert "reclaim incomplete" in result.stderr
+        pending = [r for r in records if r["state"] != "reclaimed"]
+        assert all(r["kind"] == "driver" and r["scope"] == "product"
+                   and r["state"] == "candidate" for r in pending)
     after = inventory()
     service.retained_drivers = {name: stopped.rows["service", name] for name in names}
     assert_foreign(stopped, after, {("service", name) for name in names})
@@ -289,9 +294,6 @@ def driver_conflict():
         service.ctl("stop", instance)
         service.stop()
         assert_foreign(foreign_state, service.inventory(), {("service", n) for n in names})
-        # These disabled registrations belong to the fixture and will be
-        # removed by its ExitStack before uninstall. No native survivor is allowed.
-        service.retained_drivers = dict.fromkeys(names)
 
 
 def program_rule_conflict():

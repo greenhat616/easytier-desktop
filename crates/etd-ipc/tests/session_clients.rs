@@ -60,6 +60,57 @@ async fn low_integrity_copy_is_refused_at_open() {
     assert_eq!(error.kind(), ErrorKind::PermissionDenied);
 }
 
+/// NtCreateFile asking for FILE_APPEND_DATA alone: the pipe file system does
+/// not check that bit on a client open, and nothing else is requested for
+/// the label or DACL to refuse. If such a handle opens, the listener must
+/// still refuse what it writes.
+#[tokio::test]
+#[ignore = "Windows administrator CI runner: low integrity and low-box token copies"]
+async fn append_only_open_from_low_or_app_container_is_refused() {
+    let (f, mut listener) = bind();
+    let leaf = endpoint_arg(&f.ep)
+        .to_str()
+        .unwrap()
+        .strip_prefix(r"\\.\pipe\")
+        .unwrap()
+        .to_owned();
+    let mut outcomes = Vec::new();
+    for (label, token) in [
+        ("Low", restricted_token(LOW)),
+        ("AppContainer", app_container_token()),
+    ] {
+        match impersonating(&token, || nt_open(&leaf, 0x4)) {
+            Err(status) => {
+                // STATUS_ACCESS_DENIED
+                assert_eq!(status as u32, 0xC000_0022, "{label}: {:#x}", status as u32);
+                outcomes.push(format!("{label}: refused at open"));
+            }
+            Ok(handle) => {
+                let written = nt_write(&handle, &[1]);
+                if written == 0 {
+                    let error = listener.accept().await.err().unwrap();
+                    assert_eq!(
+                        error.kind(),
+                        ErrorKind::PermissionDenied,
+                        "{label}: {error}"
+                    );
+                    outcomes.push(format!(
+                        "{label}: opened, wrote, refused at admission: {error}"
+                    ));
+                } else {
+                    drop(handle);
+                    let error = listener.accept().await.err().unwrap();
+                    outcomes.push(format!(
+                        "{label}: opened, write failed {:#x}, connection dropped: {error}",
+                        written as u32
+                    ));
+                }
+            }
+        }
+    }
+    println!("{outcomes:#?}");
+}
+
 /// The admission predicate itself is unit-tested in
 /// `platform::windows::identity`; a low-box token cannot get past the DACL
 /// and label to reach it.

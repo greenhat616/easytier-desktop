@@ -33,7 +33,7 @@ use windows::{
             Pipes::CreatePipe,
             SystemServices::SE_GROUP_INTEGRITY,
             Threading::{
-                CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
+                CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessAsUserW,
                 GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, PROCESS_INFORMATION,
                 STARTF_USESTDHANDLES, STARTUPINFOW, WaitForSingleObject,
             },
@@ -143,8 +143,52 @@ struct ObjectAttributes {
     descriptor: *const core::ffi::c_void,
     qos: *const core::ffi::c_void,
 }
+#[repr(C)]
+struct UnicodeString {
+    length: u16,
+    maximum: u16,
+    buffer: *const u16,
+}
+/// SECURITY_QUALITY_OF_SERVICE.
+#[repr(C)]
+struct Qos {
+    length: u32,
+    level: u32,
+    tracking: u8,
+    effective_only: u8,
+}
+#[repr(C)]
+#[derive(Default)]
+struct IoStatus {
+    status: usize,
+    information: usize,
+}
 #[link(name = "ntdll")]
 unsafe extern "system" {
+    fn NtCreateFile(
+        handle: *mut HANDLE,
+        access: u32,
+        attributes: *const ObjectAttributes,
+        io: *mut IoStatus,
+        allocation: *const i64,
+        file_attributes: u32,
+        share: u32,
+        disposition: u32,
+        options: u32,
+        ea: *const core::ffi::c_void,
+        ea_length: u32,
+    ) -> i32;
+    fn NtWriteFile(
+        handle: HANDLE,
+        event: HANDLE,
+        apc: *const core::ffi::c_void,
+        apc_context: *const core::ffi::c_void,
+        io: *mut IoStatus,
+        buffer: *const u8,
+        length: u32,
+        offset: *const i64,
+        key: *const u32,
+    ) -> i32;
     fn NtQueryObject(
         handle: HANDLE,
         class: u32,
@@ -223,8 +267,107 @@ pub fn granted_access(file: &File) -> u32 {
     info.granted_access
 }
 
-/// Run `f` on this thread while impersonating `token`. No await happens
-/// inside, so the impersonation cannot leak to another task.
+/// Open `\\.\pipe\<leaf>` with exactly `access`, nothing added (CreateFile
+/// always adds SYNCHRONIZE and FILE_READ_ATTRIBUTES), identifying the
+/// caller. Returns the NTSTATUS on failure.
+pub fn nt_open(leaf: &str, access: u32) -> Result<OwnedHandle, i32> {
+    let path = wide(&format!(r"\??\pipe\{leaf}"));
+    let name = UnicodeString {
+        length: ((path.len() - 1) * 2) as u16,
+        maximum: (path.len() * 2) as u16,
+        buffer: path.as_ptr(),
+    };
+    let qos = Qos {
+        length: size_of::<Qos>() as u32,
+        level: 1, // SecurityIdentification
+        tracking: 0,
+        effective_only: 0,
+    };
+    let attributes = ObjectAttributes {
+        length: size_of::<ObjectAttributes>() as u32,
+        root: HANDLE::default(),
+        name: (&raw const name).cast(),
+        attributes: 0x40, // OBJ_CASE_INSENSITIVE
+        descriptor: ptr::null(),
+        qos: (&raw const qos).cast(),
+    };
+    let mut handle = HANDLE::default();
+    let mut io = IoStatus::default();
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            access,
+            &attributes,
+            &mut io,
+            ptr::null(),
+            0,
+            3,    // FILE_SHARE_READ | FILE_SHARE_WRITE
+            1,    // FILE_OPEN
+            0x40, // FILE_NON_DIRECTORY_FILE; asynchronous, no SYNCHRONIZE needed
+            ptr::null(),
+            0,
+        )
+    };
+    if status < 0 {
+        return Err(status);
+    }
+    Ok(unsafe { OwnedHandle::from_raw_handle(handle.0) })
+}
+
+/// Write `bytes` to an asynchronous handle opened by [`nt_open`] and wait
+/// for the result. Returns the final NTSTATUS.
+pub fn nt_write(handle: &OwnedHandle, bytes: &[u8]) -> i32 {
+    let event = unsafe { CreateEventW(None, true, false, PCWSTR::null()).unwrap() };
+    let event = unsafe { OwnedHandle::from_raw_handle(event.0) };
+    let mut io = IoStatus::default();
+    let offset = 0i64;
+    let mut status = unsafe {
+        NtWriteFile(
+            HANDLE(handle.as_raw_handle()),
+            HANDLE(event.as_raw_handle()),
+            ptr::null(),
+            ptr::null(),
+            &mut io,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+            &offset,
+            ptr::null(),
+        )
+    };
+    if status == 0x103 {
+        // STATUS_PENDING
+        unsafe { WaitForSingleObject(HANDLE(event.as_raw_handle()), 10_000) };
+        status = io.status as i32;
+    }
+    status
+}
+
+/// Connect with `connector` from a dedicated thread that impersonates
+/// `token` for the whole connection, as a UI process with that token would.
+pub fn connect_as(
+    token: OwnedHandle,
+    connector: etd_ipc::platform::LocalConnector,
+    endpoint: etd_ipc::Endpoint,
+) -> io::Result<etd_ipc::ServerIdentity> {
+    use etd_ipc::Connector;
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        impersonating(&token, || {
+            runtime
+                .block_on(connector.connect(&endpoint))
+                .map(|(_, server)| server)
+        })
+    })
+    .join()
+    .unwrap()
+}
+
+/// Run `f` on this thread while impersonating `token`. `f` must not hand
+/// work to another thread (no await on a shared runtime), so the
+/// impersonation applies to everything it does.
 pub fn impersonating<T>(token: &OwnedHandle, f: impl FnOnce() -> T) -> T {
     unsafe { ImpersonateLoggedOnUser(HANDLE(token.as_raw_handle())).unwrap() };
     let result = f();

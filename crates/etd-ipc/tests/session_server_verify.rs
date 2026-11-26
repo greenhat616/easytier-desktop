@@ -50,6 +50,23 @@ async fn genuine_elevated_host_is_accepted() {
     );
 }
 
+/// The production case: a non-elevated Medium UI of the same account
+/// inspects the elevated host (process, image, token) and accepts it.
+#[tokio::test]
+#[ignore = "Windows administrator CI runner: restricted token copy of the runner"]
+async fn medium_ui_accepts_the_genuine_elevated_host() {
+    if !run_as_host("medium_ui_accepts_the_genuine_elevated_host") {
+        return;
+    }
+    let f = Fixture::new();
+    let _listener = session_listener(&f);
+    let server = connect_as(restricted_token(MEDIUM), elevated_connector(), f.ep.clone())
+        .expect("a Medium UI must be able to verify the elevated host");
+    assert_eq!(server.peer.user, current_user().unwrap());
+    assert!(server.peer.elevated);
+    assert_eq!(server.peer.pid, std::process::id());
+}
+
 #[tokio::test]
 #[ignore = "Windows administrator CI runner: elevated runner token"]
 async fn handshake_round_trip_over_the_session_pipe() {
@@ -190,8 +207,14 @@ async fn non_elevated_squatter_is_refused_before_any_write() {
     }
 
     // The squatter runs the trusted image as the same user; only the
-    // missing elevation identifies it.
-    let error = elevated_connector().connect(&squat.ep).await.err().unwrap();
+    // missing elevation identifies it. The client is a Medium UI.
+    let error = connect_as(
+        restricted_token(MEDIUM),
+        elevated_connector(),
+        squat.ep.clone(),
+    )
+    .err()
+    .unwrap();
     assert_eq!(error.kind(), ErrorKind::PermissionDenied);
     assert!(error.to_string().contains("not elevated"), "{error}");
 

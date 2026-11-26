@@ -180,7 +180,7 @@ async fn second_account_denied_allowed_and_revoked_on_real_pipe() {
     )
     .unwrap();
     let (token, second_user) = windows_account::logon();
-    let open = || {
+    let open = |ep: &etd_ipc::Endpoint| {
         unsafe {
             ImpersonateLoggedOnUser(HANDLE(token.as_raw_handle())).unwrap();
         }
@@ -188,7 +188,7 @@ async fn second_account_denied_allowed_and_revoked_on_real_pipe() {
             .read(true)
             .access_mode(FILE_READ_DATA.0 | FILE_WRITE_DATA.0)
             .security_qos_flags(windows::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION.0)
-            .open(endpoint_arg(&f.ep));
+            .open(endpoint_arg(ep));
         if unsafe { RevertToSelf() }.is_err() {
             std::process::abort();
         }
@@ -196,7 +196,7 @@ async fn second_account_denied_allowed_and_revoked_on_real_pipe() {
     };
     let policy = listener.policy_handle();
     assert_eq!(
-        open().unwrap_err().kind(),
+        open(&f.ep).unwrap_err().kind(),
         std::io::ErrorKind::PermissionDenied
     );
     policy
@@ -205,22 +205,29 @@ async fn second_account_denied_allowed_and_revoked_on_real_pipe() {
             ..Default::default()
         })
         .unwrap();
-    let mut allowed = open().unwrap();
+    let mut allowed = open(&f.ep).unwrap();
     allowed.write_all(&[1]).unwrap();
     let (stream, peer) = listener.accept().await.unwrap();
     assert_eq!(peer.user, second_user);
     policy.update(&ListenerPolicy::default()).unwrap();
     assert_eq!(
-        open().unwrap_err().kind(),
+        open(&f.ep).unwrap_err().kind(),
         std::io::ErrorKind::PermissionDenied
     );
     drop(stream);
     drop(allowed);
     drop(listener);
-    let user =
-        LocalListener::bind(etd_ipc::HostForm::User, &f.ep, &ListenerPolicy::default()).unwrap();
+    // Tokio may retain overlapped named-pipe handles briefly after drop;
+    // this is a separate user-host endpoint, not a service-name takeover.
+    let user_fixture = Fixture::new();
+    let user = LocalListener::bind(
+        etd_ipc::HostForm::User,
+        &user_fixture.ep,
+        &ListenerPolicy::default(),
+    )
+    .unwrap();
     assert_eq!(
-        open().unwrap_err().kind(),
+        open(&user_fixture.ep).unwrap_err().kind(),
         std::io::ErrorKind::PermissionDenied
     );
     drop(user);

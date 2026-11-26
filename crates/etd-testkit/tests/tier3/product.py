@@ -15,7 +15,7 @@ from consistency import (
     FirewallReadbackPending, UnpredictedChanges, adapter_defaults, check_closed, check_generation, installed_image,
     managed_service_changes, runner_noise, scope, system_policy_changes, tun_created,
 )
-from inventory import assert_exited, capture, file_identity, native_application_id
+from inventory import assert_exited, capture, file_identity, native_application_id, native_interface_guid
 import foreign
 
 
@@ -256,10 +256,19 @@ def verify_shared_driver_purge(service, baseline, stopped, inventory, foreign_ke
     names = {name for name in ("wintun", "windivert")
              if ("service", name) not in baseline.rows and ("service", name) in stopped.rows}
     assert "wintun" in names, "the real kernel did not load its TUN driver"
+    interfaces = {name: native_interface_guid(stopped.rows[kind, name]["index"])
+                  for kind, name in foreign_keys if kind == "interface"}
     prior = service.ctl("reclaim-report")
+    assert not prior["conflicts"]
+    swept = {}
     for candidate in prior["candidates"]:
         print(f"before offline purge: candidate {candidate['kind']} "
               f"{candidate['origin']} {candidate['identity']}", flush=True)
+        assert candidate["kind"] == "win.tun" and candidate["origin"] == "prefix_match"
+        match = re.fullmatch(r"interface (\S+) (\{.+\})", candidate["identity"])
+        assert match and match[1] not in swept, "ambiguous swept interface"
+        swept[match[1]] = uuid.UUID(match[2].strip("{}"))
+    assert swept == interfaces, "swept candidates differ from the native foreign interface identities"
     service.stop()
     result = command(service.installer, "reclaim", "--all", "--purge", check=False, timeout=240)
     records = service.effects()
@@ -291,9 +300,16 @@ def verify_shared_driver_purge(service, baseline, stopped, inventory, foreign_ke
     delta.remove(hosts[0])
     if delta:
         print(f"post-purge native differences: {sorted(delta)}", flush=True)
-    assert result.returncode == 0, f"standalone purge exited {result.returncode}"
-    assert report and int(report[2]) == len(names) and int(report[3]) == 0
-    assert_driver_notice(result.stdout, service.retained_drivers)
+    assert report and int(report[2]) == len(names) + len(interfaces) and int(report[3]) == 0
+    if interfaces:
+        # The same-prefix tunnel belongs to the fixture. Purge cannot
+        # declare completion while this non-driver candidate is present.
+        assert result.returncode and "reclaim incomplete" in result.stderr
+        for name, guid in interfaces.items():
+            assert native_interface_guid(after.rows["interface", name]["index"]) == guid
+    else:
+        assert result.returncode == 0, f"standalone purge exited {result.returncode}"
+        assert_driver_notice(result.stdout, service.retained_drivers)
     assert not delta, f"post-purge native differences: {sorted(delta)}"
 
 

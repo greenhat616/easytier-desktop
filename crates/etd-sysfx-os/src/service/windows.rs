@@ -502,6 +502,83 @@ windows_service::define_windows_service!(ffi_service_main, service_main);
 fn service_main(_: Vec<OsString>) {
     let _ = SERVICE_RESULT.set(run_service());
 }
+
+/// A standard UI must be able to verify the image path and creation time
+/// of the LocalSystem process named by its pipe. Extend the existing process
+/// DACL by exactly QUERY_LIMITED_INFORMATION, not token, VM or control access.
+/// This grants no pipe/contract role and expires when this process exits.
+fn allow_identity_query() -> io::Result<()> {
+    use ::windows::{
+        Win32::{
+            Security::{
+                Authorization::{
+                    ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetSecurityInfo,
+                    SE_KERNEL_OBJECT, SetEntriesInAclW, SetSecurityInfo, TRUSTEE_IS_SID,
+                    TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
+                },
+                NO_INHERITANCE,
+            },
+            System::Threading::PROCESS_QUERY_LIMITED_INFORMATION,
+        },
+        core::w,
+    };
+    if current_sid()? != "S-1-5-18" {
+        return Err(denied());
+    }
+    unsafe {
+        let process = GetCurrentProcess();
+        let mut old_acl = std::ptr::null_mut();
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        GetSecurityInfo(
+            process,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut old_acl),
+            None,
+            Some(&mut descriptor),
+        )
+        .ok()
+        .map_err(other)?;
+        let _descriptor = Allocation(HLOCAL(descriptor.0));
+        if old_acl.is_null() {
+            return Err(denied());
+        }
+        let mut sid = PSID::default();
+        ConvertStringSidToSidW(w!("S-1-5-11"), &mut sid).map_err(other)?; // Authenticated Users
+        let _sid = Allocation(HLOCAL(sid.0));
+        let access = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: PROCESS_QUERY_LIMITED_INFORMATION.0,
+            grfAccessMode: GRANT_ACCESS,
+            grfInheritance: NO_INHERITANCE,
+            Trustee: TRUSTEE_W {
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_WELL_KNOWN_GROUP,
+                ptstrName: PWSTR(sid.0.cast()),
+                ..Default::default()
+            },
+        };
+        let mut acl = std::ptr::null_mut();
+        SetEntriesInAclW(Some(&[access]), Some(old_acl), &mut acl)
+            .ok()
+            .map_err(other)?;
+        let _acl = Allocation(HLOCAL(acl.cast()));
+        SetSecurityInfo(
+            process,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(acl),
+            None,
+        )
+        .ok()
+        .map_err(other)?;
+    }
+    Ok(())
+}
+
 fn run_service() -> io::Result<()> {
     use windows_service::{
         service::{ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceStatus},
@@ -530,6 +607,10 @@ fn run_service() -> io::Result<()> {
         wait_hint: Duration::ZERO,
         process_id: None,
     };
+    if let Err(error) = allow_identity_query() {
+        let _ = handle.set_service_status(status(ServiceState::Stopped, 1));
+        return Err(error);
+    }
     handle
         .set_service_status(status(ServiceState::Running, 0))
         .map_err(other)?;

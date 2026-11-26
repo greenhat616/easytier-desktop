@@ -129,6 +129,29 @@ pub fn group_id() -> io::Result<u32> {
     Ok(group.gid.as_raw())
 }
 
+// DirectoryService may acknowledge a macOS group change before libc's
+// group lookup cache observes it. Poll the actual identity rather than
+// assuming acknowledgement means success or weakening group verification.
+#[cfg(target_os = "macos")]
+fn await_group(present: bool) -> io::Result<Option<u32>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let found = Group::from_name(GROUP)
+            .map_err(other)?
+            .map(|group| group.gid.as_raw());
+        if found.is_some() == present {
+            return Ok(found);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "DirectoryService did not publish the service group change",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 fn create_group(layout: &HostLayout) -> io::Result<()> {
     if Group::from_name(GROUP).map_err(other)?.is_some() {
         return Err(io::Error::new(
@@ -143,13 +166,17 @@ fn create_group(layout: &HostLayout) -> io::Result<()> {
         "/usr/sbin/dseditgroup",
         &["-o", "create", "-n", "/Local/Default", GROUP],
     )?;
+    #[cfg(target_os = "macos")]
+    let gid = await_group(true)?.ok_or_else(denied)?;
+    #[cfg(target_os = "linux")]
+    let gid = group_id()?;
     use std::{io::Write, os::unix::fs::OpenOptionsExt};
     let mut record = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(layout.state.join(GROUP_RECORD))?;
-    write!(record, "{}", group_id()?)?;
+    write!(record, "{gid}")?;
     record.sync_all()?;
     Ok(())
 }
@@ -299,10 +326,13 @@ pub(super) fn remove(layout: &HostLayout) -> io::Result<()> {
         invoke("/usr/sbin/groupdel", &[GROUP])?;
     }
     #[cfg(target_os = "macos")]
-    invoke(
-        "/usr/sbin/dseditgroup",
-        &["-o", "delete", "-n", "/Local/Default", GROUP],
-    )?;
+    {
+        invoke(
+            "/usr/sbin/dseditgroup",
+            &["-o", "delete", "-n", "/Local/Default", GROUP],
+        )?;
+        let _ = await_group(false)?;
+    }
     if let Some(socket) = &layout.socket_dir
         && socket.try_exists()?
     {

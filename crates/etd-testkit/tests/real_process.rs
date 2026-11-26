@@ -329,6 +329,39 @@ async fn orphan_with_uncontained_descendant_is_quarantined_before_root_kill() {
     .unwrap();
     root.wait().await.unwrap();
 }
+/// Regression for the macOS abrupt-parent-death flake: a host killed before
+/// the fake core's first write left it writing to a pipe with no reader, so
+/// it died on EPIPE and the marker sweep correctly no longer listed it. The
+/// read ends are closed before spawn, so this fails deterministically if any
+/// startup output can still terminate the fake core.
+#[tokio::test]
+async fn fake_core_outlives_closed_output_pipes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ready = dir.path().join("ready");
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let mut child = tokio::process::Command::new(executable())
+        .args([
+            "--mode",
+            "ignore",
+            "--exit-after-ms",
+            "30000",
+            "--ready-file",
+        ])
+        .arg(&ready)
+        .stdout(writer.try_clone().unwrap())
+        .stderr(writer)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    file(&ready).await;
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "fake-core exited after writing to a closed pipe"
+    );
+    child.kill().await.unwrap();
+}
+
 #[tokio::test]
 async fn abrupt_parent_death_platform_guarantee() {
     let dir = tempfile::tempdir().unwrap();

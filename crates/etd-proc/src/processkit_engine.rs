@@ -295,6 +295,11 @@ fn candidate_matches(
     )
 }
 fn marked(marker: &ProcessMarker) -> Result<Vec<ProcessIdentity>, ProcessError> {
+    // Listed before the snapshot: a PID missing from the later snapshot has
+    // either exited meanwhile or was dropped by sysinfo as uninspectable.
+    #[cfg(target_os = "macos")]
+    let listed = identity::all_pids()
+        .map_err(|e| ProcessError::Enumeration(format!("kernel PID list: {e}")))?;
     let snapshot = identity::snapshot(ProcessesToUpdate::All)?;
     let own = snapshot
         .process(identity::pid(std::process::id()))
@@ -302,83 +307,140 @@ fn marked(marker: &ProcessMarker) -> Result<Vec<ProcessIdentity>, ProcessError> 
         .ok_or_else(|| ProcessError::Enumeration("cannot determine host user".into()))?;
     let mut found = Vec::new();
     for process in snapshot.processes().values() {
-        // Both passes use the same tri-state predicate. A positive mismatch
-        // is a negative candidate; a missing field is not. Kernel-defined
-        // minimal processes are exempt because they cannot execute our core.
-        if identity::minimal_process(process)
-            || matches!(candidate_matches(process, own, marker), Ok(false))
-        {
-            continue;
+        found.extend(marked_candidate(process, own, marker)?);
+    }
+    #[cfg(target_os = "macos")]
+    for pid in listed {
+        // PID 0 is kernel_task (see identity::minimal_process).
+        if pid != 0 && snapshot.process(identity::pid(pid)).is_none() {
+            found.extend(unlisted_candidate(pid, own, marker)?);
         }
-        let pid = process.pid().as_u32();
-        let candidate_error = |error: ProcessError| {
-            ProcessError::Enumeration(format!(
-                "marker candidate PID {pid} ({:?}): {error}",
-                process.name()
-            ))
-        };
-        // On platforms with an object/descriptor handle, keep that object
-        // pinned throughout candidate verification (including owner & argv).
-        #[cfg(any(windows, target_os = "linux"))]
-        let pin = match identity::Pin::open(pid, false) {
-            Ok(pin) => pin,
-            Err(error) => {
-                if read_token(pid).map_err(candidate_error)?.is_none() {
-                    continue;
-                }
-                return Err(candidate_error(ProcessError::Enumeration(
-                    error.to_string(),
-                )));
-            }
-        };
-        let Some(token) = read_token(pid).map_err(candidate_error)? else {
-            continue;
-        };
-        let pids = [identity::pid(pid)];
-        let fresh = identity::snapshot(ProcessesToUpdate::Some(&pids))?;
-        let Some(p) = fresh.process(pids[0]) else {
-            if read_token(pid).map_err(candidate_error)?.is_none() {
-                continue;
-            }
-            return Err(ProcessError::Enumeration(
-                "candidate disappeared from snapshot but is not confirmed exited".into(),
-            ));
-        };
-        match candidate_matches(p, own, marker) {
-            Ok(false) => continue,
-            Ok(true) => {}
-            Err(error) => {
-                if read_token(pid).map_err(candidate_error)?.is_none() {
-                    continue;
-                }
-                return Err(candidate_error(error));
-            }
-        }
-        let current = match inspect(pid) {
-            Ok(current) => current,
-            Err(error) => {
-                if read_token(pid)?.is_none() {
-                    continue;
-                }
-                return Err(error);
-            }
-        };
-        let Some(current) = current else {
-            continue;
-        };
-        if current.start_token != token || !identity::under(&current.exe, &marker.exe_root) {
-            return Err(ProcessError::Enumeration(
-                "candidate identity changed during marker sweep".into(),
-            ));
-        }
-        #[cfg(any(windows, target_os = "linux"))]
-        if pin.gone() {
-            continue;
-        }
-        found.push(current);
     }
     found.sort_by_key(|id| id.pid);
     Ok(found)
+}
+
+/// Verify one snapshot entry. `Ok(None)` only for a positive mismatch or a
+/// confirmed exit; an unobservable live candidate is an error, never a skip.
+fn marked_candidate(
+    process: &sysinfo::Process,
+    own: &sysinfo::Uid,
+    marker: &ProcessMarker,
+) -> Result<Option<ProcessIdentity>, ProcessError> {
+    // Both passes use the same tri-state predicate. A positive mismatch
+    // is a negative candidate; a missing field is not. Kernel-defined
+    // minimal processes are exempt because they cannot execute our core.
+    if identity::minimal_process(process)
+        || matches!(candidate_matches(process, own, marker), Ok(false))
+    {
+        return Ok(None);
+    }
+    let pid = process.pid().as_u32();
+    let candidate_error = |error: ProcessError| {
+        ProcessError::Enumeration(format!(
+            "marker candidate PID {pid} ({:?}): {error}",
+            process.name()
+        ))
+    };
+    // On platforms with an object/descriptor handle, keep that object
+    // pinned throughout candidate verification (including owner & argv).
+    #[cfg(any(windows, target_os = "linux"))]
+    let pin = match identity::Pin::open(pid, false) {
+        Ok(pin) => pin,
+        Err(error) => {
+            if read_token(pid).map_err(candidate_error)?.is_none() {
+                return Ok(None);
+            }
+            return Err(candidate_error(ProcessError::Enumeration(
+                error.to_string(),
+            )));
+        }
+    };
+    let Some(token) = read_token(pid).map_err(candidate_error)? else {
+        return Ok(None);
+    };
+    let pids = [identity::pid(pid)];
+    let fresh = identity::snapshot(ProcessesToUpdate::Some(&pids))?;
+    let Some(p) = fresh.process(pids[0]) else {
+        if read_token(pid).map_err(candidate_error)?.is_none() {
+            return Ok(None);
+        }
+        return Err(ProcessError::Enumeration(
+            "candidate disappeared from snapshot but is not confirmed exited".into(),
+        ));
+    };
+    match candidate_matches(p, own, marker) {
+        Ok(false) => return Ok(None),
+        Ok(true) => {}
+        Err(error) => {
+            if read_token(pid).map_err(candidate_error)?.is_none() {
+                return Ok(None);
+            }
+            return Err(candidate_error(error));
+        }
+    }
+    let current = match inspect(pid) {
+        Ok(current) => current,
+        Err(error) => {
+            if read_token(pid)?.is_none() {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+    };
+    let Some(current) = current else {
+        return Ok(None);
+    };
+    if current.start_token != token || !identity::under(&current.exe, &marker.exe_root) {
+        return Err(ProcessError::Enumeration(
+            "candidate identity changed during marker sweep".into(),
+        ));
+    }
+    #[cfg(any(windows, target_os = "linux"))]
+    if pin.gone() {
+        return Ok(None);
+    }
+    Ok(Some(current))
+}
+
+/// A kernel-listed PID that the full sysinfo snapshot omitted (it drops a
+/// PID whose image and argv are both unreadable: a zombie, or an exiting or
+/// exec'ing process). Absence from the snapshot is not absence of the
+/// process: only exit, zombie state or another owner excludes it; a live
+/// same-user process is re-observed and verified like any candidate.
+#[cfg(target_os = "macos")]
+fn unlisted_candidate(
+    pid: u32,
+    own: &sysinfo::Uid,
+    marker: &ProcessMarker,
+) -> Result<Option<ProcessIdentity>, ProcessError> {
+    const ATTEMPTS: usize = 20;
+    // Name the process so H1's notice tells the user what blocks the sweep.
+    let mut name = String::from("name unavailable");
+    let mut reason = String::from("not observed");
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        match identity::bsd_state(pid) {
+            Ok(None) => return Ok(None),
+            Ok(Some(state)) if state.zombie || state.ruid != **own => return Ok(None),
+            Ok(Some(state)) => name = state.name,
+            Err(error) => {
+                reason = error.to_string();
+                continue;
+            }
+        }
+        let pids = [identity::pid(pid)];
+        let fresh = identity::snapshot(ProcessesToUpdate::Some(&pids))?;
+        if let Some(process) = fresh.process(pids[0]) {
+            return marked_candidate(process, own, marker);
+        }
+        reason = "live same-user process whose image and argv stay unreadable".into();
+    }
+    Err(ProcessError::Enumeration(format!(
+        "PID {pid} ({name}) is missing from the process snapshot: {reason}"
+    )))
 }
 /// A stale Windows PPID is not ancestry: a real child cannot predate
 /// its parent. Unreadable candidate metadata is an uncertainty, not absence.
@@ -1182,6 +1244,49 @@ mod audit_tests {
         assert!(match_criteria(Some(true), Some(true), None).is_err());
         assert!(!match_criteria(None, Some(false), None).unwrap());
         assert!(match_criteria(Some(true), Some(true), Some(true)).unwrap());
+    }
+
+    /// sysinfo drops an unreaped zombie from its macOS snapshot (no image or
+    /// argv). The kernel-list reconciliation must classify it as exited, not
+    /// fail the sweep, while still listing every live PID it reconciles.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unreaped_zombie_missing_from_snapshot_is_not_a_live_candidate() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--help")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // Block until the child has exited, but leave it unreaped (WNOWAIT).
+        // SAFETY: siginfo_t is plain old data; waitid only writes into it.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: waits on our own child; WNOWAIT keeps it a zombie.
+        let rc =
+            unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+        // Observed on macOS CI: the short BSD info flavor reports an
+        // unreaped zombie as ESRCH, so either answer must exclude it.
+        assert!(
+            identity::bsd_state(pid)
+                .unwrap()
+                .is_none_or(|state| state.zombie)
+        );
+        assert!(identity::all_pids().unwrap().contains(&std::process::id()));
+        let snapshot = identity::snapshot(ProcessesToUpdate::All).unwrap();
+        let own = snapshot
+            .process(identity::pid(std::process::id()))
+            .and_then(|p| p.user_id())
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = ProcessMarker {
+            exe_root: std::env::current_exe().unwrap().parent().unwrap().into(),
+            cmdline_root: dir.path().into(),
+        };
+        assert!(unlisted_candidate(pid, own, &marker).unwrap().is_none());
+        assert!(marked(&marker).unwrap().is_empty());
+        child.wait().unwrap();
     }
 
     #[tokio::test]

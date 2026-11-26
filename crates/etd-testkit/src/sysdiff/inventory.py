@@ -45,6 +45,7 @@ class Inventory:
     # command lines, firewall policy dumps, or environment variables in CI.
     rows: dict = field(default_factory=dict)
     descendants: dict = field(default_factory=dict)
+    wfp: dict = field(default_factory=dict)
 
     def put(self, kind, key, value):
         entry = (kind, str(key))
@@ -244,6 +245,14 @@ def windows(inv):
                           for field in ("providerKey", "subLayerKey"))
             assert key and key not in groups[group], "missing or duplicate WFP filter key"
             groups[group].add(key)
+            def semantic(node):
+                return node.tag, (node.text or "").strip(), tuple(sorted(node.attrib.items())), tuple(semantic(c) for c in node)
+            def signature(skip):
+                return hashlib.sha256(repr([semantic(c) for c in item if c.tag not in skip]).encode()).hexdigest()
+            hashes = (signature({"filterKey", "filterId"}), signature({"filterKey", "filterId", "effectiveWeight"}))
+            summary = (item.findtext("layerKey"), item.findtext("action/type"),
+                       tuple(c.text for c in item.findall("filterCondition/item/fieldKey")))
+            inv.wfp.setdefault("wfp-group/" + "/".join(group), {})[key] = (hashes, summary)
             label = item.findtext("displayData/name", "").strip()
             if ("51e7d001-7bc3-43b9-a795-7b80c196382f" in group
                     or "51e7d002-7bc3-43b9-a795-7b80c196382f" in group):

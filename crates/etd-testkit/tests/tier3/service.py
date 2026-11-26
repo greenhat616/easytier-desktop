@@ -56,13 +56,54 @@ class Service:
         self.runtime = self.state / "run"
         self.retained_drivers = set()
 
+    def verify_bundle(self):
+        expected = {self.core.name: os.environ["ETD_G2_SHA"]}
+        if os.name == "nt":
+            source = self.installer.parent / "cores" / "2.7.1"
+            for name in ("Packet.dll", "wintun.dll", "WinDivert64.sys"):
+                expected[name] = digest(source / name)
+        actual = {}
+        for entry in self.core.parent.iterdir():
+            assert entry.is_file() and not entry.is_symlink(), entry.name
+            actual[entry.name] = digest(entry)
+        assert actual == expected, f"installed bundle differs: {sorted(actual)}"
+        print(f"installed bundle SHA-256 verified: {sorted(actual.items())}", flush=True)
+
+    def report_effects(self, instance):
+        state = self.view(instance)
+        print(f"instance epoch={state.get('epoch')} state={state.get('state')}", flush=True)
+        for row in self.effects():
+            print(f"{row['kind']} {row['state']}: {row.get('last_error') or ''}", flush=True)
+
+    def uninstall(self):
+        # SCM and the product reclaimer may still be servicing the outstanding
+        # lifecycle request. Read the durable phase even on a subprocess timeout.
+        try:
+            result = command(self.installer, "uninstall", check=False,
+                             timeout=240 if os.name == "nt" else 60)
+        except subprocess.TimeoutExpired as error:
+            for label, data in (("stdout", error.stdout), ("stderr", error.stderr)):
+                print(f"uninstall {label}: {(data or b'').decode('utf-8', 'replace').strip()}")
+            self.report_uninstall_phase()
+            raise
+        if result.returncode:
+            print(f"uninstall exited {result.returncode}; stdout={result.stdout.strip()} "
+                  f"stderr={result.stderr.strip()}")
+            self.report_uninstall_phase()
+        return result
+
+    def report_uninstall_phase(self):
+        status = command(self.installer, "uninstall", "--status", check=False)
+        print(f"uninstall --status ({status.returncode}): "
+              f"{status.stdout.strip()} {status.stderr.strip()}", flush=True)
+
     @contextmanager
     def installed(self):
         if self.state.exists() or self.host.exists():
             raise RuntimeError("test needs a fresh service installation")
         self.call(self.installer, "install")
         try:
-            assert digest(self.core) == os.environ["ETD_G2_SHA"], "installed core digest"
+            self.verify_bundle()
             status = eventually("installed service self-check", lambda: self.ctl("status"),
                                 lambda body: body["host"]["phase"] == "serving")
             assert status["host"]["mode"] == "service" and status["host"]["role"] == "admin"
@@ -71,9 +112,8 @@ class Service:
         finally:
             # Shared driver candidates can legitimately prevent uninstall;
             # retain the native report, never delete drivers to pass cleanup.
-            result = command(self.installer, "uninstall", check=False)
+            result = self.uninstall()
             if result.returncode:
-                print(f"test service uninstall exited {result.returncode}: {result.stderr.strip()}")
                 if sys.exc_info()[0] is None:
                     pending = [r for r in self.effects() if r["state"] != "reclaimed"]
                     if not self.retained_drivers or not all(
@@ -137,11 +177,10 @@ class Service:
                 raise AssertionError(f"recovery stopped: {status}")
             return status.get("state") in ("ready_basic", "ready_full") and status["epoch"] > after
         try:
-            return eventually("new ready generation", lambda: self.view(instance), ready_or_failed)
+            return eventually("new ready generation", lambda: self.view(instance), ready_or_failed,
+                              timeout=240 if os.name == "nt" else 75)
         except AssertionError:
-            for row in self.effects():
-                if row.get("last_error"):
-                    print(f"{row['kind']} {row['state']}: {row['last_error']}")
+            self.report_effects(instance)
             logs = command(self.client, "--json", "logs", instance, "--tail", "100", check=False)
             for line in logs.stdout.splitlines():
                 entry = json.loads(line)

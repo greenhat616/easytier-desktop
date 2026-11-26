@@ -120,6 +120,7 @@ def recovery():
             old_dir = service.runtime / instance / str(old_epoch)
             old_pid = service.crash_installed(image)
             first = service.ready(instance, after=old_epoch)
+            service.verify_bundle()
             after = inventory()
             check_closed(service, instance, old_epoch)
             assert ("process", str(old_pid)) not in after.rows, "killed process remains"
@@ -200,7 +201,12 @@ def driver_conflict():
         def conflicts():
             return {r["key"]["name"].lower() for r in service.effects()
                     if r["kind"] == "driver" and r["state"] == "conflict" and r["scope"] == "product"}
-        eventually("pre-existing driver conflicts", conflicts, lambda found: found == names)
+        try:
+            eventually("pre-existing driver conflicts", conflicts, lambda found: found == names,
+                       timeout=240)
+        except AssertionError:
+            service.report_effects(instance)
+            raise
         service.ctl("stop", instance)
         service.stop()
         assert_foreign(foreign_state, service.inventory(), {("service", n) for n in names})

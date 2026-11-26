@@ -16,10 +16,10 @@ from xml.etree import ElementTree
 CLASSES = ("interface", "route", "resolver", "firewall", "registry", "service", "runtime", "process")
 
 
-def command(*args, check=True, **kwargs):
+def command(*args, check=True, timeout=60, **kwargs):
     result = subprocess.run(
         [str(arg) for arg in args], check=False, capture_output=True, text=True,
-        encoding="utf-8", errors="replace", timeout=60,
+        encoding="utf-8", errors="replace", timeout=timeout,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), **kwargs,
     )
     if check and result.returncode:
@@ -77,6 +77,7 @@ def directories(inv, root):
 def processes(inv, paths):
     import psutil
     roots = [path.resolve() for path in paths]
+    psutil.process_iter.cache_clear()
     for process in psutil.process_iter(["pid", "exe", "create_time"]):
         image = process.info["exe"]
         if not image:

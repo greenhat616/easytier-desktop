@@ -80,15 +80,20 @@ def check_generation(base, live, records, instance, view):
             rule_id = match[1].removeprefix("policy/")
             if kind == "win.program_firewall_rule":
                 assert "core_binary" in record["scope"]
-                name, group, direction, _, _, image, *_ = live.rows[match]
+                rule_name, group, direction, _, _, image, *_ = live.rows[match]
                 assert json.loads(value) == {
-                    "id": rule_id, "name": name.lower(), "group": group.lower(),
+                    "id": rule_id, "name": rule_name.lower(), "group": group.lower(),
                     "direction": direction.lower(), "program": image.removeprefix("\\\\?\\").lower(),
-                }, f"stale program rule credential for {name}"
+                }, f"stale program rule credential for {rule_name}"
             else:
                 assert value == rule_id, f"stale interface rule credential for {key['name']}"
         elif kind == "win.registry_value":
-            matches = {("registry", key["key"] + "\\" + key["value"])}
+            path = key["key"] + "\\" + key["value"]
+            matches = {k for k in live.rows if k[0] == "registry" and k[1].casefold() == path.casefold()}
+            assert len(matches) == 1, f"missing registry value {path}"
+            setting = record["undo"]["ours"]
+            assert setting["type"] == "u32"
+            assert live.rows[next(iter(matches))] == ["DWord", setting["value"]], path
         elif kind == "win.network_profile":
             matches = {k for k, v in live.rows.items() if k[0] == "registry"
                        and k[1].endswith("\\ProfileName") and v[-1] == key["profile_name"]}

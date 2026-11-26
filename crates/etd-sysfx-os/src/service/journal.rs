@@ -192,6 +192,28 @@ impl LifecycleJournal {
         serde_json::to_writer(&mut file, &self.record).map_err(io::Error::other)?;
         file.flush()?;
         file.as_file().sync_all()?;
+        // Windows scanners can briefly hold either name without delete
+        // sharing. Retry only the atomic replacement of the same synced file;
+        // never delete the old journal or fall back to an in-place write.
+        #[cfg(windows)]
+        {
+            let mut attempts = 0;
+            loop {
+                match file.persist(&self.path) {
+                    Ok(_) => break,
+                    Err(error)
+                        if matches!(error.error.raw_os_error(), Some(5 | 32 | 33))
+                            && attempts < 20 =>
+                    {
+                        file = error.file;
+                        attempts += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    Err(error) => return Err(error.error),
+                }
+            }
+        }
+        #[cfg(unix)]
         file.persist(&self.path).map_err(|error| error.error)?;
         sync_parent(&self.path)
     }
@@ -238,9 +260,11 @@ mod tests {
                         Ok(())
                     }
                 });
-                if result.is_err() {
+                if index == failed {
+                    assert_eq!(result.unwrap_err().to_string(), "injected after creation");
                     break;
                 }
+                result.unwrap();
             }
             let journal = LifecycleJournal::read(path.clone()).unwrap().unwrap();
             assert_eq!(journal.phase(), Phase::Installing);
@@ -295,21 +319,21 @@ mod tests {
             journal.advance(Phase::Installed).unwrap();
             let mut removed = Vec::new();
             for (index, phase) in phases.iter().copied().enumerate() {
-                if journal
-                    .step(phase, || {
-                        if !removed.contains(&phase) {
-                            removed.push(phase);
-                        }
-                        if index == failed {
-                            Err(io::Error::other("injected"))
-                        } else {
-                            Ok(())
-                        }
-                    })
-                    .is_err()
-                {
+                let result = journal.step(phase, || {
+                    if !removed.contains(&phase) {
+                        removed.push(phase);
+                    }
+                    if index == failed {
+                        Err(io::Error::other("injected"))
+                    } else {
+                        Ok(())
+                    }
+                });
+                if index == failed {
+                    assert_eq!(result.unwrap_err().to_string(), "injected");
                     break;
                 }
+                result.unwrap();
             }
             let mut journal = LifecycleJournal::read(path).unwrap().unwrap();
             for (index, phase) in phases.iter().copied().enumerate() {

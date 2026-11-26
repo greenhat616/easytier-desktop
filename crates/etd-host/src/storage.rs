@@ -116,18 +116,8 @@ pub async fn install_bundled_cores(bundle_root: &Path, target: &Path) -> Result<
         }
         let stage = tempfile::tempdir_in(target)?;
         let staged = stage.path().join(CORE_FILE);
-        let mut input =
-            fs::File::open(&source).with_context(|| format!("bundled core {version} missing"))?;
-        let mut output = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&staged)?;
-        io::copy(&mut input, &mut output)?;
-        output.sync_all()?;
-        drop(output);
-        if hash_file(&staged)? != expected {
-            bail!("bundled core {version} hash differs from embedded release table");
-        }
+        copy_verified_core(&source, &staged, expected)
+            .with_context(|| format!("bundled core {version}"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -147,6 +137,21 @@ pub async fn install_bundled_cores(bundle_root: &Path, target: &Path) -> Result<
     }
     manifest.default_version = manifest.cores.first().map(|entry| entry.version.clone());
     atomic_json(&target.join(MANIFEST_FILE), &manifest)
+}
+
+fn copy_verified_core(source: &Path, staged: &Path, expected: &str) -> Result<()> {
+    let mut input = fs::File::open(source)?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(staged)?;
+    io::copy(&mut input, &mut output)?;
+    output.sync_all()?;
+    drop(output);
+    if hash_file(staged)? != expected {
+        bail!("hash differs from embedded release table");
+    }
+    Ok(())
 }
 
 fn hash_file(path: &Path) -> Result<String> {
@@ -212,6 +217,19 @@ pub fn native_history(state: &Path, available: bool, fresh: bool) -> Result<bool
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bundle_copy_requires_the_embedded_hash() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("bundle");
+        let staged = root.path().join("staged");
+        std::fs::write(&source, b"trusted core fixture").unwrap();
+        let hash = super::hash_file(&source).unwrap();
+        super::copy_verified_core(&source, &staged, &hash).unwrap();
+        assert_eq!(std::fs::read(&staged).unwrap(), b"trusted core fixture");
+        std::fs::write(&source, b"modified core fixture").unwrap();
+        assert!(super::copy_verified_core(&source, &root.path().join("bad"), &hash).is_err());
+    }
+
     #[test]
     fn native_adapter_history_is_monotonic() {
         let state = tempfile::tempdir().unwrap();

@@ -108,6 +108,7 @@ def recovery():
             receipt = eventually("durable commit", lambda: service.receipt(request), bool)
         # Abrupt desktop exit after the durable request does not cancel launch.
         first = service.ready(instance)
+        print(f"installed kernel ready: {first['state']} epoch={first['epoch']}", flush=True)
         before = inventory()
         check_generation(baseline, before, service.effects(), instance, first)
         assert_foreign(baseline, before, keys)
@@ -199,7 +200,7 @@ def driver_conflict():
         for name in sorted(names):
             native = foreign_state.rows.get(("service", name))
             print(f"pre-existing driver {name}: {native}", flush=True)
-            assert native and native[1].lower() == "disabled", f"driver fixture missing: {name}"
+            assert native and "DISABLED" in native and f"absent-g2-{name}.sys" in native, name
         instance = str(uuid.uuid4())
         service.apply(spec(), instance, str(uuid.uuid4()), str(service.ctl("status")["revision"]))
         def conflicts():

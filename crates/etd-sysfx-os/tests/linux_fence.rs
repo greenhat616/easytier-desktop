@@ -185,7 +185,27 @@ async fn fence_survives_host_death() {
             println!("installer_killed={killed} {address} {verification:?}");
         }
     }
+    let incomplete = "etd_f_00000000000000000000000000000000_15999";
+    assert!(
+        Command::new("nft")
+            .arg(format!(
+                "create table inet {incomplete} {{ comment \"easytier-desk rpc fence v1\"; }}"
+            ))
+            .status()
+            .unwrap()
+            .success()
+    );
     let marked = os.sweeper.find_marked(None, &[]).await.unwrap();
+    assert!(!marked.iter().any(
+        |object| matches!(&object.key,ObjectKey::Fence{container,..} if container==incomplete)
+    ));
+    assert!(
+        Command::new("nft")
+            .args(["delete", "table", "inet", incomplete])
+            .status()
+            .unwrap()
+            .success()
+    );
     assert!(
         marked
             .iter()

@@ -35,7 +35,11 @@ pub(super) async fn manager(previously_seen: bool) -> io::Result<Option<Proxy<'s
 async fn connect(previously_seen: bool) -> io::Result<Option<Proxy<'static>>> {
     let conn = match Connection::system().await {
         Ok(conn) => conn,
-        Err(zbus::Error::InputOutput(e)) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(zbus::Error::InputOutput(e) | zbus::Error::Connection(e, _))
+            if e.kind() == io::ErrorKind::NotFound =>
+        {
+            return Ok(None);
+        }
         Err(e) => return Err(other(e)),
     };
     let bus = zbus::fdo::DBusProxy::new(&conn).await.map_err(other)?;

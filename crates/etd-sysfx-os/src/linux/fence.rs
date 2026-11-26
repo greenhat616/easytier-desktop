@@ -75,25 +75,31 @@ impl Table {
         )
     }
 }
-/// Our generation table without its chain or both rules, in a listing
-/// that succeeded.
+/// A listing that succeeded shows our generation table ineffective: without
+/// its chain or both rules, a rule that differs from the planned fence, or a
+/// foreign object in it.
 #[derive(Debug)]
-struct Incomplete;
-impl std::fmt::Display for Incomplete {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("incomplete fence table")
+struct Ineffective(&'static str);
+impl Ineffective {
+    fn error(why: &'static str) -> io::Error {
+        io::Error::other(Ineffective(why))
     }
 }
-impl std::error::Error for Incomplete {}
+impl std::fmt::Display for Ineffective {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for Ineffective {}
 
-/// The fence as a successful listing shows it: an absent table, or one
-/// without its chain or rules, is positively missing
+/// The fence as a successful listing shows it: an absent table, or an
+/// ineffective one ([`Ineffective`]), is positively missing
 /// ([`FenceError::Missing`]); a listing that failed stays an OS error.
 fn present(found: io::Result<Option<Table>>) -> Result<Table, FenceError> {
     match found {
         Ok(Some(table)) => Ok(table),
         Ok(None) => Err(FenceError::Missing("fence table absent".into())),
-        Err(e) if e.get_ref().is_some_and(|inner| inner.is::<Incomplete>()) => {
+        Err(e) if e.get_ref().is_some_and(|inner| inner.is::<Ineffective>()) => {
             Err(FenceError::Missing(e.to_string()))
         }
         Err(e) => Err(error(e)),
@@ -198,7 +204,9 @@ fn inspect(all: &[Value], name: &str, native: Option<&str>) -> io::Result<Option
                         != serde_json::json!({"match":{"op":"!=","left":{"meta":{"key":"skuid"}},"right":0}})
                     || verdict["reject"]["type"] != "tcp reset"
                 {
-                    return Err(other("generation rule differs from the planned fence"));
+                    return Err(Ineffective::error(
+                        "generation rule differs from the planned fence",
+                    ));
                 }
                 rules[slot] = item["handle"]
                     .as_u64()
@@ -207,11 +215,11 @@ fn inspect(all: &[Value], name: &str, native: Option<&str>) -> io::Result<Option
                     .as_u64()
                     .ok_or_else(|| other("missing nft counter"))?;
             }
-            _ => return Err(other("foreign object in fence table")),
+            _ => return Err(Ineffective::error("foreign object in fence table")),
         }
     }
     if !chain || rules.contains(&0) {
-        return Err(io::Error::other(Incomplete));
+        return Err(Ineffective::error("incomplete fence table"));
     }
     Ok(Some(Table {
         handle,
@@ -488,6 +496,17 @@ mod tests {
         assert!(matches!(
             present(inspect(&header_only, name, None)),
             Err(FenceError::Missing(_))
+        ));
+        // Our table with a foreign object in it.
+        let foreign = vec![
+            header_only[0].clone(),
+            serde_json::json!({
+                "set": {"family": "inet", "table": name, "name": "someone-else"}
+            }),
+        ];
+        assert!(matches!(
+            present(inspect(&foreign, name, None)),
+            Err(FenceError::Missing(m)) if m.contains("foreign object")
         ));
         // A listing that failed proves nothing.
         assert!(matches!(

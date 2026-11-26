@@ -132,7 +132,12 @@ mod missing_tests {
 
     #[test]
     fn an_absent_fence_or_disabled_pf_is_missing_not_a_failed_query() {
-        for why in ["generation fence is not active", "PF is disabled"] {
+        for why in [
+            "generation fence is not active",
+            "PF is disabled",
+            "PF wildcard filter hook unavailable",
+            "PF loopback filtering is skipped or unavailable",
+        ] {
             assert_eq!(
                 confirmed(pf::Missing::error(why)),
                 FenceError::Missing(why.into())

@@ -110,6 +110,22 @@ def runner_noise(base, live):
     return set()
 
 
+def active_signature(base, live, profile_guid):
+    unmanaged = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Signatures\Unmanaged"
+    matches = [path for path, target in live.signature_profiles.items()
+               if target == profile_guid and path.rsplit("\\", 2)[0] == unmanaged]
+    if len(matches) != 1:
+        return set()
+    signature = matches[0].rsplit("\\", 1)[0]
+    key = ("registry", "key/" + signature)
+    values = {("registry", signature + "\\" + field) for field in
+              ("ProfileGuid", "Description", "FirstNetwork", "DnsSuffix", "DefaultGatewayMac", "Source")}
+    if key in base.rows or not values <= live.rows.keys():
+        return set()
+    print(f"native NLA signature {signature} points to active profile {profile_guid}", flush=True)
+    return values | {key}
+
+
 def profile_metadata(base, live, profile_name_key, name, credential):
     profile = profile_name_key.rsplit("\\", 1)[0]
     profile_guid = UUID(profile.rsplit("\\", 1)[1])
@@ -120,12 +136,9 @@ def profile_metadata(base, live, profile_name_key, name, credential):
     connections = [c for c in live.profile_connections if c["index"] == nic["index"]]
     assert connections == [{"alias": name, "index": nic["index"], "matches": True}], "native NLA profile/adapter mismatch"
     print(f"active NLA profile {profile_guid}: adapter={name} GUID={nic['guid']} ifIndex={nic['index']}", flush=True)
-    for path, target in live.signature_profiles.items():
-        if target == profile_guid:
-            print(f"native NLA signature {path} points to active profile {target}", flush=True)
     # Windows NLA creates these only while this specific adapter's profile
     # exists. At stop and afterwards all five native values must disappear.
-    included = set()
+    included = active_signature(base, live, profile_guid)
     description = ("registry", profile + "\\Description")
     if live.rows.get(description) == live.rows["registry", profile_name_key]:
         included.add(description)

@@ -2,7 +2,7 @@
 use etd_client::stub::host_service_client::HostServiceClient;
 use etd_contract::{
     VERSION_MAJOR, VERSION_METADATA_KEY, VERSION_MINOR,
-    v1::{Hello, HostMode, HostPhase, Role, SnapshotRequest},
+    v1::{Hello, HostMode, HostPhase, HostSnapshot, Role, SnapshotRequest},
     version_metadata_value,
 };
 use etd_ipc::{
@@ -112,6 +112,52 @@ async fn revoke_user(
     Ok(())
 }
 
+/// The service did not reach Serving in time: print where it stood and the
+/// tail of its log, so the cause survives the cleanup that removes them.
+fn report_unserved(layout: &etd_sysfx_os::service::HostLayout, last: Option<HostSnapshot>) {
+    match &last {
+        Some(snapshot) => {
+            eprintln!("last snapshot phase: {:?}", snapshot.phase());
+            if let Some(reclaim) = &snapshot.reclaim {
+                for note in &reclaim.notes {
+                    eprintln!("reclaim note: {} {}", note.code, note.message);
+                }
+                eprintln!(
+                    "reclaim: {} instance(s), {} candidate(s), {} conflict(s)",
+                    reclaim.instances.len(),
+                    reclaim.candidates.len(),
+                    reclaim.conflicts.len()
+                );
+            }
+        }
+        None => eprintln!("no snapshot was received"),
+    }
+    let mut logs: Vec<_> = std::fs::read_dir(&layout.state)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("host.log"))
+        })
+        .collect();
+    logs.sort();
+    for path in logs {
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().collect();
+        eprintln!(
+            "--- {} (last {} lines)",
+            path.display(),
+            lines.len().min(200)
+        );
+        for line in &lines[lines.len().saturating_sub(200)..] {
+            eprintln!("{line}");
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires a disposable elevated CI runner and ETD_HOST_CI_INSTALL=1"]
 async fn install_connect_uninstall() {
@@ -166,6 +212,10 @@ async fn install_connect_uninstall() {
         drop(connection);
         identity
     });
+    // The latest snapshot seen while waiting for Serving, reported with the
+    // host log if the service never gets there (before cleanup removes it).
+    let last = Arc::new(std::sync::Mutex::new(None::<HostSnapshot>));
+    let seen = last.clone();
     let handshake = tokio::time::timeout(Duration::from_secs(30), async {
         let channel = tonic::transport::Endpoint::from_static("http://localhost")
             .connect_with_connector(ClientIo::new(connector.clone(), endpoint.clone()))
@@ -188,7 +238,9 @@ async fn install_connect_uninstall() {
                 version_metadata_value().parse().unwrap(),
             );
             let snapshot = client.snapshot(request).await?.into_inner();
-            if snapshot.phase() == HostPhase::Serving {
+            let serving = snapshot.phase() == HostPhase::Serving;
+            *seen.lock().unwrap() = Some(snapshot);
+            if serving {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -196,6 +248,9 @@ async fn install_connect_uninstall() {
         Ok::<_, Box<dyn std::error::Error>>(welcome)
     })
     .await;
+    if !matches!(handshake, Ok(Ok(_))) {
+        report_unserved(&layout, last.lock().unwrap().take());
+    }
     #[cfg(windows)]
     let standard = standard_user_handshake(&account, connector.clone(), endpoint.clone());
     #[cfg(windows)]

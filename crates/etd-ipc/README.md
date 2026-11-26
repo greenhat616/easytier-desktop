@@ -144,8 +144,9 @@ opened: `PermissionDenied` on Windows, `Unsupported` on Unix.
   `elevated: false`). User form: the token user must match. Elevated session
   (`CurrentUserElevated`): the server token must be readable, be the current user's, be
   elevated and have integrity High or above (a restricted or lowered copy of an
-  elevated token still reports `TokenElevation`); there is no owner fallback, so a
-  token that cannot be queried is refused.
+  elevated token still reports `TokenElevation`), and the server must run in the
+  client's Windows session (`GetNamedPipeServerSessionId`). There is no owner fallback:
+  a token or session that cannot be queried is refused.
   Finally the server PID must be unchanged and the process still running. Only then
   does the client send the marker byte.
 - **Linux:** checks run before connecting. Every directory from `/` to the socket's

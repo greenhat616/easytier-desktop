@@ -168,8 +168,8 @@ fn effectively_elevated(token_elevated: bool, integrity: u32) -> bool {
     token_elevated && integrity >= HIGH_INTEGRITY
 }
 
-/// The elevated session host's own account and Windows session, read once
-/// from its process token when the listener binds.
+/// The account and Windows session of this process: the elevated session
+/// host's, read once when the listener binds, or the connecting client's.
 #[derive(Debug, Clone)]
 pub(super) struct SessionOwner {
     user: OsUserId,
@@ -328,17 +328,37 @@ fn server_token(process: HANDLE, pid: u32) -> io::Result<(PeerIdentity, u32)> {
     Ok((token_peer(&token, pid)?, token_integrity(&token)?))
 }
 
+/// The Windows session of the pipe's server process.
+fn pipe_server_session(pipe: HANDLE) -> io::Result<u32> {
+    let mut session = 0;
+    // SAFETY: the pipe handle is open for the duration of the call and
+    // `session` is a live u32.
+    unsafe { windows::Win32::System::Pipes::GetNamedPipeServerSessionId(pipe, &mut session) }
+        .map_err(win_error)?;
+    Ok(session)
+}
+
 /// The elevated session host proof: the current user's elevated token at
-/// High integrity or above. Unlike the service proof there is no fallback:
-/// a server token that cannot be read is refused.
+/// High integrity or above, in this client's Windows session. Unlike the
+/// service proof there is no fallback: a server token or session that
+/// cannot be read is refused.
 fn elevated_session_peer(
     token: io::Result<(PeerIdentity, u32)>,
-    current: &OsUserId,
+    server_session: io::Result<u32>,
+    client: &SessionOwner,
 ) -> io::Result<PeerIdentity> {
     let (peer, integrity) =
         token.map_err(|e| denied(format!("unreadable session host token: {e}")))?;
-    if &peer.user != current {
+    if peer.user != client.user {
         return Err(denied("unexpected host account"));
+    }
+    let server_session = server_session
+        .map_err(|e| denied(format!("unreadable session host Windows session: {e}")))?;
+    if server_session != client.session {
+        return Err(denied(format!(
+            "session host runs in Windows session {server_session}, this client in {}",
+            client.session
+        )));
     }
     if !effectively_elevated(peer.elevated, integrity) {
         return Err(denied("session host token is not elevated"));
@@ -397,8 +417,8 @@ pub(super) fn server_identity(
     let exe = verify_image(exe_dir, &path)?;
     let pipe_handle = HANDLE(pipe.as_raw_handle());
     let system = OsUserId::WindowsSid("S-1-5-18".into());
-    let token = process_token(handle).and_then(|token| token_peer(&token, pid));
     let peer = if proof.privileged {
+        let token = process_token(handle).and_then(|token| token_peer(&token, pid));
         let owner = pipe_owner(pipe_handle)?;
         let mut session = 0;
         let session = unsafe {
@@ -408,9 +428,13 @@ pub(super) fn server_identity(
         .map(|_| session);
         service_peer(proof.user.unwrap_or(&system), owner, pid, session, token)?
     } else if proof.elevated {
-        elevated_session_peer(server_token(handle, pid), &current_user()?)?
+        elevated_session_peer(
+            server_token(handle, pid),
+            pipe_server_session(pipe_handle),
+            &session_owner()?,
+        )?
     } else {
-        let peer = token?;
+        let peer = process_token(handle).and_then(|token| token_peer(&token, pid))?;
         verify_user(proof, &peer.user, current_user()?, system)?;
         peer
     };
@@ -462,34 +486,47 @@ mod tests {
     const OTHER: &str = "S-1-5-21-1-2-3-1002";
 
     #[test]
-    fn session_server_with_unreadable_token_is_refused() {
-        let me = OsUserId::WindowsSid(ME.into());
+    fn session_server_with_unreadable_token_or_session_is_refused() {
+        let me = SessionOwner {
+            user: OsUserId::WindowsSid(ME.into()),
+            session: 1,
+        };
         for error in [
             io::ErrorKind::PermissionDenied.into(),
             io::Error::other("TokenElevation failed"),
             io::Error::other("TokenIntegrityLevel failed"),
         ] {
-            let refused = elevated_session_peer(Err(error), &me).unwrap_err();
+            let refused = elevated_session_peer(Err(error), Ok(1), &me).unwrap_err();
             assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
         }
+        let token = Ok((peer(ME, 1, true), HIGH_INTEGRITY));
+        let refused =
+            elevated_session_peer(token, Err(io::ErrorKind::PermissionDenied.into()), &me)
+                .unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]
-    fn session_server_must_be_the_current_user_and_elevated() {
-        let me = OsUserId::WindowsSid(ME.into());
+    fn session_server_must_be_the_current_user_elevated_in_this_session() {
+        let me = SessionOwner {
+            user: OsUserId::WindowsSid(ME.into()),
+            session: 1,
+        };
         let high = HIGH_INTEGRITY;
-        let accepted = elevated_session_peer(Ok((peer(ME, 1, true), high)), &me).unwrap();
-        assert_eq!(accepted.user, me);
+        let accepted = elevated_session_peer(Ok((peer(ME, 1, true), high)), Ok(1), &me).unwrap();
+        assert_eq!(accepted.user, me.user);
         assert!(accepted.elevated);
-        elevated_session_peer(Ok((peer(ME, 1, true), 0x4000)), &me).unwrap();
-        for (wrong, integrity) in [
-            (peer(ME, 1, false), high),
+        elevated_session_peer(Ok((peer(ME, 1, true), 0x4000)), Ok(1), &me).unwrap();
+        for (wrong, integrity, session) in [
+            (peer(ME, 1, false), high, 1),
             // A Medium copy of an elevated token still reports elevated.
-            (peer(ME, 1, true), MEDIUM_INTEGRITY),
-            (peer(OTHER, 1, true), high),
-            (peer("S-1-5-18", 0, true), 0x4000),
+            (peer(ME, 1, true), MEDIUM_INTEGRITY, 1),
+            (peer(OTHER, 1, true), high, 1),
+            (peer("S-1-5-18", 0, true), 0x4000, 1),
+            (peer(ME, 2, true), high, 2),
         ] {
-            let refused = elevated_session_peer(Ok((wrong, integrity)), &me).unwrap_err();
+            let refused =
+                elevated_session_peer(Ok((wrong, integrity)), Ok(session), &me).unwrap_err();
             assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
         }
     }

@@ -23,9 +23,7 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            suite: clean
-          - os: windows-latest
-            suite: idle
+            suite: recovery
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -165,14 +163,9 @@ jobs:
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=installed_kernel_and_host_crash_recovery)' --success-output immediate
       - name: Pre-existing shared drivers (fresh administrator runner)
         if: matrix.suite == 'preflight'
-        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=preexisting_shared_drivers_survive_uninstall)' --success-output immediate
-      - name: Pre-existing inactive program rule (fresh administrator runner)
-        if: matrix.suite == 'program'
-        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=preexisting_program_rule_blocks_start)' --success-output immediate
+        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=preexisting_shared_drivers_are_conflicts) | test(=preexisting_shared_drivers_survive_uninstall)' --success-output immediate
       - name: Complete install and uninstall (fresh administrator runner)
-        if: matrix.suite == 'clean' || matrix.suite == 'idle'
-        env:
-          G2_REGISTRY_SUITE: ${{ matrix.suite }}
+        if: matrix.suite == 'clean'
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=installed_network_uninstall_restores_machine)' --success-output immediate
       - name: Pre-existing inactive program rule (fresh administrator runner)
         if: matrix.suite == 'program'

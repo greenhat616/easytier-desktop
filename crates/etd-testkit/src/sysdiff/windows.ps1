@@ -11,6 +11,7 @@ Get-NetIPAddress -PolicyStore ActiveStore | Group-Object InterfaceIndex | ForEac
     $addresses[[int]$_.Name] = @($_.Group | ForEach-Object { "$($_.IPAddress)/$($_.PrefixLength)" } | Sort-Object)
 }
 foreach ($nic in Get-NetAdapter -IncludeHidden) {
+    if ($inventory.interface.ContainsKey($nic.Name)) { throw "Duplicate NetAdapter name: $($nic.Name)" }
     $inventory.interface[$nic.Name] = @{
         index=$nic.ifIndex; guid=$nic.InterfaceGuid; device=$nic.PnPDeviceID
         addresses=$addresses[[int]$nic.ifIndex]
@@ -18,7 +19,11 @@ foreach ($nic in Get-NetAdapter -IncludeHidden) {
 }
 # IPv6 tunnel and software loopback interfaces may have no NetAdapter row.
 foreach ($nic in Get-NetIPInterface) {
-    if (!$inventory.interface.ContainsKey($nic.InterfaceAlias)) {
+    if ($inventory.interface.ContainsKey($nic.InterfaceAlias)) {
+        if ($inventory.interface[$nic.InterfaceAlias].index -ne $nic.InterfaceIndex) {
+            throw "Ambiguous interface alias: $($nic.InterfaceAlias)"
+        }
+    } else {
         $inventory.interface[$nic.InterfaceAlias] = @{
             index=$nic.InterfaceIndex; addresses=$addresses[[int]$nic.InterfaceIndex]
         }
@@ -34,21 +39,65 @@ foreach ($rule in Get-DnsClientNrptRule) {
 }
 $rulesPath = 'SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules'
 $ruleStore = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($rulesPath)
-foreach ($rule in Get-NetFirewallRule -PolicyStore ActiveStore | Where-Object {
-    $_.Group -eq 'EasyTier' -or $_.DisplayName -like 'EasyTier *'
-}) {
-    $app = $rule | Get-NetFirewallApplicationFilter
-    $ports = $rule | Get-NetFirewallPortFilter
+$sha = [Security.Cryptography.SHA256]::Create()
+function StableHash($value) {
+    $json = ConvertTo-Json -InputObject $value -Depth 10 -Compress
+    return [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($json))).Replace('-','')
+}
+# InstanceID joins the native policy rule to its associated filter objects.
+# Bulk reads avoid one PowerShell/CIM round trip per filter per rule.
+$specs = [ordered]@{
+    Application = @('Program','Package')
+    Port = @('Protocol','LocalPort','RemotePort','IcmpType','DynamicTarget')
+    Address = @('LocalAddress','RemoteAddress')
+    Interface = @('InterfaceAlias')
+    InterfaceType = @('InterfaceType')
+    Service = @('Service')
+    Security = @('Authentication','Encryption','LocalUser','RemoteUser','RemoteMachine','OverrideBlockRules')
+}
+$filters = @{}
+foreach ($kind in $specs.Keys) {
+    $byId = @{}
+    foreach ($filter in (& "Get-NetFirewall${kind}Filter" -PolicyStore ActiveStore)) {
+        $fields = [ordered]@{}
+        foreach ($field in $specs[$kind]) { $fields[$field] = $filter.$field }
+        $byId.Add($filter.InstanceID, $fields)
+    }
+    $filters[$kind] = $byId
+}
+foreach ($rule in Get-NetFirewallRule -PolicyStore ActiveStore) {
+    $policyKey = "policy/$($rule.Name)"
+    if ($inventory.firewall.ContainsKey($policyKey)) { throw "Duplicate firewall rule ID: $($rule.Name)" }
+    $fields = [ordered]@{}
+    foreach ($field in 'Description','Profile','Platform','EdgeTraversalPolicy','LooseSourceMapping',
+        'LocalOnlyMapping','Owner','PolicyStoreSource','PolicyStoreSourceType') {
+        $fields[$field] = $rule.$field
+    }
+    foreach ($kind in $specs.Keys) {
+        if (!$filters[$kind].ContainsKey($rule.InstanceID)) { throw "Missing $kind filter for $policyKey" }
+        $fields[$kind] = $filters[$kind][$rule.InstanceID]
+    }
+    $fields['persistent'] = $ruleStore.GetValue($rule.Name)
     $inventory.firewall["policy/$($rule.Name)"] = @(
         $rule.DisplayName, $rule.Group, [string]$rule.Direction, [string]$rule.Action,
-        [string]$rule.Enabled, $app.Program, [string]$ports.Protocol, $ports.LocalPort,
-        $ruleStore.GetValue($rule.Name)
+        [string]$rule.Enabled, $fields.Application.Program, (StableHash $fields)
     )
 }
 $ruleStore.Dispose()
+$sha.Dispose()
 $system = 'HKLM:\SYSTEM\CurrentControlSet\Services'
 $network = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles'
 $product = 'HKLM:\SOFTWARE\EasyTier'
+$boot = 'HKLM:\SOFTWARE\EasyTierDesk\Volatile'
+if (Test-Path -LiteralPath $boot) {
+    $key = Get-Item -LiteralPath $boot
+    $inventory.registry['HKLM\SOFTWARE\EasyTierDesk\Volatile'] = @('key')
+    foreach ($name in $key.GetValueNames()) {
+        $inventory.registry["HKLM\SOFTWARE\EasyTierDesk\Volatile\$name"] = @(
+            [string]$key.GetValueKind($name), $key.GetValue($name)
+        )
+    }
+}
 if (Test-Path -LiteralPath $product) {
     foreach ($key in Get-ChildItem -Recurse -LiteralPath $product) {
         foreach ($name in $key.GetValueNames()) {
@@ -63,7 +112,8 @@ foreach ($tree in @("$system\Tcpip\Parameters\Interfaces","$system\Tcpip6\Parame
     foreach ($key in Get-ChildItem -LiteralPath $tree) {
         foreach ($name in $key.GetValueNames()) {
             if ($name -in @('RegistrationEnabled','DisableDynamicUpdate',
-                'MaxNumberOfAddressesToRegister','NetbiosOptions','SearchList','ProfileName','Category')) {
+                'MaxNumberOfAddressesToRegister','NetbiosOptions','SearchList','ProfileName','Category',
+                'NameServer','Domain','EnableDHCP')) {
                 $id = $key.Name.Replace('HKEY_LOCAL_MACHINE','HKLM') + '\' + $name
                 $inventory.registry[$id] = @([string]$key.GetValueKind($name),$key.GetValue($name))
             }

@@ -12,9 +12,9 @@ import uuid
 from service import Desktop, Service, command, eventually, require_runner
 from consistency import (
     FirewallReadbackPending, UnpredictedChanges, check_closed, check_generation, installed_image,
-    managed_service_changes, runner_noise, scope,
+    managed_service_changes, runner_noise, scope, tun_created,
 )
-from inventory import capture, file_identity
+from inventory import assert_exited, capture, file_identity
 import foreign
 
 
@@ -123,9 +123,16 @@ def recovery():
             return service.inventory([foreign_image], [other_runtime])
         baseline = inventory()
         differences = []
+        generation_processes = set()
         def verify_generation(snapshot, view):
             end = time.monotonic() + 240
             while True:
+                cores = [(int(k[1]), value[1]) for k, value in snapshot.rows.items()
+                         if k[0] == "process" and installed_image(value) == service.core]
+                assert len(cores) == 1, "expected exactly one installed kernel"
+                pid, born = cores[0]
+                generation_processes.add((pid, born))
+                generation_processes.update(snapshot.descendants[pid])
                 try:
                     check_generation(baseline, snapshot, service.effects(), instance, view)
                 except FirewallReadbackPending:
@@ -167,7 +174,8 @@ def recovery():
             wait_for_firewall_readback(service, instance, first["epoch"])
             after = inventory()
             check_closed(service, instance, old_epoch)
-            assert ("process", str(old_pid)) not in after.rows, "killed process remains"
+            assert_exited(generation_processes)
+            generation_processes.clear()
             assert not old_dir.exists(), f"old generation directory remains: {old_dir}"
             # A replacement host has a different pid. Compare generation
             # effects against the same prelaunch baseline at the new host pid.
@@ -179,6 +187,7 @@ def recovery():
                 assert len(prior) == len(current) == 1 and prior != current
                 del baseline.rows[prior[0]]
                 baseline.rows[current[0]] = after.rows[current[0]]
+                assert int(prior[0][1]) == old_pid
             after = verify_generation(after, first)
             assert_foreign(baseline, after, keys)
             # Replay the very first request across both restarts. Ticket,
@@ -192,9 +201,10 @@ def recovery():
                    timeout=240 if os.name == "nt" else 75)
         check_closed(service, instance, first["epoch"])
         stopped = inventory()
+        assert_exited(generation_processes)
         assert_foreign(baseline, stopped, keys)
         remaining = baseline.delta(stopped) - managed_service_changes(baseline, stopped)
-        remaining -= runner_noise(baseline, stopped)
+        remaining -= runner_noise(baseline, stopped) | tun_created(baseline, stopped)
         if os.name == "nt":
             records = service.effects()
             for key in remaining.copy():
@@ -212,14 +222,18 @@ def recovery():
             print(message, flush=True)
             differences.append(message)
         if os.name == "nt":
-            verify_shared_driver_purge(service, baseline, stopped)
+            verify_shared_driver_purge(service, baseline, stopped, inventory, keys)
         assert not differences, "\n".join(differences)
 
 
-def verify_shared_driver_purge(service, baseline, stopped):
+def verify_shared_driver_purge(service, baseline, stopped, inventory, foreign_keys):
     names = {name for name in ("wintun", "windivert")
              if ("service", name) not in baseline.rows and ("service", name) in stopped.rows}
     assert "wintun" in names, "the real kernel did not load its TUN driver"
+    program_rules = {("firewall", "policy/" + json.loads(r["observation"]["credential"]["value"])["id"])
+                     for r in service.effects() if "core_binary" in r["scope"]
+                     and r["kind"] == "win.program_firewall_rule" and r["state"] == "applied"}
+    assert len(program_rules) == 2 and program_rules <= stopped.rows.keys()
     service.stop()
     result = command(service.installer, "reclaim", "--all", "--purge", check=False, timeout=240)
     records = service.effects()
@@ -227,9 +241,19 @@ def verify_shared_driver_purge(service, baseline, stopped):
                 and r["kind"] == "driver" and r["state"] == "candidate"}
     assert retained == names, f"expected shared driver candidates {names}, got {retained}"
     assert result.returncode and "candidates" in result.stdout and "reclaim incomplete" in result.stderr
-    after = service.inventory()
+    after = inventory()
+    service.retained_drivers = {name: stopped.rows["service", name] for name in names}
     assert_foreign(stopped, after, {("service", name) for name in names})
-    service.retained_drivers = names
+    assert_foreign(baseline, after, foreign_keys)
+    assert not program_rules & after.rows.keys(), "CoreBinary firewall rules survived purge"
+    delta = baseline.delta(after) - managed_service_changes(baseline, after)
+    delta -= runner_noise(baseline, after) | {("service", name) for name in names}
+    # The installed baseline included a running host. Purge is an offline
+    # command, so that exact host identity must now have exited.
+    hosts = [k for k, v in baseline.rows.items() if k[0] == "process" and installed_image(v) == service.host]
+    assert len(hosts) == 1 and hosts[0] not in after.rows
+    delta.remove(hosts[0])
+    assert not delta, f"post-purge native differences: {sorted(delta)}"
 
 
 def driver_conflict():
@@ -265,7 +289,9 @@ def driver_conflict():
         service.ctl("stop", instance)
         service.stop()
         assert_foreign(foreign_state, service.inventory(), {("service", n) for n in names})
-        service.retained_drivers = names
+        # These disabled registrations belong to the fixture and will be
+        # removed by its ExitStack before uninstall. No native survivor is allowed.
+        service.retained_drivers = dict.fromkeys(names)
 
 
 def program_rule_conflict():

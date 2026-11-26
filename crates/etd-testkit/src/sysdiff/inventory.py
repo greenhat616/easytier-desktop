@@ -44,6 +44,7 @@ class Inventory:
     # Values are stable credentials/configuration. Never print file contents,
     # command lines, firewall policy dumps, or environment variables in CI.
     rows: dict = field(default_factory=dict)
+    descendants: dict = field(default_factory=dict)
 
     def put(self, kind, key, value):
         entry = (kind, str(key))
@@ -78,13 +79,42 @@ def processes(inv, paths):
     import psutil
     roots = [path.resolve() for path in paths]
     psutil.process_iter.cache_clear()
-    for process in psutil.process_iter(["pid", "exe", "create_time"]):
-        image = process.info["exe"]
-        if not image:
+    table = {p.pid: p.info for p in psutil.process_iter(["pid", "ppid", "exe", "create_time"])}
+    children = defaultdict(list)
+    for pid, row in table.items():
+        if row["ppid"] != pid:
+            children[row["ppid"]].append(pid)
+    for parent, row in table.items():
+        if not row["exe"]:
             continue
-        path = Path(image).resolve()
-        if any(path == root or root in path.parents for root in roots):
-            inv.put("process", process.pid, [str(path), process.info["create_time"]])
+        path = Path(row["exe"])
+        if not any(path == root or root in path.parents for root in roots):
+            continue
+        seen = set()
+        pending = [parent]
+        while pending:
+            pid = pending.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            child = table[pid]
+            born = child["create_time"]
+            assert born is not None, f"no creation time for product process {pid}"
+            if ("process", str(pid)) not in inv.rows:
+                inv.put("process", pid, [child["exe"] or "", born])
+            pending.extend(p for p in children[pid] if table[p]["create_time"] is None
+                           or table[p]["create_time"] >= born)
+        inv.descendants[parent] = {(pid, table[pid]["create_time"]) for pid in seen - {parent}}
+
+
+def assert_exited(identities):
+    import psutil
+    for pid, born in identities:
+        try:
+            if psutil.Process(pid).create_time() == born:
+                raise AssertionError(f"old process identity remains: pid={pid}, created={born}")
+        except psutil.NoSuchProcess:
+            pass
 
 
 def linux(inv):
@@ -127,7 +157,8 @@ def linux(inv):
     for row in output("systemctl", "list-unit-files", "--type=service", "--no-legend",
                       "--no-pager", "--plain").splitlines():
         unit, state, *_ = row.split()
-        inv.put("service", unit, state)
+        config = output("systemctl", "cat", unit) if unit.startswith("easytier-desk") else None
+        inv.put("service", unit, (state, hashlib.sha256(config.encode()).hexdigest() if config else None))
     tun = Path("/dev/net/tun")
     if tun.exists():
         st = tun.stat()
@@ -165,17 +196,29 @@ def darwin(inv):
         for file in resolver.iterdir():
             if file.is_file():
                 inv.put("resolver", str(file), file_identity(file))
-    for anchor in ("com.apple/easytier-desk", "com.apple/easytier-desk-g2-foreign"):
-        for line in output("/sbin/pfctl", "-a", anchor, "-sr").splitlines():
-            label = re.search(r' label "([^"]+)"', line)
-            inv.put("firewall", label[1] if label else line, (anchor, line))
+    pf = "/sbin/pfctl"
+    status = re.search(r"^Status:\s+(Enabled|Disabled)\b", output(pf, "-si"), re.M)
+    assert status, "missing PF status"
+    inv.put("firewall", "pf/status", status[1])
+    refs = output(pf, "-s", "References").strip()
+    # Compare native enable references without emitting their tokens.
+    inv.put("firewall", "pf/references", hashlib.sha256(refs.encode()).hexdigest())
+    anchors = output(pf, "-v", "-s", "Anchors").split()
+    for anchor in ["", *anchors]:
+        args = [pf, "-a", anchor] if anchor else [pf]
+        tables = {name: sorted(output(*args, "-t", name, "-T", "show").splitlines())
+                  for name in output(*args, "-s", "Tables").split()}
+        inv.put("firewall", "pf/anchor/" + anchor, {
+            "rules": output(*args, "-sr").splitlines(),
+            "nat": output(*args, "-sn").splitlines(), "tables": tables,
+        })
     for file in Path("/Library/LaunchDaemons").glob("*.plist"):
         inv.put("service", file.name, file_identity(file))
 
 
 def windows(inv):
     data = json.loads(command("powershell.exe", "-NoProfile", "-NonInteractive", "-File",
-                              Path(__file__).with_name("windows.ps1")).stdout)
+                              Path(__file__).with_name("windows.ps1"), timeout=180).stdout)
     # Win32_SystemDriver can omit a disabled SCM registration with no
     # loadable image. SCM is authoritative for these two product-wide names.
     for name in ("wintun", "windivert"):
@@ -192,23 +235,31 @@ def windows(inv):
     with tempfile.TemporaryDirectory() as directory:
         filters = Path(directory) / "filters.xml"
         command("netsh.exe", "wfp", "show", "filters", "verbose=on", f"file={filters}")
-        count = 0
+        groups = defaultdict(set)
         for _, item in ElementTree.iterparse(filters):
             if item.tag != "item" or item.find("filterKey") is None:
                 continue
-            count += 1
+            key = item.findtext("filterKey").strip().lower()
+            group = tuple(item.findtext(field, "").strip().strip("{}").lower()
+                          for field in ("providerKey", "subLayerKey"))
+            assert key and key not in groups[group], "missing or duplicate WFP filter key"
+            groups[group].add(key)
             label = item.findtext("displayData/name", "").strip()
-            if label.startswith("etd-fence:"):
-                inv.put("firewall", "wfp/" + item.findtext("filterKey"),
+            if ("51e7d001-7bc3-43b9-a795-7b80c196382f" in group
+                    or "51e7d002-7bc3-43b9-a795-7b80c196382f" in group):
+                inv.put("firewall", "wfp/" + key,
                         [label, ElementTree.tostring(item, encoding="unicode")])
             item.clear()
-        assert count, "WFP export contains no native filters"
+        assert groups, "WFP export contains no native filters"
+        for group, keys in groups.items():
+            inv.put("firewall", "wfp-group/" + "/".join(group), sorted(keys))
 
 
 def capture(run_dir, images, other_run_dirs=()):
     inv = Inventory()
     for root in (run_dir, *other_run_dirs):
-        directories(inv, root)
+        if root.exists():
+            directories(inv, root)
     {"linux": linux, "darwin": darwin, "win32": windows}[sys.platform](inv)
     processes(inv, images)
     return inv

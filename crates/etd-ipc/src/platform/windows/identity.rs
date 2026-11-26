@@ -210,7 +210,8 @@ fn service_peer(
 
 pub(super) fn server_identity(
     pipe: &NamedPipeClient,
-    expect: &ServerExpectation,
+    exe_dir: &Path,
+    proof: Proof<'_>,
     opened_after: std::time::SystemTime,
 ) -> io::Result<ServerIdentity> {
     let mut pid = 0;
@@ -255,11 +256,11 @@ pub(super) fn server_identity(
         .map_err(|e| io::Error::other(format!("QueryFullProcessImageNameW: {e}")))?;
     }
     let path = PathBuf::from(OsString::from_wide(&path[..len as usize]));
-    let exe = verify_image(&expect.exe_dir, &path)?;
+    let exe = verify_image(exe_dir, &path)?;
     let pipe_handle = HANDLE(pipe.as_raw_handle());
     let system = OsUserId::WindowsSid("S-1-5-18".into());
     let token = process_token(handle).and_then(|token| token_peer(&token, pid));
-    let peer = if expect.privileged {
+    let peer = if proof.privileged {
         let owner = pipe_owner(pipe_handle)?;
         let mut session = 0;
         let session = unsafe {
@@ -267,16 +268,10 @@ pub(super) fn server_identity(
         }
         .ok()
         .map(|_| session);
-        service_peer(
-            expect.user.as_ref().unwrap_or(&system),
-            owner,
-            pid,
-            session,
-            token,
-        )?
+        service_peer(proof.user.unwrap_or(&system), owner, pid, session, token)?
     } else {
         let peer = token?;
-        verify_user(expect, &peer.user, current_user()?, system)?;
+        verify_user(proof, &peer.user, current_user()?, system)?;
         peer
     };
     // Keep the process object pinned through image and owner verification.

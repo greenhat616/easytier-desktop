@@ -15,13 +15,14 @@ Frozen (`src/lib.rs`, `src/transport.rs`):
 | Item | Purpose |
 | --- | --- |
 | `SERVICE_PIPE_NAME`, `SERVICE_SOCKET_PATH`, `SERVICE_SOCKET_GROUP` | Service host endpoint and optional socket group name |
-| `HostForm` (`Service`, `User`) | Which host owns a listener and its singleton lock |
+| `HostForm` (`Service`, `User`, `ElevatedSession`) | Which host owns a listener and its singleton lock; `ElevatedSession` is not implemented yet and binding it fails with `Unsupported` |
 | `Endpoint` (`NamedPipe`, `UnixSocket`) | Where a host listens |
 | `OsUserId`, `OsGroupId` | Windows SID strings or Unix uid/gid |
 | `PeerIdentity` | `user`, enabled `groups`, `pid`, Windows `session`, `elevated`; never taken from client data |
 | `ServerIdentity` | Verified server `peer` plus its image path `exe` |
 | `ListenerPolicy` | `allow_users`, `allow_groups`, `unix_group` granted besides the built-in owners |
-| `ServerExpectation` | `exe_dir`, optional `user`, `privileged` (service host) |
+| `ServerExpectation` | `exe_dir` and a `ServerRequirement` |
+| `ServerRequirement` | `Service` (SYSTEM / root), `CurrentUser`, `CurrentUserElevated` (Windows only, not implemented yet), and `ServiceAccount(user)` / `UserAccount(user)`, the same proofs for a named account |
 | `Listener`, `Connector`, `Connection`, `BoxConn` | Transport traits |
 
 Implementation (`platform`, `tonic_io`):
@@ -109,9 +110,12 @@ policy (user form). It does not set `unix_group`.
 ## Server verification (connector side)
 
 The server image must be exactly `<canonical exe_dir>/etd-host` (`etd-host.exe` on
-Windows): an existing file whose canonical path is itself. The expected account is
-`expectation.user` if set; otherwise it is SYSTEM (`S-1-5-18`) or uid 0 when
-`privileged`, else the current user.
+Windows): an existing file whose canonical path is itself. The expected account comes
+from `expectation.requirement`: SYSTEM (`S-1-5-18`) or uid 0 for `Service`, the current
+user for `CurrentUser`, or the named account. `Service` and `ServiceAccount` use the
+service-host proof below ("privileged"), the others the user-host proof. Until the
+elevated session proof exists, `CurrentUserElevated` fails before the endpoint is
+opened: `PermissionDenied` on Windows, `Unsupported` on Unix.
 
 - **Windows:** the client opens the pipe with `SECURITY_IDENTIFICATION`, so the server
   can identify the client but not impersonate it. The server process must have been

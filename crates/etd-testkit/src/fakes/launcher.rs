@@ -2,7 +2,7 @@
 use async_trait::async_trait;
 use etd_app::{HostLauncher, HostTarget, LaunchError};
 use etd_contract::HostMode;
-use etd_ipc::{Endpoint, ServerExpectation};
+use etd_ipc::{Endpoint, ServerExpectation, ServerRequirement};
 use std::{collections::VecDeque, sync::Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,8 +31,11 @@ impl FakeHostLauncher {
             endpoint: Endpoint::NamedPipe(format!(r"\\.\pipe\fake-{mode:?}")),
             expectation: ServerExpectation {
                 exe_dir: "fake".into(),
-                user: None,
-                privileged: mode == HostMode::Service,
+                requirement: match mode {
+                    HostMode::Service => ServerRequirement::Service,
+                    HostMode::ElevatedSession => ServerRequirement::CurrentUserElevated,
+                    _ => ServerRequirement::CurrentUser,
+                },
             },
         }
     }

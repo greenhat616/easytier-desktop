@@ -641,7 +641,7 @@ fn require_journal(layout: &HostLayout, install_id: &str) -> Result<LifecycleJou
 }
 
 async fn start_and_verify(layout: &HostLayout, install_id: &str) -> Result<()> {
-    use etd_ipc::{Connector, ServerExpectation, platform::LocalConnector};
+    use etd_ipc::{Connector, ServerExpectation, ServerRequirement, platform::LocalConnector};
     ensure!(
         require_journal(layout, install_id)?.phase() == Phase::Installed,
         "service is not in the installed phase"
@@ -654,8 +654,7 @@ async fn start_and_verify(layout: &HostLayout, install_id: &str) -> Result<()> {
                 .parent()
                 .context("missing installed image directory")?
                 .to_owned(),
-            user: None,
-            privileged: true,
+            requirement: ServerRequirement::Service,
         },
     };
     let endpoint = endpoint(HostMode::Service, layout)?;

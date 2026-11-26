@@ -13,7 +13,7 @@ use etd_host_core::{
     reclaimers::host_reclaimers,
 };
 use etd_ipc::{
-    Endpoint, HostForm, OsUserId, ServerExpectation,
+    Endpoint, HostForm, OsUserId, ServerExpectation, ServerRequirement,
     platform::{LocalConnector, current_user},
     tonic_io::ClientIo,
 };
@@ -431,8 +431,11 @@ async fn connect(root: &Path, service: bool) -> Client {
     let connector = Arc::new(LocalConnector {
         expectation: ServerExpectation {
             exe_dir: root.to_owned(),
-            user: None,
-            privileged: service,
+            requirement: if service {
+                ServerRequirement::Service
+            } else {
+                ServerRequirement::CurrentUser
+            },
         },
     });
     timeout(LIMIT, async {

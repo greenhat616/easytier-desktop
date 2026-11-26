@@ -6,7 +6,8 @@ use etd_contract::{
     version_metadata_value,
 };
 use etd_ipc::{
-    Connector, Endpoint, ServerExpectation, platform::LocalConnector, tonic_io::ClientIo,
+    Connector, Endpoint, ServerExpectation, ServerRequirement, platform::LocalConnector,
+    tonic_io::ClientIo,
 };
 use etd_sysfx_os::service::{
     HostFilesystem, NativeHostFilesystem, NativeServiceManager, ServiceManager,
@@ -201,8 +202,7 @@ async fn install_connect_uninstall() {
     let connector = Arc::new(LocalConnector {
         expectation: ServerExpectation {
             exe_dir: layout.executable.parent().unwrap().to_owned(),
-            user: None,
-            privileged: true,
+            requirement: ServerRequirement::Service,
         },
     });
     let connection = tokio::time::timeout(Duration::from_secs(30), async {

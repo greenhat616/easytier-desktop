@@ -12,7 +12,10 @@
 use crate::{HostLauncher, HostTarget, LaunchError};
 use async_trait::async_trait;
 use etd_contract::HostMode;
-use etd_ipc::{Connector, Endpoint, SERVICE_PIPE_NAME, SERVICE_SOCKET_PATH, ServerExpectation};
+use etd_ipc::{
+    Connector, Endpoint, SERVICE_PIPE_NAME, SERVICE_SOCKET_PATH, ServerExpectation,
+    ServerRequirement,
+};
 use std::{
     ffi::OsString,
     io,
@@ -68,8 +71,7 @@ impl ServiceHostConfig {
         };
         let expectation = ServerExpectation {
             exe_dir: directory_of(&program),
-            user: None,
-            privileged: true,
+            requirement: ServerRequirement::Service,
         };
         Self {
             program,
@@ -103,8 +105,7 @@ impl UserHostConfig {
         let endpoint = user_endpoint(&user)?;
         let expectation = ServerExpectation {
             exe_dir: directory_of(&program),
-            user: Some(user),
-            privileged: false,
+            requirement: ServerRequirement::CurrentUser,
         };
         Ok(Self {
             program,

@@ -2,7 +2,7 @@
 //! root before handing the listener to `tonic_io::incoming`.
 use crate::{
     BoxConn, Connector, Endpoint, HostForm, ListenerPolicy, OsUserId, ServerExpectation,
-    ServerIdentity,
+    ServerIdentity, ServerRequirement,
 };
 use std::{
     io,
@@ -86,20 +86,51 @@ impl Connector for LocalConnector {
     }
 }
 
+/// The account proof a [`ServerRequirement`] asks for.
+#[derive(Clone, Copy)]
+pub(super) struct Proof<'a> {
+    /// The service-host proof (SYSTEM / root, endpoint owner) rather than
+    /// the user-host proof.
+    pub privileged: bool,
+    /// The expected account; `None` means SYSTEM / root when `privileged`,
+    /// else the current user.
+    pub user: Option<&'a OsUserId>,
+}
+
+/// Call before opening the endpoint. The elevated session proof is not
+/// implemented yet, so that requirement fails closed.
+pub(super) fn proof(expect: &ServerExpectation) -> io::Result<Proof<'_>> {
+    let (privileged, user) = match &expect.requirement {
+        ServerRequirement::Service => (true, None),
+        ServerRequirement::ServiceAccount(user) => (true, Some(user)),
+        ServerRequirement::CurrentUser => (false, None),
+        ServerRequirement::UserAccount(user) => (false, Some(user)),
+        ServerRequirement::CurrentUserElevated => return Err(elevated_unavailable()),
+    };
+    Ok(Proof { privileged, user })
+}
+
+#[cfg(windows)]
+fn elevated_unavailable() -> io::Error {
+    denied("elevated session host verification is not implemented")
+}
+
+#[cfg(unix)]
+fn elevated_unavailable() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the elevated session host is Windows-only",
+    )
+}
+
 fn verify_user(
-    expect: &ServerExpectation,
+    proof: Proof<'_>,
     actual: &OsUserId,
     current: OsUserId,
     service: OsUserId,
 ) -> io::Result<()> {
-    let default = if expect.privileged {
-        &service
-    } else {
-        &current
-    };
-    if actual != expect.user.as_ref().unwrap_or(default)
-        || (expect.privileged && actual != &service)
-    {
+    let default = if proof.privileged { &service } else { &current };
+    if actual != proof.user.unwrap_or(default) || (proof.privileged && actual != &service) {
         return Err(denied("unexpected host account"));
     }
     Ok(())
@@ -122,4 +153,44 @@ fn verify_image(directory: &Path, image: &Path) -> io::Result<PathBuf> {
         )));
     }
     Ok(host)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unused_endpoint() -> Endpoint {
+        let leaf = format!("etd-ipc-no-elevated-{}", std::process::id());
+        #[cfg(windows)]
+        return Endpoint::NamedPipe(format!(r"\\.\pipe\{leaf}"));
+        #[cfg(unix)]
+        return Endpoint::UnixSocket(std::env::temp_dir().join(leaf).join("host.sock"));
+    }
+
+    #[tokio::test]
+    async fn an_elevated_session_requirement_fails_closed() {
+        let connector = LocalConnector {
+            expectation: ServerExpectation {
+                exe_dir: PathBuf::new(),
+                requirement: ServerRequirement::CurrentUserElevated,
+            },
+        };
+        let error = connector.connect(&unused_endpoint()).await.err().unwrap();
+        #[cfg(windows)]
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        #[cfg(unix)]
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn an_elevated_session_listener_is_not_implemented() {
+        let error = LocalListener::bind(
+            HostForm::ElevatedSession,
+            &unused_endpoint(),
+            &ListenerPolicy::default(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
 }

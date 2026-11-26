@@ -79,6 +79,12 @@ fn descriptor(form: HostForm, policy: &ListenerPolicy) -> io::Result<identity::A
                 return Err(invalid("user host pipe policy must be owner-only"));
             }
         }
+        HostForm::ElevatedSession => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "elevated session not implemented",
+            ));
+        }
     }
     let mut add = |sid: &str| -> io::Result<()> {
         // Only numeric SIDs may be interpolated into SDDL. The OS parser
@@ -282,6 +288,7 @@ pub(super) async fn connect(
     endpoint: &Endpoint,
     expect: &ServerExpectation,
 ) -> io::Result<(BoxConn, ServerIdentity)> {
+    let proof = proof(expect)?;
     let name = pipe_name(endpoint)?;
     let before = SystemTime::now();
     let file = OpenOptions::new()
@@ -292,7 +299,8 @@ pub(super) async fn connect(
         .security_qos_flags(SECURITY_IDENTIFICATION.0)
         .open(name)?;
     let mut pipe = unsafe { NamedPipeClient::from_raw_handle(file.into_raw_handle())? };
-    let server = identity::server_identity(&pipe, expect, before).map_err(denied)?;
+    let server =
+        identity::server_identity(&pipe, &expect.exe_dir, proof, before).map_err(denied)?;
     pipe.write_u8(1).await?;
     Ok((Box::new(pipe), server))
 }

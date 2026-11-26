@@ -249,6 +249,12 @@ impl LocalListener {
     ) -> io::Result<Self> {
         let path = path(endpoint)?;
         let uid = Uid::effective().as_raw();
+        if form == HostForm::ElevatedSession {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the elevated session host is Windows-only",
+            ));
+        }
         if form == HostForm::Service && uid != 0 {
             return Err(denied("service socket requires root"));
         }
@@ -309,8 +315,9 @@ pub(super) async fn connect(
     endpoint: &Endpoint,
     expect: &ServerExpectation,
 ) -> io::Result<(BoxConn, ServerIdentity)> {
+    let proof = proof(expect)?;
     let path = path(endpoint)?;
-    let form = if expect.privileged {
+    let form = if proof.privileged {
         HostForm::Service
     } else {
         HostForm::User
@@ -323,22 +330,27 @@ pub(super) async fn connect(
     })?;
     let stream = UnixStream::connect(path).await?;
     let peer = os::peer(&stream).map_err(denied)?;
-    verify_user(expect, &peer.user, current_user()?, OsUserId::UnixUid(0))?;
+    verify_user(proof, &peer.user, current_user()?, OsUserId::UnixUid(0))?;
     if id != socket_identity(path, form).map_err(denied)? {
         return Err(denied("socket changed during connect"));
     }
     #[cfg(target_os = "linux")]
     let exe = {
-        if !expect.privileged && peer.user != current_user()? {
+        if !proof.privileged && peer.user != current_user()? {
             return Err(denied("user host must run as the current user"));
         }
-        os::verified_image(expect, peer.pid, os::pidfd(&stream))?
+        os::verified_image(
+            &expect.exe_dir,
+            proof.privileged,
+            peer.pid,
+            os::pidfd(&stream),
+        )?
     };
     #[cfg(target_os = "macos")]
     let exe = match os::image(&stream, peer.pid) {
         Ok(image) => verify_image(&expect.exe_dir, &image)?,
         Err(e)
-            if expect.privileged
+            if proof.privileged
                 && matches!(
                     e.kind(),
                     io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
@@ -366,8 +378,11 @@ mod tests {
     async fn failure(socket: PathBuf, privileged: bool) -> io::ErrorKind {
         let expect = ServerExpectation {
             exe_dir: ROOT_DIR.into(),
-            user: None,
-            privileged,
+            requirement: if privileged {
+                ServerRequirement::Service
+            } else {
+                ServerRequirement::CurrentUser
+            },
         };
         match connect(&Endpoint::UnixSocket(socket), &expect).await {
             Ok(_) => panic!("connected"),

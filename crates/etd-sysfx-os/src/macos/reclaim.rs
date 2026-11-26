@@ -201,6 +201,14 @@ fn resolved(path: &Path) -> io::Result<PathBuf> {
                 return Ok(base);
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                // A dangling symlink exists but points nowhere; what it
+                // would name cannot be decided.
+                if std::fs::symlink_metadata(current).is_ok() {
+                    return Err(io::Error::other(format!(
+                        "{} is a dangling symlink",
+                        current.display()
+                    )));
+                }
                 let (Some(name), Some(parent)) = (current.file_name(), current.parent()) else {
                     return Err(err);
                 };
@@ -432,5 +440,10 @@ mod tests {
         );
         // A missing component followed by `..` cannot be resolved.
         assert!(resolved(&link.join("missing/..")).is_err());
+        // Nor can a path through a dangling symlink.
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+        assert!(resolved(&dangling.join("run/i/1")).is_err());
+        assert!(resolved(&dangling).is_err());
     }
 }

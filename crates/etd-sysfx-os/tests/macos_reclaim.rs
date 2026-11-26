@@ -600,3 +600,102 @@ async fn unnamed_utun_inherited_by_a_kernel_helper_is_indeterminate() {
         "Kernel helper sh holding inherited {name} kept unnamed records indeterminate; absent after it exited"
     );
 }
+
+/// A user host's kernel runs with the user's UID. A holder with that UID
+/// whose -c lies in the generation directory keeps unnamed records
+/// indeterminate when the host (and so CoreIdentity) runs as that user.
+#[tokio::test]
+#[ignore = "disposable macOS runner with a second account"]
+async fn unnamed_utun_held_by_a_user_mode_kernel_is_indeterminate() {
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::env::var("ETD_O3_CI").as_deref(), Ok("1"));
+    let user = nix::unistd::User::from_name("etd_o3_probe")
+        .unwrap()
+        .unwrap();
+    assert!(!user.uid.is_root());
+    if let Some(marker) = std::env::var_os("ETD_MF_USER_HOLDER") {
+        if let Some(name) = std::env::var_os("ETD_MF_USER_UTUN") {
+            // Second stage: an ordinary user process holding the utun.
+            std::fs::write(marker, name.as_encoded_bytes()).unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        // Only root can open a utun: open it, become the user for good,
+        // then exec again (same PID, same argv, the socket inherited) so the
+        // process no longer carries the set-id taint of the switch.
+        use std::os::unix::process::CommandExt;
+        let (socket, name) = utun(0);
+        nix::unistd::setgid(user.gid).unwrap();
+        nix::unistd::setuid(user.uid).unwrap();
+        let error = Command::new(std::env::current_exe().unwrap())
+            .args(std::env::args_os().skip(1))
+            .env("ETD_MF_USER_UTUN", name)
+            .exec();
+        drop(socket);
+        panic!("{error}");
+    }
+    let dir = tempfile::tempdir_in("/private/tmp").unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let epoch_dir = dir.path().join("run").join(INSTANCE).join("1");
+    std::fs::create_dir_all(&epoch_dir).unwrap();
+    let ready = dir.path().join("ready");
+    std::fs::create_dir(&ready).unwrap();
+    std::fs::set_permissions(&ready, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let marker = ready.join("holder");
+    // A copy the user may execute; the runner's home is not traversable.
+    let exe = dir.path().join("holder-bin");
+    std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    struct Fixture(std::process::Child);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut holder = Fixture(
+        Command::new(&exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "unnamed_utun_held_by_a_user_mode_kernel_is_indeterminate",
+                "--",
+                "-c",
+            ])
+            .arg(epoch_dir.join("config.toml"))
+            .env("ETD_MF_USER_HOLDER", &marker)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(holder.0.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let name = std::fs::read_to_string(&marker).unwrap();
+    let pid = holder.0.id();
+    // Act as the user host: same effective UID as the user-mode kernel.
+    // Command capture files must go where that user may write.
+    // SAFETY: single-threaded test runtime; nothing reads the environment
+    // concurrently.
+    unsafe { std::env::set_var("TMPDIR", "/private/tmp") };
+    nix::unistd::seteuid(user.uid).unwrap();
+    let os = adapters_with_run(&dir, dir.path().join("run"));
+    let effects = unnamed_utun_effects(&os);
+    let mut probes = vec![];
+    for e in &effects {
+        let r = os.reclaimers.iter().find(|r| r.kind() == e.kind).unwrap();
+        probes.push((e.kind, r.probe(e).await));
+    }
+    nix::unistd::seteuid(nix::unistd::Uid::from_raw(0)).unwrap();
+    for (kind, probe) in &probes {
+        assert!(
+            matches!(probe, Probe::Indeterminate(m) if m.contains(&format!("PID {pid} "))),
+            "{kind} while user PID {pid} holds {name}: {probe:?}"
+        );
+    }
+    holder.0.kill().unwrap();
+    holder.0.wait().unwrap();
+    println!("User-mode kernel holder of {name} kept unnamed records indeterminate");
+}

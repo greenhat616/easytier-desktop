@@ -421,6 +421,7 @@ pub fn render_editor(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
 
     let form = div()
         .id("network-editor-scroll")
+        .test_support()
         .flex_1()
         .overflow_y_scroll()
         .flex()

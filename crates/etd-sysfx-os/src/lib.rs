@@ -6,6 +6,8 @@
 use etd_sysfx::{BootIdSource, PortFence, Reclaimer, Sweeper, SystemObserver};
 use std::{path::PathBuf, sync::Arc};
 
+pub mod appearance;
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "macos")]
@@ -65,6 +67,16 @@ pub enum OsError {
 /// Build the adapters for the running platform.
 pub fn adapters(config: &OsConfig) -> Result<OsAdapters, OsError> {
     platform::adapters(config)
+}
+
+/// Uninstall of the service form: remove the volatile boot marker the
+/// service host keeps (Windows `HKLM\SOFTWARE\EasyTierDesk\Volatile`;
+/// elsewhere nothing to remove). Missing is fine; idempotent.
+#[cfg(windows)]
+pub use windows::remove_service_boot_marker;
+#[cfg(not(windows))]
+pub fn remove_service_boot_marker() -> Result<(), OsError> {
+    Ok(())
 }
 
 /// Check whether a system driver references a protected kernel bundle.

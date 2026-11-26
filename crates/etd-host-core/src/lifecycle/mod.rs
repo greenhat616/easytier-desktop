@@ -61,6 +61,16 @@ pub struct LifecycleConfig {
     /// the ledger for the next start's self-check (or the uninstaller's
     /// purge) to reclaim. Kept well below the uninstaller's 60 s stop wait.
     pub shutdown_budget: Duration,
+    /// While a fenced kernel runs, its fence is verified again this often
+    /// (a firewall reload can drop the rule under a running kernel).
+    pub fence_recheck: Duration,
+    /// After a definite loss of the fence, the retry comes this much later;
+    /// a second definite loss in a row kills the kernel.
+    pub fence_retry: Duration,
+    /// After a re-verification that proved nothing either way (observer
+    /// error, firewall busy, timeout), the retry comes this much later; it
+    /// never kills the kernel.
+    pub fence_unverifiable_retry: Duration,
 }
 
 impl Default for LifecycleConfig {
@@ -74,6 +84,9 @@ impl Default for LifecycleConfig {
             log_lines: 1000,
             lease_grace: Duration::from_secs(30),
             shutdown_budget: Duration::from_secs(30),
+            fence_recheck: Duration::from_secs(30),
+            fence_retry: Duration::from_secs(2),
+            fence_unverifiable_retry: Duration::from_secs(10),
         }
     }
 }
@@ -93,6 +106,13 @@ pub(crate) struct Ctx {
     /// Every supervisor task started, so a host that stops waiting for them
     /// can still end them before it gives up its lock.
     pub tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Held by a generation from the check of its kernel's program firewall
+    /// rules before the spawn until their read-back after basic readiness
+    /// (or the end of the generation). The kernel deletes and recreates
+    /// those rules on every start, so two starts in flight at once would
+    /// see each other's replacement as a foreign rule (or leave duplicates
+    /// behind); generations that replace them start one at a time.
+    pub program_rules: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Ctx {
@@ -228,6 +248,7 @@ impl Orchestrator {
                 hold: std::sync::Mutex::new(None),
                 excluded: std::sync::Mutex::new(Default::default()),
                 tasks: std::sync::Mutex::new(Vec::new()),
+                program_rules: Arc::new(tokio::sync::Mutex::new(())),
             }),
             port,
         }

@@ -435,8 +435,7 @@ async fn quarantine(edges: &mut Edges) {
     let world = World::new();
     let mut h = ready(&world, "a").await;
     let kernel = world.last_kernel();
-    // Uncertain before the exit: the host reclaims as soon as it sees the
-    // exit, on its own threads.
+    // Uncertain before the exit is delivered (the host reclaims at once).
     world
         .engine
         .set_liveness(&kernel, Some(Liveness::Uncertain));

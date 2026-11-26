@@ -424,6 +424,7 @@ impl UiController {
             }),
             focus: true,
             show: true,
+            window_background: crate::theme::window_background(cx),
             ..Default::default()
         };
 
@@ -481,7 +482,8 @@ impl UiController {
         })?;
 
         *self.active_window.borrow_mut() = Some((generation, handle));
-        let _ = handle.update(cx, |_, window, _| {
+        let _ = handle.update(cx, |_, window, cx| {
+            crate::theme::bind_window(window, cx);
             window.activate_window();
         });
         Ok(())

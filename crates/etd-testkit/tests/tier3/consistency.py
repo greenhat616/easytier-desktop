@@ -104,6 +104,13 @@ def check_generation(base, live, records, instance, view, adapter_guids):
     except (AssertionError, KeyError, OSError):
         for kind, key in sorted(base.delta(live)):
             print(f"native delta: {kind} {key}", flush=True)
+            if kind == "process":
+                source = live if (kind, key) in live.rows else base
+                path, born = source.rows[kind, key]
+                parent = source.parents.get(int(key))
+                parent_row = source.rows.get((kind, str(parent)))
+                print(f"process {key} image={Path(path).name} created={born} parent={parent} "
+                      f"parent_image={Path(parent_row[0]).name if parent_row else 'outside tree'}", flush=True)
             if kind == "service":
                 old = base.rows.get((kind, key))
                 new = live.rows.get((kind, key))

@@ -1020,3 +1020,101 @@ fn tray_hide_and_restore_preserves_state_and_exits_from_menu(cx: &mut TestAppCon
         etd_app::window_tray::Visibility::Shown
     );
 }
+
+#[test]
+fn icon_asset_source_serves_eye_svg() {
+    use gpui_kit::AssetSource as _;
+
+    let bytes = gpui_kit::assets::Assets
+        .load("icons/eye.svg")
+        .expect("asset source should not error")
+        .expect("icons/eye.svg must be embedded for Input::mask_toggle()");
+    let svg = std::str::from_utf8(&bytes).expect("icons/eye.svg should be valid UTF-8");
+    assert!(
+        svg.contains("<svg"),
+        "expected SVG markup for icons/eye.svg"
+    );
+}
+
+#[test]
+fn main_thread_constrained_stack_renders_all_views_banners_and_editor_without_overflow() {
+    // Windows default main-thread stack is 1 MiB (0x100000), of which Win32 WndProc /
+    // gpui_windows dispatch consumes ~110 KiB before entering GPUI rendering, while
+    // gpui_component::Button::render alone uses ~340 KiB in unoptimized debug builds.
+    // Run the full GPUI render + banners + editor + reclaim flow on a 768 KiB stack
+    // thread (leaving 256 KiB Win32 headroom) so debug stack-frame bloat in etd-ui
+    // fails deterministically in CI across all OSes.
+    let handle = std::thread::Builder::new()
+        .name("win-constrained-stack-repro".into())
+        .stack_size(768 * 1024)
+        .spawn(|| {
+            let mut cx = TestAppContext::single();
+            let (tray, _, _) = FakeTray::available();
+            let (installer, _) = FakeInstaller::ok();
+            let harness = TestHarness::new(&mut cx, Box::new(tray), installer, false);
+
+            // 1. Render NotInstalled onboarding banner (first-run Windows state).
+            harness.push_store(
+                StateStore {
+                    link: HostLink::LaunchFailed(LaunchFailure {
+                        mode: Some(HostMode::Service),
+                        kind: LaunchFailureKind::NotInstalled,
+                        message: "no host service is installed".into(),
+                    }),
+                    ..StateStore::default()
+                },
+                &mut cx,
+            );
+
+            // 2. Render Reconnecting + CutUnconfirmed + Waiting + GaveUp + Reclaim + Editor.
+            let mut store = connected_store(&[
+                capability::INSTANCES,
+                capability::TUN,
+                capability::QUERY_NODES,
+                capability::QUERY_ROUTES,
+                capability::QUERY_TRAFFIC,
+                capability::RECLAIM,
+                capability::RECLAIM_CANDIDATES,
+            ]);
+            store.link = HostLink::Reconnecting { attempt: 2 };
+            for entry in [
+                make_entry(
+                    "m1",
+                    "Mesh One",
+                    InstanceState::ReadyFull,
+                    ManagementAccess::Available,
+                    true,
+                ),
+                make_entry(
+                    "cut1",
+                    "Cut Mesh",
+                    InstanceState::CutUnconfirmed,
+                    ManagementAccess::Pending,
+                    false,
+                ),
+            ] {
+                store.instances.insert(entry.id.clone(), entry);
+            }
+            harness.push_store(store, &mut cx);
+
+            cx.update_window(harness.window, |_, window, cx| {
+                assert!(window.find("banner-reconnecting").visible());
+                assert!(window.find("banner-cut-unconfirmed").visible());
+                window.click("btn-new-network", cx);
+                window.click("editor-network-name", cx);
+                window.input("中文测试net", cx);
+                window.click("editor-network-secret", cx);
+                window.input("secret-123", cx);
+                window.click("btn-suggested-listeners", cx);
+                window.click("editor-cancel", cx);
+                window.click("nav-reclaim", cx);
+                window.click("nav-instances", cx);
+            })
+            .unwrap();
+        })
+        .expect("spawn 768 KiB stack thread");
+
+    handle
+        .join()
+        .expect("768 KiB stack thread panicked or overflowed");
+}

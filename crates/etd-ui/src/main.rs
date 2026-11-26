@@ -2,9 +2,9 @@
 //!
 //! Starts the background Tokio runtime via [`etd_app::AppRuntime::start`] with
 //! `GrpcHostClient` + `LocalConnector`, elevation-aware `LocalHostLauncher`,
-//! and `TomlProfileStore`, then runs GPUI with [`QuitMode::Explicit`] and
-//! [`etd_ui::NativeTrayBackend`]. Every exit funnels through [`etd_app::ExitGate`]
-//! before `cx.quit()`.
+//! and `TomlProfileStore`, then runs GPUI with [`QuitMode::Explicit`],
+//! [`gpui_kit::assets::Assets`], and [`etd_ui::NativeTrayBackend`]. Every exit
+//! funnels through [`etd_app::ExitGate`] before `cx.quit()`.
 
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
@@ -26,7 +26,9 @@ fn main() {
         AppRuntime::start(services, BridgeConfig::default()).expect("failed to start app runtime");
     let installer = Arc::new(PlatformServiceInstaller::detect());
 
-    let app = gpui_kit::application().with_quit_mode(QuitMode::Explicit);
+    let app = gpui_kit::application()
+        .with_assets(gpui_kit::assets::Assets)
+        .with_quit_mode(QuitMode::Explicit);
     let controller_slot: Rc<RefCell<Option<UiController>>> = Rc::new(RefCell::new(None));
     let reopen_slot = controller_slot.clone();
     app.on_reopen(move |cx| {

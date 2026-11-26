@@ -3,16 +3,14 @@
 pub mod banners;
 pub mod instances;
 pub mod reclaim;
+pub mod ui;
 
 use etd_app::UserCommand;
 use etd_contract::{Desired, InstanceId, NetworkSpec, capability};
 use gpui_kit::{
-    Context, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    Styled as _, TestSupportExt as _, Window,
-    component::{
-        ActiveTheme as _, Sizable as _,
-        button::{Button, ButtonVariant, ButtonVariants as _},
-    },
+    AnyElement, Context, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+    SharedString, Styled as _, TestSupportExt as _, Window,
+    component::{ActiveTheme as _, Size, button::ButtonVariant},
     div, px,
 };
 
@@ -20,6 +18,7 @@ use crate::{
     controller::UiController,
     editor::{NetworkEditorState, render_editor},
     model::Section,
+    views::ui::{BtnStyle, action_button},
 };
 
 /// Main desktop window view.
@@ -83,10 +82,98 @@ impl MainView {
     }
 }
 
+#[inline(never)]
+fn render_sidebar(
+    active_section: Section,
+    instance_count: usize,
+    reclaim_count: usize,
+    cx: &mut Context<MainView>,
+) -> AnyElement {
+    let border = cx.theme().border;
+    let sidebar = cx.theme().sidebar;
+    let reclaim_label = if reclaim_count > 0 {
+        format!("Reclaim Report ({reclaim_count})")
+    } else {
+        "Reclaim Report".to_owned()
+    };
+
+    let new_btn = action_button(
+        "btn-new-network",
+        "+ New Network",
+        BtnStyle::new(ButtonVariant::Primary, Size::Small),
+        cx.listener(|this, _, window, cx| {
+            this.open_new_editor(window, cx);
+        }),
+    );
+    let instances_btn = action_button(
+        "nav-instances",
+        SharedString::from(format!("Instances ({instance_count})")),
+        BtnStyle::new(
+            if active_section == Section::Instances {
+                ButtonVariant::Secondary
+            } else {
+                ButtonVariant::Ghost
+            },
+            Size::Small,
+        ),
+        cx.listener(|this, _, _, cx| {
+            this.controller.select_section(Section::Instances, cx);
+        }),
+    );
+    let reclaim_btn = action_button(
+        "nav-reclaim",
+        SharedString::from(reclaim_label),
+        BtnStyle::new(
+            if active_section == Section::Reclaim {
+                ButtonVariant::Secondary
+            } else {
+                ButtonVariant::Ghost
+            },
+            Size::Small,
+        ),
+        cx.listener(|this, _, _, cx| {
+            this.controller.select_section(Section::Reclaim, cx);
+        }),
+    );
+
+    div()
+        .id("sidebar-nav")
+        .w(px(210.))
+        .h_full()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p_3()
+        .border_r_1()
+        .border_color(border)
+        .bg(sidebar)
+        .child(new_btn)
+        .child(instances_btn)
+        .child(reclaim_btn)
+        .into_any_element()
+}
+
+#[inline(never)]
+fn render_section_content(
+    view: &MainView,
+    section: Section,
+    cx: &mut Context<MainView>,
+) -> AnyElement {
+    let inner = match section {
+        Section::Instances => instances::render_instances_workspace(view, cx),
+        Section::Reclaim => reclaim::render_reclaim_view(view, cx),
+        Section::Editor => render_editor(view, cx),
+    };
+    div()
+        .flex_1()
+        .h_full()
+        .overflow_hidden()
+        .child(inner)
+        .into_any_element()
+}
+
 impl Render for MainView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = cx.theme().border;
-        let sidebar = cx.theme().sidebar;
         let background = cx.theme().background;
         let foreground = cx.theme().foreground;
         let (active_section, instance_count, reclaim_count) = {
@@ -98,76 +185,10 @@ impl Render for MainView {
             )
         };
 
-        let reclaim_label = if reclaim_count > 0 {
-            format!("Reclaim Report ({reclaim_count})")
-        } else {
-            "Reclaim Report".to_owned()
-        };
-
-        let nav = div()
-            .id("sidebar-nav")
-            .w(px(210.))
-            .h_full()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_3()
-            .border_r_1()
-            .border_color(border)
-            .bg(sidebar)
-            .child(
-                Button::new("btn-new-network")
-                    .primary()
-                    .small()
-                    .label("+ New Network")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_new_editor(window, cx);
-                    })),
-            )
-            .child(
-                Button::new("nav-instances")
-                    .small()
-                    .with_variant(if active_section == Section::Instances {
-                        ButtonVariant::Secondary
-                    } else {
-                        ButtonVariant::Ghost
-                    })
-                    .label(SharedString::from(format!("Instances ({instance_count})")))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.controller.select_section(Section::Instances, cx);
-                    })),
-            )
-            .child(
-                Button::new("nav-reclaim")
-                    .small()
-                    .with_variant(if active_section == Section::Reclaim {
-                        ButtonVariant::Secondary
-                    } else {
-                        ButtonVariant::Ghost
-                    })
-                    .label(SharedString::from(reclaim_label))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.controller.select_section(Section::Reclaim, cx);
-                    })),
-            );
-
-        let content = match active_section {
-            Section::Instances => div()
-                .flex_1()
-                .h_full()
-                .overflow_hidden()
-                .child(instances::render_instances_workspace(self, cx)),
-            Section::Reclaim => div()
-                .flex_1()
-                .h_full()
-                .overflow_hidden()
-                .child(reclaim::render_reclaim_view(self, cx)),
-            Section::Editor => div()
-                .flex_1()
-                .h_full()
-                .overflow_hidden()
-                .child(render_editor(self, cx)),
-        };
+        let header = banners::render_header(self, cx);
+        let banners = banners::render_banners(self, cx);
+        let nav = render_sidebar(active_section, instance_count, reclaim_count, cx);
+        let content = render_section_content(self, active_section, cx);
 
         div()
             .id("etd-main-root")
@@ -177,8 +198,8 @@ impl Render for MainView {
             .size_full()
             .bg(background)
             .text_color(foreground)
-            .child(banners::render_header(self, cx))
-            .child(banners::render_banners(self, cx))
+            .child(header)
+            .child(banners)
             .child(
                 div()
                     .flex_1()

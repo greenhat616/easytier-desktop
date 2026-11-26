@@ -3,6 +3,9 @@
 //! Security invariant: network secrets are **never** stored in `UiModel`,
 //! `StateStore`, or `ProfileStore`. Every create/edit starts with an empty
 //! masked secret input and scrubs the field immediately after submit or cancel.
+//!
+//! Each form section is built in a separate `#[inline(never)]` helper returning
+//! [`AnyElement`] so debug stack frames remain small on Windows' 1 MiB main stack.
 
 use etd_app::{
     ApplyDraft, SUGGESTED_LISTENERS, Secret, SecretFreeSpec, SecretInput, new_instance_id,
@@ -12,16 +15,16 @@ use etd_contract::{
     v1::{NetworkFlags, network_spec::Ipv4},
 };
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
+    AnyElement, App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
     ParentElement as _, Role, SharedString, StatefulInteractiveElement as _, Styled as _,
     TestSupportExt as _, Window,
-    component::{
-        ActiveTheme as _, Sizable as _, StyledExt as _,
-        button::{Button, ButtonVariants as _},
-        input::{Input, InputContentType, InputState},
-        switch::Switch,
-    },
+    component::{ActiveTheme as _, Size, StyledExt as _, button::ButtonVariant, input::InputState},
     div,
+};
+
+use crate::views::{
+    MainView,
+    ui::{BtnStyle, action_button, password_input, switch_control, text_field},
 };
 
 /// How the user chooses to handle the network secret on create or edit.
@@ -389,455 +392,42 @@ fn parse_optional_u32(raw: &str, label: &str) -> Result<u32, String> {
         .map_err(|_| format!("{label} must be a non-negative integer."))
 }
 
-/// Renders the Network Config Editor inside [`crate::views::MainView`].
-pub fn render_editor(
-    view: &crate::views::MainView,
-    cx: &mut Context<crate::views::MainView>,
-) -> impl IntoElement {
-    let theme = cx.theme();
-    let model = view.controller.model.read(cx);
-    let tun_available = model.store.has_capability(capability::TUN);
-    let editor = &view.editor;
-    let is_edit = editor.editing_instance.is_some();
-
+/// Renders the Network Config Editor inside [`MainView`].
+#[inline(never)]
+pub fn render_editor(view: &MainView, cx: &mut Context<MainView>) -> AnyElement {
+    let tun_available = view
+        .controller
+        .model
+        .read(cx)
+        .store
+        .has_capability(capability::TUN);
+    let is_edit = view.editor.editing_instance.is_some();
     let title = if is_edit {
         "Edit Network Configuration"
     } else {
         "New Network Configuration"
     };
 
-    let secret_hint = if is_edit {
-        if editor.host_has_secret {
-            "Network secrets are never stored in the UI. The host currently holds a secret; choose Keep, Replace, or Clear."
-        } else {
-            "Network secrets are never stored in the UI. The host currently has no secret stored."
-        }
-    } else {
-        "Network secrets are never stored locally and are asked on each create or edit."
-    };
+    let header = render_editor_header(title, is_edit, cx);
+    let mut sections: Vec<AnyElement> = Vec::new();
 
-    let secret_input_disabled = editor.secret_mode != SecretMode::Set;
+    if let Some(error) = &view.editor.validation_error {
+        sections.push(render_validation_error(error, cx));
+    }
+    sections.push(render_identity_section(&view.editor, is_edit, cx));
+    sections.push(render_addressing_section(&view.editor, cx));
+    sections.push(render_listeners_section(&view.editor, cx));
+    sections.push(render_options_section(&view.editor, tun_available, cx));
 
-    let save_desired = if is_edit {
-        Desired::Unspecified
-    } else {
-        Desired::Stopped
-    };
-
-    let header = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .px_5()
-        .py_3()
-        .border_b_1()
-        .border_color(theme.border)
-        .bg(theme.background)
-        .child(
-            div()
-                .text_lg()
-                .font_semibold()
-                .text_color(theme.foreground)
-                .child(title),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(
-                    Button::new("editor-cancel")
-                        .ghost()
-                        .small()
-                        .label("Cancel")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.cancel_editor(window, cx);
-                        })),
-                )
-                .child(
-                    Button::new("editor-submit-save")
-                        .secondary()
-                        .small()
-                        .label("Save")
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.submit_editor(save_desired, window, cx);
-                        })),
-                )
-                .child(
-                    Button::new("editor-submit-start")
-                        .primary()
-                        .small()
-                        .label("Save & Start")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.submit_editor(Desired::Running, window, cx);
-                        })),
-                ),
-        );
-
-    let mut form = div()
+    let form = div()
         .id("network-editor-scroll")
         .flex_1()
         .overflow_y_scroll()
         .flex()
         .flex_col()
         .gap_4()
-        .p_5();
-
-    if let Some(error) = &editor.validation_error {
-        form = form.child(
-            div()
-                .id("editor-validation-error")
-                .role(Role::Alert)
-                .test_support()
-                .aria_label(SharedString::from(error.clone()))
-                .px_3()
-                .py_2()
-                .rounded_md()
-                .border_1()
-                .border_color(theme.danger)
-                .bg(theme.danger.opacity(0.12))
-                .text_color(theme.danger)
-                .text_sm()
-                .child(error.clone()),
-        );
-    }
-
-    // Core identity fields
-    form = form.child(
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p_4()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.secondary.opacity(0.25))
-            .child(field_row(
-                "Display Name",
-                Input::new(&editor.display_name)
-                    .id("editor-display-name")
-                    .aria_label("Display Name"),
-                cx,
-            ))
-            .child(field_row(
-                "Network Name *",
-                Input::new(&editor.network_name)
-                    .id("editor-network-name")
-                    .aria_label("Network Name"),
-                cx,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_medium()
-                            .text_color(theme.foreground)
-                            .child("Network Secret (never saved locally)"),
-                    )
-                    .child(
-                        div()
-                            .id("editor-secret-hint")
-                            .test_support()
-                            .aria_label(SharedString::from(secret_hint))
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(secret_hint),
-                    )
-                    .child({
-                        let mut mode_row = div().flex().flex_row().gap_2();
-                        if is_edit {
-                            mode_row = mode_row.child(
-                                Button::new("secret-mode-keep")
-                                    .small()
-                                    .outline()
-                                    .label("Keep Existing")
-                                    .with_variant(if editor.secret_mode == SecretMode::Keep {
-                                        gpui_kit::component::button::ButtonVariant::Primary
-                                    } else {
-                                        gpui_kit::component::button::ButtonVariant::Secondary
-                                    })
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.editor.secret_mode = SecretMode::Keep;
-                                        this.editor.clear_secret(window, cx);
-                                        cx.notify();
-                                    })),
-                            );
-                        }
-                        mode_row
-                            .child(
-                                Button::new("secret-mode-set")
-                                    .small()
-                                    .outline()
-                                    .label(if is_edit {
-                                        "Replace Secret"
-                                    } else {
-                                        "Set Secret"
-                                    })
-                                    .with_variant(if editor.secret_mode == SecretMode::Set {
-                                        gpui_kit::component::button::ButtonVariant::Primary
-                                    } else {
-                                        gpui_kit::component::button::ButtonVariant::Secondary
-                                    })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.editor.secret_mode = SecretMode::Set;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("secret-mode-clear")
-                                    .small()
-                                    .outline()
-                                    .label(if is_edit { "Clear Secret" } else { "No Secret" })
-                                    .with_variant(if editor.secret_mode == SecretMode::Clear {
-                                        gpui_kit::component::button::ButtonVariant::Primary
-                                    } else {
-                                        gpui_kit::component::button::ButtonVariant::Secondary
-                                    })
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.editor.secret_mode = SecretMode::Clear;
-                                        this.editor.clear_secret(window, cx);
-                                        cx.notify();
-                                    })),
-                            )
-                    })
-                    .child(
-                        Input::new(&editor.network_secret)
-                            .id("editor-network-secret")
-                            .aria_label("Network Secret")
-                            .content_type(InputContentType::Password)
-                            .mask_toggle()
-                            .disabled(secret_input_disabled),
-                    ),
-            )
-            .child(field_row(
-                "Hostname",
-                Input::new(&editor.hostname)
-                    .id("editor-hostname")
-                    .aria_label("Hostname"),
-                cx,
-            )),
-    );
-
-    // Addressing & Peers
-    form = form.child(
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p_4()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.secondary.opacity(0.25))
-            .child(
-                Switch::new("editor-dhcp")
-                    .checked(editor.dhcp)
-                    .label("Assign virtual IPv4 automatically (DHCP)")
-                    .on_change(cx.listener(|this, checked, _, cx| {
-                        this.editor.dhcp = *checked;
-                        cx.notify();
-                    })),
-            )
-            .child(field_row(
-                "Static IPv4 CIDR",
-                Input::new(&editor.ipv4_cidr)
-                    .id("editor-ipv4-cidr")
-                    .aria_label("Static IPv4 CIDR")
-                    .disabled(editor.dhcp),
-                cx,
-            ))
-            .child(field_row(
-                "Peers",
-                Input::new(&editor.peers)
-                    .id("editor-peers")
-                    .aria_label("Peers"),
-                cx,
-            )),
-    );
-
-    // Listeners & Suggested 11010 set (without faketcp)
-    let mut suggested_chips = div().flex().flex_row().flex_wrap().gap_2();
-    for (idx, uri) in SUGGESTED_LISTENERS.iter().enumerate() {
-        let uri_owned = (*uri).to_owned();
-        suggested_chips = suggested_chips.child(
-            Button::new(SharedString::from(format!("btn-suggested-listener-{idx}")))
-                .xsmall()
-                .secondary()
-                .label(*uri)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.editor.add_suggested_listener(&uri_owned, window, cx);
-                    cx.notify();
-                })),
-        );
-    }
-
-    form = form.child(
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p_4()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.secondary.opacity(0.25))
-            .child(field_row(
-                "Listeners",
-                Input::new(&editor.listeners)
-                    .id("editor-listeners")
-                    .aria_label("Listeners")
-                    .disabled(editor.no_listener),
-                cx,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child("Suggested listeners (upstream 11010 set; faketcp excluded):"),
-                    )
-                    .child(
-                        Button::new("btn-suggested-listeners")
-                            .xsmall()
-                            .outline()
-                            .label("Use Suggested 11010 Set")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.editor.apply_suggested_listeners(window, cx);
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(suggested_chips)
-            .child(
-                Switch::new("editor-no-listener")
-                    .checked(editor.no_listener)
-                    .label("Disable all listeners (no_listener)")
-                    .on_change(cx.listener(|this, checked, _, cx| {
-                        this.editor.no_listener = *checked;
-                        cx.notify();
-                    })),
-            ),
-    );
-
-    // Routing, TUN, and advanced toggles
-    let no_tun_label = if tun_available {
-        "No TUN interface (SOCKS5 / port forwarding only)"
-    } else {
-        "No TUN interface (required by current user-mode host)"
-    };
-
-    form = form.child(
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p_4()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.secondary.opacity(0.25))
-            .child(field_row(
-                "Proxy CIDRs",
-                Input::new(&editor.proxy_cidrs)
-                    .id("editor-proxy-cidrs")
-                    .aria_label("Proxy CIDRs"),
-                cx,
-            ))
-            .child(field_row(
-                "Exit Nodes",
-                Input::new(&editor.exit_nodes)
-                    .id("editor-exit-nodes")
-                    .aria_label("Exit Nodes"),
-                cx,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_3()
-                    .child(div().flex_1().child(field_row(
-                        "MTU",
-                        Input::new(&editor.mtu).id("editor-mtu").aria_label("MTU"),
-                        cx,
-                    )))
-                    .child(
-                        div().flex_1().child(field_row(
-                            "SOCKS5 Port",
-                            Input::new(&editor.socks5_port)
-                                .id("editor-socks5-port")
-                                .aria_label("SOCKS5 Port"),
-                            cx,
-                        )),
-                    ),
-            )
-            .child(
-                Switch::new("editor-no-tun")
-                    .checked(editor.no_tun)
-                    .label(no_tun_label)
-                    .on_change(cx.listener(|this, checked, _, cx| {
-                        this.editor.no_tun = *checked;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Switch::new("editor-enable-exit-node")
-                    .checked(editor.enable_exit_node)
-                    .label("Act as exit node")
-                    .on_change(cx.listener(|this, checked, _, cx| {
-                        this.editor.enable_exit_node = *checked;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Switch::new("editor-magic-dns")
-                    .checked(editor.magic_dns)
-                    .label("Enable Magic DNS")
-                    .on_change(cx.listener(|this, checked, _, cx| {
-                        this.editor.magic_dns = *checked;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Switch::new("editor-latency-first")
-                    .checked(editor.latency_first)
-                    .label("Latency-first routing")
-                    .on_change(cx.listener(|this, checked, _, cx| {
-                        this.editor.latency_first = *checked;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Switch::new("editor-private-mode")
-                    .checked(editor.private_mode)
-                    .label("Private mode")
-                    .on_change(cx.listener(|this, checked, _, cx| {
-                        this.editor.private_mode = *checked;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Switch::new("editor-disable-p2p")
-                    .checked(editor.disable_p2p)
-                    .label("Disable P2P (relay only)")
-                    .on_change(cx.listener(|this, checked, _, cx| {
-                        this.editor.disable_p2p = *checked;
-                        cx.notify();
-                    })),
-            ),
-    );
+        .p_5()
+        .children(sections);
 
     div()
         .id("network-editor-view")
@@ -849,20 +439,492 @@ pub fn render_editor(
         .overflow_hidden()
         .child(header)
         .child(form)
+        .into_any_element()
 }
 
-fn field_row(label: &str, control: impl IntoElement, cx: &App) -> impl IntoElement {
-    let theme = cx.theme();
+#[inline(never)]
+fn render_editor_header(
+    title: &'static str,
+    is_edit: bool,
+    cx: &mut Context<MainView>,
+) -> AnyElement {
+    let border = cx.theme().border;
+    let bg = cx.theme().background;
+    let fg = cx.theme().foreground;
+    let save_desired = if is_edit {
+        Desired::Unspecified
+    } else {
+        Desired::Stopped
+    };
+
+    let cancel_btn = action_button(
+        "editor-cancel",
+        "Cancel",
+        BtnStyle::new(ButtonVariant::Ghost, Size::Small),
+        cx.listener(|this, _, window, cx| {
+            this.cancel_editor(window, cx);
+        }),
+    );
+    let save_btn = action_button(
+        "editor-submit-save",
+        "Save",
+        BtnStyle::new(ButtonVariant::Secondary, Size::Small),
+        cx.listener(move |this, _, window, cx| {
+            this.submit_editor(save_desired, window, cx);
+        }),
+    );
+    let start_btn = action_button(
+        "editor-submit-start",
+        "Save & Start",
+        BtnStyle::new(ButtonVariant::Primary, Size::Small),
+        cx.listener(|this, _, window, cx| {
+            this.submit_editor(Desired::Running, window, cx);
+        }),
+    );
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .px_5()
+        .py_3()
+        .border_b_1()
+        .border_color(border)
+        .bg(bg)
+        .child(div().text_lg().font_semibold().text_color(fg).child(title))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(cancel_btn)
+                .child(save_btn)
+                .child(start_btn),
+        )
+        .into_any_element()
+}
+
+#[inline(never)]
+fn render_validation_error(error: &str, cx: &Context<MainView>) -> AnyElement {
+    let danger = cx.theme().danger;
+    div()
+        .id("editor-validation-error")
+        .role(Role::Alert)
+        .test_support()
+        .aria_label(SharedString::from(error.to_owned()))
+        .px_3()
+        .py_2()
+        .rounded_md()
+        .border_1()
+        .border_color(danger)
+        .bg(danger.opacity(0.12))
+        .text_color(danger)
+        .text_sm()
+        .child(error.to_owned())
+        .into_any_element()
+}
+
+#[inline(never)]
+fn render_identity_section(
+    editor: &NetworkEditorState,
+    is_edit: bool,
+    cx: &mut Context<MainView>,
+) -> AnyElement {
+    let border = cx.theme().border;
+    let sec = cx.theme().secondary;
+
+    let display = text_field(
+        "Display Name",
+        "editor-display-name",
+        "Display Name",
+        &editor.display_name,
+        false,
+        cx,
+    );
+    let net_name = text_field(
+        "Network Name *",
+        "editor-network-name",
+        "Network Name",
+        &editor.network_name,
+        false,
+        cx,
+    );
+    let secret = render_secret_block(editor, is_edit, cx);
+    let hostname = text_field(
+        "Hostname",
+        "editor-hostname",
+        "Hostname",
+        &editor.hostname,
+        false,
+        cx,
+    );
+
     div()
         .flex()
         .flex_col()
-        .gap_1()
+        .gap_3()
+        .p_4()
+        .rounded_md()
+        .border_1()
+        .border_color(border)
+        .bg(sec.opacity(0.25))
+        .child(display)
+        .child(net_name)
+        .child(secret)
+        .child(hostname)
+        .into_any_element()
+}
+
+#[inline(never)]
+fn render_secret_block(
+    editor: &NetworkEditorState,
+    is_edit: bool,
+    cx: &mut Context<MainView>,
+) -> AnyElement {
+    let fg = cx.theme().foreground;
+    let muted = cx.theme().muted_foreground;
+    let secret_hint = if is_edit {
+        if editor.host_has_secret {
+            "Network secrets are never stored in the UI. The host currently holds a secret; choose Keep, Replace, or Clear."
+        } else {
+            "Network secrets are never stored in the UI. The host currently has no secret stored."
+        }
+    } else {
+        "Network secrets are never stored locally and are asked on each create or edit."
+    };
+
+    let mut mode_btns = Vec::new();
+    if is_edit {
+        mode_btns.push(action_button(
+            "secret-mode-keep",
+            "Keep Existing",
+            BtnStyle::new(
+                if editor.secret_mode == SecretMode::Keep {
+                    ButtonVariant::Primary
+                } else {
+                    ButtonVariant::Secondary
+                },
+                Size::Small,
+            )
+            .outline(),
+            cx.listener(|this, _, window, cx| {
+                this.editor.secret_mode = SecretMode::Keep;
+                this.editor.clear_secret(window, cx);
+                cx.notify();
+            }),
+        ));
+    }
+    mode_btns.push(action_button(
+        "secret-mode-set",
+        if is_edit {
+            "Replace Secret"
+        } else {
+            "Set Secret"
+        },
+        BtnStyle::new(
+            if editor.secret_mode == SecretMode::Set {
+                ButtonVariant::Primary
+            } else {
+                ButtonVariant::Secondary
+            },
+            Size::Small,
+        )
+        .outline(),
+        cx.listener(|this, _, _, cx| {
+            this.editor.secret_mode = SecretMode::Set;
+            cx.notify();
+        }),
+    ));
+    mode_btns.push(action_button(
+        "secret-mode-clear",
+        if is_edit { "Clear Secret" } else { "No Secret" },
+        BtnStyle::new(
+            if editor.secret_mode == SecretMode::Clear {
+                ButtonVariant::Primary
+            } else {
+                ButtonVariant::Secondary
+            },
+            Size::Small,
+        )
+        .outline(),
+        cx.listener(|this, _, window, cx| {
+            this.editor.secret_mode = SecretMode::Clear;
+            this.editor.clear_secret(window, cx);
+            cx.notify();
+        }),
+    ));
+
+    let secret_input = password_input(
+        "editor-network-secret",
+        "Network Secret",
+        &editor.network_secret,
+        editor.secret_mode != SecretMode::Set,
+    );
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
         .child(
             div()
                 .text_sm()
                 .font_medium()
-                .text_color(theme.foreground)
-                .child(label.to_owned()),
+                .text_color(fg)
+                .child("Network Secret (never saved locally)"),
         )
-        .child(control)
+        .child(
+            div()
+                .id("editor-secret-hint")
+                .test_support()
+                .aria_label(SharedString::from(secret_hint))
+                .text_xs()
+                .text_color(muted)
+                .child(secret_hint),
+        )
+        .child(div().flex().flex_row().gap_2().children(mode_btns))
+        .child(secret_input)
+        .into_any_element()
+}
+
+#[inline(never)]
+fn render_addressing_section(
+    editor: &NetworkEditorState,
+    cx: &mut Context<MainView>,
+) -> AnyElement {
+    let border = cx.theme().border;
+    let sec = cx.theme().secondary;
+
+    let dhcp_sw = switch_control(
+        "editor-dhcp",
+        "Assign virtual IPv4 automatically (DHCP)",
+        editor.dhcp,
+        cx.listener(|this, checked, _, cx| {
+            this.editor.dhcp = *checked;
+            cx.notify();
+        }),
+    );
+    let cidr = text_field(
+        "Static IPv4 CIDR",
+        "editor-ipv4-cidr",
+        "Static IPv4 CIDR",
+        &editor.ipv4_cidr,
+        editor.dhcp,
+        cx,
+    );
+    let peers = text_field("Peers", "editor-peers", "Peers", &editor.peers, false, cx);
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .p_4()
+        .rounded_md()
+        .border_1()
+        .border_color(border)
+        .bg(sec.opacity(0.25))
+        .child(dhcp_sw)
+        .child(cidr)
+        .child(peers)
+        .into_any_element()
+}
+
+#[inline(never)]
+fn render_listeners_section(editor: &NetworkEditorState, cx: &mut Context<MainView>) -> AnyElement {
+    let border = cx.theme().border;
+    let sec = cx.theme().secondary;
+    let muted = cx.theme().muted_foreground;
+
+    let listeners_input = text_field(
+        "Listeners",
+        "editor-listeners",
+        "Listeners",
+        &editor.listeners,
+        editor.no_listener,
+        cx,
+    );
+    let apply_all_btn = action_button(
+        "btn-suggested-listeners",
+        "Use Suggested 11010 Set",
+        BtnStyle::new(ButtonVariant::Default, Size::XSmall).outline(),
+        cx.listener(|this, _, window, cx| {
+            this.editor.apply_suggested_listeners(window, cx);
+            cx.notify();
+        }),
+    );
+
+    let mut chips = Vec::with_capacity(SUGGESTED_LISTENERS.len());
+    for (idx, uri) in SUGGESTED_LISTENERS.iter().enumerate() {
+        let uri_owned = (*uri).to_owned();
+        chips.push(action_button(
+            SharedString::from(format!("btn-suggested-listener-{idx}")),
+            *uri,
+            BtnStyle::new(ButtonVariant::Secondary, Size::XSmall),
+            cx.listener(move |this, _, window, cx| {
+                this.editor.add_suggested_listener(&uri_owned, window, cx);
+                cx.notify();
+            }),
+        ));
+    }
+
+    let no_listener_sw = switch_control(
+        "editor-no-listener",
+        "Disable all listeners (no_listener)",
+        editor.no_listener,
+        cx.listener(|this, checked, _, cx| {
+            this.editor.no_listener = *checked;
+            cx.notify();
+        }),
+    );
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .p_4()
+        .rounded_md()
+        .border_1()
+        .border_color(border)
+        .bg(sec.opacity(0.25))
+        .child(listeners_input)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("Suggested listeners (upstream 11010 set; faketcp excluded):"),
+                )
+                .child(apply_all_btn),
+        )
+        .child(div().flex().flex_row().flex_wrap().gap_2().children(chips))
+        .child(no_listener_sw)
+        .into_any_element()
+}
+
+#[inline(never)]
+fn render_options_section(
+    editor: &NetworkEditorState,
+    tun_available: bool,
+    cx: &mut Context<MainView>,
+) -> AnyElement {
+    let border = cx.theme().border;
+    let sec = cx.theme().secondary;
+
+    let no_tun_label = if tun_available {
+        "No TUN interface (SOCKS5 / port forwarding only)"
+    } else {
+        "No TUN interface (required by current user-mode host)"
+    };
+
+    let proxy = text_field(
+        "Proxy CIDRs",
+        "editor-proxy-cidrs",
+        "Proxy CIDRs",
+        &editor.proxy_cidrs,
+        false,
+        cx,
+    );
+    let exits = text_field(
+        "Exit Nodes",
+        "editor-exit-nodes",
+        "Exit Nodes",
+        &editor.exit_nodes,
+        false,
+        cx,
+    );
+    let mtu = text_field("MTU", "editor-mtu", "MTU", &editor.mtu, false, cx);
+    let socks = text_field(
+        "SOCKS5 Port",
+        "editor-socks5-port",
+        "SOCKS5 Port",
+        &editor.socks5_port,
+        false,
+        cx,
+    );
+
+    let switches = vec![
+        switch_control(
+            "editor-no-tun",
+            no_tun_label,
+            editor.no_tun,
+            cx.listener(|this, checked, _, cx| {
+                this.editor.no_tun = *checked;
+                cx.notify();
+            }),
+        ),
+        switch_control(
+            "editor-enable-exit-node",
+            "Act as exit node",
+            editor.enable_exit_node,
+            cx.listener(|this, checked, _, cx| {
+                this.editor.enable_exit_node = *checked;
+                cx.notify();
+            }),
+        ),
+        switch_control(
+            "editor-magic-dns",
+            "Enable Magic DNS",
+            editor.magic_dns,
+            cx.listener(|this, checked, _, cx| {
+                this.editor.magic_dns = *checked;
+                cx.notify();
+            }),
+        ),
+        switch_control(
+            "editor-latency-first",
+            "Latency-first routing",
+            editor.latency_first,
+            cx.listener(|this, checked, _, cx| {
+                this.editor.latency_first = *checked;
+                cx.notify();
+            }),
+        ),
+        switch_control(
+            "editor-private-mode",
+            "Private mode",
+            editor.private_mode,
+            cx.listener(|this, checked, _, cx| {
+                this.editor.private_mode = *checked;
+                cx.notify();
+            }),
+        ),
+        switch_control(
+            "editor-disable-p2p",
+            "Disable P2P (relay only)",
+            editor.disable_p2p,
+            cx.listener(|this, checked, _, cx| {
+                this.editor.disable_p2p = *checked;
+                cx.notify();
+            }),
+        ),
+    ];
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .p_4()
+        .rounded_md()
+        .border_1()
+        .border_color(border)
+        .bg(sec.opacity(0.25))
+        .child(proxy)
+        .child(exits)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_3()
+                .child(div().flex_1().child(mtu))
+                .child(div().flex_1().child(socks)),
+        )
+        .children(switches)
+        .into_any_element()
 }

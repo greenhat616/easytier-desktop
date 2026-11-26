@@ -36,7 +36,7 @@ use etd_testkit::fakes::{
     clock::FakeClock, core::FakeCoreDriver, ledger::MemoryLedger, process::FakeProcessEngine,
     system::FakeSystem,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -145,6 +145,37 @@ pub struct AllowAll;
 impl Authorizer for AllowAll {
     fn role_of(&self, _peer: &etd_ipc::PeerIdentity) -> Option<Role> {
         Some(Role::Admin)
+    }
+}
+
+/// The fake fence, whose `verify` can be made to return given errors (e.g.
+/// `FenceError::Missing`, which the fake itself never produces).
+pub struct TestFence {
+    pub inner: Arc<dyn PortFence>,
+    pub verify_errors: Arc<Mutex<VecDeque<FenceError>>>,
+}
+
+#[async_trait]
+impl PortFence for TestFence {
+    fn plan(&self, spec: &FenceSpec) -> EffectIntent {
+        self.inner.plan(spec)
+    }
+    async fn install(&self, spec: &FenceSpec) -> Result<Observation, FenceError> {
+        self.inner.install(spec).await
+    }
+    async fn verify(
+        &self,
+        spec: &FenceSpec,
+        listener_pid: u32,
+    ) -> Result<FenceVerification, FenceError> {
+        let injected = self.verify_errors.lock().unwrap().pop_front();
+        match injected {
+            Some(e) => Err(e),
+            None => self.inner.verify(spec, listener_pid).await,
+        }
+    }
+    async fn remove(&self, spec: &FenceSpec) -> Result<Reclaimed, FenceError> {
+        self.inner.remove(spec).await
     }
 }
 
@@ -574,6 +605,9 @@ pub struct World {
     pub mode: HostMode,
     pub fence: bool,
     pub config: LifecycleConfig,
+    /// Errors the fence's next `verify` calls return, in order, before the
+    /// fake answers again ([`TestFence`]).
+    pub verify_errors: Arc<Mutex<VecDeque<FenceError>>>,
 }
 
 impl World {
@@ -662,6 +696,7 @@ impl World {
             mode,
             fence,
             config,
+            verify_errors: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -704,7 +739,12 @@ impl World {
             boot_id: self.sys.boot_id_source(),
             install_key: InstallKey([7; 32]),
             observer: self.sys.observer(),
-            fence: self.fence.then(|| self.sys.fence(Self::fence_kind())),
+            fence: self.fence.then(|| {
+                Arc::new(TestFence {
+                    inner: self.sys.fence(Self::fence_kind()),
+                    verify_errors: self.verify_errors.clone(),
+                }) as Arc<dyn PortFence>
+            }),
             core: self.test_driver.clone() as Arc<dyn CoreDriver>,
             core_store: self.store.clone(),
             authorizer: Arc::new(AllowAll),

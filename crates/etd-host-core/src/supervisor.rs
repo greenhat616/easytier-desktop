@@ -212,7 +212,10 @@ struct PostMortem {
 }
 
 /// A fence re-verification running off the supervisor's task; aborted with
-/// the generation it was started for.
+/// the generation it was started for. Aborting stops the task at its next
+/// await point only: a command an adapter already runs in `spawn_blocking`
+/// (pfctl, lsof, a WFP enumeration) runs to completion, and its result is
+/// dropped with the receiver.
 struct FenceTask {
     rx: oneshot::Receiver<fence_seq::Recheck>,
     abort: tokio::task::AbortHandle,
@@ -1135,7 +1138,7 @@ impl Supervisor {
         // a time (`Ctx::program_rules`), held until they are read back.
         let has_rules = stored.effects.iter().any(is_program_rule);
         let rule_gate = if has_rules {
-            Some(self.rule_gate().await?)
+            Some(self.rule_gate(false).await?)
         } else {
             None
         };
@@ -1567,7 +1570,13 @@ impl Supervisor {
 
     /// Wait for `Ctx::program_rules`. Commands meanwhile are deferred, except
     /// a cut or a shutdown, which abandon this launch (nothing is spawned).
-    async fn rule_gate(&mut self) -> Result<OwnedMutexGuard<()>, LaunchFail> {
+    ///
+    /// `yield_to_desire`: a new desired state (Stop, Apply) abandons the
+    /// wait instead of waiting behind it; the command is served next.
+    async fn rule_gate(
+        &mut self,
+        yield_to_desire: bool,
+    ) -> Result<OwnedMutexGuard<()>, LaunchFail> {
         let gate = self.ctx.program_rules.clone();
         if let Ok(held) = gate.clone().try_lock_owned() {
             return Ok(held);
@@ -1596,6 +1605,14 @@ impl Supervisor {
                     }
                     Some(SupCmd::Query { reply, .. }) => {
                         let _ = reply.send(Err(unavailable(&self.id)));
+                    }
+                    Some(desire @ SupCmd::Desire { .. }) if yield_to_desire => {
+                        self.deferred.push_back(desire);
+                        self.status.message.clear();
+                        self.publish();
+                        return Err(LaunchFail::Superseded(
+                            "a new desired state arrived while waiting for the gate".into(),
+                        ));
                     }
                     Some(other) => self.deferred.push_back(other),
                     None => {
@@ -1815,12 +1832,14 @@ impl Supervisor {
             self.post_mortem = Some(pm);
             return;
         }
-        let _gate = match self.rule_gate().await {
+        // A Stop or Apply meanwhile abandons this read-back (ruling topic#40
+        // msg#1237): the next start judges the rules as before.
+        let _gate = match self.rule_gate(true).await {
             Ok(gate) => gate,
             // Served after this pass; the read-back is dropped (the next
             // start decides as before).
             Err(LaunchFail::Cut(reply)) => {
-                self.deferred.push_front(SupCmd::Cut { reply });
+                self.deferred.push_back(SupCmd::Cut { reply });
                 return;
             }
             Err(_) => return,

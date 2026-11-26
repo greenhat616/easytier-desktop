@@ -104,8 +104,9 @@ pub(crate) async fn check(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Recheck {
     Verified,
-    /// Definite: the unprivileged probe actually connected (rule missing,
-    /// firewall disabled), or another process holds the port.
+    /// Definite: the adapter reports the fence missing or disabled
+    /// (`FenceError::Missing`), the unprivileged probe actually connected,
+    /// or another process holds the port.
     Lost(String),
     /// Nothing proven either way: observer error, firewall writer busy,
     /// timeout, no listener, a probe that could not run.
@@ -145,6 +146,9 @@ pub(crate) async fn recheck(
             _ => Recheck::Unverifiable(format!("fence verification inconclusive: {v:?}")),
         },
         Err(FenceError::Unsupported(m)) => Recheck::Lost(format!("fencing unsupported: {m}")),
+        // The adapter's query succeeded and shows our fence absent or
+        // disabled (ruling topic#40 msg#1237).
+        Err(FenceError::Missing(m)) => Recheck::Lost(format!("fence missing: {m}")),
         Err(e) => Recheck::Unverifiable(format!("fence verification failed: {e}")),
     }
 }

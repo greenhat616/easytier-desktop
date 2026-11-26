@@ -1,6 +1,15 @@
 //! Windows system effects, using a persistent native WFP fence and independent
 //! Windows management provider queries. No request data is executed as code.
 pub mod driver_refs;
+
+/// Uninstall: remove the service host's volatile boot marker (see
+/// `registry::remove_machine_boot_marker`).
+pub fn remove_service_boot_marker() -> Result<(), crate::OsError> {
+    registry::remove_machine_boot_marker().map_err(|e| crate::OsError::Os {
+        code: e.code,
+        message: e.message,
+    })
+}
 mod execution;
 mod interfaces;
 mod magic;
@@ -243,6 +252,18 @@ fn program_credential_matches(key: &ObjectKey, observation: &Observation) -> boo
         && group
             .as_ref()
             .is_none_or(|g| v["group"].as_str() == Some(g.to_lowercase().as_str()))
+}
+/// Our WFP filters as a successful enumeration shows them: not all four
+/// present is positively missing (`FenceError::Missing`); an enumeration
+/// that failed stays an OS error.
+fn fence_presence(complete: bool) -> Result<(), FenceError> {
+    if complete {
+        Ok(())
+    } else {
+        Err(FenceError::Missing(
+            "persistent fence is incomplete: our WFP filters are not all present".into(),
+        ))
+    }
 }
 /// A program rule under the key's name whose application condition, group
 /// or direction differ from what the name says: its identity stays the
@@ -1015,12 +1036,11 @@ impl PortFence for WindowsFence {
         listener_pid: u32,
     ) -> Result<FenceVerification, FenceError> {
         let key = wfp::key(spec);
-        if !blocking(move || wfp::complete(&key))
-            .await
-            .map_err(WinError::fence)?
-        {
-            return Err(FenceError::Probe("persistent fence is incomplete".into()));
-        }
+        fence_presence(
+            blocking(move || wfp::complete(&key))
+                .await
+                .map_err(WinError::fence)?,
+        )?;
         let check = listener_check(spec.address, listener_pid).await;
         if check != ListenerCheck::Expected {
             return Ok(FenceVerification {
@@ -1242,6 +1262,16 @@ mod tests {
         );
         assert!(!program_credential_matches(&key, &other));
         assert_ne!(obs.credential, other.credential);
+    }
+    #[test]
+    fn incomplete_filters_in_a_successful_enumeration_are_missing() {
+        assert_eq!(fence_presence(true), Ok(()));
+        assert!(matches!(fence_presence(false), Err(FenceError::Missing(_))));
+        // A failed enumeration is not a verdict.
+        assert!(matches!(
+            WinError::new(5, "access denied").fence(),
+            FenceError::Os { .. }
+        ));
     }
     #[test]
     fn a_foreign_program_rule_is_reported_under_the_key_its_condition_names() {

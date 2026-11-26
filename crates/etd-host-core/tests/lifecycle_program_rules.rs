@@ -598,3 +598,51 @@ async fn rules_given_up_at_the_deadline_are_read_back_once_the_kernel_is_gone() 
     assert!(notices(&mut h, "program_rule.conflict").is_empty());
     assert!(!host_deleted_a_rule(&world));
 }
+
+#[tokio::test]
+async fn a_stop_while_the_read_back_waits_for_the_gate_is_not_kept_waiting() {
+    let world = with_rules();
+    // a never becomes ready; it holds the gate while it starts.
+    world.behave(KernelBehaviour {
+        address: false,
+        ..KernelBehaviour::default()
+    });
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.apply("a", spec("net-a"), Desired::Running).await;
+    h.until("a spawned", |_| world.spawned().len() == 1).await;
+    let a_kernel = world.last_kernel();
+
+    // b waits for the gate; once it has it, its rules cannot be read back,
+    // so it keeps the gate until its deadline.
+    world.behave(KernelBehaviour::default());
+    observer_fails_after_spawn(&world, None);
+    h.apply("b", spec("net-b"), Desired::Running).await;
+    h.idle(Duration::from_millis(250), Duration::from_secs(1))
+        .await;
+    assert_eq!(world.spawned().len(), 1, "b waits behind a");
+
+    // a dies before readiness: b takes the gate, a's read-back waits for it.
+    world.engine.exit(
+        &a_kernel,
+        etd_proc::Exit {
+            code: Some(101),
+            signal: None,
+            cause: etd_proc::ExitCause::Exited,
+        },
+    );
+    h.until("b ready", |h| h.state("b") == S::ReadyFull).await;
+
+    // Stopping a abandons its read-back instead of waiting behind b.
+    h.set_desired("a", Desired::Stopped).await.unwrap();
+    h.until_by(
+        "a stopped well before b's deadline",
+        Duration::from_millis(100),
+        Duration::from_secs(5),
+        |h| h.state("a") == S::Stopped,
+    )
+    .await;
+    assert!(notices(&mut h, "program_rule.unsettled").is_empty());
+    assert_eq!(h.state("b"), S::ReadyFull);
+    world.sys.clear_faults();
+}

@@ -14,7 +14,10 @@ use etd_contract::{
     Desired, DesiredInstance, ErrorDetail, HostMode, HostPhase, HostSnapshot, InstanceId,
     InstanceState, InstanceStatus, NetworkSpec, QueryKind, QueryResponse, Receipt, RequestId, Role,
 };
-use etd_core_api::CoreDriver;
+use etd_core_api::{
+    CoreDescriptor, CoreDriver, CoreEndpoint, CoreError, CoreSession, LaunchContext, LaunchPlan,
+    ReadinessCondition,
+};
 use etd_host_core::api::{
     ClientPresence, Command, HostDeps, HostDirs, HostEvent, OrchestratorHandle, Planned,
     orchestrator_channel,
@@ -33,6 +36,7 @@ use etd_testkit::fakes::{
     clock::FakeClock, core::FakeCoreDriver, ledger::MemoryLedger, process::FakeProcessEngine,
     system::FakeSystem,
 };
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -144,6 +148,134 @@ impl Authorizer for AllowAll {
     }
 }
 
+/// Plan shapes the fake driver does not produce on its own.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlanExtras {
+    /// Windows: the two program firewall rules named after the kernel
+    /// binary (core-binary scope), which upstream deletes and recreates on
+    /// every start.
+    pub program_rules: bool,
+    /// macOS: a system-assigned interface name (utun), found via the
+    /// kernel's pid, with the routes recorded via that interface.
+    pub assigned_name: bool,
+    /// Windows: the driver services every kernel shares (product scope),
+    /// which upstream reports without a creation credential.
+    pub shared_drivers: bool,
+}
+
+/// Keys of the shared driver services (as upstream names them).
+pub fn shared_driver_keys() -> Vec<ObjectKey> {
+    ["wintun", "WinDivert"]
+        .iter()
+        .map(|n| ObjectKey::Service { name: (*n).into() })
+        .collect()
+}
+
+/// Group of the program firewall rules (as upstream names it).
+pub const FIREWALL_GROUP: &str = "EasyTier";
+
+/// Keys of the program firewall rules of a kernel binary.
+pub fn program_rule_keys(binary: &Path) -> Vec<ObjectKey> {
+    ["Inbound", "Outbound"]
+        .iter()
+        .map(|d| ObjectKey::Rule {
+            name: format!("EasyTier {} ({d})", binary.display()),
+            group: Some(FIREWALL_GROUP.into()),
+        })
+        .collect()
+}
+
+/// [`FakeCoreDriver`] plus [`PlanExtras`]; remembers the plans it made for
+/// the simulated kernel.
+pub struct TestDriver {
+    pub inner: FakeCoreDriver,
+    pub extras: Mutex<PlanExtras>,
+    plans: Mutex<HashMap<PathBuf, LaunchPlan>>,
+}
+
+impl TestDriver {
+    pub fn plan_for(&self, runtime_dir: &Path) -> Option<LaunchPlan> {
+        self.plans.lock().unwrap().get(runtime_dir).cloned()
+    }
+}
+
+#[async_trait]
+impl CoreDriver for TestDriver {
+    async fn identify(&self, binary: &Path) -> Result<CoreDescriptor, CoreError> {
+        self.inner.identify(binary).await
+    }
+    fn profile(&self, core: &CoreDescriptor) -> Option<etd_core_api::AdapterProfile> {
+        self.inner.profile(core)
+    }
+    fn plan_launch(&self, ctx: &LaunchContext) -> Result<LaunchPlan, CoreError> {
+        let mut plan = self.inner.plan_launch(ctx)?;
+        let extras = *self.extras.lock().unwrap();
+        if !ctx.inputs.spec.no_tun {
+            if extras.assigned_name {
+                for e in &mut plan.effects {
+                    if let ObjectKey::Interface { name, .. } = &mut e.key {
+                        *name = None;
+                    }
+                }
+                plan.effects.push(EffectIntent {
+                    scope: EffectScope::Instance {
+                        instance: ctx.instance.clone(),
+                        epoch: ctx.epoch,
+                    },
+                    kind: EffectKind::Route,
+                    key: ObjectKey::RoutesVia { interface: None },
+                    undo: Undo::EnsureAbsent,
+                    persistence: Persistence::WithProcess,
+                });
+                plan.readiness.condition = ReadinessCondition::OwnedInterfaceAddress;
+            }
+            if extras.program_rules {
+                let sha256: String = ctx
+                    .inputs
+                    .core
+                    .sha256
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                for key in program_rule_keys(&ctx.inputs.core.binary) {
+                    plan.effects.push(EffectIntent {
+                        scope: EffectScope::CoreBinary {
+                            sha256: sha256.clone(),
+                        },
+                        kind: EffectKind::WinProgramFirewallRule,
+                        key,
+                        undo: Undo::EnsureAbsent,
+                        persistence: Persistence::Persistent,
+                    });
+                }
+            }
+        }
+        if extras.shared_drivers {
+            for key in shared_driver_keys() {
+                plan.effects.push(EffectIntent {
+                    scope: EffectScope::Product,
+                    kind: EffectKind::Driver,
+                    key,
+                    undo: Undo::EnsureAbsent,
+                    persistence: Persistence::Persistent,
+                });
+            }
+        }
+        self.plans
+            .lock()
+            .unwrap()
+            .insert(ctx.inputs.runtime_dir.clone(), plan.clone());
+        Ok(plan)
+    }
+    async fn attach(
+        &self,
+        ep: &CoreEndpoint,
+        core: &CoreDescriptor,
+    ) -> Result<Box<dyn CoreSession>, CoreError> {
+        self.inner.attach(ep, core).await
+    }
+}
+
 /// How the simulated kernel behaves once spawned.
 #[derive(Debug, Clone, Copy)]
 pub struct KernelBehaviour {
@@ -157,6 +289,9 @@ pub struct KernelBehaviour {
     pub squatter: Option<u32>,
     /// The created objects show no creation credential.
     pub no_credentials: bool,
+    /// A third party adds a second rule of the same name right after the
+    /// kernel recreated each program firewall rule.
+    pub duplicate_program_rules: bool,
 }
 
 impl Default for KernelBehaviour {
@@ -167,6 +302,7 @@ impl Default for KernelBehaviour {
             listen: true,
             squatter: None,
             no_credentials: false,
+            duplicate_program_rules: false,
         }
     }
 }
@@ -176,11 +312,14 @@ impl Default for KernelBehaviour {
 pub struct KernelSim {
     pub engine: FakeProcessEngine,
     pub sys: FakeSystem,
-    pub driver: FakeCoreDriver,
+    pub driver: Arc<TestDriver>,
     pub behaviour: Mutex<KernelBehaviour>,
     pub spawned: Mutex<Vec<(ProcessIdentity, ProcCommand)>>,
     /// The system's objects as each spawn saw them.
     pub objects_at_spawn: Mutex<Vec<Vec<etd_testkit::fakes::system::FakeObject>>>,
+    /// Injected into the system right after the next spawn (after the
+    /// host's checks before it).
+    pub faults_after_spawn: Mutex<Vec<etd_testkit::fakes::system::Fault>>,
 }
 
 impl KernelSim {
@@ -207,8 +346,28 @@ impl ProcessEngine for KernelSim {
         if let Some(plan) = cmd.cwd.as_deref().and_then(|d| self.driver.plan_for(d)) {
             if b.create_objects {
                 for intent in &plan.effects {
-                    self.sys.apply_intent_with_pid(intent, Some(id.pid));
-                    if b.no_credentials
+                    // Routes via a system-assigned interface go with it.
+                    if intent.key == (ObjectKey::RoutesVia { interface: None }) {
+                        continue;
+                    }
+                    // Upstream deletes every rule of that name, then adds
+                    // its own (a fresh GUID on every start).
+                    if intent.kind == EffectKind::WinProgramFirewallRule {
+                        while self.sys.vanish(intent.kind, &intent.key) {}
+                    }
+                    // A driver service already registered is used as it is.
+                    if intent.kind == EffectKind::Driver
+                        && self.sys.find(intent.kind, &intent.key).is_some()
+                    {
+                        continue;
+                    }
+                    let obs = self.sys.apply_intent_with_pid(intent, Some(id.pid));
+                    if b.duplicate_program_rules
+                        && intent.kind == EffectKind::WinProgramFirewallRule
+                    {
+                        self.sys.create_foreign(intent.kind, intent.key.clone());
+                    }
+                    if (b.no_credentials || intent.kind == EffectKind::Driver)
                         && let Some(mut o) = self.sys.find(intent.kind, &intent.key)
                     {
                         self.sys.vanish(intent.kind, &intent.key);
@@ -218,7 +377,7 @@ impl ProcessEngine for KernelSim {
                     if b.address && matches!(intent.key, ObjectKey::Interface { .. }) {
                         self.sys.set_addresses(
                             intent.kind,
-                            &intent.key,
+                            obs.key.as_ref().unwrap_or(&intent.key),
                             vec![(IpAddr::V4(Ipv4Addr::new(10, 144, 0, 1)), 24)],
                         );
                     }
@@ -229,6 +388,9 @@ impl ProcessEngine for KernelSim {
             } else if b.listen {
                 self.sys.set_listener(plan.endpoint.0, id.pid);
             }
+        }
+        for fault in self.faults_after_spawn.lock().unwrap().drain(..) {
+            self.sys.inject(fault);
         }
         Ok(handle)
     }
@@ -402,6 +564,8 @@ pub struct World {
     pub sys: FakeSystem,
     pub engine: FakeProcessEngine,
     pub driver: FakeCoreDriver,
+    /// What the host plans with: `driver` plus [`PlanExtras`].
+    pub test_driver: Arc<TestDriver>,
     pub kernel: Arc<KernelSim>,
     pub ledger: Arc<TestLedger>,
     pub index: Arc<MemIndex>,
@@ -442,13 +606,19 @@ impl World {
         let sys = FakeSystem::new();
         let engine = FakeProcessEngine::new(clock.clone());
         let driver = FakeCoreDriver::new();
+        let test_driver = Arc::new(TestDriver {
+            inner: driver.clone(),
+            extras: Mutex::new(PlanExtras::default()),
+            plans: Mutex::new(HashMap::new()),
+        });
         let kernel = Arc::new(KernelSim {
             engine: engine.clone(),
             sys: sys.clone(),
-            driver: driver.clone(),
+            driver: test_driver.clone(),
             behaviour: Mutex::new(KernelBehaviour::default()),
             spawned: Mutex::new(Vec::new()),
             objects_at_spawn: Mutex::new(Vec::new()),
+            faults_after_spawn: Mutex::new(Vec::new()),
         });
         let ledger = Arc::new(TestLedger {
             inner: Arc::new(MemoryLedger::new(sys.boot())),
@@ -473,6 +643,9 @@ impl World {
             reclaim_retry: Duration::from_millis(500),
             log_lines: 100,
             lease_grace: Duration::from_secs(30),
+            fence_recheck: Duration::from_secs(30),
+            fence_retry: Duration::from_secs(2),
+            fence_unverifiable_retry: Duration::from_secs(10),
         };
         Self {
             scratch,
@@ -480,6 +653,7 @@ impl World {
             sys,
             engine,
             driver,
+            test_driver,
             kernel,
             ledger,
             index: Arc::new(MemIndex::default()),
@@ -531,7 +705,7 @@ impl World {
             install_key: InstallKey([7; 32]),
             observer: self.sys.observer(),
             fence: self.fence.then(|| self.sys.fence(Self::fence_kind())),
-            core: Arc::new(self.driver.clone()) as Arc<dyn CoreDriver>,
+            core: self.test_driver.clone() as Arc<dyn CoreDriver>,
             core_store: self.store.clone(),
             authorizer: Arc::new(AllowAll),
         })
@@ -602,6 +776,10 @@ impl World {
         }
         let boot = self.sys.reboot();
         self.ledger.inner.set_boot_id(boot);
+    }
+
+    pub fn extras(&self, extras: PlanExtras) {
+        *self.test_driver.extras.lock().unwrap() = extras;
     }
 
     pub fn behave(&self, b: KernelBehaviour) {

@@ -59,8 +59,10 @@ enum Action {
     },
     /// Stop, reclaim and remove the installed service.
     Uninstall {
-        #[arg(long, hide = true)]
+        #[arg(long, hide = true, requires = "install_id")]
         wait_parent: Option<u32>,
+        #[arg(long, hide = true, requires = "wait_parent")]
+        install_id: Option<String>,
     },
     /// Re-enable a service disabled by an incomplete uninstall (before reclaim finished).
     ResumeService,
@@ -130,13 +132,19 @@ fn execute(cli: Cli) -> Result<()> {
             runtime.block_on(host::remove_core(mode.into(), &version))
         }
         Action::Install { allow_user } => runtime.block_on(host::install(&allow_user)),
-        Action::Uninstall { wait_parent } => {
-            if let Some(pid) = wait_parent {
+        Action::Uninstall {
+            wait_parent,
+            install_id,
+        } => {
+            if let (Some(pid), Some(id)) = (wait_parent, install_id) {
                 #[cfg(windows)]
-                etd_sysfx_os::service::wait_uninstall_parent(pid)?;
+                {
+                    etd_sysfx_os::service::wait_uninstall_parent(pid)?;
+                    return host::finish_deferred_uninstall(&id);
+                }
                 #[cfg(not(windows))]
                 {
-                    let _ = pid;
+                    let _ = (pid, id);
                     bail!("uninstall worker is Windows-only");
                 }
             }

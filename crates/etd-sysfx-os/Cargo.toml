@@ -23,7 +23,7 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "net", "process", "rt", "sync", "time"] }
 tracing = { workspace = true, features = ["std"] }
-uuid = { workspace = true, features = ["std", "v5"] }
+uuid = { workspace = true, features = ["std", "v4", "v5"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [

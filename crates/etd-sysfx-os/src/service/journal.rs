@@ -38,6 +38,7 @@ pub enum Phase {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Record {
+    install_id: String,
     phase: Phase,
     planned: Vec<Resource>,
     completed: Vec<Resource>,
@@ -77,6 +78,7 @@ impl LifecycleJournal {
         let journal = Self {
             path,
             record: Record {
+                install_id: uuid::Uuid::new_v4().to_string(),
                 phase: Phase::Installing,
                 planned: vec![],
                 completed: vec![],
@@ -88,6 +90,15 @@ impl LifecycleJournal {
     }
     pub fn phase(&self) -> Phase {
         self.record.phase
+    }
+    pub fn install_id(&self) -> &str {
+        &self.record.install_id
+    }
+    /// A deferred helper is fenced to the specific install transaction and
+    /// the final cleanup phase. It may never stop/reclaim a later install.
+    pub fn can_finish_deferred(&self, install_id: &str) -> bool {
+        self.record.install_id == install_id
+            && matches!(self.phase(), Phase::StateRemoved | Phase::InstallRemoved)
     }
     pub fn planned(&self, resource: Resource) -> bool {
         self.record.planned.contains(&resource)
@@ -300,6 +311,21 @@ mod tests {
         );
         let journal = LifecycleJournal::read(path).unwrap().unwrap();
         assert!(journal.rollback_resources().is_empty());
+    }
+    #[test]
+    fn delayed_helper_cannot_act_on_other_installations_or_earlier_phases() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("journal");
+        let mut old = LifecycleJournal::new_at(path.clone()).unwrap();
+        let id = old.install_id().to_owned();
+        old.advance(Phase::Installed).unwrap();
+        assert!(!old.can_finish_deferred(&id));
+        old.advance(Phase::StateRemoved).unwrap();
+        assert!(old.can_finish_deferred(&id));
+        old.clear().unwrap();
+        let mut new = LifecycleJournal::new_at(path).unwrap();
+        new.advance(Phase::StateRemoved).unwrap();
+        assert!(!new.can_finish_deferred(&id));
     }
     #[test]
     fn every_uninstall_phase_can_retry_after_failure() {

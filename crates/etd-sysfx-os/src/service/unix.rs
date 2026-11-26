@@ -553,6 +553,6 @@ pub(super) fn remove_state(layout: &HostLayout) -> io::Result<()> {
 pub(super) fn remove_install(layout: &HostLayout) -> io::Result<()> {
     remove_owned_tree(layout.executable.parent().ok_or_else(denied)?)
 }
-pub(super) fn defer_install_removal(_: &HostLayout) -> io::Result<bool> {
+pub(super) fn defer_install_removal(_: &HostLayout, _: &str) -> io::Result<bool> {
     Ok(false)
 }

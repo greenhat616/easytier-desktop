@@ -581,7 +581,7 @@ pub(super) fn remove_install(layout: &HostLayout) -> io::Result<()> {
     remove_owned_tree(layout.executable.parent().ok_or_else(denied)?, true)
 }
 
-pub(super) fn defer_install_removal(layout: &HostLayout) -> io::Result<bool> {
+pub(super) fn defer_install_removal(layout: &HostLayout, install_id: &str) -> io::Result<bool> {
     use ::windows::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW};
     use ::windows::core::PCWSTR;
     use sha2::{Digest, Sha256};
@@ -647,6 +647,8 @@ pub(super) fn defer_install_removal(layout: &HostLayout) -> io::Result<bool> {
             "uninstall",
             "--wait-parent",
             &std::process::id().to_string(),
+            "--install-id",
+            install_id,
         ])
         .spawn()?;
     Ok(true)

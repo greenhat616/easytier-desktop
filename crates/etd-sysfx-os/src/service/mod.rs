@@ -127,7 +127,7 @@ pub trait ServiceManager {
     fn remove_state(&self, layout: &HostLayout) -> io::Result<()>;
     fn remove_install(&self, layout: &HostLayout) -> io::Result<()>;
     /// Windows installed executable handoff for the last uninstall stage.
-    fn defer_install_removal(&self, layout: &HostLayout) -> io::Result<bool>;
+    fn defer_install_removal(&self, layout: &HostLayout, install_id: &str) -> io::Result<bool>;
     fn entry_is_elevated(&self) -> io::Result<bool>;
 }
 
@@ -173,8 +173,8 @@ impl ServiceManager for NativeServiceManager {
     fn remove_install(&self, layout: &HostLayout) -> io::Result<()> {
         native::remove_install(layout)
     }
-    fn defer_install_removal(&self, layout: &HostLayout) -> io::Result<bool> {
-        native::defer_install_removal(layout)
+    fn defer_install_removal(&self, layout: &HostLayout, install_id: &str) -> io::Result<bool> {
+        native::defer_install_removal(layout, install_id)
     }
     fn entry_is_elevated(&self) -> io::Result<bool> {
         native::elevated()

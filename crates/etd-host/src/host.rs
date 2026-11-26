@@ -956,7 +956,7 @@ pub async fn uninstall() -> Result<()> {
         NativeServiceManager.remove_state(&layout)
     })?;
     if journal.phase() < Phase::InstallRemoved {
-        if NativeServiceManager.defer_install_removal(&layout)? {
+        if NativeServiceManager.defer_install_removal(&layout, journal.install_id())? {
             println!(
                 "service and data removed; protected helper will finish the install directory after this process exits"
             );
@@ -965,6 +965,24 @@ pub async fn uninstall() -> Result<()> {
         NativeServiceManager.remove_install(&layout)?;
         journal.advance(Phase::InstallRemoved)?;
     }
+    journal.clear()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn finish_deferred_uninstall(install_id: &str) -> Result<()> {
+    let layout = layout(HostMode::Service)?;
+    let _guard = NativeHostFilesystem.lock(&layout)?;
+    let Some(mut journal) = LifecycleJournal::open(&layout)? else {
+        return Ok(()); // another maintenance process already completed it
+    };
+    ensure!(
+        journal.can_finish_deferred(install_id),
+        "deferred uninstall no longer matches its transaction and final phase"
+    );
+    journal.step(Phase::InstallRemoved, || {
+        NativeServiceManager.remove_install(&layout)
+    })?;
     journal.clear()?;
     Ok(())
 }

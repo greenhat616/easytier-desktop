@@ -81,13 +81,14 @@ def adapter_defaults(base, live, adapter_indices):
                 iaids[(prefix + "\\Dhcpv6Iaid").casefold()] = index
             expected.update({(prefix + "\\" + name).casefold(): value for name, value in fields.items()})
     allowed = set()
-    for key, setting in live.rows.items():
+    for key in live.rows:
         if key[0] != "registry" or key in base.rows:
             continue
         path = key[1].casefold()
+        setting = live.registry_values.get(key[1])
         if path in expected and setting == expected[path]:
             allowed.add(key)
-        elif path in iaids:
+        elif path in iaids and setting:
             kind, value = setting
             if kind == "DWord" and type(value) is int and 0 <= value <= 0xffffffff and value >> 24 == iaids[path]:
                 allowed.add(key)
@@ -300,10 +301,10 @@ def compare_generation(base, live, records, instance, view, adapter_indices, wor
             assert len(matches) == 1, f"missing registry value {path}"
             setting = record["undo"]["ours"]
             assert setting["type"] == "u32"
-            assert live.rows[next(iter(matches))] == ["DWord", setting["value"]], path
+            assert live.registry_values.get(next(iter(matches))[1]) == ["DWord", setting["value"]], path
         elif kind == "win.network_profile":
-            matches = {k for k, v in live.rows.items() if k[0] == "registry"
-                       and k[1].endswith("\\ProfileName") and v[-1] == key["profile_name"]}
+            matches = {("registry", path) for path, value in live.registry_values.items()
+                       if path.endswith("\\ProfileName") and value == ["String", key["profile_name"]]}
             assert len(matches) == 1, f"NetworkList profile for {name}"
         else:
             raise AssertionError(f"unmapped local launch effect {kind}")
@@ -316,7 +317,7 @@ def compare_generation(base, live, records, instance, view, adapter_indices, wor
     for kind, path in expected:
         if kind == "registry" and path.endswith("\\ProfileName"):
             category = ("registry", path.removesuffix("ProfileName") + "Category")
-            if live.rows.get(category) == ["DWord", 1]:
+            if live.registry_values.get(category[1]) == ["DWord", 1]:
                 exempt.add(category)
     assert expected <= changed, f"predicted effects already present at baseline: {sorted(expected - changed)}"
     unexpected = changed - expected - exempt - runner_noise(base, live)

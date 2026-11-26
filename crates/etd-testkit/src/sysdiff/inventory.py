@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 from xml.etree import ElementTree
 
 
@@ -55,6 +56,7 @@ class Inventory:
     descendants: dict = field(default_factory=dict)
     parents: dict = field(default_factory=dict)
     management_workers: set = field(default_factory=set)
+    registry_values: dict = field(default_factory=dict)
     policy_filters: dict = field(default_factory=dict)
     quarantine_fields: dict = field(default_factory=dict)
     application_filters: dict = field(default_factory=dict)
@@ -144,14 +146,23 @@ def processes(inv, paths):
         inv.descendants[parent] = {(pid, table[pid]["create_time"]) for pid in seen - {parent}}
 
 
-def assert_exited(identities):
+def assert_exited(identities, timeout=0):
     import psutil
-    for pid, born in identities:
-        try:
-            if psutil.Process(pid).create_time() == born:
-                raise AssertionError(f"old process identity remains: pid={pid}, created={born}")
-        except psutil.NoSuchProcess:
-            pass
+    end = time.monotonic() + timeout
+    pending = set(identities)
+    while pending:
+        for pid, born in pending.copy():
+            try:
+                if psutil.Process(pid).create_time() == born:
+                    continue
+            except psutil.NoSuchProcess:
+                pass
+            pending.remove((pid, born))
+        if pending:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(f"old process identities remain: {sorted(pending)}")
+            time.sleep(min(remaining, 0.2))
 
 
 def linux(inv):
@@ -194,8 +205,18 @@ def linux(inv):
     for row in output("systemctl", "list-unit-files", "--type=service", "--no-legend",
                       "--no-pager", "--plain").splitlines():
         unit, state, *_ = row.split()
-        config = output("systemctl", "cat", unit) if unit.startswith("easytier-desk") else None
-        inv.put("service", unit, (state, hashlib.sha256(config.encode()).hexdigest() if config else None))
+        inv.put("service", unit, state)
+    # Cover the bytes of every service fragment and drop-in in systemd's
+    # native load path, including templates, aliases, masks and service.d.
+    # File contents and environment directives never leave this process.
+    for directory in set(output("systemd-analyze", "unit-paths").splitlines()):
+        root = Path(directory)
+        files = set(root.glob("*.service"))
+        for pattern in ("*.service.d/*.conf", "service.d/*.conf"):
+            files.update(root.glob(pattern))
+        for file in files:
+            link = os.readlink(file) if file.is_symlink() else None
+            inv.put("service", str(file), (link, digest(file) if file.is_file() else None))
     tun = Path("/dev/net/tun")
     try:
         st = tun.lstat()
@@ -356,7 +377,69 @@ def native_interface_guid(index):
     return UUID(bytes_le=bytes(data))
 
 
+def windows_registry(inv):
+    import ctypes
+    from ctypes import wintypes
+    import winreg
+    query = ctypes.WinDLL("advapi32").RegQueryValueExW
+    query.argtypes = [wintypes.HKEY, wintypes.LPCWSTR, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD),
+                      ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+    query.restype = wintypes.LONG
+    services = r"SYSTEM\CurrentControlSet\Services"
+    product = r"SOFTWARE\EasyTierDesk"
+    trees = [r"SOFTWARE\EasyTier", r"SOFTWARE\EasyTierDesk",
+             r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles",
+             *(services + "\\" + stack + r"\Parameters\Interfaces" for stack in ("Tcpip", "Tcpip6", "NetBT"))]
+
+    def visit(key, path):
+        if path.casefold() == product.casefold() or path.casefold().startswith(product.casefold() + "\\"):
+            inv.put("registry", "key/HKLM\\" + path, ["key"])
+        children, values, _ = winreg.QueryInfoKey(key)
+        for index in range(values):
+            name, _, _ = winreg.EnumValue(key, index)
+            # Get the original bytes even for unknown types, unexpanded paths,
+            # or unusual string terminators. Compare type and bytes together.
+            size = wintypes.DWORD()
+            kind = wintypes.DWORD()
+            rc = query(int(key), name, None, ctypes.byref(kind), None, ctypes.byref(size))
+            if rc:
+                raise ctypes.WinError(rc)
+            for _ in range(5):
+                data = ctypes.create_string_buffer(max(1, size.value))
+                rc = query(int(key), name, None, ctypes.byref(kind), data, ctypes.byref(size))
+                if rc != 234:  # ERROR_MORE_DATA if the value grew between the reads
+                    break
+            if rc:
+                raise ctypes.WinError(rc)
+            key_name = "HKLM\\" + path + "\\" + name
+            raw = data.raw[:size.value]
+            fingerprint = hashlib.sha256(kind.value.to_bytes(4, "little") + raw).hexdigest()
+            inv.put("registry", key_name, (kind.value, fingerprint))
+            # Only these semantic values are needed for plan and default
+            # checks. The strict diff above always compares the native bytes.
+            if kind.value == winreg.REG_DWORD and len(raw) == 4:
+                inv.registry_values[key_name] = ["DWord", int.from_bytes(raw, "little")]
+            elif kind.value == winreg.REG_SZ:
+                if raw in (b"", b"\x00\x00"):
+                    inv.registry_values[key_name] = ["String", ""]
+                elif name == "ProfileName":
+                    inv.registry_values[key_name] = ["String", raw.decode("utf-16-le").removesuffix("\0")]
+        for index in range(children):
+            name = winreg.EnumKey(key, index)
+            with winreg.OpenKey(key, name) as child:
+                visit(child, path + "\\" + name)
+
+    for path in trees:
+        try:
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path)
+        except FileNotFoundError:
+            continue
+        with key:
+            visit(key, path)
+
+
 def windows(inv):
+    windows_registry(inv)
     data = json.loads(command("powershell.exe", "-NoProfile", "-NonInteractive", "-File",
                               Path(__file__).with_name("windows.ps1"), timeout=180).stdout)
     # Win32_SystemDriver can omit a disabled SCM registration with no

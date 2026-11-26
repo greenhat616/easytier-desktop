@@ -2,7 +2,7 @@
 use std::{path::Path, process::Command};
 mod desktop;
 
-fn run_case(case: &str) {
+fn require_runner() {
     for (key, expected) in [
         ("ETD_G2_CI", "1"),
         ("GITHUB_ACTIONS", "true"),
@@ -10,6 +10,15 @@ fn run_case(case: &str) {
     ] {
         assert_eq!(std::env::var(key).as_deref(), Ok(expected), "{key}");
     }
+    let directory = |key| std::fs::canonicalize(std::env::var_os(key).expect(key)).expect(key);
+    let temp = directory("RUNNER_TEMP");
+    let workspace = directory("GITHUB_WORKSPACE");
+    assert_eq!(temp.file_name(), Some(std::ffi::OsStr::new("_temp")));
+    assert!(workspace.starts_with(temp.parent().expect("runner work directory")));
+}
+
+fn run_case(case: &str) {
+    require_runner();
     let mut command = Command::new(std::env::var_os("ETD_G2_PYTHON").expect("CI Python"));
     command.env("ETD_G2_TEST_IMAGE", std::env::current_exe().unwrap());
     #[cfg(windows)]

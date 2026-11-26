@@ -3,6 +3,7 @@ use crate::{identity, parent_death, *};
 use async_trait::async_trait;
 use std::{
     collections::HashMap,
+    ffi::{OsStr, OsString},
     io,
     path::{Path, PathBuf},
     pin::Pin,
@@ -909,6 +910,93 @@ async fn rollback_started(
         ))),
     }
 }
+/// Which environment rules apply. Only the host's variant is built outside
+/// tests; the unit tests check both on every host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum EnvPlatform {
+    Unix,
+    Windows,
+}
+
+impl EnvPlatform {
+    #[cfg(windows)]
+    const HOST: Self = Self::Windows;
+    #[cfg(not(windows))]
+    const HOST: Self = Self::Unix;
+}
+
+/// Fixed search path for children on Unix hosts. Upstream easytier-core
+/// shells out to system tools (`ifconfig`, `route`, `ip`) by bare name.
+const UNIX_CHILD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+/// Windows search path, each entry relative to the Windows directory
+/// reported by the OS (`trusted_system_root`).
+const WINDOWS_CHILD_PATH: [&str; 4] = [
+    r"\System32",
+    "",
+    r"\System32\Wbem",
+    r"\System32\WindowsPowerShell\v1.0",
+];
+
+/// Builds the complete child environment. The engine starts every child
+/// from an empty environment and owns a small set of variables: `PATH` (a
+/// fixed trusted search path, never the host's own) and, on Windows,
+/// `SystemRoot`/`windir`. A caller-supplied value for an owned variable is
+/// dropped with a warning rather than rejected: the engine's value is the
+/// one the child must see, so honoring the rest of the command is safe, and
+/// a stray inherited key must not turn into a kernel that cannot start.
+fn compose_env(
+    platform: EnvPlatform,
+    extra: Vec<(OsString, OsString)>,
+    // Windows only: the OS-reported Windows directory.
+    system_root: Option<OsString>,
+) -> Result<Vec<(OsString, OsString)>, String> {
+    let owned: &[&str] = match platform {
+        EnvPlatform::Unix => &["PATH"],
+        EnvPlatform::Windows => &["PATH", "SystemRoot", "windir"],
+    };
+    let is_owned = |key: &OsStr| {
+        let key = key.to_string_lossy();
+        owned.iter().any(|name| match platform {
+            EnvPlatform::Unix => key == *name,
+            EnvPlatform::Windows => key.eq_ignore_ascii_case(name),
+        })
+    };
+    let mut env: Vec<_> = extra
+        .into_iter()
+        .filter(|(key, _)| {
+            let keep = !is_owned(key);
+            if !keep {
+                tracing::warn!(
+                    key = %key.to_string_lossy(),
+                    "ignoring engine-owned variable in launch command environment"
+                );
+            }
+            keep
+        })
+        .collect();
+    match platform {
+        EnvPlatform::Unix => env.push(("PATH".into(), UNIX_CHILD_PATH.into())),
+        EnvPlatform::Windows => {
+            let root = system_root
+                .filter(|root| !root.is_empty())
+                .ok_or_else(|| "Windows system directory is unavailable".to_owned())?;
+            let mut path = OsString::new();
+            for (index, suffix) in WINDOWS_CHILD_PATH.iter().enumerate() {
+                if index > 0 {
+                    path.push(";");
+                }
+                path.push(&root);
+                path.push(suffix);
+            }
+            env.push(("SystemRoot".into(), root.clone()));
+            env.push(("windir".into(), root));
+            env.push(("PATH".into(), path));
+        }
+    }
+    Ok(env)
+}
+
 async fn launch(
     cmd: Command,
     tx: &mpsc::Sender<ProcessEvent>,
@@ -931,13 +1019,24 @@ async fn launch(
     let group =
         processkit::ProcessGroup::new().map_err(|e| ProcessError::Containment(e.to_string()))?;
     let kind = containment(&group)?;
+    // The Windows directory comes from the OS, never from this host's own
+    // (caller-controlled) SystemRoot/windir environment.
     #[cfg(windows)]
-    let env = cmd.env.into_iter().filter(|(key, _)| {
-        let key = key.to_string_lossy();
-        !key.eq_ignore_ascii_case("SystemRoot") && !key.eq_ignore_ascii_case("windir")
-    });
+    let system_root = match crate::trusted_system_root() {
+        Ok(root) => Some(root),
+        Err(error) => {
+            tracing::warn!(%error, "Windows system directory is unavailable");
+            None
+        }
+    };
     #[cfg(not(windows))]
-    let env = cmd.env;
+    let system_root = None;
+    let env = compose_env(EnvPlatform::HOST, cmd.env, system_root).map_err(|message| {
+        ProcessError::Spawn {
+            executable: executable.clone(),
+            message,
+        }
+    })?;
     let mut backend = processkit::Command::new(&executable)
         .args(cmd.args)
         .env_clear()
@@ -954,17 +1053,6 @@ async fn launch(
             stderr: true,
             dropped: false,
         });
-    #[cfg(windows)]
-    {
-        let root = std::env::var_os("SystemRoot")
-            .or_else(|| std::env::var_os("windir"))
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| ProcessError::Spawn {
-                executable: executable.clone(),
-                message: "host SystemRoot is unavailable".into(),
-            })?;
-        backend = backend.env("SystemRoot", &root).env("windir", &root);
-    }
     if let Some(cwd) = cmd.cwd {
         backend = backend.current_dir(cwd);
     }
@@ -1390,5 +1478,123 @@ mod audit_tests {
         assert_eq!(exit.code, Some(0));
         assert!(exit.abnormal());
         assert!(group.members().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+
+    fn pairs(env: &[(OsString, OsString)]) -> Vec<(String, String)> {
+        env.iter()
+            .map(|(k, v)| (k.to_string_lossy().into(), v.to_string_lossy().into()))
+            .collect()
+    }
+
+    fn var(key: &str, value: &str) -> (OsString, OsString) {
+        (key.into(), value.into())
+    }
+
+    #[test]
+    fn unix_child_gets_the_fixed_system_path() {
+        let env = compose_env(EnvPlatform::Unix, vec![var("RUST_LOG", "info")], None).unwrap();
+        assert_eq!(
+            pairs(&env),
+            [
+                ("RUST_LOG".into(), "info".into()),
+                ("PATH".into(), "/usr/bin:/bin:/usr/sbin:/sbin".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn unix_command_path_cannot_override_the_engine_path() {
+        let env = compose_env(
+            EnvPlatform::Unix,
+            vec![var("PATH", "/tmp/evil"), var("A", "1")],
+            Some("ignored".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            pairs(&env),
+            [
+                ("A".into(), "1".into()),
+                ("PATH".into(), "/usr/bin:/bin:/usr/sbin:/sbin".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn unix_variable_names_stay_case_sensitive() {
+        let env = compose_env(EnvPlatform::Unix, vec![var("Path", "x")], None).unwrap();
+        assert_eq!(
+            pairs(&env),
+            [
+                ("Path".into(), "x".into()),
+                ("PATH".into(), "/usr/bin:/bin:/usr/sbin:/sbin".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_child_path_is_built_from_system_root() {
+        let env = compose_env(
+            EnvPlatform::Windows,
+            vec![var("RUST_LOG", "info")],
+            Some(r"C:\Windows".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            pairs(&env),
+            [
+                ("RUST_LOG".into(), "info".into()),
+                ("SystemRoot".into(), r"C:\Windows".into()),
+                ("windir".into(), r"C:\Windows".into()),
+                (
+                    "PATH".into(),
+                    r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0"
+                        .into()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_command_cannot_override_owned_variables_in_any_case() {
+        let env = compose_env(
+            EnvPlatform::Windows,
+            vec![
+                var("Path", r"C:\evil"),
+                var("path", r"C:\evil"),
+                var("SYSTEMROOT", r"C:\evil"),
+                var("WinDir", r"C:\evil"),
+                var("A", "1"),
+            ],
+            Some(r"C:\Windows".into()),
+        )
+        .unwrap();
+        let env = pairs(&env);
+        assert_eq!(env[0], ("A".into(), "1".into()));
+        assert_eq!(env.len(), 4);
+        assert!(env.iter().all(|(_, v)| !v.contains("evil")));
+    }
+
+    /// The root is the OS-reported Windows directory, whatever this
+    /// process's own SystemRoot says.
+    #[cfg(windows)]
+    #[test]
+    fn host_windows_root_comes_from_the_os() {
+        let root = crate::trusted_system_root().unwrap();
+        assert!(Path::new(&root).join("System32").is_dir(), "{root:?}");
+        let env = compose_env(EnvPlatform::HOST, Vec::new(), Some(root.clone())).unwrap();
+        let path = &env.iter().find(|(k, _)| k == "PATH").unwrap().1;
+        let first = path.to_string_lossy().split(';').next().unwrap().to_owned();
+        assert_eq!(Path::new(&first), Path::new(&root).join("System32"));
+    }
+
+    #[test]
+    fn windows_without_system_root_fails_closed() {
+        assert!(compose_env(EnvPlatform::Windows, Vec::new(), None).is_err());
+        assert!(compose_env(EnvPlatform::Windows, Vec::new(), Some(OsString::new())).is_err());
     }
 }

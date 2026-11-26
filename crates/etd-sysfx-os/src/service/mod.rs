@@ -1,3 +1,309 @@
 //! Service installation: copy binaries to an admin-only location, register
 //! allowed SIDs, create the easytier-desk group, SCM / systemd / launchd
 //! registration. Owned by HR.
+
+use std::{
+    fs::{self, File, OpenOptions},
+    io,
+    path::{Path, PathBuf},
+};
+
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use self::windows as native;
+#[cfg(unix)]
+use unix as native;
+
+pub const SERVICE_NAME: &str = "easytier-desk-host";
+
+/// Host directories. Service paths come from the OS, not from RPC clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostLayout {
+    pub state: PathBuf,
+    pub run: PathBuf,
+    pub cores: PathBuf,
+    pub executable: PathBuf,
+    pub socket_dir: Option<PathBuf>,
+    user_host: bool,
+}
+
+/// A cross-process exclusive OS lock. Keep the lock file: deleting it while
+/// a holder or waiter exists would permit a second independent lock inode.
+pub struct HostLock {
+    files: Vec<File>,
+}
+impl HostLock {
+    pub fn acquire(directory: &Path) -> io::Result<Self> {
+        let path = directory.join("host.lock");
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.custom_flags(0x00200000); // FILE_FLAG_OPEN_REPARSE_POINT
+        }
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || related_path(&metadata) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "invalid host lock file",
+            ));
+        }
+        file.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "host already running; stop it before maintenance",
+            ),
+            std::fs::TryLockError::Error(error) => error,
+        })?;
+        Ok(Self { files: vec![file] })
+    }
+}
+
+fn related_path(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+/// Filesystem layout and lock operations used by the host composition root.
+pub trait HostFilesystem {
+    fn user_layout(
+        &self,
+        state_override: Option<&Path>,
+        runtime_dir: Option<&Path>,
+    ) -> io::Result<HostLayout>;
+    fn service_layout(&self) -> io::Result<HostLayout>;
+    fn prepare_user(&self, layout: &HostLayout) -> io::Result<()>;
+    fn validate_service(&self, layout: &HostLayout) -> io::Result<()>;
+    fn is_installed_image(&self, layout: &HostLayout) -> io::Result<bool>;
+    fn lock(&self, layout: &HostLayout) -> io::Result<HostLock>;
+}
+
+/// Privileged changes are deliberately separated from composition. Only the
+/// installer invokes these methods; ordinary user hosts never do.
+pub trait ServiceManager {
+    /// Create *fresh*, protected directories; copy the host before any
+    /// registration. Refuse pre-existing product paths rather than claiming
+    /// objects that may belong to someone else.
+    fn prepare_install(&self, layout: &HostLayout) -> io::Result<()>;
+    /// Register with the service manager using the protected executable.
+    fn register(&self, layout: &HostLayout) -> io::Result<()>;
+    /// Disable restart and stop before invoking maintenance reclaim.
+    fn stop_and_disable(&self, layout: &HostLayout) -> io::Result<()>;
+    /// Remove registration and validated product directories after reclaim.
+    fn remove(&self, layout: &HostLayout) -> io::Result<()>;
+    fn entry_is_elevated(&self) -> io::Result<bool>;
+}
+
+pub struct NativeServiceManager;
+impl ServiceManager for NativeServiceManager {
+    fn prepare_install(&self, layout: &HostLayout) -> io::Result<()> {
+        native::prepare_install(layout)
+    }
+    fn register(&self, layout: &HostLayout) -> io::Result<()> {
+        native::register(layout)
+    }
+    fn stop_and_disable(&self, layout: &HostLayout) -> io::Result<()> {
+        native::stop_and_disable(layout)
+    }
+    fn remove(&self, layout: &HostLayout) -> io::Result<()> {
+        native::remove(layout)
+    }
+    fn entry_is_elevated(&self) -> io::Result<bool> {
+        native::elevated()
+    }
+}
+
+pub fn user_temp_runtime() -> io::Result<PathBuf> {
+    native::user_temp_runtime()
+}
+pub fn current_exe() -> io::Result<PathBuf> {
+    std::env::current_exe()?.canonicalize()
+}
+#[cfg(unix)]
+pub use unix::group_id as service_group_id;
+#[cfg(windows)]
+pub use windows::dispatch_service;
+
+#[derive(Default)]
+pub struct NativeHostFilesystem;
+
+#[cfg(unix)]
+fn missing(name: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::NotFound, format!("{name} not configured"))
+}
+fn absolute(path: PathBuf) -> io::Result<PathBuf> {
+    if path.is_absolute()
+        && !path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        Ok(path)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "host directory must be absolute without parent traversal",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn private_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(path) {
+        Ok(()) => (),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
+        Err(e) => return Err(e),
+    }
+    let m = fs::symlink_metadata(path)?;
+    if !m.is_dir()
+        || m.uid() != nix::unistd::Uid::effective().as_raw()
+        || m.mode() & 0o7777 != 0o700
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "host directory must be owned by current user and mode 0700",
+        ));
+    }
+    Ok(())
+}
+#[cfg(windows)]
+fn private_dir(path: &Path) -> io::Result<()> {
+    native::private_user_dir(path)
+}
+
+impl HostFilesystem for NativeHostFilesystem {
+    fn user_layout(
+        &self,
+        state_override: Option<&Path>,
+        runtime_dir: Option<&Path>,
+    ) -> io::Result<HostLayout> {
+        let state = if let Some(p) = state_override {
+            p.to_owned()
+        } else {
+            user_state()?
+        };
+        let state = absolute(state)?;
+        let socket_dir = runtime_dir.map(|p| absolute(p.to_owned())).transpose()?;
+        Ok(HostLayout {
+            run: state.join("run"),
+            cores: state.join("cores"),
+            executable: std::env::current_exe()?.canonicalize()?,
+            state,
+            socket_dir,
+            user_host: true,
+        })
+    }
+    fn service_layout(&self) -> io::Result<HostLayout> {
+        service_layout()
+    }
+    fn prepare_user(&self, layout: &HostLayout) -> io::Result<()> {
+        if let Some(parent) = layout.state.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        private_dir(&layout.state)?;
+        private_dir(&layout.run)?;
+        private_dir(&layout.cores)?;
+        if let Some(path) = &layout.socket_dir {
+            private_dir(path)?;
+        }
+        Ok(())
+    }
+    fn validate_service(&self, layout: &HostLayout) -> io::Result<()> {
+        native::validate_service(layout)
+    }
+    fn is_installed_image(&self, layout: &HostLayout) -> io::Result<bool> {
+        Ok(current_exe()? == layout.executable.canonicalize()?)
+    }
+    fn lock(&self, layout: &HostLayout) -> io::Result<HostLock> {
+        let mut guard = HostLock::acquire(&layout.state)?;
+        // A different XDG state directory must not permit a second claim
+        // for the same user endpoint.
+        if layout.user_host
+            && let Some(runtime) = &layout.socket_dir
+            && runtime != &layout.state
+        {
+            guard.files.extend(HostLock::acquire(runtime)?.files);
+        }
+        Ok(guard)
+    }
+}
+
+#[cfg(windows)]
+fn user_state() -> io::Result<PathBuf> {
+    Ok(native::local_app_data()?.join("EasyTierDesk"))
+}
+#[cfg(target_os = "macos")]
+fn user_state() -> io::Result<PathBuf> {
+    Ok(
+        PathBuf::from(std::env::var_os("HOME").ok_or_else(|| missing("HOME"))?)
+            .join("Library/Application Support/easytier-desk"),
+    )
+}
+#[cfg(target_os = "linux")]
+fn user_state() -> io::Result<PathBuf> {
+    let root = if let Some(root) = std::env::var_os("XDG_STATE_HOME").filter(|s| !s.is_empty()) {
+        PathBuf::from(root)
+    } else {
+        PathBuf::from(std::env::var_os("HOME").ok_or_else(|| missing("HOME"))?).join(".local/state")
+    };
+    Ok(root.join("easytier-desk"))
+}
+
+#[cfg(windows)]
+fn service_layout() -> io::Result<HostLayout> {
+    let state = absolute(native::program_data()?.join("EasyTierDesk"))?;
+    let install = absolute(native::program_files()?.join("EasyTierDesk"))?;
+    Ok(HostLayout {
+        run: state.join("run"),
+        cores: install.join("cores"),
+        executable: install.join("etd-host.exe"),
+        state,
+        socket_dir: None,
+        user_host: false,
+    })
+}
+#[cfg(target_os = "linux")]
+fn service_layout() -> io::Result<HostLayout> {
+    let state = PathBuf::from("/var/lib/easytier-desk");
+    let install = PathBuf::from("/usr/local/lib/easytier-desk");
+    Ok(HostLayout {
+        run: state.join("run"),
+        cores: install.join("cores"),
+        executable: install.join("etd-host"),
+        state,
+        socket_dir: Some(PathBuf::from("/run/easytier-desk")),
+        user_host: false,
+    })
+}
+#[cfg(target_os = "macos")]
+fn service_layout() -> io::Result<HostLayout> {
+    let state = PathBuf::from("/var/lib/easytier-desk");
+    let install = PathBuf::from("/Library/Application Support/easytier-desk");
+    Ok(HostLayout {
+        run: state.join("run"),
+        cores: install.join("cores"),
+        executable: install.join("etd-host"),
+        state,
+        socket_dir: Some(install.join("run")),
+        user_host: false,
+    })
+}

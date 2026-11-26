@@ -12,6 +12,11 @@
 //!    readiness of a fenced instance waits for [`FenceCheck::Verified`];
 //!    management (the RPC session) is opened only after it. Any mismatch is
 //!    [`FenceCheck::Failed`]: the supervisor kills the kernel and reclaims.
+//!    While the kernel runs, the supervisor repeats [`check`] every
+//!    `LifecycleConfig::fence_recheck` (a firewall reload can drop the
+//!    rule); two misses in a row (failed or not verifiable) end the
+//!    management session, kill the kernel and reclaim, and the restart
+//!    policy brings a new generation with a new fence.
 //! 4. The fallback is a new generation planned with
 //!    `ManagementGuard::DenyAll`; the kernel driver accepts it only when the
 //!    adapter profile marks its deny-all configuration verified, otherwise

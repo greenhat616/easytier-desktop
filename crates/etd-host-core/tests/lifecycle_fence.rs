@@ -185,3 +185,85 @@ async fn fence_stays_while_the_kernel_is_not_verified_dead() {
     .await;
     assert_eq!(fences(&world), 1, "only epoch 2's fence remains");
 }
+
+fn notices(h: &mut Host<'_>, code: &str) -> usize {
+    h.settle_sync();
+    h.log
+        .iter()
+        .filter(|e| {
+            matches!(&e.payload,
+                etd_contract::v1::event::Payload::Notice(n) if n.code == code)
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn a_fence_lost_while_the_kernel_runs_kills_reclaims_and_restarts() {
+    let world = World::new();
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.apply("a", spec("net"), Desired::Running).await;
+    h.wait_state("a", S::ReadyFull).await;
+    let first = world.last_kernel();
+    let attaches = world.driver.attach_calls();
+
+    // A firewall reload drops the rule under the running kernel.
+    let rule = world
+        .sys
+        .objects()
+        .into_iter()
+        .find(|o| o.kind == World::fence_kind())
+        .expect("the fence rule");
+    assert!(world.sys.vanish(rule.kind, &rule.key));
+
+    h.until("restarted with a new fence", |h| {
+        h.status("a").is_some_and(|s| {
+            s.epoch == 2
+                && s.state() == S::ReadyFull
+                && s.management() == ManagementAccess::Available
+        })
+    })
+    .await;
+    assert_eq!(world.engine.liveness(&first).await, Liveness::Gone);
+    assert_eq!(notices(&mut h, "fence.lost"), 1);
+    assert!(
+        h.history("a").contains(&S::Reclaiming),
+        "the killed generation was reclaimed"
+    );
+    // Only the new generation is open, with its own fence.
+    let open = world.open_records("a").await;
+    assert!(
+        open.iter()
+            .all(|e| e.scope.generation().is_some_and(|(_, ep)| ep.0 == 2))
+    );
+    assert_eq!(fences(&world), 1);
+    assert!(
+        world.driver.attach_calls() > attaches,
+        "management reopened"
+    );
+}
+
+#[tokio::test]
+async fn a_single_missed_fence_check_is_retried_without_action() {
+    let world = World::new();
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.apply("a", spec("net"), Desired::Running).await;
+    h.wait_state("a", S::ReadyFull).await;
+    let kernel = world.last_kernel();
+
+    // The next re-verification fails once (transient), the retry passes.
+    world.sys.inject(
+        etd_testkit::fakes::system::Fault::on(etd_testkit::fakes::system::Step::FenceVerify).once(),
+    );
+    h.idle(
+        std::time::Duration::from_millis(500),
+        std::time::Duration::from_secs(70),
+    )
+    .await;
+    assert_eq!(world.engine.liveness(&kernel).await, Liveness::Same);
+    assert_eq!(world.spawned().len(), 1);
+    assert_eq!(h.state("a"), S::ReadyFull);
+    assert_eq!(h.status("a").unwrap().epoch, 1);
+    assert_eq!(notices(&mut h, "fence.lost"), 0);
+}

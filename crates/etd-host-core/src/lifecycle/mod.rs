@@ -55,6 +55,12 @@ pub struct LifecycleConfig {
     /// Session-form host: how long no client may hold a lease before the
     /// host stops its instances and exits.
     pub lease_grace: Duration,
+    /// While a fenced kernel runs, its fence is verified again this often
+    /// (a firewall reload can drop the rule under a running kernel).
+    pub fence_recheck: Duration,
+    /// After one failed or indeterminate re-verification, the retry comes
+    /// this much later; a second miss in a row kills the kernel.
+    pub fence_retry: Duration,
 }
 
 impl Default for LifecycleConfig {
@@ -67,6 +73,8 @@ impl Default for LifecycleConfig {
             reclaim_retry: Duration::from_secs(2),
             log_lines: 1000,
             lease_grace: Duration::from_secs(30),
+            fence_recheck: Duration::from_secs(30),
+            fence_retry: Duration::from_secs(2),
         }
     }
 }
@@ -83,6 +91,13 @@ pub(crate) struct Ctx {
     /// until a sweep of their own run directories proves no kernel of
     /// theirs is alive (RetryReclaim).
     pub excluded: std::sync::Mutex<std::collections::BTreeSet<InstanceId>>,
+    /// Held by a generation from the check of its kernel's program firewall
+    /// rules before the spawn until their read-back after basic readiness
+    /// (or the end of the generation). The kernel deletes and recreates
+    /// those rules on every start, so two starts in flight at once would
+    /// see each other's replacement as a foreign rule (or leave duplicates
+    /// behind); generations that replace them start one at a time.
+    pub program_rules: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Ctx {
@@ -175,6 +190,7 @@ impl Orchestrator {
                 config,
                 hold: std::sync::Mutex::new(None),
                 excluded: std::sync::Mutex::new(Default::default()),
+                program_rules: Arc::new(tokio::sync::Mutex::new(())),
             }),
             port,
         }

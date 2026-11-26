@@ -25,7 +25,12 @@
 //!   an addressed interface or the expected listener) and, on a fenced
 //!   host, a verified fence; the management session is opened afterwards;
 //! - a cut (stop not persisted) kills the kernel and reclaims nothing until
-//!   a desired state is committed.
+//!   a desired state is committed;
+//! - the Windows program firewall rules a kernel deletes and recreates on
+//!   every start (core-binary scope) must be absent or exactly as recorded
+//!   before the spawn, else the start is refused; after basic readiness
+//!   their credential is refreshed only from a single confirmed rule, else
+//!   they become conflicts. Such starts run one at a time.
 use crate::api::{ClientPresence, LogStream, Reply};
 use crate::fence_seq::{self, FenceCheck};
 use crate::lifecycle::logs::{self, LineBuffer, LogBook};
@@ -43,14 +48,14 @@ use etd_proc::{
     RestartPolicy,
 };
 use etd_sysfx::{
-    Credential, Effect, EffectKind, EffectState, Epoch, FenceSpec, GenerationOutcome,
-    GenerationReport, LaunchInputs, LedgerError, ManagementGuard, ObjectKey, Observation,
-    Persistence, ScopeFilter, StoredGeneration, Undo,
+    Credential, Effect, EffectKind, EffectScope, EffectState, Epoch, FenceSpec, GenerationOutcome,
+    GenerationReport, InterfaceInfo, LaunchInputs, LedgerError, ManagementGuard, ObjectKey,
+    Observation, Persistence, ScopeFilter, StoredGeneration, SystemClass, Undo,
 };
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{OwnedMutexGuard, mpsc, oneshot, watch};
 
 /// Actor -> supervisor.
 pub(crate) enum SupCmd {
@@ -139,6 +144,13 @@ enum LaunchFail {
     Taken(String),
     /// The committed desired state no longer wants this generation.
     Superseded(String),
+    /// Starting would let the kernel replace a system object that is not
+    /// ours (a program firewall rule we did not record): no start until a
+    /// RetryStart.
+    Refused(String),
+    /// A cut arrived before the spawn: nothing runs; the generation is
+    /// reclaimed once a desired state is committed.
+    Cut(Reply<()>),
 }
 
 struct Live {
@@ -152,6 +164,10 @@ struct Live {
     start_deadline: Instant,
     fence: Option<FenceSpec>,
     fence_ok: bool,
+    /// Next re-verification of a verified fence while the kernel runs.
+    fence_due: Instant,
+    /// Re-verifications missed in a row (failed or indeterminate).
+    fence_misses: u32,
     basic: bool,
     session: Option<Arc<dyn CoreSession>>,
     attach_after: Instant,
@@ -159,6 +175,14 @@ struct Live {
     cursor: Option<CoreEventCursor>,
     /// Kernel records still `Planned` (enumerated until they appear).
     pending: Vec<Effect>,
+    /// Program firewall rule records (core-binary scope) this start may
+    /// replace, as last recorded: followed while starting, settled after
+    /// basic readiness ([`Supervisor::settle_rules`]).
+    rules: Vec<Effect>,
+    /// `Ctx::program_rules`, held until the first settling pass.
+    rule_gate: Option<OwnedMutexGuard<()>>,
+    /// Next settling pass of `rules` (after basic readiness).
+    rules_due: Instant,
     next_tick: Instant,
     /// Partial output lines (a secret may span chunks).
     stdout: LineBuffer,
@@ -273,10 +297,47 @@ fn is_host_kind(kind: EffectKind) -> bool {
     matches!(kind, EffectKind::Process | EffectKind::RuntimeDir) || is_fence_kind(kind)
 }
 
+/// One of the Windows program firewall rules named after the kernel binary
+/// (core-binary scope, shared by every instance launched from it). Upstream
+/// deletes and recreates them on every start (easytier-core c97f36b
+/// `arch/windows.rs` 230-232), so the recorded rule GUID goes stale with
+/// each start: they are checked before the spawn and read back after basic
+/// readiness instead of being read back once (ruling topic#36 msg#931).
+fn is_program_rule(e: &Effect) -> bool {
+    e.kind == EffectKind::WinProgramFirewallRule
+        && matches!(e.scope, EffectScope::CoreBinary { .. })
+}
+
+/// The credential a record holds as ours: only an applied record has one
+/// (a candidate or conflict keeps what it saw, which is not ours).
+fn recorded_credential(e: &Effect) -> Option<&Credential> {
+    (e.state == EffectState::Applied)
+        .then(|| e.observation.as_ref().and_then(|o| o.credential.as_ref()))
+        .flatten()
+}
+
+/// What is found under a program firewall rule's name.
+enum RuleRead {
+    /// No rule with that name.
+    Absent,
+    /// Exactly one rule with that name, confirmed by the observer as the
+    /// one for the kernel binary it names, with its credential.
+    One(Observation),
+    /// Several rules with that name.
+    Ambiguous(usize),
+    /// Exactly one rule with that name that the observer does not confirm
+    /// as the kernel's (another program, group or direction; no
+    /// credential).
+    Unconfirmed(String),
+    /// Could not tell; never taken as absent or as foreign.
+    Unknown(String),
+}
+
 /// A kernel record whose creation credential the host reads back after the
 /// spawn (lease and expiring records are record-only: never waited on).
 fn needs_read_back(e: &Effect) -> bool {
     !is_host_kind(e.kind)
+        && !is_program_rule(e)
         && e.state == EffectState::Planned
         && !matches!(
             e.persistence,
@@ -848,6 +909,19 @@ impl Supervisor {
                         self.notice(NoticeLevel::Info, "start.superseded", m);
                         Then::Settle
                     }
+                    LaunchFail::Refused(m) => {
+                        self.notice(NoticeLevel::Error, "start.refused", m.clone());
+                        Then::GiveUp(m)
+                    }
+                    LaunchFail::Cut(reply) => {
+                        // Nothing was spawned; like a cut of a live kernel,
+                        // the generation waits for a committed desired state.
+                        self.status.epoch = epoch.0;
+                        self.phase = Phase::Cut { epoch: Some(epoch) };
+                        self.set_state(InstanceState::CutUnconfirmed, "stop could not be recorded");
+                        let _ = reply.send(Ok(()));
+                        return Flow::Continue;
+                    }
                 };
                 self.enter_reclaim(epoch, then, "launch failed");
                 Flow::Continue
@@ -928,9 +1002,23 @@ impl Supervisor {
             }
         }
 
+        // Program firewall rules the kernel will replace: one such start at
+        // a time (`Ctx::program_rules`), held until they are read back.
+        let has_rules = stored.effects.iter().any(is_program_rule);
+        let rule_gate = if has_rules {
+            Some(self.rule_gate().await?)
+        } else {
+            None
+        };
+
         // No side effect for a generation the committed state no longer
         // wants (a stop or a new configuration committed meanwhile).
         self.still_wanted(stored).await?;
+        let rules = if has_rules {
+            self.check_program_rules(epoch).await?
+        } else {
+            Vec::new()
+        };
         let pending = self
             .flag_preexisting(stored)
             .await
@@ -1060,12 +1148,17 @@ impl Supervisor {
             start_deadline: now + self.ctx.config.start_timeout,
             fence,
             fence_ok: false,
+            fence_due: now,
+            fence_misses: 0,
             basic: false,
             session: None,
             attach_after: now,
             poller: None,
             cursor: None,
             pending,
+            rules,
+            rule_gate,
+            rules_due: now,
             next_tick: now,
             stdout: LineBuffer::default(),
             stderr: LineBuffer::default(),
@@ -1104,11 +1197,40 @@ impl Supervisor {
             match fence_seq::check(deps.observer.as_ref(), fence.as_ref(), spec, live.pid).await {
                 FenceCheck::Verified => {
                     live.fence_ok = true;
+                    live.fence_due = now + self.ctx.config.fence_recheck;
                     self.status.management = ManagementAccess::Available as i32;
                     self.publish();
                 }
                 FenceCheck::Failed(m) => return Err(KillFor::Fence(m)),
                 FenceCheck::Pending => {}
+            }
+        } else if let Some(spec) = &live.fence
+            && live.fence_ok
+            && now >= live.fence_due
+            && let Some(fence) = deps.fence.as_ref()
+        {
+            // While it runs: a firewall reload or another program can drop
+            // the rule under the kernel. No verified fence, no management:
+            // two misses in a row (one retry absorbs a transient error)
+            // kill and reclaim; the restart installs and verifies it anew.
+            match fence_seq::check(deps.observer.as_ref(), fence.as_ref(), spec, live.pid).await {
+                FenceCheck::Verified => {
+                    live.fence_misses = 0;
+                    live.fence_due = now + self.ctx.config.fence_recheck;
+                }
+                missed => {
+                    let why = match missed {
+                        FenceCheck::Failed(m) => m,
+                        _ => "the fence could not be verified (no listener, or the observation failed)"
+                            .to_string(),
+                    };
+                    live.fence_misses += 1;
+                    if live.fence_misses >= 2 {
+                        return Err(KillFor::FenceLost(why));
+                    }
+                    tracing::warn!(instance = %self.id, reason = %why, "fence re-verification missed; retrying");
+                    live.fence_due = now + self.ctx.config.fence_retry;
+                }
             }
         }
 
@@ -1125,6 +1247,16 @@ impl Supervisor {
             } else if now >= live.start_deadline {
                 return Err(KillFor::NotReady);
             }
+        }
+
+        // Program firewall rules: follow the kernel's replacement while it
+        // starts, settle them once it is basically ready.
+        if live.rules.is_empty() {
+            live.rule_gate = None;
+        } else if !live.basic {
+            self.follow_rules(live).await;
+        } else if self.now() >= live.rules_due {
+            self.settle_rules(live).await;
         }
 
         let may_attach = live.basic
@@ -1178,7 +1310,299 @@ impl Supervisor {
             // those records as candidates.
             live.next_tick = live.next_tick.min(now + self.ctx.config.readiness_tick);
         }
+        if live.fence.is_some() && live.fence_ok {
+            live.next_tick = live.next_tick.min(live.fence_due.max(now));
+        }
+        if !live.rules.is_empty() {
+            let due = if live.basic {
+                live.rules_due.max(now)
+            } else {
+                now + self.ctx.config.readiness_tick
+            };
+            live.next_tick = live.next_tick.min(due);
+        }
         Ok(())
+    }
+
+    /// Read what is found under a program firewall rule's name: the
+    /// observer locates the rule (and fails closed on several, or on one
+    /// for another program, group or direction); an independent
+    /// enumeration counts every rule of that name.
+    async fn read_program_rule(&mut self, e: &Effect) -> RuleRead {
+        let observer = self.ctx.deps.observer.clone();
+        let ObjectKey::Rule { name, .. } = &e.key else {
+            return RuleRead::Unknown("not a named rule".into());
+        };
+        let observed = observer.observe(e.kind, &e.key).await;
+        if let Ok(None) = observed {
+            return RuleRead::Absent;
+        }
+        let same_name = match observer.enumerate(SystemClass::FirewallRules).await {
+            Ok(entries) => entries
+                .iter()
+                .filter(|s| {
+                    matches!(&s.key, ObjectKey::Rule { name: n, .. } if n.eq_ignore_ascii_case(name))
+                })
+                .count(),
+            Err(err) => return RuleRead::Unknown(format!("cannot enumerate firewall rules: {err}")),
+        };
+        match (same_name, observed) {
+            (0, Ok(_)) => RuleRead::Unknown("the rule vanished while it was looked at".into()),
+            (0, Err(err)) => RuleRead::Unknown(err.to_string()),
+            (1, Ok(Some(o))) if o.credential.is_some() => RuleRead::One(o),
+            (1, Ok(_)) => RuleRead::Unconfirmed("no creation credential could be read".into()),
+            (1, Err(err)) => RuleRead::Unconfirmed(err.to_string()),
+            (n, _) => RuleRead::Ambiguous(n),
+        }
+    }
+
+    /// Wait for `Ctx::program_rules`. Commands meanwhile are deferred, except
+    /// a cut or a shutdown, which abandon this launch (nothing is spawned).
+    async fn rule_gate(&mut self) -> Result<OwnedMutexGuard<()>, LaunchFail> {
+        let gate = self.ctx.program_rules.clone();
+        if let Ok(held) = gate.clone().try_lock_owned() {
+            return Ok(held);
+        }
+        self.status.message =
+            "waiting for another start of this kernel to settle its firewall rules".into();
+        self.publish();
+        let acquire = gate.lock_owned();
+        tokio::pin!(acquire);
+        let abandoned =
+            || LaunchFail::Superseded("generation not started: the host is shutting down".into());
+        loop {
+            tokio::select! {
+                biased;
+                held = &mut acquire => {
+                    self.status.message.clear();
+                    self.publish();
+                    return Ok(held);
+                }
+                cmd = self.cmds.recv(), if !self.cmds_closed => match cmd {
+                    Some(SupCmd::Cut { reply }) => return Err(LaunchFail::Cut(reply)),
+                    Some(SupCmd::Shutdown { reply }) => {
+                        self.shutdown = Some(reply);
+                        self.stopping_for_exit = true;
+                        return Err(abandoned());
+                    }
+                    Some(SupCmd::Query { reply, .. }) => {
+                        let _ = reply.send(Err(unavailable(&self.id)));
+                    }
+                    Some(other) => self.deferred.push_back(other),
+                    None => {
+                        // The orchestrator is gone: wind down.
+                        self.cmds_closed = true;
+                        self.stopping_for_exit = true;
+                        let (tx, _) = oneshot::channel();
+                        self.shutdown = Some(tx);
+                        return Err(abandoned());
+                    }
+                },
+            }
+        }
+    }
+
+    /// Before the spawn, holding `Ctx::program_rules`: the program firewall
+    /// rules the kernel will delete and recreate must be absent or exactly
+    /// the ones this host recorded (ruling topic#36 msg#931). Anything else
+    /// (a rule we never recorded, another identity, several of that name,
+    /// one the observer does not confirm, a record awaiting an
+    /// administrator) refuses the start: the kernel would overwrite a rule
+    /// that is not ours. Returns the records to follow.
+    async fn check_program_rules(&mut self, epoch: Epoch) -> Result<Vec<Effect>, LaunchFail> {
+        // Fresh states: another generation of this kernel may have
+        // refreshed the shared records since this one was read.
+        let stored = match self.ctx.deps.ledger.generation(&self.id, epoch).await {
+            Ok(Some(stored)) => stored,
+            Ok(None) => return Err(LaunchFail::Abnormal("reserved generation vanished".into())),
+            Err(e) => return Err(LaunchFail::Abnormal(format!("ledger unavailable: {e}"))),
+        };
+        let mut follow = Vec::new();
+        for e in stored.effects.into_iter().filter(is_program_rule) {
+            let what = format!("{} {}", e.kind, view::key_text(&e.key));
+            if !matches!(e.state, EffectState::Planned | EffectState::Applied) {
+                return Err(LaunchFail::Refused(format!(
+                    "{what} is {:?} in the ledger, awaiting an administrator; the kernel would replace it",
+                    e.state
+                )));
+            }
+            match self.read_program_rule(&e).await {
+                RuleRead::Absent => follow.push(e),
+                RuleRead::One(o) if o.credential.as_ref() == recorded_credential(&e) => {
+                    follow.push(e);
+                }
+                RuleRead::One(_) => {
+                    return Err(LaunchFail::Refused(format!(
+                        "{what} exists but is not the rule this host recorded; the kernel would replace it"
+                    )));
+                }
+                RuleRead::Ambiguous(n) => {
+                    return Err(LaunchFail::Refused(format!(
+                        "{n} rules with the name of {what} exist; the kernel would replace them"
+                    )));
+                }
+                RuleRead::Unconfirmed(m) => {
+                    return Err(LaunchFail::Refused(format!(
+                        "{what} exists and is not confirmed as this kernel's ({m}); the kernel would replace it"
+                    )));
+                }
+                // An unknown baseline is never taken as absent: no start.
+                RuleRead::Unknown(m) => {
+                    return Err(LaunchFail::Abnormal(format!(
+                        "cannot check {what} before the start: {m}"
+                    )));
+                }
+            }
+        }
+        Ok(follow)
+    }
+
+    /// While the kernel starts: record its replacement of a program rule as
+    /// soon as it is the only rule of that name, so a kernel that dies
+    /// before readiness leaves the current credential, not a stale one.
+    async fn follow_rules(&mut self, live: &mut Live) {
+        let observer = self.ctx.deps.observer.clone();
+        for i in 0..live.rules.len() {
+            let e = live.rules[i].clone();
+            let seen = match observer.observe(e.kind, &e.key).await {
+                Ok(Some(o)) => o.credential,
+                _ => continue,
+            };
+            if seen.is_none() || seen.as_ref() == recorded_credential(&e) {
+                continue;
+            }
+            if let RuleRead::One(o) = self.read_program_rule(&e).await {
+                self.refresh_rule(&mut live.rules[i], o).await;
+            }
+        }
+    }
+
+    /// After basic readiness: a followed record takes the found credential
+    /// only when exactly one rule of that name exists and the observer
+    /// confirms it as the kernel binary's; several, or one not confirmed,
+    /// is a conflict (never deleted). Absent: nothing to claim, the record
+    /// stays as it was. Unknown: retried while the kernel runs. The gate is
+    /// released after the first pass.
+    async fn settle_rules(&mut self, live: &mut Live) {
+        let mut left = Vec::new();
+        for mut e in std::mem::take(&mut live.rules) {
+            let settled = match self.read_program_rule(&e).await {
+                RuleRead::One(o) => {
+                    (e.state == EffectState::Applied
+                        && recorded_credential(&e) == o.credential.as_ref())
+                        || self.refresh_rule(&mut e, o).await
+                }
+                RuleRead::Absent => {
+                    tracing::info!(
+                        instance = %self.id,
+                        rule = %view::key_text(&e.key),
+                        "program rule absent after the start; record left as it was"
+                    );
+                    true
+                }
+                RuleRead::Ambiguous(n) => {
+                    self.conflict_rule(
+                        &mut e,
+                        format!("{n} rules with this name after the kernel started"),
+                    )
+                    .await
+                }
+                RuleRead::Unconfirmed(m) => {
+                    self.conflict_rule(
+                        &mut e,
+                        format!("not confirmed as the kernel's rule after it started: {m}"),
+                    )
+                    .await
+                }
+                RuleRead::Unknown(m) => {
+                    tracing::debug!(instance = %self.id, error = %m, "program rule not read back yet");
+                    false
+                }
+            };
+            if !settled {
+                left.push(e);
+            }
+        }
+        live.rules = left;
+        live.rule_gate = None;
+        live.rules_due = self.now() + self.ctx.config.reclaim_retry;
+    }
+
+    /// Record `o` as the rule's credential (planned or stale before).
+    /// `true` once nothing is left to do for this record.
+    async fn refresh_rule(&mut self, e: &mut Effect, o: Observation) -> bool {
+        match self
+            .ctx
+            .deps
+            .ledger
+            .transition(&e.id, EffectState::Applied, Some(o.clone()))
+            .await
+        {
+            Ok(()) => {
+                e.state = EffectState::Applied;
+                e.observation = Some(o);
+                true
+            }
+            // Moved on meanwhile (e.g. settled as a conflict): not ours to
+            // overwrite.
+            Err(LedgerError::InvalidTransition { from, .. }) => {
+                tracing::warn!(instance = %self.id, ?from, "program rule record moved on; not refreshed");
+                true
+            }
+            Err(err) => {
+                tracing::warn!(instance = %self.id, error = %err, "program rule not refreshed");
+                false
+            }
+        }
+    }
+
+    /// The record's rule cannot be claimed: a conflict for an
+    /// administrator, keeping the credential we recorded (if any) as the
+    /// expected one. `true` once nothing is left to do for this record.
+    async fn conflict_rule(&mut self, e: &mut Effect, reason: String) -> bool {
+        let ledger = self.ctx.deps.ledger.clone();
+        if e.state != EffectState::Reclaiming {
+            match ledger
+                .transition(&e.id, EffectState::Reclaiming, None)
+                .await
+            {
+                Ok(()) => e.state = EffectState::Reclaiming,
+                Err(LedgerError::InvalidTransition { .. }) => return true,
+                Err(err) => {
+                    tracing::warn!(instance = %self.id, error = %err, "program rule conflict not recorded");
+                    return false;
+                }
+            }
+        }
+        let observation = Observation {
+            credential: e.observation.as_ref().and_then(|o| o.credential.clone()),
+            key: Some(e.key.clone()),
+            observed_at: self.ctx.deps.clock.wall_now(),
+            detail: Some(reason.clone()),
+        };
+        match ledger
+            .transition(&e.id, EffectState::Conflict, Some(observation))
+            .await
+        {
+            Ok(()) => {
+                e.state = EffectState::Conflict;
+                self.notice(
+                    NoticeLevel::Warning,
+                    "program_rule.conflict",
+                    format!(
+                        "{} {}: {reason}; left for an administrator",
+                        e.kind,
+                        view::key_text(&e.key)
+                    ),
+                );
+                true
+            }
+            Err(LedgerError::InvalidTransition { .. }) => true,
+            Err(err) => {
+                tracing::warn!(instance = %self.id, error = %err, "program rule conflict not recorded");
+                false
+            }
+        }
     }
 
     /// Record the creation credential of every kernel object that has
@@ -1196,16 +1620,16 @@ impl Supervisor {
                 ObjectKey::Interface { name: None, .. } | ObjectKey::RoutesVia { interface: None }
             )
         });
-        let mut assigned: Option<String> = None;
+        let mut assigned: Option<InterfaceInfo> = None;
         if unnamed && let Ok(found) = deps.observer.interfaces_owned_by(live.pid).await {
-            assigned = found.into_iter().next().map(|i| i.name);
+            assigned = found.into_iter().next();
         }
         let mut still = Vec::new();
         for e in std::mem::take(&mut live.pending) {
             let obs = match (&e.key, &assigned) {
-                (ObjectKey::Interface { name: None, guid }, Some(name)) => {
+                (ObjectKey::Interface { name: None, guid }, Some(info)) => {
                     let key = ObjectKey::Interface {
-                        name: Some(name.clone()),
+                        name: Some(info.name.clone()),
                         guid: guid.clone(),
                     };
                     deps.observer
@@ -1218,12 +1642,15 @@ impl Supervisor {
                             o
                         })
                 }
-                (ObjectKey::RoutesVia { interface: None }, Some(name)) => {
+                (ObjectKey::RoutesVia { interface: None }, Some(info)) => {
                     let key = ObjectKey::RoutesVia {
-                        interface: Some(name.clone()),
+                        interface: Some(info.name.clone()),
                     };
+                    // The interface's credential from the same lookup, so
+                    // the reclaimer can tell whether a later interface of
+                    // that name (index reused) is still this one.
                     Some(Observation {
-                        credential: None,
+                        credential: Some(info.credential.clone()),
                         key: Some(key),
                         observed_at: deps.clock.wall_now(),
                         detail: None,
@@ -1656,8 +2083,27 @@ impl Supervisor {
                 };
                 self.abnormal_then(&exit)
             }
+            KillFor::FenceLost(m) => {
+                // Management stops at once; the kernel is killed below.
+                live.session = None;
+                live.poller = None;
+                self.status.management = ManagementAccess::Pending as i32;
+                self.notice(
+                    NoticeLevel::Warning,
+                    "fence.lost",
+                    format!(
+                        "the management port fence no longer holds ({m}); restarting the kernel"
+                    ),
+                );
+                let exit = Exit {
+                    code: None,
+                    signal: None,
+                    cause: ExitCause::Exited,
+                };
+                self.abnormal_then(&exit)
+            }
         };
-        let failed = matches!(why, KillFor::NotReady);
+        let failed = matches!(why, KillFor::NotReady | KillFor::FenceLost(_));
         match Self::terminate(live.handle.as_mut(), None).await {
             // A kernel that never became ready failed on its own account,
             // although the host ended it: report it as abnormal.
@@ -2106,8 +2552,12 @@ impl Supervisor {
 
 /// Why a live kernel is killed by the supervisor itself.
 enum KillFor {
+    /// The fence failed its verification at the start: deny-all fallback.
     Fence(String),
     NotReady,
+    /// A verified fence missed two re-verifications in a row while the
+    /// kernel ran: normal restart policy (a new fence is installed).
+    FenceLost(String),
 }
 
 /// The log stream of one instance.

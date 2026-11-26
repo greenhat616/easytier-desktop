@@ -13,72 +13,23 @@ use etd_sysfx_os::service::{
 };
 use std::{process::Command, sync::Arc, time::Duration};
 
-// Reuse the existing CI-only temporary-account fixture. Its password is
-// generated in memory and immediately erased; no credential is logged.
 #[cfg(windows)]
-#[path = "../../etd-ipc/tests/common/windows_account.rs"]
-mod windows_account;
+use etd_sysfx_os::service::ci_fixture::{StandardAccount, assert_query_only};
 
 #[cfg(windows)]
 fn standard_user_handshake(
-    token: std::os::windows::io::OwnedHandle,
+    account: &StandardAccount,
     connector: Arc<LocalConnector>,
     endpoint: Endpoint,
 ) -> anyhow::Result<(etd_ipc::ServerIdentity, etd_contract::v1::Welcome)> {
-    // Isolate impersonation to a dedicated thread with a current-thread
-    // runtime so no unrelated operation can inherit the test account token.
-    use std::os::windows::io::AsRawHandle;
-    use windows::Win32::{
-        Foundation::HANDLE,
-        Security::{ImpersonateLoggedOnUser, RevertToSelf},
-    };
-    struct Revert;
-    impl Drop for Revert {
-        fn drop(&mut self) {
-            if unsafe { RevertToSelf() }.is_err() {
-                std::process::abort();
-            }
-        }
-    }
-    std::thread::spawn(move || -> anyhow::Result<_> {
-        unsafe {
-            ImpersonateLoggedOnUser(HANDLE(token.as_raw_handle()))?;
-        }
-        let _revert = Revert;
+    account.run(move || -> anyhow::Result<_> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(15), async {
                 let (_, identity) = connector.connect(&endpoint).await?;
-                // Verify the query-only grant without taking any action on
-                // the service process. A handle for a sensitive right is a
-                // failure, even if the process would reject our RPCs.
-                use windows::Win32::{
-                    Foundation::{CloseHandle, ERROR_ACCESS_DENIED},
-                    System::Threading::{
-                        OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_TERMINATE, PROCESS_VM_READ,
-                    },
-                };
-                for access in [
-                    PROCESS_TERMINATE,
-                    PROCESS_VM_READ,
-                    PROCESS_ACCESS_RIGHTS(0x0004_0000),
-                ] {
-                    match unsafe { OpenProcess(access, false, identity.peer.pid) } {
-                        Ok(handle) => {
-                            let _ = unsafe { CloseHandle(handle) };
-                            anyhow::bail!(
-                                "standard token unexpectedly acquired process right {:#x}",
-                                access.0
-                            );
-                        }
-                        Err(error) => anyhow::ensure!(
-                            error.code() == ERROR_ACCESS_DENIED.to_hresult(),
-                            "unexpected sensitive process access error: {error}"
-                        ),
-                    }
-                }
+                assert_query_only(identity.peer.pid)?;
                 let channel = tonic::transport::Endpoint::from_static("http://localhost")
                     .connect_with_connector(ClientIo::new(connector, endpoint))
                     .await?;
@@ -97,9 +48,7 @@ fn standard_user_handshake(
             })
             .await?
         })
-    })
-    .join()
-    .map_err(|_| anyhow::anyhow!("standard-user handshake thread panicked"))?
+    })?
 }
 
 #[cfg(windows)]
@@ -176,12 +125,10 @@ async fn install_connect_uninstall() {
     let mut install = Command::new(binary);
     install.arg("install");
     #[cfg(windows)]
-    let (token, enrolled_sid) = {
-        let (token, etd_ipc::OsUserId::WindowsSid(sid)) = windows_account::logon() else {
-            panic!("expected Windows SID")
-        };
-        install.args(["--allow-user", &sid]);
-        (token, sid)
+    let account = {
+        let account = StandardAccount::create().unwrap();
+        install.args(["--allow-user", account.sid()]);
+        account
     };
     let result = install.output().unwrap();
     assert!(
@@ -246,18 +193,15 @@ async fn install_connect_uninstall() {
     })
     .await;
     #[cfg(windows)]
-    let standard = token
-        .try_clone()
-        .map_err(anyhow::Error::from)
-        .and_then(|token| standard_user_handshake(token, connector.clone(), endpoint.clone()));
+    let standard = standard_user_handshake(&account, connector.clone(), endpoint.clone());
     #[cfg(windows)]
     let revoked = tokio::time::timeout(
         Duration::from_secs(15),
-        revoke_user(connector.clone(), endpoint.clone(), &enrolled_sid),
+        revoke_user(connector.clone(), endpoint.clone(), account.sid()),
     )
     .await;
     #[cfg(windows)]
-    let after_revoke = standard_user_handshake(token, connector.clone(), endpoint.clone());
+    let after_revoke = standard_user_handshake(&account, connector.clone(), endpoint.clone());
     let cleanup = Command::new(binary).arg("uninstall").output().unwrap();
     assert!(
         cleanup.status.success(),

@@ -34,12 +34,10 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "std"]
 [dev-dependencies]
 assert_cmd = { workspace = true }
 etd-client = { workspace = true }
+etd-sysfx-os = { workspace = true, features = ["ci-test-fixtures"] }
 etd-testkit = { workspace = true }
 predicates = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-
-[target.'cfg(windows)'.dev-dependencies]
-windows = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading"] }
 
 [lints]
 workspace = true

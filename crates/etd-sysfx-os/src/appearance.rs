@@ -31,7 +31,9 @@ impl AppearanceSnapshot {
 }
 
 #[cfg(windows)]
-pub use crate::windows::appearance::{AppearanceWatch, mica_backdrop_accepted};
+pub use crate::windows::appearance::{
+    AppearanceWatch, mica_backdrop_accepted, set_window_dark_mode,
+};
 
 #[cfg(not(windows))]
 #[derive(Debug)]
@@ -51,6 +53,12 @@ impl AppearanceWatch {
 /// Non-Windows has no Windows DWM material; the UI chooses an opaque fallback.
 #[cfg(not(windows))]
 pub fn mica_backdrop_accepted(_hwnd: NonZeroIsize) -> bool {
+    false
+}
+
+/// Non-Windows has no DWM window dark-mode attribute.
+#[cfg(not(windows))]
+pub fn set_window_dark_mode(_hwnd: NonZeroIsize, _dark: bool) -> bool {
     false
 }
 
@@ -86,5 +94,6 @@ mod tests {
     fn non_windows_adapter_is_inert() {
         assert!(AppearanceWatch::new(|| panic!("no WinRT event on non-Windows")).is_none());
         assert!(!mica_backdrop_accepted(NonZeroIsize::new(1).unwrap()));
+        assert!(!set_window_dark_mode(NonZeroIsize::new(1).unwrap(), true));
     }
 }

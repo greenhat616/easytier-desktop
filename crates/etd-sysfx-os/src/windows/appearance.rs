@@ -1,5 +1,5 @@
-//! Read-only Windows appearance settings and DWM acknowledgement. Neither
-//! system settings nor window attributes are written by this adapter.
+//! Windows appearance queries and DWM acknowledgement. The only write is
+//! the dark-mode attribute of an application-owned window; never OS settings.
 
 use std::{num::NonZeroIsize, sync::Arc};
 
@@ -14,11 +14,12 @@ use ::windows::{
         Foundation::HWND,
         Graphics::Dwm::{
             DWM_SYSTEMBACKDROP_TYPE, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
-            DwmGetWindowAttribute,
+            DWMWA_USE_IMMERSIVE_DARK_MODE, DwmGetWindowAttribute, DwmSetWindowAttribute,
         },
         System::SystemInformation::OSVERSIONINFOW,
+        UI::WindowsAndMessaging::GetWindowThreadProcessId,
     },
-    core::IInspectable,
+    core::{BOOL, IInspectable},
 };
 
 use crate::appearance::{AccentRamp, AppearanceSnapshot};
@@ -150,6 +151,31 @@ pub fn mica_backdrop_accepted(hwnd: NonZeroIsize) -> bool {
     }
     .is_ok()
         && actual == DWMSBT_MAINWINDOW
+}
+
+/// Set the native window's dark appearance to match the app theme. Only
+/// HWNDs owned by the current process are accepted. Failure leaves the
+/// caller free to fall back to a solid background of its chosen theme.
+pub fn set_window_dark_mode(hwnd: NonZeroIsize, dark: bool) -> bool {
+    let hwnd = HWND(hwnd.get() as *mut std::ffi::c_void);
+    let mut owner = 0;
+    // SAFETY: HWND is borrowed from the UI; owner is a valid output buffer.
+    if unsafe { GetWindowThreadProcessId(hwnd, Some(&mut owner)) } == 0
+        || owner != std::process::id()
+    {
+        return false;
+    }
+    let enabled = BOOL::from(dark);
+    // SAFETY: the BOOL buffer and size match the documented DWM attribute.
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            (&enabled as *const BOOL).cast(),
+            std::mem::size_of::<BOOL>() as u32,
+        )
+    }
+    .is_ok()
 }
 
 #[cfg(test)]

@@ -11,7 +11,8 @@ import uuid
 
 from service import Desktop, Service, command, eventually, require_runner
 from consistency import (
-    UnpredictedChanges, check_closed, check_generation, installed_image, managed_service_changes, scope,
+    FirewallReadbackPending, UnpredictedChanges, check_closed, check_generation, installed_image,
+    managed_service_changes, scope,
 )
 from inventory import capture, file_identity
 import foreign
@@ -123,14 +124,24 @@ def recovery():
         baseline = inventory()
         differences = []
         def verify_generation(snapshot, view):
-            try:
-                check_generation(baseline, snapshot, service.effects(), instance, view)
-            except UnpredictedChanges as err:
-                # Finish both crash observations and final cleanup even when a
-                # fully observed epoch changed an extra object. Fail below.
-                message = f"epoch {view['epoch']}: {err}"
-                print(message, flush=True)
-                differences.append(message)
+            end = time.monotonic() + 240
+            while True:
+                try:
+                    check_generation(baseline, snapshot, service.effects(), instance, view)
+                except FirewallReadbackPending:
+                    # A shared Applied record can still carry the preceding
+                    # epoch's rule ID while the fresh native policy is visible.
+                    if time.monotonic() >= end:
+                        raise
+                    time.sleep(2)
+                    snapshot = inventory()
+                    continue
+                except UnpredictedChanges as err:
+                    # Finish both crashes; the accumulated difference fails below.
+                    message = f"epoch {view['epoch']}: {err}"
+                    print(message, flush=True)
+                    differences.append(message)
+                return snapshot
         keys.update(key for key in baseline.rows if key[0] == "runtime")
         revision = str(service.ctl("status")["revision"])
         desktop = Desktop(instance, request, revision, stack.enter_context(tempfile.TemporaryDirectory()))
@@ -141,7 +152,7 @@ def recovery():
         print(f"installed kernel ready: {first['state']} epoch={first['epoch']}", flush=True)
         wait_for_firewall_readback(service, instance, first["epoch"])
         before = inventory()
-        verify_generation(before, first)
+        before = verify_generation(before, first)
         assert_foreign(baseline, before, keys)
         with desktop.connected("hold"):
             assert desktop.read("logs") > 0
@@ -158,7 +169,6 @@ def recovery():
             check_closed(service, instance, old_epoch)
             assert ("process", str(old_pid)) not in after.rows, "killed process remains"
             assert not old_dir.exists(), f"old generation directory remains: {old_dir}"
-            assert_foreign(baseline, after, keys)
             # A replacement host has a different pid. Compare generation
             # effects against the same prelaunch baseline at the new host pid.
             if image == service.host:
@@ -169,7 +179,8 @@ def recovery():
                 assert len(prior) == len(current) == 1 and prior != current
                 del baseline.rows[prior[0]]
                 baseline.rows[current[0]] = after.rows[current[0]]
-            verify_generation(after, first)
+            after = verify_generation(after, first)
+            assert_foreign(baseline, after, keys)
             # Replay the very first request across both restarts. Ticket,
             # revision and acceptance time must still be identical.
             assert desktop.read("receipt") == desktop.read("replay") == receipt

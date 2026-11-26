@@ -10,6 +10,10 @@ class UnpredictedChanges(AssertionError):
     """All expected objects were verified, but there were additional changes."""
 
 
+class FirewallReadbackPending(AssertionError):
+    """The native program rule and its asynchronous ledger readback differ."""
+
+
 def scope(instance, epoch):
     return {"instance": {"instance": instance, "epoch": epoch}}
 
@@ -32,6 +36,8 @@ def managed_service_changes(base, live):
 def check_generation(base, live, records, instance, view):
     try:
         return compare_generation(base, live, records, instance, view)
+    except FirewallReadbackPending:
+        raise
     except (AssertionError, KeyError, OSError):
         for kind, key in sorted(base.delta(live)):
             print(f"native delta: {kind} {key}", flush=True)
@@ -121,10 +127,15 @@ def compare_generation(base, live, records, instance, view):
             if kind == "win.program_firewall_rule":
                 assert "core_binary" in record["scope"]
                 rule_name, group, direction, _, _, image, *_ = live.rows[match]
-                assert json.loads(value) == {
+                credential = json.loads(value)
+                if credential != {
                     "id": rule_id, "name": rule_name.lower(), "group": group.lower(),
                     "direction": direction.lower(), "program": image.removeprefix("\\\\?\\").lower(),
-                }, f"stale program rule credential for {rule_name}"
+                }:
+                    raise FirewallReadbackPending(
+                        f"{rule_name}: native ID {rule_id}, ledger ID {credential.get('id')}; "
+                        "full program rule credential differs"
+                    )
             else:
                 assert value == rule_id, f"stale interface rule credential for {key['name']}"
         elif kind == "win.registry_value":

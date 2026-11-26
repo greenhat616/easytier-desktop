@@ -1,7 +1,7 @@
 use super::*;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
-pub(super) const NFT: &str = "/usr/sbin/nft";
+pub(super) const NFT: &str = "nft";
 const PREFIX: &str = "etd_f_";
 const MARK: &str = "easytier-desk rpc fence v1";
 const CHAIN: &str = "output";
@@ -184,7 +184,14 @@ pub(super) async fn sweep() -> io::Result<Vec<FoundObject>> {
         if t["comment"] != MARK {
             continue;
         }
-        if let Some(table) = inspect(&all, name)? {
+        let table = match inspect(&all, name) {
+            Ok(t) => t,
+            Err(error) => {
+                tracing::warn!(table=name,port,%error,"skipped unverified fence table during sweep");
+                continue;
+            }
+        };
+        if let Some(table) = table {
             let key = ObjectKey::Fence {
                 container: name.into(),
                 rule: CHAIN.into(),
@@ -200,28 +207,39 @@ pub(super) async fn sweep() -> io::Result<Vec<FoundObject>> {
     }
     Ok(found)
 }
-pub(super) async fn remove(key: &ObjectKey) -> Result<Reclaimed, ReclaimError> {
-    let (table, port) = parts(key).map_err(uncertain)?;
-    let Some(t) = inspect(&ruleset().await.map_err(uncertain)?, table).map_err(uncertain)? else {
-        return Ok(Reclaimed::AlreadyAbsent);
-    };
-    for addr in [
-        SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-        SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
-    ] {
-        if !network::sockets(addr).map_err(uncertain)?.is_empty() {
-            return Err(ReclaimError::Busy(
-                "protected port still has a listener".into(),
-            ));
+impl Linux {
+    pub(super) async fn remove_fence(
+        &self,
+        key: &ObjectKey,
+        generation: Option<(&InstanceId, Epoch)>,
+    ) -> Result<Reclaimed, ReclaimError> {
+        let (table, port) = parts(key).map_err(uncertain)?;
+        let Some(t) = inspect(&ruleset().await.map_err(uncertain)?, table).map_err(uncertain)?
+        else {
+            return Ok(Reclaimed::AlreadyAbsent);
+        };
+        let store = self.core_store_dir.clone();
+        let listeners = blocking(move || network::listener_images(port, &store))
+            .await
+            .map_err(uncertain)?;
+        if let Some(core) = listeners.iter().find(|l| l.in_store) {
+            return Err(ReclaimError::Busy(format!(
+                "protected core PID {} still listens on {port}",
+                core.pid
+            )));
         }
+        run(
+            NFT,
+            &["delete", "table", "inet", "handle", &t.handle.to_string()],
+        )
+        .await
+        .map_err(uncertain)?;
+        for listener in listeners {
+            tracing::warn!(instance=generation.map(|(i,_)|i.as_str()),epoch=generation.map(|(_,e)|e.0),
+            port,pid=listener.pid,exe=%listener.exe.display(),table,"reclaimed fence; unrelated listener left running");
+        }
+        Ok(Reclaimed::Removed)
     }
-    run(
-        NFT,
-        &["delete", "table", "inet", "handle", &t.handle.to_string()],
-    )
-    .await
-    .map_err(uncertain)?;
-    Ok(Reclaimed::Removed)
 }
 fn error(e: impl std::fmt::Display) -> FenceError {
     FenceError::Os {
@@ -236,41 +254,45 @@ async fn host(addr: SocketAddr) -> DirectionResult {
         Err(_) => DirectionResult::Error("timeout".into()),
     }
 }
-// Exit codes alone cannot distinguish failure to exec from a TCP refusal.
-// Only ECONNREFUSED on a socket created after dropping privileges counts.
+// nft meta skuid reads the fsuid captured by the socket file at creation.
 async fn dropped(addr: SocketAddr) -> Result<DirectionResult, FenceError> {
-    const PROBE: &str = r#"import errno, os, socket, sys
-assert os.geteuid() == 65534 and os.getegid() == 65534 and not os.getgroups()
-with socket.socket(socket.AF_INET6 if ':' in sys.argv[1] else socket.AF_INET) as s:
-    s.settimeout(2)
-    rc = s.connect_ex((sys.argv[1], int(sys.argv[2])))
-    print('refused' if rc == errno.ECONNREFUSED else 'connected' if rc == 0 else str(rc))"#;
-    let out = run(
-        "/usr/bin/setpriv",
-        &[
-            "--reuid=65534",
-            "--regid=65534",
-            "--clear-groups",
-            "--no-new-privs",
-            "--inh-caps=-all",
-            "--ambient-caps=-all",
-            "--bounding-set=-all",
-            "/usr/bin/python3",
-            "-I",
-            "-S",
-            "-c",
-            PROBE,
-            &addr.ip().to_string(),
-            &addr.port().to_string(),
-        ],
+    use nix::unistd::{Uid, setfsuid};
+    use tokio::net::TcpSocket;
+    let (send, recv) = tokio::sync::oneshot::channel();
+    // Never lend a runtime worker altered credentials, even on cancellation.
+    std::thread::Builder::new()
+        .name("etd-fence-probe".into())
+        .spawn(move || {
+            let probe = Uid::from_raw(65534);
+            let prior = setfsuid(probe);
+            let result = if setfsuid(probe) != probe || !prior.is_root() {
+                Err(other("could not establish the probe fsuid"))
+            } else if addr.is_ipv4() {
+                TcpSocket::new_v4()
+            } else {
+                TcpSocket::new_v6()
+            };
+            setfsuid(prior);
+            let result = if setfsuid(prior) == prior {
+                result
+            } else {
+                Err(other("could not restore probe thread fsuid"))
+            };
+            let _ = send.send(result);
+        })
+        .map_err(|e| FenceError::Probe(e.to_string()))?;
+    let socket = recv
+        .await
+        .map_err(|e| FenceError::Probe(e.to_string()))?
+        .map_err(|e| FenceError::Probe(e.to_string()))?;
+    Ok(
+        match tokio::time::timeout(Duration::from_secs(2), socket.connect(addr)).await {
+            Ok(Ok(_)) => DirectionResult::Connected,
+            Ok(Err(e)) if e.raw_os_error() == Some(libc::ECONNREFUSED) => DirectionResult::Refused,
+            Ok(Err(e)) => DirectionResult::Error(e.to_string()),
+            Err(_) => DirectionResult::Error("timeout".into()),
+        },
     )
-    .await
-    .map_err(|e| FenceError::Probe(e.to_string()))?;
-    Ok(match out.trim() {
-        "refused" => DirectionResult::Refused,
-        "connected" => DirectionResult::Connected,
-        v => DirectionResult::Error(v.into()),
-    })
 }
 
 #[async_trait]
@@ -327,7 +349,7 @@ add rule inet {name} output ip6 daddr ::1 tcp dport {port} meta skuid != 0 count
             Err(e) => ListenerCheck::Indeterminate(e.to_string()),
         };
         let mut result = FenceVerification {
-            listener: check(network::listener(addr)),
+            listener: check(blocking(move || network::listener(addr)).await),
             host: DirectionResult::NoListener,
             unprivileged: DirectionResult::NoListener,
         };
@@ -339,7 +361,7 @@ add rule inet {name} output ip6 daddr ::1 tcp dport {port} meta skuid != 0 count
             return Ok(result);
         }
         result.unprivileged = dropped(addr).await?;
-        result.listener = check(network::listener(addr));
+        result.listener = check(blocking(move || network::listener(addr)).await);
         result.host = host(addr).await;
         let after = inspect(&ruleset().await.map_err(error)?, name)
             .map_err(error)?
@@ -358,13 +380,33 @@ add rule inet {name} output ip6 daddr ::1 tcp dport {port} meta skuid != 0 count
     }
     async fn remove(&self, spec: &FenceSpec) -> Result<Reclaimed, FenceError> {
         validate(spec)?;
-        remove(&object(spec)).await.map_err(error)
+        self.remove_fence(&object(spec), Some((&spec.instance, spec.epoch)))
+            .await
+            .map_err(error)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "reads the nft JSON produced by a distribution compatibility job"]
+    fn parse_distribution_ruleset() {
+        let file = std::env::var_os("ETD_O2_RULESET").expect("CI ruleset path");
+        let value: Value = serde_json::from_reader(std::fs::File::open(file).unwrap()).unwrap();
+        let all = rows(&value["nftables"]).unwrap();
+        let tables: Vec<_> = all
+            .iter()
+            .filter_map(|r| r["table"]["name"].as_str())
+            .filter(|n| parse_table(n).is_some())
+            .collect();
+        assert_eq!(tables.len(), 1);
+        let table = inspect(all, tables[0]).unwrap().unwrap();
+        println!(
+            "parsed {} with table handle {} and two rule handles {:?}",
+            tables[0], table.handle, table.rules
+        );
+    }
     #[test]
     fn fence_names_are_generation_bound_and_grammar_checked() {
         let mut s = FenceSpec {

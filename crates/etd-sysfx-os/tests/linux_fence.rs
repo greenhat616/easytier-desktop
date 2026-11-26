@@ -46,6 +46,14 @@ async fn installing_host() {
             .success()
     );
     installed.unwrap();
+    if let Some(file) = std::env::var_os("ETD_O2_TABLE_EXPORT") {
+        let dump = Command::new("nft")
+            .args(["-n", "list", "table", "inet", &container])
+            .output()
+            .unwrap();
+        assert!(dump.status.success());
+        std::fs::write(file, dump.stdout).unwrap();
+    }
     std::fs::write(dir.join("installed"), "ready").unwrap();
     std::future::pending::<()>().await;
 }
@@ -137,7 +145,26 @@ async fn fence_survives_host_death() {
         Some(Credential::ExclusiveContainer { .. })
     ));
     println!("Independent fence readback {:?}", obs.detail);
-    assert!(f.remove(&spec4).await.is_err());
+    // The same listener must keep its fence when its actual executable is
+    // inside the configured store. A copy under another store is a distinct
+    // inode even when both executables have the same name.
+    let exe = std::env::current_exe().unwrap();
+    let core = adapters(&OsConfig {
+        run_dir: dir.path().into(),
+        state_dir: dir.path().into(),
+        core_store_dir: exe.parent().unwrap().into(),
+    })
+    .unwrap()
+    .fence
+    .unwrap();
+    std::fs::copy(&exe, dir.path().join(exe.file_name().unwrap())).unwrap();
+    assert!(
+        core.remove(&spec4)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("protected core PID")
+    );
     for killed in [false, true] {
         if killed {
             child.kill().unwrap();
@@ -158,8 +185,6 @@ async fn fence_survives_host_death() {
             println!("installer_killed={killed} {address} {verification:?}");
         }
     }
-    drop(v4);
-    drop(v6);
     let marked = os.sweeper.find_marked(None, &[]).await.unwrap();
     assert!(
         marked
@@ -167,6 +192,9 @@ async fn fence_survives_host_death() {
             .any(|o| o.key == intent.key && o.origin == FoundBy::ExclusiveContainer)
     );
     assert_eq!(f.remove(&spec4).await.unwrap(), Reclaimed::Removed);
+    second(v4addr, true);
+    second(v6addr, true);
+    drop((v4, v6));
     assert_eq!(f.remove(&spec4).await.unwrap(), Reclaimed::AlreadyAbsent);
     let ObjectKey::Fence { container, .. } = intent.key else {
         panic!()

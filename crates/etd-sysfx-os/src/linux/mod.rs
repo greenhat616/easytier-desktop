@@ -16,19 +16,24 @@ use tokio::process::Command;
 #[derive(Clone)]
 struct Linux {
     run_dir: PathBuf,
+    core_store_dir: PathBuf,
 }
 struct LinuxReclaimer(EffectKind, Arc<Linux>);
 
 impl LinuxReclaimer {
     async fn current(&self, e: &Effect) -> Result<Option<Observation>, ObserveError> {
-        if let (
-            EffectKind::LinuxResolvedLink,
-            ObjectKey::ResolvedLink { interface },
-            Undo::RestoreIfOurs { .. },
-        ) = (e.kind, &e.key, &e.undo)
+        if let (EffectKind::LinuxResolvedLink, ObjectKey::ResolvedLink { interface }) =
+            (e.kind, &e.key)
         {
-            // An empty list can be the value a RestoreIfOurs record wrote.
-            return self.1.resolved_observation(&e.key, interface, true).await;
+            let include_empty = matches!(e.undo, Undo::RestoreIfOurs { .. });
+            let previously_seen = e
+                .observation
+                .as_ref()
+                .is_some_and(|o| o.credential.is_some());
+            return self
+                .1
+                .resolved_observation(&e.key, interface, include_empty, previously_seen)
+                .await;
         }
         self.1.observe(e.kind, &e.key).await
     }
@@ -37,6 +42,7 @@ impl LinuxReclaimer {
 pub(crate) fn adapters(config: &crate::OsConfig) -> Result<crate::OsAdapters, crate::OsError> {
     let linux = Arc::new(Linux {
         run_dir: config.run_dir.clone(),
+        core_store_dir: config.core_store_dir.clone(),
     });
     Ok(crate::OsAdapters {
         reclaimers: [
@@ -71,20 +77,36 @@ fn uncertain(error: impl std::fmt::Display) -> ReclaimError {
     ReclaimError::Indeterminate(error.to_string())
 }
 
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    tokio::task::spawn_blocking(f).await.map_err(other)?
+}
+
 async fn output(program: &str, args: &[&str]) -> io::Result<std::process::Output> {
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        Command::new(program)
-            .args(args)
-            .env_clear()
-            .env("LC_ALL", "C")
-            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-            .current_dir("/")
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(other)?
+    for directory in ["/usr/sbin", "/sbin", "/usr/bin", "/bin"] {
+        let executable = std::path::Path::new(directory).join(program);
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            Command::new(executable)
+                .args(args)
+                .env_clear()
+                .env("LC_ALL", "C")
+                .current_dir("/")
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(other)?;
+        match result {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            other => return other,
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("{program} missing from system executable directories"),
+    ))
 }
 async fn run(program: &str, args: &[&str]) -> io::Result<String> {
     let out = output(program, args).await?;
@@ -168,15 +190,16 @@ impl Reclaimer for LinuxReclaimer {
                 if expected.is_some() && expected != current.credential.as_ref() {
                     return Err(ReclaimError::CredentialMismatch);
                 }
-                fence::remove(&e.key).await
+                self.1.remove_fence(&e.key, e.scope.generation()).await
             }
             (EffectKind::LinuxTun, Undo::EnsureAbsent) => {
                 let index = checked_index(expected, current.credential.as_ref())?;
-                network::delete(index).await.map_err(uncertain)?;
-                Ok(Reclaimed::Removed)
+                network::delete(index).await.map_err(uncertain)
             }
             (EffectKind::LinuxResolvedLink, _) => {
                 let index = checked_index(expected, current.credential.as_ref())?;
+                // R1 ruling (msg#940): the verified TUN owns its resolve1 link settings.
+                // Only this credential-checked path may authorize RevertLink.
                 resolved::restore(index, &e.undo).await
             }
             // Linux drops these routes with the link. A route that survived is
@@ -196,50 +219,79 @@ impl Sweeper for Linux {
         known: &'a [InstanceId],
     ) -> BoxFuture<'a, Result<Vec<FoundObject>, ReclaimError>> {
         Box::pin(async move {
-            let mut found = observe::runtime_objects(&self.run_dir).map_err(uncertain)?;
-            for link in network::links().await.map_err(uncertain)? {
-                if !link.name.starts_with(naming::INTERFACE_PREFIX) {
-                    continue;
-                }
-                let origin = key
-                    .and_then(|k| {
-                        known
-                            .iter()
-                            .find(|id| naming::interface_name(k, id) == link.name)
-                    })
-                    .map_or(FoundBy::PrefixOnly, |id| FoundBy::DerivedName {
-                        instance: id.clone(),
-                    });
-                let object = network::key(&link.name);
-                for (kind, key) in [
-                    (
-                        EffectKind::Route,
-                        ObjectKey::RoutesVia {
-                            interface: Some(link.name.clone()),
-                        },
-                    ),
-                    (
-                        EffectKind::LinuxResolvedLink,
-                        ObjectKey::ResolvedLink {
-                            interface: link.name.clone(),
-                        },
-                    ),
-                ] {
-                    if let Some(observation) = self.observe(kind, &key).await.map_err(uncertain)? {
+            let root = self.run_dir.clone();
+            let mut found = blocking(move || observe::runtime_objects(&root))
+                .await
+                .map_err(uncertain)?;
+            let links: Vec<_> = network::links()
+                .await
+                .map_err(uncertain)?
+                .into_iter()
+                .filter(|l| l.name.starts_with(naming::INTERFACE_PREFIX))
+                .collect();
+            if !links.is_empty() {
+                let routes = network::routes().await;
+                let manager = resolved::manager(false).await;
+                for link in links {
+                    let origin = key
+                        .and_then(|k| {
+                            known
+                                .iter()
+                                .find(|id| naming::interface_name(k, id) == link.name)
+                        })
+                        .map_or(FoundBy::PrefixOnly, |id| FoundBy::DerivedName {
+                            instance: id.clone(),
+                        });
+                    let object = network::key(&link.name);
+                    let mut related = |kind, key, detail| {
                         found.push(FoundObject {
                             kind,
+                            observation: observed(&key, link.credential.clone(), detail),
                             key,
-                            observation,
                             origin: origin.clone(),
-                        });
+                        })
+                    };
+                    match &routes {
+                        Ok(routes) if routes.iter().any(|r| network::via(r, &link.name)) => {
+                            related(
+                                EffectKind::Route,
+                                ObjectKey::RoutesVia {
+                                    interface: Some(link.name.clone()),
+                                },
+                                None,
+                            )
+                        }
+                        Err(error) => {
+                            tracing::warn!(interface=%link.name,%error,"skipped route inspection during sweep")
+                        }
+                        _ => {}
                     }
+                    if let Credential::UnixInterface { index, .. } = link.credential {
+                        let dns = match &manager {
+                            Ok(m) => resolved::read_from(m.as_ref(), index).await,
+                            Err(error) => Err(other(error)),
+                        };
+                        match dns {
+                            Ok(Some(settings)) if !settings.empty() => related(
+                                EffectKind::LinuxResolvedLink,
+                                ObjectKey::ResolvedLink {
+                                    interface: link.name.clone(),
+                                },
+                                serde_json::to_string(&settings).ok(),
+                            ),
+                            Err(error) => {
+                                tracing::warn!(interface=%link.name,index,%error,"skipped resolve1 link during sweep")
+                            }
+                            _ => {}
+                        }
+                    }
+                    found.push(FoundObject {
+                        kind: EffectKind::LinuxTun,
+                        observation: observed(&object, link.credential, None),
+                        key: object,
+                        origin,
+                    });
                 }
-                found.push(FoundObject {
-                    kind: EffectKind::LinuxTun,
-                    observation: observed(&object, link.credential, None),
-                    key: object,
-                    origin,
-                });
             }
             // An unprivileged user host cannot own a kernel nftables table.
             if nix::unistd::Uid::effective().is_root() {

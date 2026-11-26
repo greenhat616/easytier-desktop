@@ -53,6 +53,10 @@ async fn reclaim_real_link_route_and_dns() {
     let foreign = "etd-0badf00d";
     let epoch_dir = temp.path().join("integration/7");
     std::fs::create_dir_all(&epoch_dir).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let foreign_epoch = temp.path().join("shared/1");
+    std::fs::create_dir_all(&foreign_epoch).unwrap();
+    std::fs::set_permissions(&foreign_epoch, std::fs::Permissions::from_mode(0o777)).unwrap();
     for name in [name.as_str(), foreign] {
         command("ip", &["tuntap", "add", "dev", name, "mode", "tun"]);
         command("ip", &["link", "set", name, "up"]);
@@ -126,6 +130,10 @@ async fn reclaim_real_link_route_and_dns() {
             path: epoch_dir.clone()
         }
         && o.origin == FoundBy::ExclusiveContainer));
+    assert!(!marked.iter().any(|o| o.key
+        == ObjectKey::Path {
+            path: foreign_epoch.clone()
+        }));
     for class in [
         SystemClass::Interfaces,
         SystemClass::Routes,
@@ -182,7 +190,21 @@ async fn reclaim_real_link_route_and_dns() {
                 .unwrap()
                 .is_none()
         );
-        println!("No resolve1 owner on private bus: live TUN has no resolved effect");
+        let old = record(dns_kind, dns_key.clone(), obs.clone());
+        if std::env::var_os("ETD_O2_NO_BUS").is_some() {
+            assert_eq!(reclaim(dns_kind).probe(&old).await, Probe::Absent);
+            println!("Missing system bus socket: no resolve1 effect");
+        } else {
+            assert!(matches!(
+                reclaim(dns_kind).probe(&old).await,
+                Probe::Indeterminate(_)
+            ));
+            assert!(matches!(
+                reclaim(dns_kind).reclaim(&old).await,
+                Err(ReclaimError::Indeterminate(_))
+            ));
+            println!("Ownerless private bus: previously observed resolve1 effect held for retry");
+        }
     } else {
         command("resolvectl", &["dns", &name, "192.0.2.53"]);
         command("resolvectl", &["domain", &name, "~o2.invalid"]);

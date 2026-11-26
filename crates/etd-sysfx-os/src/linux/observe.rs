@@ -44,10 +44,11 @@ impl SystemObserver for Linux {
                     .then(|| observed(key, l.credential, None)))
             }
             (EffectKind::LinuxResolvedLink, ObjectKey::ResolvedLink { interface }) => {
-                self.resolved_observation(key, interface, false).await
+                self.resolved_observation(key, interface, false, false)
+                    .await
             }
             (EffectKind::RuntimeDir, ObjectKey::Path { path }) => {
-                match fs::symlink_metadata(path) {
+                match tokio::fs::symlink_metadata(path).await {
                     Ok(m) => Ok(Some(observed(key, file(&m), None))),
                     Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
                     Err(e) => Err(os(e)),
@@ -60,28 +61,10 @@ impl SystemObserver for Linux {
                     cmdline_marker,
                 },
             ) => {
-                let mut found = None;
-                use std::os::unix::ffi::OsStrExt;
-                for p in processes().map_err(os)? {
-                    if let ObjectKey::Process { exe: current, .. } = &p.key
-                        && current == exe
-                        && let Some(Credential::Process { pid, .. }) = &p.identity
-                    {
-                        let cmd = match fs::read(format!("/proc/{pid}/cmdline")) {
-                            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                            r => r.map_err(os)?,
-                        };
-                        if cmd.split(|b| *b == 0).any(|a| {
-                            Path::new(std::ffi::OsStr::from_bytes(a)).starts_with(cmdline_marker)
-                        }) {
-                            if found.is_some() {
-                                return Err(os(other("ambiguous process key")));
-                            }
-                            found = Some(observed(key, p.identity.unwrap(), None));
-                        }
-                    }
-                }
-                Ok(found)
+                let (exe, marker) = (exe.clone(), cmdline_marker.clone());
+                blocking(move || process_observation(&exe, &marker))
+                    .await
+                    .map_err(os)
             }
             _ => Err(ObserveError::Unsupported(kind)),
         }
@@ -106,7 +89,9 @@ impl SystemObserver for Linux {
             .map_err(os)
     }
     async fn interfaces_owned_by(&self, pid: u32) -> Result<Vec<InterfaceInfo>, ObserveError> {
-        let names = network::tun_names(pid).map_err(os)?;
+        let names = blocking(move || network::tun_names(pid))
+            .await
+            .map_err(os)?;
         Ok(network::links()
             .await
             .map_err(os)?
@@ -139,6 +124,26 @@ fn dirs(path: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+fn trusted_children(parent: &Path, owner: u32) -> Vec<PathBuf> {
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(path=%parent.display(),%error,"skipped unreadable sweep directory");
+            return Vec::new();
+        }
+    };
+    entries.filter_map(|item|{
+        let entry=match item {Ok(entry)=>entry,Err(error)=>{tracing::warn!(path=%parent.display(),%error,"skipped unreadable directory entry");return None;}};
+        let path=entry.path();
+        match fs::symlink_metadata(&path) {
+            Ok(m) if !m.is_dir()=>None,
+            Ok(m) if m.uid()==owner && m.mode()&0o022==0=>Some(path),
+            Ok(_)=>{tracing::warn!(path=%path.display(),"skipped nonexclusive sweep directory");None}
+            Err(error)=>{tracing::warn!(path=%path.display(),%error,"skipped unverified sweep directory");None}
+        }
+    }).collect()
+}
+
 /// The host reclaimer accepts an exclusive epoch directory by key. Grant
 /// that authority only under a host-owned root with no writable or linked
 /// instance component. The host composition root supplies the trusted path.
@@ -152,11 +157,8 @@ pub(super) fn runtime_objects(root: &Path) -> io::Result<Vec<FoundObject>> {
         Err(e) => return Err(e),
     }
     let mut result = Vec::new();
-    for instance in dirs(root)? {
-        if !trusted(&fs::symlink_metadata(&instance)?) {
-            return Err(other("nonexclusive instance directory"));
-        }
-        for path in dirs(&instance)? {
+    for instance in trusted_children(root, owner) {
+        for path in trusted_children(&instance, owner) {
             let Some(epoch) = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -166,9 +168,6 @@ pub(super) fn runtime_objects(root: &Path) -> io::Result<Vec<FoundObject>> {
             };
             if path.file_name().and_then(|n| n.to_str()) != Some(&epoch.to_string()) {
                 continue;
-            }
-            if !trusted(&fs::symlink_metadata(&path)?) {
-                return Err(other("nonexclusive epoch directory"));
             }
             let key = ObjectKey::Path { path };
             let credential = Credential::ExclusiveContainer {
@@ -185,6 +184,53 @@ pub(super) fn runtime_objects(root: &Path) -> io::Result<Vec<FoundObject>> {
     Ok(result)
 }
 
+fn process_observation(exe: &Path, cmdline_marker: &Path) -> io::Result<Option<Observation>> {
+    let mut found = None;
+    use std::os::unix::ffi::OsStrExt;
+    for p in processes()? {
+        if let ObjectKey::Process { exe: current, .. } = &p.key
+            && current == exe
+            && let Some(Credential::Process { pid, .. }) = &p.identity
+        {
+            let cmd = match fs::read(format!("/proc/{pid}/cmdline")) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                r => r?,
+            };
+            if cmd
+                .split(|b| *b == 0)
+                .any(|a| Path::new(std::ffi::OsStr::from_bytes(a)).starts_with(cmdline_marker))
+            {
+                if found.is_some() {
+                    return Err(other("ambiguous process key"));
+                }
+                found = Some(observed(
+                    &ObjectKey::Process {
+                        exe: exe.into(),
+                        cmdline_marker: cmdline_marker.into(),
+                    },
+                    p.identity.unwrap(),
+                    None,
+                ));
+            }
+        }
+    }
+    Ok(found)
+}
+fn runtime_entries(root: &Path) -> io::Result<Vec<SystemEntry>> {
+    let mut entries = Vec::new();
+    for instance in dirs(root)? {
+        for path in dirs(&instance)? {
+            let m = fs::symlink_metadata(&path)?;
+            entries.push(entry(
+                SystemClass::RuntimeDirs,
+                ObjectKey::Path { path },
+                Some(file(&m)),
+                format!("mode={:o} uid={} gid={}", m.mode(), m.uid(), m.gid()),
+            ));
+        }
+    }
+    Ok(entries)
+}
 fn processes() -> io::Result<Vec<SystemEntry>> {
     let mut entries = Vec::new();
     let boot = boot()?;
@@ -240,6 +286,7 @@ impl Linux {
         key: &ObjectKey,
         interface: &str,
         include_empty: bool,
+        previously_seen: bool,
     ) -> Result<Option<Observation>, ObserveError> {
         let Some(link) = self.interface(&network::key(interface)).await? else {
             return Ok(None);
@@ -247,7 +294,8 @@ impl Linux {
         let Credential::UnixInterface { index, .. } = link.credential else {
             return Err(os(other("missing link index")));
         };
-        Ok(resolved::read(index)
+        let m = resolved::manager(previously_seen).await.map_err(os)?;
+        Ok(resolved::read_from(m.as_ref(), index)
             .await
             .map_err(os)?
             .filter(|s| include_empty || !s.empty())
@@ -280,19 +328,20 @@ impl Linux {
             }
             SystemClass::DnsPolicy => {
                 let path = Path::new("/etc/resolv.conf");
-                match fs::read_to_string(path) {
+                match tokio::fs::read_to_string(path).await {
                     Ok(content) => entries.push(entry(
                         class,
                         ObjectKey::Path { path: path.into() },
-                        Some(file(&fs::metadata(path)?)),
+                        Some(file(&tokio::fs::metadata(path).await?)),
                         content,
                     )),
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e),
                 }
+                let m = resolved::manager(false).await?;
                 for l in network::links().await? {
                     if let Credential::UnixInterface { index, .. } = l.credential
-                        && let Some(s) = resolved::read(index).await?
+                        && let Some(s) = resolved::read_from(m.as_ref(), index).await?
                     {
                         entries.push(entry(
                             class,
@@ -332,7 +381,7 @@ impl Linux {
             }
             SystemClass::Services => {
                 let units = json(
-                    "/usr/bin/systemctl",
+                    "systemctl",
                     &[
                         "list-unit-files",
                         "--type=service",
@@ -354,19 +403,10 @@ impl Linux {
                 }
             }
             SystemClass::RuntimeDirs => {
-                for instance in dirs(&self.run_dir)? {
-                    for path in dirs(&instance)? {
-                        let m = fs::symlink_metadata(&path)?;
-                        entries.push(entry(
-                            class,
-                            ObjectKey::Path { path },
-                            Some(file(&m)),
-                            format!("mode={:o} uid={} gid={}", m.mode(), m.uid(), m.gid()),
-                        ));
-                    }
-                }
+                let root = self.run_dir.clone();
+                return blocking(move || runtime_entries(&root)).await;
             }
-            SystemClass::Processes => return processes(),
+            SystemClass::Processes => return blocking(processes).await,
             SystemClass::RegistryValues => {}
             _ => return Err(other("unsupported system class")),
         }

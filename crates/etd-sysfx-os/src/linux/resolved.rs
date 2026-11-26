@@ -23,14 +23,39 @@ impl Settings {
     }
 }
 
-async fn manager() -> io::Result<Option<Proxy<'static>>> {
-    let conn = Connection::system().await.map_err(other)?;
+async fn bounded<T>(operation: impl Future<Output = io::Result<T>>) -> io::Result<T> {
+    tokio::time::timeout(Duration::from_secs(5), operation)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "resolve1 operation timed out"))?
+}
+
+pub(super) async fn manager(previously_seen: bool) -> io::Result<Option<Proxy<'static>>> {
+    bounded(connect(previously_seen)).await
+}
+async fn connect(previously_seen: bool) -> io::Result<Option<Proxy<'static>>> {
+    let conn = match Connection::system().await {
+        Ok(conn) => conn,
+        Err(zbus::Error::InputOutput(e)) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(other(e)),
+    };
     let bus = zbus::fdo::DBusProxy::new(&conn).await.map_err(other)?;
     // Pin the daemon for the entire read/compare/write operation. If it
     // restarts, a stale snapshot cannot authorize a call to the new owner.
     let owner = match bus.get_name_owner(SERVICE.try_into().map_err(other)?).await {
         Ok(owner) => owner,
-        Err(zbus::fdo::Error::NameHasNoOwner(_)) => return Ok(None),
+        Err(zbus::fdo::Error::NameHasNoOwner(_)) => {
+            if previously_seen
+                || bus
+                    .list_activatable_names()
+                    .await
+                    .map_err(other)?
+                    .iter()
+                    .any(|n| n.as_str() == SERVICE)
+            {
+                return Err(other("resolve1 has no current owner; retry after restart"));
+            }
+            return Ok(None);
+        }
         Err(err) => return Err(other(err)),
     };
     Ok(Some(
@@ -65,11 +90,12 @@ async fn snapshot(manager: &Proxy<'_>, index: i32) -> io::Result<Option<Settings
     }))
 }
 
-pub(super) async fn read(index: u32) -> io::Result<Option<Settings>> {
-    let Some(m) = manager().await? else {
-        return Ok(None);
-    };
-    snapshot(&m, index.try_into().map_err(other)?).await
+pub(super) async fn read_from(
+    manager: Option<&Proxy<'_>>,
+    index: u32,
+) -> io::Result<Option<Settings>> {
+    let Some(m) = manager else { return Ok(None) };
+    bounded(snapshot(m, index.try_into().map_err(other)?)).await
 }
 
 // RestoreIfOurs identifies just the ordered list of plain DNS servers.
@@ -108,8 +134,13 @@ fn servers(v: &SettingValue) -> io::Result<Vec<(i32, Vec<u8>)>> {
         .collect()
 }
 pub(super) async fn restore(index: u32, undo: &Undo) -> Result<Reclaimed, ReclaimError> {
+    tokio::time::timeout(Duration::from_secs(10), restore_link(index, undo))
+        .await
+        .map_err(|_| ReclaimError::Timeout)?
+}
+async fn restore_link(index: u32, undo: &Undo) -> Result<Reclaimed, ReclaimError> {
     let index = i32::try_from(index).map_err(uncertain)?;
-    let Some(m) = manager().await.map_err(uncertain)? else {
+    let Some(m) = manager(true).await.map_err(uncertain)? else {
         return Ok(Reclaimed::AlreadyAbsent);
     };
     let Some(now) = snapshot(&m, index).await.map_err(uncertain)? else {

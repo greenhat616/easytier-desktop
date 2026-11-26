@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Run only on the disposable CI runner. Never replace an existing PF ruleset.
+[[ $(id -u) == 0 ]]
+work=$(mktemp -d /tmp/etd-s1-macos.XXXXXX)
+chmod 755 "$work"
+cp "$1" "$work/fixture"
+chmod 755 "$work/fixture"
+fixture="$work/fixture"
+user=etd_s1_probe
+anchor=com.apple/etd-s1-fence
+port=$((40000 + $$ % 15000))
+control=$((port + 1))
+token="fixture-$$"
+pids=()
+created=0
+owned=0
+pf_token=""
+cleanup() {
+  local rc=$?
+  trap - EXIT
+  for p in $(jobs -pr); do kill -KILL "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; done
+  if (( owned )); then pfctl -a "$anchor" -F rules || rc=1; fi
+  if [[ -n $pf_token ]]; then pfctl -X "$pf_token" || rc=1; fi
+  if (( created )); then sysadminctl -deleteUser "$user" || rc=1; fi
+  exit "$rc"
+}
+trap cleanup EXIT
+wait_marker() {
+  for _ in {1..100}; do [[ -s $1 ]] && return; sleep .1; done
+  echo "missing marker $1"; return 1
+}
+start_listener() {
+  "$fixture" listen "$1" "$work/$2" "$token" &
+  pids+=("$!")
+  wait_marker "$work/$2"
+  [[ $(cat "$work/$2") == "$!" ]]
+}
+probe() {
+  local identity=$1 endpoint=$2 expectation=$3
+  echo "=== $identity $endpoint $expectation ==="
+  if [[ $identity == root ]]; then
+    id
+    "$fixture" probe "$endpoint" "$token" "$expectation"
+  else
+    sudo -u "$user" -- id
+    sudo -u "$user" -- "$fixture" probe "$endpoint" "$token" "$expectation"
+  fi
+}
+sysadminctl -addUser "$user" -fullName "S1 fence probe" -password "$(uuidgen)"
+created=1
+[[ $(id -u "$user") != 0 ]]
+# Apple ships an existing wildcard filter anchor. Use it for the spike only;
+# no changes to /etc/pf.conf or any other anchor.
+pfctl -sr | tee "$work/top-rules.txt"
+if ! grep -F 'anchor "com.apple/*"' "$work/top-rules.txt"; then
+  echo "UNPROVEN: missing active wildcard anchor hook"; exit 1
+fi
+pfctl -a "$anchor" -sr > "$work/before.txt"
+[[ ! -s "$work/before.txt" ]]
+pfctl -E > "$work/enable.txt" 2>&1
+pf_token=$(awk '/Token *:/ {print $NF}' "$work/enable.txt")
+[[ -n $pf_token ]]
+echo "PF reference acquired"
+start_listener "127.0.0.1:$control" control4
+start_listener "[::1]:$control" control6
+probe second "127.0.0.1:$control" allowed
+probe second "[::1]:$control" allowed
+cat > "$work/rules.conf" <<RULES
+block return out quick on lo0 inet proto tcp from any to 127.0.0.1 port $port user != 0
+block return out quick on lo0 inet6 proto tcp from any to ::1 port $port user != 0
+RULES
+owned=1
+(
+  pfctl -a "$anchor" -f "$work/rules.conf"
+  exec "$fixture" hold "$work/host"
+) &
+host=$!
+pids+=("$host")
+wait_marker "$work/host"
+[[ $(cat "$work/host") == "$host" ]]
+pfctl -a "$anchor" -vvsr
+start_listener "127.0.0.1:$port" listener4
+start_listener "[::1]:$port" listener6
+check_both() {
+  for endpoint in "127.0.0.1:$port" "[::1]:$port"; do
+    probe root "$endpoint" allowed
+    probe second "$endpoint" denied
+    probe root "$endpoint" allowed
+  done
+  pfctl -a "$anchor" -vvsr
+}
+check_both
+kill -KILL "$host"; wait "$host" || true
+! kill -0 "$host" 2>/dev/null
+echo "HOST_KILLED pid=$host; listeners remain"
+check_both
+for marker in listener4 listener6; do
+  pid=$(cat "$work/$marker")
+  kill -KILL "$pid"; wait "$pid" || true
+  ! kill -0 "$pid" 2>/dev/null
+done
+pfctl -a "$anchor" -F rules
+owned=0
+# Enumerate the anchor rules and the recursive active rules independently.
+pfctl -a "$anchor" -sr | tee "$work/post-anchor.txt"
+[[ ! -s "$work/post-anchor.txt" ]]
+pfctl -a '*' -sr | tee "$work/post-rules.txt"
+if grep -F "$anchor" "$work/post-rules.txt"; then exit 1; fi
+pfctl -a com.apple -s Anchors | tee "$work/post-anchors.txt"
+if grep -F 'etd-s1-fence' "$work/post-anchors.txt"; then exit 1; fi
+echo "PASS macOS IPv4 + IPv6: identity fence persists after host death; no S1 rules remain"

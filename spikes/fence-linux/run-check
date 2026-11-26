@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Run only in the disposable privileged CI runner.
+[[ $(id -u) == 0 ]]
+fixture=$(realpath "$1")
+work=$(mktemp -d /tmp/etd-s1-linux.XXXXXX)
+chmod 755 "$work"
+cp "$fixture" "$work/fixture"
+chmod 755 "$work/fixture"
+fixture="$work/fixture"
+user=etd_s1_probe
+table=etd_s1_fence
+port=$((40000 + $$ % 15000))
+control=$((port + 1))
+token="fixture-$$"
+pids=()
+created=0
+owned=0
+cleanup() {
+  local rc=$?
+  trap - EXIT
+  for p in $(jobs -pr); do kill -KILL "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; done
+  if (( owned )) && nft list table inet "$table" >/dev/null 2>&1; then nft delete table inet "$table" || rc=1; fi
+  if (( created )); then userdel "$user" || rc=1; fi
+  exit "$rc"
+}
+trap cleanup EXIT
+
+wait_marker() {
+  for _ in {1..100}; do [[ -s $1 ]] && return; sleep .1; done
+  echo "missing marker $1"; return 1
+}
+start_listener() {
+  "$fixture" listen "$1" "$work/$2" "$token" &
+  pids+=("$!")
+  wait_marker "$work/$2"
+  [[ $(cat "$work/$2") == "$!" ]]
+}
+probe() {
+  local identity=$1 endpoint=$2 expectation=$3
+  echo "=== $identity $endpoint $expectation ==="
+  if [[ $identity == root ]]; then
+    id
+    "$fixture" probe "$endpoint" "$token" "$expectation"
+  else
+    sudo -u "$user" -- id
+    sudo -u "$user" -- "$fixture" probe "$endpoint" "$token" "$expectation"
+  fi
+}
+useradd --no-create-home --shell /bin/sh "$user"
+created=1
+[[ $(id -u "$user") != 0 ]]
+# A control listener proves the second account can execute the probe and connect.
+start_listener "127.0.0.1:$control" control4
+start_listener "[::1]:$control" control6
+probe second "127.0.0.1:$control" allowed
+probe second "[::1]:$control" allowed
+if nft list table inet "$table" >/dev/null 2>&1; then
+  echo "unexpected pre-existing S1 table"; exit 1
+fi
+owned=1
+# The independent host process installs the fence and stays alive.
+(
+  nft -f - <<RULES
+table inet $table {
+  chain output {
+    type filter hook output priority -150; policy accept;
+    ip daddr 127.0.0.1 tcp dport $port meta skuid != 0 counter reject with tcp reset
+    ip6 daddr ::1 tcp dport $port meta skuid != 0 counter reject with tcp reset
+  }
+}
+RULES
+  exec "$fixture" hold "$work/host"
+) &
+host=$!
+pids+=("$host")
+wait_marker "$work/host"
+[[ $(cat "$work/host") == "$host" ]]
+nft -a list table inet "$table"
+start_listener "127.0.0.1:$port" listener4
+start_listener "[::1]:$port" listener6
+check_both() {
+  for endpoint in "127.0.0.1:$port" "[::1]:$port"; do
+    probe root "$endpoint" allowed
+    probe second "$endpoint" denied
+    probe root "$endpoint" allowed
+  done
+  nft -a list table inet "$table"
+}
+check_both
+kill -KILL "$host"
+wait "$host" || true
+! kill -0 "$host" 2>/dev/null
+echo "HOST_KILLED pid=$host; listeners remain"
+check_both
+# Reclaim only after the protected listeners are dead.
+for marker in listener4 listener6; do
+  pid=$(cat "$work/$marker")
+  kill -KILL "$pid"; wait "$pid" || true
+  ! kill -0 "$pid" 2>/dev/null
+done
+nft delete table inet "$table"
+owned=0
+# Independent global enumeration, not the delete return code.
+nft list tables | tee "$work/post-tables.txt"
+if grep -Fx "table inet $table" "$work/post-tables.txt"; then exit 1; fi
+echo "PASS Linux IPv4 + IPv6: identity fence persists after host death; no S1 table remains"

@@ -1,0 +1,55 @@
+name: S1 management port fence
+on:
+  push:
+    branches: [wbs/S1-fence]
+    paths:
+      - 'spikes/fence-*/*'
+      - 'spikes/fence-*/**'
+      - '.github/workflows/s1-fence.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fence:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-latest
+            platform: macos
+          - os: windows-latest
+            platform: windows
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      CARGO_BUILD_JOBS: 4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build standalone spike
+        working-directory: spikes/fence-${{ matrix.platform }}
+        run: cargo build --locked --bins
+      - name: Install nftables
+        if: matrix.platform == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y nftables
+      - name: Privileged Unix check
+        if: matrix.platform != 'windows'
+        working-directory: spikes/fence-${{ matrix.platform }}
+        shell: bash
+        run: |
+          set -o pipefail
+          sudo bash ./run-check "$PWD/target/debug/fixture" 2>&1 | tee evidence.log
+      - name: Privileged Windows check
+        if: matrix.platform == 'windows'
+        working-directory: spikes/fence-windows
+        shell: pwsh
+        run: |
+          & ./run-check.ps1 -Fixture target/debug/fixture.exe -Wfp target/debug/wfp.exe *>&1 | Tee-Object -FilePath evidence.log
+      - name: Capture evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s1-fence-${{ matrix.platform }}
+          path: spikes/fence-${{ matrix.platform }}/evidence.log
+          if-no-files-found: ignore

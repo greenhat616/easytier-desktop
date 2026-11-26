@@ -94,6 +94,7 @@ windows = { version = "0.62.2", default-features = false }
 windows-service = "0.8.1"
 zbus = { version = "6.5.0", default-features = false }
 zeroize = "1.9.2"
+zip = { version = "8.6.0", default-features = false }
 
 # EasyTier prototype pin (keep upstream types inside etd-core-easytier).
 easytier-proto = { git = "https://github.com/EasyTier/EasyTier.git", rev = "c97f36b8d40f3bde7a95cc9ec99fe95fe35a6ff0", default-features = false }

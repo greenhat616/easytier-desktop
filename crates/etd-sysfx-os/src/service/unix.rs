@@ -122,11 +122,54 @@ fn invoke(program: &str, args: &[&str]) -> io::Result<()> {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub fn group_id() -> io::Result<u32> {
     let group = Group::from_name(GROUP)
         .map_err(other)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "service group missing"))?;
     Ok(group.gid.as_raw())
+}
+
+#[cfg(target_os = "macos")]
+pub fn group_id() -> io::Result<u32> {
+    // Query the local directory node itself, not libc's potentially stale
+    // positive/negative cache. A successful listing without our exact name
+    // proves absence; a failed lookup does not.
+    let result = Command::new("/usr/bin/dscl")
+        .args(["/Local/Default", "-list", "/Groups", "PrimaryGroupID"])
+        .env_clear()
+        .output()?;
+    if !result.status.success() {
+        return Err(other(format!(
+            "local DirectoryService group listing failed: {}",
+            result.status
+        )));
+    }
+    let listing = String::from_utf8(result.stdout).map_err(other)?;
+    let mut found = None;
+    for line in listing.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some(GROUP) {
+            continue;
+        }
+        let gid = fields
+            .next()
+            .ok_or_else(|| other("service group has no PrimaryGroupID"))?
+            .parse::<u32>()
+            .map_err(other)?;
+        if found.replace(gid).is_some() {
+            return Err(other("duplicate service group record"));
+        }
+    }
+    found.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "service group missing"))
+}
+
+fn group_exists() -> io::Result<bool> {
+    match group_id() {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 // DirectoryService may acknowledge a macOS group change before libc's
@@ -136,11 +179,22 @@ pub fn group_id() -> io::Result<u32> {
 fn await_group(present: bool) -> io::Result<Option<u32>> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let found = Group::from_name(GROUP)
-            .map_err(other)?
-            .map(|group| group.gid.as_raw());
-        if found.is_some() == present {
-            return Ok(found);
+        let local = match group_id() {
+            Ok(gid) => Some(gid),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        if !present && local.is_none() {
+            return Ok(None);
+        }
+        if present
+            && local.is_some()
+            && Group::from_name(GROUP)
+                .map_err(other)?
+                .map(|group| group.gid.as_raw())
+                == local
+        {
+            return Ok(local);
         }
         if std::time::Instant::now() >= deadline {
             return Err(io::Error::new(
@@ -153,7 +207,7 @@ fn await_group(present: bool) -> io::Result<Option<u32>> {
 }
 
 fn create_group(layout: &HostLayout) -> io::Result<()> {
-    if Group::from_name(GROUP).map_err(other)?.is_some() {
+    if group_exists()? || Group::from_name(GROUP).map_err(other)?.is_some() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             "service group already exists",
@@ -209,6 +263,7 @@ pub(super) fn prepare_install(layout: &HostLayout) -> io::Result<()> {
         || install.try_exists()?
         || socket.try_exists()?
         || Path::new(UNIT).try_exists()?
+        || group_exists()?
         || Group::from_name(GROUP).map_err(other)?.is_some()
     {
         return Err(io::Error::new(
@@ -329,7 +384,7 @@ pub(super) fn remove(layout: &HostLayout) -> io::Result<()> {
     {
         invoke(
             "/usr/sbin/dseditgroup",
-            &["-o", "delete", "-n", "/Local/Default", GROUP],
+            &["-o", "delete", "-q", "-n", "/Local/Default", GROUP],
         )?;
         let _ = await_group(false)?;
     }

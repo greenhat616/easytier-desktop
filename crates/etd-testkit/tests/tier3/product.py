@@ -177,14 +177,15 @@ def recovery():
             assert_exited(generation_processes)
             generation_processes.clear()
             assert not old_dir.exists(), f"old generation directory remains: {old_dir}"
-            # A replacement host has a different pid. Compare generation
-            # effects against the same prelaunch baseline at the new host pid.
+            # Verify the old host identity exited even if its PID was reused.
+            # Compare the next generation against the replacement host.
             if image == service.host:
                 prior = [k for k,v in baseline.rows.items()
                          if k[0] == "process" and installed_image(v) == service.host]
                 current = [k for k,v in after.rows.items()
                            if k[0] == "process" and installed_image(v) == service.host]
-                assert len(prior) == len(current) == 1 and prior != current
+                assert len(prior) == len(current) == 1
+                assert_exited({(old_pid, baseline.rows[prior[0]][1])})
                 del baseline.rows[prior[0]]
                 baseline.rows[current[0]] = after.rows[current[0]]
                 assert int(prior[0][1]) == old_pid

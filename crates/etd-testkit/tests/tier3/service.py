@@ -35,6 +35,33 @@ def eventually(description, read, accept, timeout=75):
         time.sleep(0.4)
 
 
+def empty_pf_namespace(before, after):
+    anchor = "com.apple/easytier-desk"
+    key = ("firewall", "pf/anchor/" + anchor)
+    if key not in before.rows and key in after.rows:
+        children = output("/sbin/pfctl", "-a", anchor, "-s", "Anchors").split()
+        policy = after.rows[key]
+        references = []
+        for (kind, path), ruleset in after.rows.items():
+            if kind != "firewall" or not path.startswith("pf/anchor/"):
+                continue
+            parent = path.removeprefix("pf/anchor/")
+            for line in ruleset["rules"] + ruleset["nat"]:
+                for target in re.findall(r'\banchor\s+"([^"]+)"', line):
+                    if anchor in (target.strip("/"), (parent + "/" + target).strip("/")):
+                        references.append(parent)
+        same_state = all(before.rows["firewall", k] == after.rows["firewall", k]
+                         for k in ("pf/status", "pf/references"))
+        print(f"post-uninstall PF {anchor}: rules={len(policy['rules'])}, "
+              f"nat={len(policy['nat'])}, tables={len(policy['tables'])}, "
+              f"children={len(children)}, explicit references={len(references)}, "
+              f"original status and enable references restored={same_state}", flush=True)
+        if (policy == {"rules": [], "nat": [], "tables": {}} and not children
+                and not references and same_state):
+            return {key}  # PF can retain an empty namespace (ruling msg#892).
+    return set()
+
+
 class Service:
     def __init__(self):
         require_runner()
@@ -180,6 +207,8 @@ class Service:
             after = self.inventory()
             delta = before.delta(after) - managed_service_changes(before, after)
             delta -= runner_noise(before, after) | tun_created(before, after)
+            if sys.platform == "darwin":
+                delta -= empty_pf_namespace(before, after)
             for name in self.retained_drivers:
                 key = ("service", name)
                 if key not in before.rows and after.rows.get(key) == self.retained_drivers[name]:

@@ -87,6 +87,12 @@ pub enum FenceError {
     Probe(String),
     #[error("operating system error {code}: {message}")]
     Os { code: i64, message: String },
+    /// The query succeeded and positively shows that this generation's
+    /// fence is absent or disabled (rule, filter, table or chain missing;
+    /// the packet filter turned off). A query that failed or timed out is
+    /// `Probe` / `Os`, never this.
+    #[error("fence missing: {0}")]
+    Missing(String),
 }
 
 #[async_trait]

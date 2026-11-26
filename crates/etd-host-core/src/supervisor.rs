@@ -25,7 +25,12 @@
 //!   an addressed interface or the expected listener) and, on a fenced
 //!   host, a verified fence; the management session is opened afterwards;
 //! - a cut (stop not persisted) kills the kernel and reclaims nothing until
-//!   a desired state is committed.
+//!   a desired state is committed;
+//! - the Windows program firewall rules a kernel deletes and recreates on
+//!   every start (core-binary scope) must be absent or exactly as recorded
+//!   before the spawn, else the start is refused; after basic readiness
+//!   their credential is refreshed only from a single confirmed rule, else
+//!   they become conflicts. Such starts run one at a time.
 use crate::api::{ClientPresence, LogStream, Reply};
 use crate::fence_seq::{self, FenceCheck};
 use crate::lifecycle::logs::{self, LineBuffer, LogBook};
@@ -43,14 +48,15 @@ use etd_proc::{
     RestartPolicy,
 };
 use etd_sysfx::{
-    Credential, Effect, EffectKind, EffectState, Epoch, FenceSpec, GenerationOutcome,
-    GenerationReport, LaunchInputs, LedgerError, ManagementGuard, ObjectKey, Observation,
-    Persistence, ScopeFilter, StoredGeneration, Undo,
+    Credential, Effect, EffectId, EffectKind, EffectScope, EffectState, Epoch, FenceSpec,
+    GenerationOutcome, GenerationReport, InterfaceInfo, LaunchInputs, LedgerError, ManagementGuard,
+    ObjectKey, Observation, Persistence, ScopeFilter, StoredGeneration, SystemClass, Undo,
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{OwnedMutexGuard, mpsc, oneshot, watch};
 
 /// Actor -> supervisor.
 pub(crate) enum SupCmd {
@@ -139,6 +145,13 @@ enum LaunchFail {
     Taken(String),
     /// The committed desired state no longer wants this generation.
     Superseded(String),
+    /// Starting would let the kernel replace a system object that is not
+    /// ours (a program firewall rule we did not record): no start until a
+    /// RetryStart.
+    Refused(String),
+    /// A cut arrived before the spawn: nothing runs; the generation is
+    /// reclaimed once a desired state is committed.
+    Cut(Reply<()>),
 }
 
 struct Live {
@@ -152,6 +165,14 @@ struct Live {
     start_deadline: Instant,
     fence: Option<FenceSpec>,
     fence_ok: bool,
+    /// Next re-verification of a verified fence while the kernel runs.
+    fence_due: Instant,
+    /// Re-verifications in a row that found the fence definitely lost.
+    fence_lost: u32,
+    /// Re-verifications in a row that proved nothing either way.
+    fence_unverifiable: u32,
+    /// The re-verification under way (a background task).
+    fence_task: Option<FenceTask>,
     basic: bool,
     session: Option<Arc<dyn CoreSession>>,
     attach_after: Instant,
@@ -159,11 +180,55 @@ struct Live {
     cursor: Option<CoreEventCursor>,
     /// Kernel records still `Planned` (enumerated until they appear).
     pending: Vec<Effect>,
+    /// Program firewall rule records (core-binary scope) this start may
+    /// replace, as last recorded: left untouched while the kernel starts,
+    /// settled after basic readiness ([`Supervisor::settle_rules`]).
+    rules: Vec<Effect>,
+    /// `Ctx::program_rules`, held until every rule is settled or
+    /// `rules_deadline` passes.
+    rule_gate: Option<OwnedMutexGuard<()>>,
+    /// Next settling pass of `rules` (after basic readiness).
+    rules_due: Instant,
+    /// Settling gives up here (basic readiness + `start_timeout`), keeping
+    /// the records as they were.
+    rules_deadline: Option<Instant>,
+    /// Rules given up at `rules_deadline`: read back once the kernel is
+    /// dead ([`Supervisor::post_mortem_rules`]).
+    rules_unsettled: Vec<Effect>,
+    /// When several rules of a record's name were first seen in a row of
+    /// snapshots; a second sighting `reclaim_retry` later makes it foreign.
+    rules_several: HashMap<EffectId, Instant>,
     next_tick: Instant,
     /// Partial output lines (a secret may span chunks).
     stdout: LineBuffer,
     stderr: LineBuffer,
 }
+
+/// Program rules to read back after a kernel's death.
+struct PostMortem {
+    epoch: Epoch,
+    binary: PathBuf,
+    rules: Vec<Effect>,
+}
+
+/// A fence re-verification running off the supervisor's task; aborted with
+/// the generation it was started for. Aborting stops the task at its next
+/// await point only: a command an adapter already runs in `spawn_blocking`
+/// (pfctl, lsof, a WFP enumeration) runs to completion, and its result is
+/// dropped with the receiver.
+struct FenceTask {
+    rx: oneshot::Receiver<fence_seq::Recheck>,
+    abort: tokio::task::AbortHandle,
+}
+
+impl Drop for FenceTask {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
+/// Unverifiable fence re-checks in a row before an administrator is told.
+const FENCE_UNVERIFIABLE_NOTICE_AFTER: u32 = 5;
 
 enum Phase {
     Idle,
@@ -189,6 +254,9 @@ enum Input {
     Proc(Option<ProcessEvent>),
     Tick,
     Presence,
+    /// A fence re-verification finished (`None`: its task ended without a
+    /// result).
+    Fence(Option<fence_seq::Recheck>),
 }
 
 #[derive(PartialEq, Eq)]
@@ -205,6 +273,15 @@ pub(crate) struct Supervisor {
     cmds: mpsc::UnboundedReceiver<SupCmd>,
     cmds_closed: bool,
     deferred: VecDeque<SupCmd>,
+    /// Program rule records found with several rules of their name before
+    /// a spawn, and since when (two snapshots `reclaim_retry` apart refuse
+    /// the start).
+    rules_several: HashMap<EffectId, Instant>,
+    /// Program rule records a dead kernel may have replaced without them
+    /// being read back (gone before readiness, or given up at the
+    /// deadline): read back once its generation's process record is
+    /// closed (ruling topic#40 msg#1199 A).
+    post_mortem: Option<PostMortem>,
     reports: mpsc::UnboundedSender<Report>,
     presence: watch::Receiver<ClientPresence>,
     presence_closed: bool,
@@ -273,10 +350,100 @@ fn is_host_kind(kind: EffectKind) -> bool {
     matches!(kind, EffectKind::Process | EffectKind::RuntimeDir) || is_fence_kind(kind)
 }
 
+/// One of the Windows program firewall rules named after the kernel binary
+/// (core-binary scope, shared by every instance launched from it). Upstream
+/// deletes and recreates them on every start (easytier-core c97f36b
+/// `arch/windows.rs` 230-232), so the recorded rule GUID goes stale with
+/// each start: they are checked before the spawn and read back after basic
+/// readiness instead of being read back once (ruling topic#36 msg#931).
+fn is_program_rule(e: &Effect) -> bool {
+    e.kind == EffectKind::WinProgramFirewallRule
+        && matches!(e.scope, EffectScope::CoreBinary { .. })
+}
+
+/// The credential a record holds as ours: only an applied record has one
+/// (a candidate or conflict keeps what it saw, which is not ours).
+fn recorded_credential(e: &Effect) -> Option<&Credential> {
+    (e.state == EffectState::Applied)
+        .then(|| e.observation.as_ref().and_then(|o| o.credential.as_ref()))
+        .flatten()
+}
+
+/// What is found under a program firewall rule's name, from one observer
+/// call and one independent enumeration that agree (ruling topic#40
+/// msg#1150 items 2-3).
+enum RuleRead {
+    /// No rule with that name in either.
+    Absent,
+    /// Exactly one rule with that name, confirmed by the observer as the
+    /// one for the kernel binary it names, with the same identity in the
+    /// enumeration.
+    One(Observation),
+    /// Several rules with that name in this snapshot (foreign only when a
+    /// second snapshot `reclaim_retry` later agrees).
+    Several(usize),
+    /// Definitely not the kernel's: the observer found the single rule of
+    /// that name and reports no identity of ours for it.
+    Unconfirmed(String),
+    /// Could not tell (an observer error, or the two views disagree):
+    /// never taken as absent, ours or foreign.
+    Unknown(String),
+}
+
+/// Two rule keys name the same rule (Windows compares names and groups
+/// without case).
+fn same_rule_key(a: &ObjectKey, b: &ObjectKey) -> bool {
+    let same = |x: &str, y: &str| x.eq_ignore_ascii_case(y);
+    match (a, b) {
+        (
+            ObjectKey::Rule {
+                name: n1,
+                group: g1,
+            },
+            ObjectKey::Rule {
+                name: n2,
+                group: g2,
+            },
+        ) => {
+            same(n1, n2)
+                && match (g1, g2) {
+                    (Some(g1), Some(g2)) => same(g1, g2),
+                    (None, None) => true,
+                    _ => false,
+                }
+        }
+        _ => a == b,
+    }
+}
+
+/// Whether a program rule's key names `binary` (upstream: `EasyTier
+/// <current_exe without \\?\> (<direction>)`), a kernel binary inside the
+/// protected core store `store`.
+fn names_store_binary(key: &ObjectKey, binary: &Path, store: &Path) -> bool {
+    let plain = |p: &str| p.replace(r"\\?\", "").to_lowercase();
+    let ObjectKey::Rule { name, .. } = key else {
+        return false;
+    };
+    let Some(path) = name.strip_prefix("EasyTier ").and_then(|rest| {
+        rest.strip_suffix(" (Inbound)")
+            .or_else(|| rest.strip_suffix(" (Outbound)"))
+    }) else {
+        return false;
+    };
+    let binary = plain(&binary.to_string_lossy());
+    let store = plain(&store.to_string_lossy());
+    let store = store.trim_end_matches(['/', '\\']);
+    plain(path) == binary
+        && binary
+            .strip_prefix(store)
+            .is_some_and(|rest| rest.starts_with(['/', '\\']))
+}
+
 /// A kernel record whose creation credential the host reads back after the
 /// spawn (lease and expiring records are record-only: never waited on).
 fn needs_read_back(e: &Effect) -> bool {
     !is_host_kind(e.kind)
+        && !is_program_rule(e)
         && e.state == EffectState::Planned
         && !matches!(
             e.persistence,
@@ -294,6 +461,18 @@ fn credential_less(e: &Effect) -> bool {
             e.undo,
             Undo::ReplayUpstreamRecovery | Undo::RestoreIfOurs { .. }
         )
+}
+
+/// A driver service shared by every kernel (wintun, WinDivert; product
+/// scope). Upstream exposes no creation credential for it, so the read-back
+/// records what was found without one: applied here means "absent before
+/// the spawn, loaded while our kernel ran", which keeps the next start from
+/// taking our own driver for a third party's. With no credential the record
+/// never authorizes a deletion: a purge lists it as a candidate (ruling
+/// topic#36 msg#932). One present before the spawn is flagged as a conflict
+/// by [`Supervisor::flag_preexisting`] and never read back.
+fn is_shared_driver(e: &Effect) -> bool {
+    e.kind == EffectKind::Driver && e.scope == EffectScope::Product
 }
 
 impl Supervisor {
@@ -341,6 +520,8 @@ impl Supervisor {
             cmds,
             cmds_closed: false,
             deferred: VecDeque::new(),
+            rules_several: HashMap::new(),
+            post_mortem: None,
             reports,
             presence,
             presence_closed: false,
@@ -496,9 +677,12 @@ impl Supervisor {
             Some(at) => clock.sleep(at.saturating_duration_since(clock.now())),
             None => Box::pin(std::future::pending()),
         };
-        let events = match &mut self.phase {
-            Phase::Live(l) => l.events.as_mut(),
-            _ => None,
+        let (events, fence) = match &mut self.phase {
+            Phase::Live(l) => {
+                let l = &mut **l;
+                (l.events.as_mut(), l.fence_task.as_mut().map(|t| &mut t.rx))
+            }
+            _ => (None, None),
         };
         let has_events = events.is_some();
         let recv_events = async move {
@@ -507,9 +691,17 @@ impl Supervisor {
                 None => std::future::pending().await,
             }
         };
+        let has_fence = fence.is_some();
+        let recv_fence = async move {
+            match fence {
+                Some(rx) => rx.await.ok(),
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             biased;
             ev = recv_events, if has_events => Input::Proc(ev),
+            checked = recv_fence, if has_fence => Input::Fence(checked),
             cmd = self.cmds.recv(), if !self.cmds_closed => match cmd {
                 Some(cmd) => Input::Cmd(cmd),
                 None => {
@@ -534,6 +726,7 @@ impl Supervisor {
             Input::Cmd(cmd) => self.on_cmd(cmd).await,
             Input::Proc(ev) => self.on_process(ev).await,
             Input::Tick => self.on_tick().await,
+            Input::Fence(checked) => self.on_fence(checked).await,
             Input::Presence => {
                 let presence = *self.presence.borrow();
                 let now = self.now();
@@ -848,6 +1041,19 @@ impl Supervisor {
                         self.notice(NoticeLevel::Info, "start.superseded", m);
                         Then::Settle
                     }
+                    LaunchFail::Refused(m) => {
+                        self.notice(NoticeLevel::Error, "start.refused", m.clone());
+                        Then::GiveUp(m)
+                    }
+                    LaunchFail::Cut(reply) => {
+                        // Nothing was spawned; like a cut of a live kernel,
+                        // the generation waits for a committed desired state.
+                        self.status.epoch = epoch.0;
+                        self.phase = Phase::Cut { epoch: Some(epoch) };
+                        self.set_state(InstanceState::CutUnconfirmed, "stop could not be recorded");
+                        let _ = reply.send(Ok(()));
+                        return Flow::Continue;
+                    }
                 };
                 self.enter_reclaim(epoch, then, "launch failed");
                 Flow::Continue
@@ -928,9 +1134,23 @@ impl Supervisor {
             }
         }
 
+        // Program firewall rules the kernel will replace: one such start at
+        // a time (`Ctx::program_rules`), held until they are read back.
+        let has_rules = stored.effects.iter().any(is_program_rule);
+        let rule_gate = if has_rules {
+            Some(self.rule_gate(false).await?)
+        } else {
+            None
+        };
+
         // No side effect for a generation the committed state no longer
         // wants (a stop or a new configuration committed meanwhile).
         self.still_wanted(stored).await?;
+        let rules = if has_rules {
+            self.check_program_rules(epoch).await?
+        } else {
+            Vec::new()
+        };
         let pending = self
             .flag_preexisting(stored)
             .await
@@ -1060,12 +1280,22 @@ impl Supervisor {
             start_deadline: now + self.ctx.config.start_timeout,
             fence,
             fence_ok: false,
+            fence_due: now,
+            fence_lost: 0,
+            fence_unverifiable: 0,
+            fence_task: None,
             basic: false,
             session: None,
             attach_after: now,
             poller: None,
             cursor: None,
             pending,
+            rules,
+            rule_gate,
+            rules_due: now,
+            rules_deadline: None,
+            rules_unsettled: Vec::new(),
+            rules_several: HashMap::new(),
             next_tick: now,
             stdout: LineBuffer::default(),
             stderr: LineBuffer::default(),
@@ -1090,6 +1320,74 @@ impl Supervisor {
         }
     }
 
+    /// A fence re-verification finished (see [`fence_seq::recheck`]).
+    async fn on_fence(&mut self, checked: Option<fence_seq::Recheck>) -> Flow {
+        let Phase::Live(_) = &self.phase else {
+            return Flow::Continue;
+        };
+        let Phase::Live(mut live) = std::mem::replace(&mut self.phase, Phase::Idle) else {
+            unreachable!()
+        };
+        live.fence_task = None;
+        let checked = checked.unwrap_or_else(|| {
+            fence_seq::Recheck::Unverifiable("the re-verification ended without a result".into())
+        });
+        match self.fence_rechecked(&mut live, checked) {
+            Ok(()) => {
+                self.phase = Phase::Live(live);
+                Flow::Continue
+            }
+            Err(kill) => self.kill_live(live, kill).await,
+        }
+    }
+
+    /// Ruling topic#40 msg#1150 item 5: two definite losses in a row kill;
+    /// an unverifiable result is retried and never kills, and a run of them
+    /// is reported once. The next check counts from now (this one's end).
+    fn fence_rechecked(
+        &mut self,
+        live: &mut Live,
+        checked: fence_seq::Recheck,
+    ) -> Result<(), KillFor> {
+        let now = self.now();
+        let config = self.ctx.config.clone();
+        match checked {
+            fence_seq::Recheck::Verified => {
+                live.fence_lost = 0;
+                live.fence_unverifiable = 0;
+                live.fence_due = now + config.fence_recheck;
+            }
+            fence_seq::Recheck::Lost(why) => {
+                live.fence_unverifiable = 0;
+                live.fence_lost += 1;
+                if live.fence_lost >= 2 {
+                    return Err(KillFor::FenceLost(why));
+                }
+                tracing::warn!(instance = %self.id, reason = %why, "fence lost once; verifying again");
+                live.fence_due = now + config.fence_retry;
+            }
+            fence_seq::Recheck::Unverifiable(why) => {
+                live.fence_lost = 0;
+                live.fence_unverifiable += 1;
+                live.fence_due = now + config.fence_unverifiable_retry;
+                tracing::warn!(instance = %self.id, reason = %why, "fence could not be verified; retrying");
+                if live.fence_unverifiable == FENCE_UNVERIFIABLE_NOTICE_AFTER {
+                    self.notice(
+                        NoticeLevel::Warning,
+                        "fence.unverifiable",
+                        format!(
+                            "the management port fence could not be verified \
+                             {FENCE_UNVERIFIABLE_NOTICE_AFTER} times in a row (last: {why}); \
+                             the kernel keeps running and the check is retried"
+                        ),
+                    );
+                }
+            }
+        }
+        live.next_tick = live.next_tick.min(live.fence_due);
+        Ok(())
+    }
+
     /// One readiness / enumeration / fence / poll round. `Err` asks for
     /// the kernel to be killed with that consequence.
     async fn live_tick(&mut self, live: &mut Live) -> Result<(), KillFor> {
@@ -1104,12 +1402,34 @@ impl Supervisor {
             match fence_seq::check(deps.observer.as_ref(), fence.as_ref(), spec, live.pid).await {
                 FenceCheck::Verified => {
                     live.fence_ok = true;
+                    live.fence_due = now + self.ctx.config.fence_recheck;
                     self.status.management = ManagementAccess::Available as i32;
                     self.publish();
                 }
                 FenceCheck::Failed(m) => return Err(KillFor::Fence(m)),
                 FenceCheck::Pending => {}
             }
+        } else if let Some(spec) = &live.fence
+            && live.fence_ok
+            && live.fence_task.is_none()
+            && now >= live.fence_due
+            && let Some(fence) = deps.fence.clone()
+        {
+            // While it runs: a firewall reload or another program can drop
+            // the rule under the kernel. Verified off this task (a verify
+            // can take seconds); the result arrives as `Input::Fence`.
+            let observer = deps.observer.clone();
+            let spec = spec.clone();
+            let pid = live.pid;
+            let (tx, rx) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _ = tx
+                    .send(fence_seq::recheck(observer.as_ref(), fence.as_ref(), &spec, pid).await);
+            });
+            live.fence_task = Some(FenceTask {
+                rx,
+                abort: task.abort_handle(),
+            });
         }
 
         if !live.basic {
@@ -1125,6 +1445,15 @@ impl Supervisor {
             } else if now >= live.start_deadline {
                 return Err(KillFor::NotReady);
             }
+        }
+
+        // Program firewall rules: nothing is recorded while the kernel
+        // starts (a kernel gone before readiness leaves the records as they
+        // were); they are settled once it is basically ready.
+        if live.rules.is_empty() {
+            live.rule_gate = None;
+        } else if live.basic && self.now() >= live.rules_due {
+            self.settle_rules(live).await;
         }
 
         let may_attach = live.basic
@@ -1178,7 +1507,448 @@ impl Supervisor {
             // those records as candidates.
             live.next_tick = live.next_tick.min(now + self.ctx.config.readiness_tick);
         }
+        if live.fence.is_some() && live.fence_ok && live.fence_task.is_none() {
+            live.next_tick = live.next_tick.min(live.fence_due.max(now));
+        }
+        if !live.rules.is_empty() && live.basic {
+            live.next_tick = live.next_tick.min(live.rules_due.max(now));
+        }
         Ok(())
+    }
+
+    /// Read what is found under a program firewall rule's name: the
+    /// observer locates the rule (it fails closed on several, or on one for
+    /// another program, group or direction); an independent enumeration of
+    /// every rule of that name must tell the same story, else the read is
+    /// unknown. An observer error alone is never a verdict.
+    async fn read_program_rule(&mut self, e: &Effect) -> RuleRead {
+        let observer = self.ctx.deps.observer.clone();
+        let ObjectKey::Rule { name, .. } = &e.key else {
+            return RuleRead::Unknown("not a named rule".into());
+        };
+        let observed = observer.observe(e.kind, &e.key).await;
+        let same_name: Vec<_> = match observer.enumerate(SystemClass::FirewallRules).await {
+            Ok(entries) => entries
+                .into_iter()
+                .filter(|s| {
+                    matches!(&s.key, ObjectKey::Rule { name: n, .. } if n.eq_ignore_ascii_case(name))
+                })
+                .collect(),
+            Err(err) => return RuleRead::Unknown(format!("cannot enumerate firewall rules: {err}")),
+        };
+        if same_name.len() >= 2 {
+            return RuleRead::Several(same_name.len());
+        }
+        match (observed, same_name.first()) {
+            (Err(err), _) => RuleRead::Unknown(format!("cannot observe the rule: {err}")),
+            (Ok(None), None) => RuleRead::Absent,
+            (Ok(None), Some(_)) => {
+                RuleRead::Unknown("the rule appeared while it was looked at".into())
+            }
+            (Ok(Some(_)), None) => {
+                RuleRead::Unknown("the rule vanished while it was looked at".into())
+            }
+            (Ok(Some(o)), Some(one)) => match &o.credential {
+                Some(found) if one.identity.as_ref() != Some(found) => {
+                    RuleRead::Unknown("the rule changed while it was looked at".into())
+                }
+                // The observer reports a rule for another program, group
+                // or direction under the key its condition names.
+                Some(_) if !o.key.as_ref().is_some_and(|k| same_rule_key(k, &e.key)) => {
+                    RuleRead::Unconfirmed(format!(
+                        "a rule of that name for another program, group or direction ({})",
+                        o.key.as_ref().map_or("unreadable".into(), view::key_text)
+                    ))
+                }
+                Some(_) => RuleRead::One(o),
+                None => {
+                    RuleRead::Unconfirmed("no identity of the kernel's rule could be read".into())
+                }
+            },
+        }
+    }
+
+    /// Wait for `Ctx::program_rules`. Commands meanwhile are deferred, except
+    /// a cut or a shutdown, which abandon this launch (nothing is spawned).
+    ///
+    /// `yield_to_desire`: a new desired state (Stop, Apply) abandons the
+    /// wait instead of waiting behind it; the command is served next.
+    async fn rule_gate(
+        &mut self,
+        yield_to_desire: bool,
+    ) -> Result<OwnedMutexGuard<()>, LaunchFail> {
+        let gate = self.ctx.program_rules.clone();
+        if let Ok(held) = gate.clone().try_lock_owned() {
+            return Ok(held);
+        }
+        self.status.message =
+            "waiting for another start of this kernel to settle its firewall rules".into();
+        self.publish();
+        let acquire = gate.lock_owned();
+        tokio::pin!(acquire);
+        let abandoned =
+            || LaunchFail::Superseded("generation not started: the host is shutting down".into());
+        loop {
+            tokio::select! {
+                biased;
+                held = &mut acquire => {
+                    self.status.message.clear();
+                    self.publish();
+                    return Ok(held);
+                }
+                cmd = self.cmds.recv(), if !self.cmds_closed => match cmd {
+                    Some(SupCmd::Cut { reply }) => return Err(LaunchFail::Cut(reply)),
+                    Some(SupCmd::Shutdown { reply }) => {
+                        self.shutdown = Some(reply);
+                        self.stopping_for_exit = true;
+                        return Err(abandoned());
+                    }
+                    Some(SupCmd::Query { reply, .. }) => {
+                        let _ = reply.send(Err(unavailable(&self.id)));
+                    }
+                    Some(desire @ SupCmd::Desire { .. }) if yield_to_desire => {
+                        self.deferred.push_back(desire);
+                        self.status.message.clear();
+                        self.publish();
+                        return Err(LaunchFail::Superseded(
+                            "a new desired state arrived while waiting for the gate".into(),
+                        ));
+                    }
+                    Some(other) => self.deferred.push_back(other),
+                    None => {
+                        // The orchestrator is gone: wind down.
+                        self.cmds_closed = true;
+                        self.stopping_for_exit = true;
+                        let (tx, _) = oneshot::channel();
+                        self.shutdown = Some(tx);
+                        return Err(abandoned());
+                    }
+                },
+            }
+        }
+    }
+
+    /// Before the spawn, holding `Ctx::program_rules`: the program firewall
+    /// rules the kernel will delete and recreate must be absent or exactly
+    /// the ones this host recorded (ruling topic#36 msg#931). A definite
+    /// other state (a rule we never recorded, another identity, one the
+    /// observer does not confirm, several of that name in two snapshots
+    /// `reclaim_retry` apart, a record awaiting an administrator) refuses
+    /// the start: the kernel would overwrite a rule that is not ours.
+    /// Anything unknown backs off and tries again. Returns the records to
+    /// settle after readiness.
+    async fn check_program_rules(&mut self, epoch: Epoch) -> Result<Vec<Effect>, LaunchFail> {
+        // Fresh states: another generation of this kernel may have
+        // refreshed the shared records since this one was read.
+        let stored = match self.ctx.deps.ledger.generation(&self.id, epoch).await {
+            Ok(Some(stored)) => stored,
+            Ok(None) => return Err(LaunchFail::Abnormal("reserved generation vanished".into())),
+            Err(e) => return Err(LaunchFail::Abnormal(format!("ledger unavailable: {e}"))),
+        };
+        let mut settle = Vec::new();
+        for e in stored.effects.into_iter().filter(is_program_rule) {
+            let what = format!("{} {}", e.kind, view::key_text(&e.key));
+            if !matches!(e.state, EffectState::Planned | EffectState::Applied) {
+                return Err(LaunchFail::Refused(format!(
+                    "{what} is {:?} in the ledger, awaiting an administrator; the kernel would replace it",
+                    e.state
+                )));
+            }
+            let read = self.read_program_rule(&e).await;
+            let several_since = match read {
+                RuleRead::Several(_) => self.rules_several.get(&e.id).copied(),
+                _ => {
+                    self.rules_several.remove(&e.id);
+                    None
+                }
+            };
+            match read {
+                RuleRead::Absent => settle.push(e),
+                RuleRead::One(o) if o.credential.as_ref() == recorded_credential(&e) => {
+                    settle.push(e);
+                }
+                RuleRead::One(_) => {
+                    return Err(LaunchFail::Refused(format!(
+                        "{what} exists but is not the rule this host recorded; the kernel would replace it"
+                    )));
+                }
+                RuleRead::Several(n) => {
+                    let now = self.now();
+                    match several_since {
+                        Some(since)
+                            if now.saturating_duration_since(since)
+                                >= self.ctx.config.reclaim_retry =>
+                        {
+                            self.rules_several.remove(&e.id);
+                            return Err(LaunchFail::Refused(format!(
+                                "{n} rules with the name of {what} exist; the kernel would replace them"
+                            )));
+                        }
+                        Some(_) => {}
+                        None => {
+                            self.rules_several.insert(e.id.clone(), now);
+                        }
+                    }
+                    return Err(LaunchFail::Abnormal(format!(
+                        "{n} rules with the name of {what} seen; looking again before deciding"
+                    )));
+                }
+                RuleRead::Unconfirmed(m) => {
+                    return Err(LaunchFail::Refused(format!(
+                        "{what} exists and is not confirmed as this kernel's ({m}); the kernel would replace it"
+                    )));
+                }
+                // An unknown baseline is never taken as absent: no start.
+                RuleRead::Unknown(m) => {
+                    return Err(LaunchFail::Abnormal(format!(
+                        "cannot check {what} before the start: {m}"
+                    )));
+                }
+            }
+        }
+        Ok(settle)
+    }
+
+    /// After basic readiness, holding `Ctx::program_rules` (rulings topic#40
+    /// msg#967, msg#1150 items 1-3): a record takes the found credential
+    /// only when exactly one rule of that name exists and the observer
+    /// confirms it as the kernel binary's. Definitely foreign (several of
+    /// that name in two snapshots `reclaim_retry` apart, or one not
+    /// confirmed) is a conflict, never deleted. Absent: nothing to claim,
+    /// the record stays as it was. Unknown, or a ledger write that failed:
+    /// tried again every `reclaim_retry`, gate held, until
+    /// `rules_deadline`; then the records stay as they were and the gate
+    /// is released.
+    async fn settle_rules(&mut self, live: &mut Live) {
+        let now = self.now();
+        let mut left = Vec::new();
+        for mut e in std::mem::take(&mut live.rules) {
+            let read = self.read_program_rule(&e).await;
+            let several_since = match read {
+                RuleRead::Several(_) => live.rules_several.get(&e.id).copied(),
+                _ => {
+                    live.rules_several.remove(&e.id);
+                    None
+                }
+            };
+            let settled = match read {
+                RuleRead::One(o) => {
+                    (e.state == EffectState::Applied
+                        && recorded_credential(&e) == o.credential.as_ref())
+                        || self.refresh_rule(&mut e, o).await
+                }
+                RuleRead::Absent => {
+                    self.notice(
+                        NoticeLevel::Info,
+                        "program_rule.absent",
+                        format!(
+                            "{} {} is absent after the kernel started; its record is left as it was",
+                            e.kind,
+                            view::key_text(&e.key)
+                        ),
+                    );
+                    true
+                }
+                RuleRead::Several(n) => match several_since {
+                    Some(since)
+                        if now.saturating_duration_since(since)
+                            >= self.ctx.config.reclaim_retry =>
+                    {
+                        live.rules_several.remove(&e.id);
+                        self.conflict_rule(
+                            &mut e,
+                            format!("{n} rules with this name after the kernel started"),
+                        )
+                        .await
+                    }
+                    Some(_) => false,
+                    None => {
+                        live.rules_several.insert(e.id.clone(), now);
+                        false
+                    }
+                },
+                RuleRead::Unconfirmed(m) => {
+                    self.conflict_rule(
+                        &mut e,
+                        format!("not confirmed as the kernel's rule after it started: {m}"),
+                    )
+                    .await
+                }
+                RuleRead::Unknown(m) => {
+                    tracing::debug!(instance = %self.id, error = %m, "program rule not read back yet");
+                    false
+                }
+            };
+            if !settled {
+                left.push(e);
+            }
+        }
+        let deadline = *live
+            .rules_deadline
+            .get_or_insert(now + self.ctx.config.start_timeout);
+        if !left.is_empty() && now >= deadline {
+            let names: Vec<_> = left.iter().map(|e| view::key_text(&e.key)).collect();
+            self.notice(
+                NoticeLevel::Warning,
+                "program_rule.unsettled",
+                format!(
+                    "program firewall rules not read back in time, records left as they were \
+                     until the kernel is gone: {}",
+                    names.join(", ")
+                ),
+            );
+            live.rules_unsettled.append(&mut left);
+        }
+        live.rules = left;
+        if live.rules.is_empty() {
+            live.rule_gate = None;
+            live.rules_several.clear();
+        }
+        live.rules_due = now + self.ctx.config.reclaim_retry;
+    }
+
+    /// Ruling topic#40 msg#1199 A: once the kernel of the remembered
+    /// generation is verified dead (its process record closed), read its
+    /// program rules again under the gate, from one consistent snapshot,
+    /// and refresh a record only from exactly one rule of that name that
+    /// the observer confirms as the kernel binary's, the key naming that
+    /// binary inside the protected core store. Anything else leaves the
+    /// record as it is (the next start refuses, as before). Runs once.
+    async fn post_mortem_rules(&mut self) {
+        let Some(pm) = self.post_mortem.take() else {
+            return;
+        };
+        let deps = self.ctx.deps.clone();
+        let dead = match deps.ledger.generation(&self.id, pm.epoch).await {
+            Ok(Some(stored)) => stored
+                .effects
+                .iter()
+                .filter(|e| e.kind == EffectKind::Process)
+                .all(|e| e.state.is_closed()),
+            _ => false,
+        };
+        if !dead {
+            // Not yet verified dead: try again after the next reclaim pass.
+            self.post_mortem = Some(pm);
+            return;
+        }
+        // A Stop or Apply meanwhile abandons this read-back (ruling topic#40
+        // msg#1237): the next start judges the rules as before.
+        let _gate = match self.rule_gate(true).await {
+            Ok(gate) => gate,
+            // Served first after this pass, ahead of anything deferred
+            // while waiting (it stops everything anyway); the read-back is
+            // dropped (the next start decides as before).
+            Err(LaunchFail::Cut(reply)) => {
+                self.deferred.push_front(SupCmd::Cut { reply });
+                return;
+            }
+            Err(_) => return,
+        };
+        let current = match deps.ledger.generation(&self.id, pm.epoch).await {
+            Ok(Some(stored)) => stored.effects,
+            _ => return,
+        };
+        let store = deps.dirs.core_store_dir.clone();
+        for e in pm.rules {
+            let Some(mut e) = current.iter().find(|c| c.id == e.id).cloned() else {
+                continue;
+            };
+            if !matches!(e.state, EffectState::Planned | EffectState::Applied)
+                || !names_store_binary(&e.key, &pm.binary, &store)
+            {
+                continue;
+            }
+            match self.read_program_rule(&e).await {
+                RuleRead::One(o) if recorded_credential(&e) != o.credential.as_ref() => {
+                    if self.refresh_rule(&mut e, o).await {
+                        tracing::info!(
+                            instance = %self.id,
+                            rule = %view::key_text(&e.key),
+                            "program rule read back after the kernel's death"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Record `o` as the rule's credential (planned or stale before).
+    /// `true` once nothing is left to do for this record.
+    async fn refresh_rule(&mut self, e: &mut Effect, o: Observation) -> bool {
+        match self
+            .ctx
+            .deps
+            .ledger
+            .transition(&e.id, EffectState::Applied, Some(o.clone()))
+            .await
+        {
+            Ok(()) => {
+                e.state = EffectState::Applied;
+                e.observation = Some(o);
+                true
+            }
+            // Moved on meanwhile (e.g. settled as a conflict): not ours to
+            // overwrite.
+            Err(LedgerError::InvalidTransition { from, .. }) => {
+                tracing::warn!(instance = %self.id, ?from, "program rule record moved on; not refreshed");
+                true
+            }
+            Err(err) => {
+                tracing::warn!(instance = %self.id, error = %err, "program rule not refreshed");
+                false
+            }
+        }
+    }
+
+    /// The record's rule cannot be claimed: a conflict for an
+    /// administrator, keeping the credential we recorded (if any) as the
+    /// expected one. `true` once nothing is left to do for this record.
+    async fn conflict_rule(&mut self, e: &mut Effect, reason: String) -> bool {
+        let ledger = self.ctx.deps.ledger.clone();
+        if e.state != EffectState::Reclaiming {
+            match ledger
+                .transition(&e.id, EffectState::Reclaiming, None)
+                .await
+            {
+                Ok(()) => e.state = EffectState::Reclaiming,
+                Err(LedgerError::InvalidTransition { .. }) => return true,
+                Err(err) => {
+                    tracing::warn!(instance = %self.id, error = %err, "program rule conflict not recorded");
+                    return false;
+                }
+            }
+        }
+        let observation = Observation {
+            credential: e.observation.as_ref().and_then(|o| o.credential.clone()),
+            key: Some(e.key.clone()),
+            observed_at: self.ctx.deps.clock.wall_now(),
+            detail: Some(reason.clone()),
+        };
+        match ledger
+            .transition(&e.id, EffectState::Conflict, Some(observation))
+            .await
+        {
+            Ok(()) => {
+                e.state = EffectState::Conflict;
+                self.notice(
+                    NoticeLevel::Warning,
+                    "program_rule.conflict",
+                    format!(
+                        "{} {}: {reason}; left for an administrator",
+                        e.kind,
+                        view::key_text(&e.key)
+                    ),
+                );
+                true
+            }
+            Err(LedgerError::InvalidTransition { .. }) => true,
+            Err(err) => {
+                tracing::warn!(instance = %self.id, error = %err, "program rule conflict not recorded");
+                false
+            }
+        }
     }
 
     /// Record the creation credential of every kernel object that has
@@ -1196,16 +1966,16 @@ impl Supervisor {
                 ObjectKey::Interface { name: None, .. } | ObjectKey::RoutesVia { interface: None }
             )
         });
-        let mut assigned: Option<String> = None;
+        let mut assigned: Option<InterfaceInfo> = None;
         if unnamed && let Ok(found) = deps.observer.interfaces_owned_by(live.pid).await {
-            assigned = found.into_iter().next().map(|i| i.name);
+            assigned = found.into_iter().next();
         }
         let mut still = Vec::new();
         for e in std::mem::take(&mut live.pending) {
             let obs = match (&e.key, &assigned) {
-                (ObjectKey::Interface { name: None, guid }, Some(name)) => {
+                (ObjectKey::Interface { name: None, guid }, Some(info)) => {
                     let key = ObjectKey::Interface {
-                        name: Some(name.clone()),
+                        name: Some(info.name.clone()),
                         guid: guid.clone(),
                     };
                     deps.observer
@@ -1218,12 +1988,15 @@ impl Supervisor {
                             o
                         })
                 }
-                (ObjectKey::RoutesVia { interface: None }, Some(name)) => {
+                (ObjectKey::RoutesVia { interface: None }, Some(info)) => {
                     let key = ObjectKey::RoutesVia {
-                        interface: Some(name.clone()),
+                        interface: Some(info.name.clone()),
                     };
+                    // The interface's credential from the same lookup, so
+                    // the reclaimer can tell whether a later interface of
+                    // that name (index reused) is still this one.
                     Some(Observation {
-                        credential: None,
+                        credential: Some(info.credential.clone()),
                         key: Some(key),
                         observed_at: deps.clock.wall_now(),
                         detail: None,
@@ -1236,8 +2009,11 @@ impl Supervisor {
             match obs {
                 // Applied means "we hold its creation credential": without
                 // one the record keeps waiting (a crash meanwhile leaves it a
-                // candidate, never deletable by name alone).
-                Some(o) if o.credential.is_some() || credential_less(&e) => {
+                // candidate, never deletable by name alone). Shared drivers
+                // have none to wait for.
+                Some(o)
+                    if o.credential.is_some() || credential_less(&e) || is_shared_driver(&e) =>
+                {
                     if let Err(err) = deps
                         .ledger
                         .transition(&e.id, EffectState::Applied, Some(o))
@@ -1623,6 +2399,15 @@ impl Supervisor {
     fn exited(&mut self, mut live: Box<Live>, exit: Exit, then: Option<Then>) {
         // Output still queued behind the exit.
         self.flush_output(&mut live);
+        let mut rules = std::mem::take(&mut live.rules);
+        rules.append(&mut live.rules_unsettled);
+        self.post_mortem = (!rules.is_empty()).then(|| PostMortem {
+            epoch: live.epoch,
+            binary: live.inputs.core.binary.clone(),
+            rules,
+        });
+        // The gate goes with the kernel.
+        live.rule_gate = None;
         let then = match then {
             Some(t) => t,
             None if exit.abnormal() => self.abnormal_then(&exit),
@@ -1656,8 +2441,27 @@ impl Supervisor {
                 };
                 self.abnormal_then(&exit)
             }
+            KillFor::FenceLost(m) => {
+                // Management stops at once; the kernel is killed below.
+                live.session = None;
+                live.poller = None;
+                self.status.management = ManagementAccess::Pending as i32;
+                self.notice(
+                    NoticeLevel::Warning,
+                    "fence.lost",
+                    format!(
+                        "the management port fence no longer holds ({m}); restarting the kernel"
+                    ),
+                );
+                let exit = Exit {
+                    code: None,
+                    signal: None,
+                    cause: ExitCause::Exited,
+                };
+                self.abnormal_then(&exit)
+            }
         };
-        let failed = matches!(why, KillFor::NotReady);
+        let failed = matches!(why, KillFor::NotReady | KillFor::FenceLost(_));
         match Self::terminate(live.handle.as_mut(), None).await {
             // A kernel that never became ready failed on its own account,
             // although the host ended it: report it as abnormal.
@@ -1826,6 +2630,9 @@ impl Supervisor {
         };
         self.report(Report::Reclaimed(report.clone()));
         self.status.open_residues = u32::try_from(report.residues.len()).unwrap_or(u32::MAX);
+        if self.post_mortem.as_ref().is_some_and(|p| p.epoch == epoch) {
+            self.post_mortem_rules().await;
+        }
         match report.outcome {
             GenerationOutcome::Closed => self.closed(epoch, then),
             GenerationOutcome::Quarantined(reason) => {
@@ -2106,8 +2913,12 @@ impl Supervisor {
 
 /// Why a live kernel is killed by the supervisor itself.
 enum KillFor {
+    /// The fence failed its verification at the start: deny-all fallback.
     Fence(String),
     NotReady,
+    /// A verified fence missed two re-verifications in a row while the
+    /// kernel ran: normal restart policy (a new fence is installed).
+    FenceLost(String),
 }
 
 /// The log stream of one instance.

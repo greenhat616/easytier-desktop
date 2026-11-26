@@ -27,8 +27,10 @@ uses the native client stub; it is not the GPUI frontend.
 | Kill host mid-reclaim | Barrier after delegated runtime-directory removal but before ledger closure; restart handles already-absent directory and closes every old record. |
 | Log redaction | Synthetic secret equals a real fake-core stderr line; the native log stream must contain a redacted stderr line and no plaintext. |
 
-The actual product binary cannot launch cores before O1–O3 adapters land;
-repeat the scenarios against that binary in G2. Native TUN, firewall/router/DNS
+These scenarios run against the product's serving code, not the shipped `etd-host`
+binary with real OS adapters; that binary also needs a trusted kernel from a populated
+`cores.lock`. Repeating them against the shipped binary belongs to the planned tier-3
+suite. Native TUN, firewall/router/DNS
 and foreign-object preservation, system power cuts, and actual OS-side kernel
 writes are not simulated as proof of clean native system state in this suite.
 
@@ -41,15 +43,15 @@ writes are not simulated as proof of clean native system state in this suite.
   install a system service. The service host and core must survive past lease
   grace. This case is ignored by the default suite.
 - `cargo nextest run --profile privileged -p etd-core-easytier --test session_real --run-ignored only`
-  is E2's existing ignored native-kernel smoke test; supply `ETD_EASYTIER_CORE`
-  as the absolute path to the bundled release kernel (`cargo xtask
-  fetch-cores --target host`; CI's check job runs it on every OS).
-- HR's already-wired `etd-host --test install_roundtrip` privileged CI test
+  is the ignored native-kernel smoke test of `etd-core-easytier`; supply `ETD_EASYTIER_CORE`
+  as the absolute path to the bundled release kernel (`cargo xtask fetch-cores
+  --target host`); CI's `check` job runs it on every OS.
+- The `etd-host --test install_roundtrip` privileged CI test (`ci.yml`)
   verifies actual installed image/LocalSystem peer, standard versus elevated
   role, durable SetAllowList, and native revocation. The existing
   `etd-ipc --test pipe_acl` Windows second-account test runs with
   `ETD_IPC_CI_ACCOUNTS=1` in Windows CI. The existing
   `etd-ipc --test unix_service` ignored second-account tests require a root
-  runner; use the privileged nextest profile. H2's `service_allow_list_sink`
+  runner; use the privileged nextest profile. `etd-host-core`'s `service_allow_list_sink`
   covers injected ACL-update failures; actual native ACL failure injection is
   not covered by this fixture.

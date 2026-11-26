@@ -367,6 +367,11 @@ def driver_conflict(through_uninstall=False):
         if through_uninstall:
             assert conflicts() == names, "expected the foreign driver conflicts to reach uninstall"
             service.preexisting_drivers = {n: foreign_state.rows["service", n] for n in names}
+            for effect in service.effects():
+                if effect["kind"] == "driver" and effect["state"] == "conflict" and effect["scope"] == "product":
+                    detail = (effect.get("observation") or {}).get("detail")
+                    if detail and json.loads(detail).get("image_path"):
+                        service.recorded_driver_images.add(effect["key"]["name"].lower())
 
 
 def program_rule_conflict():

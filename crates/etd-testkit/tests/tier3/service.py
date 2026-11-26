@@ -62,7 +62,8 @@ def empty_pf_namespace(before, after):
     return set()
 
 
-def assert_driver_notice(stdout, retained, preexisting=False):
+def assert_driver_notice(stdout, retained, *, recorded=None):
+    preexisting = recorded is not None
     prefix = "pre-existing shared driver" if preexisting else "shared driver"
     suffix = "it belongs to other software" if preexisting else "remove it yourself if no other software uses it"
     notices = re.findall(rf"^[ \t]*left in place: {prefix} service (\S+) image (.+?); {suffix}\s*$",
@@ -74,12 +75,16 @@ def assert_driver_notice(stdout, retained, preexisting=False):
         if path.lower().startswith("\\systemroot\\"):
             return root / path[len("\\systemroot\\"):]
         return root / path if not Path(path).is_absolute() else Path(path)
-    for name, image in notices:
+    for name, description in notices:
+        source = "as recorded" if preexisting and name.lower() in recorded else "from SCM, now"
+        label = f" ({source})"
+        assert description.endswith(label), f"expected {source} for {name}: {description}"
+        image = description.removesuffix(label)
         config = retained[name.lower()]
         match = re.search(r"^\s*BINARY_PATH_NAME\s*:\s*(.+)$", config, re.M)
         assert match and not image.lower().startswith("unknown"), f"missing shared driver image for {name}"
         assert driver_path(image).samefile(driver_path(match[1])), f"shared driver report differs from SCM for {name}"
-    print(f"native shared driver notices verified: {sorted(retained)}", flush=True)
+        print(f"native shared driver notice verified: {name} image {image} ({source})", flush=True)
 
 
 class Service:
@@ -104,6 +109,7 @@ class Service:
         self.runtime = self.state / "run"
         self.retained_drivers = {}
         self.preexisting_drivers = {}
+        self.recorded_driver_images = set()
         self.adapter_indices = {}
 
     def verify_bundle(self):
@@ -245,7 +251,7 @@ class Service:
                 if self.retained_drivers:
                     assert_driver_notice(result.stdout, self.retained_drivers)
                 if self.preexisting_drivers:
-                    assert_driver_notice(result.stdout, self.preexisting_drivers, preexisting=True)
+                    assert_driver_notice(result.stdout, self.preexisting_drivers, recorded=self.recorded_driver_images)
             after = self.inventory()
             delta = before.delta(after) - managed_service_changes(before, after)
             delta -= runner_noise(before, after) | tun_created(before, after)

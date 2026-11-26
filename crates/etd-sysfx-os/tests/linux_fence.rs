@@ -32,12 +32,20 @@ async fn installing_host() {
     assert_eq!(std::env::var("ETD_O2_PRIVILEGED").as_deref(), Ok("1"));
     let dir = Path::new(&dir);
     let port = std::env::var("ETD_O2_PORT").unwrap().parse().unwrap();
-    adapter(dir)
-        .fence
-        .unwrap()
-        .install(&spec(port))
-        .await
-        .unwrap();
+    let f = adapter(dir).fence.unwrap();
+    let spec = spec(port);
+    let installed = f.install(&spec).await;
+    let ObjectKey::Fence { container, .. } = f.plan(&spec).key else {
+        panic!()
+    };
+    assert!(
+        Command::new("nft")
+            .args(["-j", "-a", "-n", "list", "table", "inet", &container])
+            .status()
+            .unwrap()
+            .success()
+    );
+    installed.unwrap();
     std::fs::write(dir.join("installed"), "ready").unwrap();
     std::future::pending::<()>().await;
 }
@@ -79,6 +87,28 @@ async fn fence_survives_host_death() {
     }
     let spec4 = spec(v4addr.port());
     let intent = f.plan(&spec4);
+    let ObjectKey::Fence {
+        container: name, ..
+    } = &intent.key
+    else {
+        panic!()
+    };
+    assert!(
+        Command::new("nft")
+            .args(["create", "table", "inet", name])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(f.install(&spec4).await.is_err());
+    assert!(f.remove(&spec4).await.is_err());
+    assert!(
+        Command::new("nft")
+            .args(["delete", "table", "inet", name])
+            .status()
+            .unwrap()
+            .success()
+    );
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", "installing_host", "--nocapture"])
         .env("ETD_O2_HOST_DIR", dir.path())

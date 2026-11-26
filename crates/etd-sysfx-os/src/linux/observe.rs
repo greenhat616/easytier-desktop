@@ -149,6 +149,52 @@ fn dirs(path: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// The host reclaimer accepts an exclusive epoch directory by key. Grant
+/// that authority only under a host-owned root with no writable or linked
+/// instance component. The host composition root supplies the trusted path.
+pub(super) fn runtime_objects(root: &Path) -> io::Result<Vec<FoundObject>> {
+    let owner = nix::unistd::Uid::effective().as_raw();
+    let trusted = |m: &fs::Metadata| m.is_dir() && m.uid() == owner && m.mode() & 0o022 == 0;
+    match fs::symlink_metadata(root) {
+        Ok(m) if trusted(&m) => {}
+        Ok(_) => return Err(other("runtime root is not exclusive")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    }
+    let mut result = Vec::new();
+    for instance in dirs(root)? {
+        if !trusted(&fs::symlink_metadata(&instance)?) {
+            return Err(other("nonexclusive instance directory"));
+        }
+        for path in dirs(&instance)? {
+            let Some(epoch) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if path.file_name().and_then(|n| n.to_str()) != Some(&epoch.to_string()) {
+                continue;
+            }
+            if !trusted(&fs::symlink_metadata(&path)?) {
+                return Err(other("nonexclusive epoch directory"));
+            }
+            let key = ObjectKey::Path { path };
+            let credential = Credential::ExclusiveContainer {
+                container: root.display().to_string(),
+            };
+            result.push(FoundObject {
+                kind: EffectKind::RuntimeDir,
+                observation: observed(&key, credential, None),
+                key,
+                origin: FoundBy::ExclusiveContainer,
+            });
+        }
+    }
+    Ok(result)
+}
+
 fn processes() -> io::Result<Vec<SystemEntry>> {
     let mut entries = Vec::new();
     let boot = boot()?;

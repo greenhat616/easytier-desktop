@@ -181,7 +181,7 @@ impl Sweeper for Linux {
         known: &'a [InstanceId],
     ) -> BoxFuture<'a, Result<Vec<FoundObject>, ReclaimError>> {
         Box::pin(async move {
-            let mut found = Vec::new();
+            let mut found = observe::runtime_objects(&self.run_dir).map_err(uncertain)?;
             for link in network::links().await.map_err(uncertain)? {
                 if !link.name.starts_with(naming::INTERFACE_PREFIX) {
                     continue;

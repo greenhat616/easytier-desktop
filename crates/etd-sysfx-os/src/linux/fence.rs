@@ -78,6 +78,7 @@ impl Table {
 // Read the marker, chain and both generation-specific rule handles in one
 // dump. Mere presence of a table with a product-looking name grants nothing.
 fn inspect(all: &[Value], name: &str) -> io::Result<Option<Table>> {
+    let port = parse_table(name).ok_or_else(|| other("invalid generation table"))?;
     let Some(table) = all
         .iter()
         .map(|e| &e["table"])
@@ -85,7 +86,7 @@ fn inspect(all: &[Value], name: &str) -> io::Result<Option<Table>> {
     else {
         return Ok(None);
     };
-    if table["comment"] != MARK {
+    if table["comment"] != MARK || table["flags"].as_array().is_some_and(|f| !f.is_empty()) {
         return Err(other("nft table ownership marker differs"));
     }
     let handle = table["handle"]
@@ -121,12 +122,33 @@ fn inspect(all: &[Value], name: &str) -> io::Result<Option<Table>> {
                 if rules[slot] != 0 {
                     return Err(other("duplicate nft rule"));
                 }
+                let (protocol, address) = if slot == 0 {
+                    ("ip", "127.0.0.1")
+                } else {
+                    ("ip6", "::1")
+                };
+                let expressions = rows(&item["expr"])?;
+                let [dst, dport, skuid, count, verdict] = expressions.as_slice() else {
+                    return Err(other("unexpected fence expression count"));
+                };
+                let payload = |protocol, field, right: Value| {
+                    serde_json::json!({
+                        "match":{"op":"==","left":{"payload":{"protocol":protocol,"field":field}},"right":right}
+                    })
+                };
+                if *dst != payload(protocol, "daddr", address.into())
+                    || *dport != payload("tcp", "dport", port.into())
+                    || *skuid
+                        != serde_json::json!({"match":{"op":"!=","left":{"meta":{"key":"skuid"}},"right":0}})
+                    || verdict["reject"]["type"] != "tcp reset"
+                {
+                    return Err(other("generation rule differs from the planned fence"));
+                }
                 rules[slot] = item["handle"]
                     .as_u64()
                     .ok_or_else(|| other("missing nft rule handle"))?;
-                packets[slot] = rows(&item["expr"])?
-                    .iter()
-                    .find_map(|e| e["counter"]["packets"].as_u64())
+                packets[slot] = count["counter"]["packets"]
+                    .as_u64()
                     .ok_or_else(|| other("missing nft counter"))?;
             }
             _ => return Err(other("foreign object in fence table")),

@@ -86,6 +86,7 @@ jobs:
           [flags]
           dev_name = "etd-o2-test"
           enable_ipv6 = false
+          enable_encryption = false
           EOF
           chmod 755 "$work"
           for mode in root net_admin none; do
@@ -100,7 +101,7 @@ jobs:
             net_admin) as=(setpriv --reuid=etd_o2_core --regid=etd_o2_core --clear-groups --inh-caps=-all,+net_admin --ambient-caps=-all,+net_admin --bounding-set=-all,+net_admin) ;;
             none) as=(setpriv --reuid=etd_o2_core --regid=etd_o2_core --clear-groups --inh-caps=-all --ambient-caps=-all --bounding-set=-all) ;;
           esac
-          "${as[@]}" ../core -c ../config.toml --rpc-portal 127.0.0.1:15998 --rpc-portal-whitelist 255.255.255.255/32 --file-log-dir . >core.log 2>&1 &
+          "${as[@]}" "$1/core" -c "$1/config.toml" --rpc-portal 127.0.0.1:15998 --rpc-portal-whitelist 255.255.255.255/32 --disable-env-parsing --file-log-dir "$PWD" >core.log 2>&1 &
           core=$!
           trap 'kill "$core" 2>/dev/null || true; wait "$core" || true' EXIT
           ready=false
@@ -110,6 +111,11 @@ jobs:
             sleep .1
           done
           echo "mode=$2 TUN_with_configured_address=$ready"
+          if [[ "$ready" != true ]]; then
+            # This isolated fixture has no peers or credentials. Keep just
+            # startup diagnostics, never a configuration or environment dump.
+            grep -Ei 'error|failed|denied|panic|caused by|invalid|not found|requires|missing|permitted' core.log | grep -Eiv 'secret|password|key|token' | tail -12 || true
+          fi
           if [[ -e /proc/$core/status ]]; then grep -E '^(Uid|CapEff):' "/proc/$core/status"; fi
           case "$2" in root) test "$ready" = true ;; none) test "$ready" = false ;; esac
           EOF

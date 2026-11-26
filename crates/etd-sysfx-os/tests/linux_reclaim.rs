@@ -135,7 +135,9 @@ async fn reclaim_real_link_route_and_dns() {
         interface: name.clone(),
     };
     let dns_kind = EffectKind::LinuxResolvedLink;
-    if std::env::var_os("ETD_O2_NO_RESOLVED").is_some() {
+    let other_resolver = std::env::var_os("ETD_O2_NO_RESOLVED").is_some();
+    let resolv_conf = std::fs::read("/etc/resolv.conf").unwrap();
+    if other_resolver {
         assert!(
             os.observer
                 .observe(dns_kind, &dns_key)
@@ -182,6 +184,10 @@ async fn reclaim_real_link_route_and_dns() {
             Reclaimed::Removed
         );
         assert_eq!(reclaim(dns_kind).probe(&dns).await, Probe::Absent);
+        // Leave new per-link settings live across RTM_DELLINK and check
+        // resolve1 independently, using its global server and domain lists.
+        command("resolvectl", &["dns", &name, "192.0.2.56"]);
+        command("resolvectl", &["domain", &name, "~o2-loss.invalid"]);
         println!(
             "resolve1 readback, preserve changed DNS, conditional restore and per-link revert passed"
         );
@@ -195,6 +201,22 @@ async fn reclaim_real_link_route_and_dns() {
     for family in ["-4", "-6"] {
         assert!(!command("ip", &[family, "route", "show", "table", "all"]).contains(&name));
     }
+    if other_resolver {
+        assert_eq!(std::fs::read("/etc/resolv.conf").unwrap(), resolv_conf);
+    } else {
+        assert!(!command("resolvectl", &["dns"]).contains("192.0.2.56"));
+        assert!(!command("resolvectl", &["domain"]).contains("o2-loss.invalid"));
+        println!("Independent resolved global DNS and domain lists clean after link loss");
+    }
+    command("ip", &["link", "set", foreign, "down"]);
+    command("ip", &["link", "set", foreign, "name", &name]);
+    assert_eq!(
+        rc.reclaim(&tun).await,
+        Err(ReclaimError::CredentialMismatch)
+    );
+    let replacement = os.observer.interface(&key).await.unwrap().unwrap();
+    assert_ne!(Some(replacement.credential), obs.credential);
+    command("ip", &["link", "set", &name, "name", foreign]);
     command("ip", &["link", "del", foreign]);
     println!(
         "Matched ifindex + boot; missing/stale credentials refused; independent ip link/route dumps clean, foreign same-prefix TUN survived"

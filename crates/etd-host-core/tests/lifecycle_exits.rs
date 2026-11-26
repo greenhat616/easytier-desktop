@@ -116,8 +116,14 @@ async fn never_ready_is_killed_at_the_start_timeout() {
     h.wait_serving().await;
     h.apply("a", spec("net"), Desired::Running).await;
     h.wait_state("a", S::Starting).await;
-    h.until("killed and backing off", |h| h.state("a") == S::Backoff)
-        .await;
+    // Backoff can be over by the time it is seen (its end is fixed at the
+    // exit, the reclaim before it takes virtual time on a loaded runner):
+    // wait for it in the history, not as the latest state, or epoch 2 runs
+    // into its own start timeout meanwhile.
+    h.until("killed and backing off", |h| {
+        h.history("a").contains(&S::Backoff)
+    })
+    .await;
     assert_eq!(exits(&mut h), BTreeSet::from([("a".into(), 1, true)]));
     assert!(
         world

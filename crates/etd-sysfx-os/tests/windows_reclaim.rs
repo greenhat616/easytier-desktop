@@ -837,3 +837,104 @@ async fn real_wintun_after_kill() {
         "REAL wintun {name}: credential observed; live removal refused; after hard kill phantom excluded, routes gone, interface and program firewall rules reclaimed"
     );
 }
+
+/// `sc.exe`, never with a console window (memory channel/windows-processes).
+fn sc(args: &[&str]) -> std::process::Output {
+    use std::os::windows::process::CommandExt;
+    Command::new("sc.exe")
+        .args(args)
+        .creation_flags(0x0800_0000)
+        .output()
+        .unwrap()
+}
+
+struct DriverService(String);
+impl Drop for DriverService {
+    fn drop(&mut self) {
+        let _ = sc(&["delete", &self.0]);
+    }
+}
+
+// Shared drivers (topic#40 msg#1179): a driver service registered before
+// the host starts must be seen whatever its start type and whether or not
+// its file exists (WMI Win32_SystemDriver omits a disabled one without a
+// file). Uses a random name; never touches wintun or WinDivert.
+#[tokio::test]
+#[ignore = "registers a disabled kernel driver service on disposable CI"]
+async fn a_disabled_driver_service_without_a_file_is_observed() {
+    assert_eq!(std::env::var("CI").as_deref(), Ok("true"));
+    let dir = tempfile::tempdir().unwrap();
+    let os = adapters(&OsConfig {
+        state_dir: dir.path().into(),
+        run_dir: dir.path().join("run"),
+        core_store_dir: dir.path().join("core"),
+    })
+    .unwrap();
+    let name = format!("etdh1f{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let key = ObjectKey::Service { name: name.clone() };
+    assert_eq!(
+        os.observer.observe(EffectKind::Driver, &key).await.unwrap(),
+        None
+    );
+
+    let missing = dir.path().join(format!("{name}.sys"));
+    assert!(!missing.exists());
+    let created = sc(&[
+        "create",
+        &name,
+        "type=",
+        "kernel",
+        "start=",
+        "disabled",
+        "binPath=",
+        missing.to_str().unwrap(),
+    ]);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stdout)
+    );
+    let fixture = DriverService(name.clone());
+
+    let found = os
+        .observer
+        .observe(EffectKind::Driver, &key)
+        .await
+        .unwrap()
+        .expect("a registered driver service is present");
+    assert_eq!(found.credential, None, "no creation credential upstream");
+    assert_eq!(found.key, Some(key.clone()));
+    let detail: serde_json::Value = serde_json::from_str(found.detail.as_deref().unwrap()).unwrap();
+    println!("observed: {detail}");
+    assert_eq!(detail["name"], name.as_str());
+    assert_eq!(detail["driver"], true);
+    assert_eq!(detail["start_type"], "disabled");
+    assert_eq!(detail["state"], "stopped");
+    assert!(
+        detail["image_path"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .ends_with(&format!("{name}.sys").to_lowercase()),
+        "{detail}"
+    );
+
+    let deleted = sc(&["delete", &name]);
+    assert!(deleted.status.success());
+    std::mem::forget(fixture);
+    let mut gone = None;
+    for _ in 0..50 {
+        match os.observer.observe(EffectKind::Driver, &key).await {
+            Ok(None) => {
+                gone = Some(());
+                break;
+            }
+            // Marked for deletion meanwhile: SCM and the registry may
+            // disagree for a moment, which is an error, never absent.
+            Ok(Some(_)) | Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+    assert!(gone.is_some(), "the deleted service is absent");
+}

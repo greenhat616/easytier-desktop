@@ -23,7 +23,7 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            suite: started
+            suite: recovery
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -54,7 +54,7 @@ jobs:
         id: python
         with:
           python-version: '3.12'
-      - run: python -m pip install psutil==7.0.0 pywin32==311
+      - run: python -m pip install psutil==7.0.0
       - uses: Swatinem/rust-cache@v2.9.3
         with:
           workspaces: |
@@ -77,7 +77,7 @@ jobs:
       # Exercise all eight inventory classes even on a revision whose
       # packaged Windows host cannot install the upstream binary yet (CB).
       - name: Qualify independent Windows inventory
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && matrix.suite == 'recovery'
         env:
           ETD_G2_PYTHON: ${{ steps.python.outputs.python-path }}
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=independent_inventory_detects_native_foreign_objects)' --success-output immediate
@@ -155,7 +155,21 @@ jobs:
           "ETD_G2_BIN=$target/debug" >> $env:GITHUB_ENV
           "ETD_G2_SHA=$digest" >> $env:GITHUB_ENV
           "ETD_G2_PYTHON=$((Get-Command python -CommandType Application | Select-Object -First 1).Source)" >> $env:GITHUB_ENV
-      - name: Observe service configuration over a matched interval
-        env:
-          G2_COMPARISON: ${{ matrix.suite }}
-        run: python crates/etd-testkit/tests/tier3/compare_start.py
+      - name: Compile runner as the build user
+        run: cargo nextest list --locked --profile privileged --run-ignored only -p etd-testkit --test tier3
+      - name: Installed service tests (administrator)
+        if: runner.os == 'Windows' && matrix.suite == 'recovery'
+        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=installed_kernel_and_host_crash_recovery)' --success-output immediate
+      - name: Pre-existing shared drivers (fresh administrator runner)
+        if: matrix.suite == 'preflight'
+        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=preexisting_shared_drivers_are_conflicts)' --success-output immediate
+      - name: Installed service tests (root)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cargo nextest archive --locked -p etd-testkit --test tier3 --archive-file "$RUNNER_TEMP/tier3.tar.zst"
+          sudo env "PATH=$PATH" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}" "RUNNER_TEMP=$RUNNER_TEMP" \
+            "ETD_G2_CI=$ETD_G2_CI" "GITHUB_ACTIONS=$GITHUB_ACTIONS" "RUNNER_ENVIRONMENT=$RUNNER_ENVIRONMENT" \
+            "ETD_G2_PYTHON=$ETD_G2_PYTHON" "ETD_G2_BIN=$ETD_G2_BIN" "ETD_G2_SHA=$ETD_G2_SHA" \
+            "$(command -v cargo-nextest)" nextest run --profile privileged --run-ignored only --archive-file "$RUNNER_TEMP/tier3.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" --no-fail-fast --success-output immediate

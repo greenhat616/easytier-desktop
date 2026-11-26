@@ -2807,7 +2807,11 @@ impl Supervisor {
         }
         let running = self.wants_running();
         if !running {
+            // An explicit stop ends the fence-failure latch too: the next
+            // start installs and verifies a fresh fence (ruling topic#59
+            // msg#1672). Automatic restarts keep it.
             self.gave_up = false;
+            self.fence_failed = false;
         }
         match std::mem::replace(&mut self.phase, Phase::Idle) {
             Phase::Idle => {

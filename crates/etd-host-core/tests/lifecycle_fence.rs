@@ -177,6 +177,34 @@ async fn no_fallback_without_a_verified_deny_all() {
 }
 
 #[tokio::test]
+async fn a_user_stop_clears_the_fence_failure_latch() {
+    let world = World::new();
+    world.driver.set_deny_all_verified(false);
+    world.behave(KernelBehaviour {
+        squatter: Some(4242),
+        ..KernelBehaviour::default()
+    });
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.apply("a", spec("net"), Desired::Running).await;
+    h.wait_state("a", S::GaveUp).await;
+
+    // The impostor is gone. An explicit stop, then start, installs and
+    // verifies a fresh fence instead of asking for deny-all again.
+    world.behave(KernelBehaviour::default());
+    h.set_desired("a", Desired::Stopped).await.unwrap();
+    h.wait_state("a", S::Stopped).await;
+    h.set_desired("a", Desired::Running).await.unwrap();
+    h.wait_state("a", S::ReadyFull).await;
+    assert_eq!(
+        h.status("a").unwrap().management(),
+        ManagementAccess::Available
+    );
+    assert_eq!(world.spawned().len(), 2);
+    assert_eq!(fences(&world), 1);
+}
+
+#[tokio::test]
 async fn fence_stays_while_the_kernel_is_not_verified_dead() {
     let world = World::new();
     let mut h = world.start();

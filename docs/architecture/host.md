@@ -190,7 +190,9 @@ kernel. For each instance a privileged host therefore:
    adapter profile states that this configuration was verified for that kernel
    version; the instance then has lifecycle, logs and reclaim only. Otherwise the
    privileged instance does not start. No current profile marks deny-all as verified,
-   so today an unverifiable fence means no privileged instance.
+   so today an unverifiable fence means no privileged instance. Automatic restarts keep
+   this verdict; an explicit stop, then start, or `etd-ctl start --retry`, tries a fresh
+   fence.
 5. **Removes the fence** only after the kernel is confirmed dead.
 
 A user host's kernel runs as the user, gains nothing over the user's own rights, and is

@@ -17,8 +17,19 @@ use std::{
 struct Sink {
     entries: Mutex<Vec<AllowEntry>>,
     fail: AtomicBool,
+    reject: AtomicBool,
 }
 impl AllowListSink for Sink {
+    fn validate(&self, _: &[AllowEntry]) -> io::Result<()> {
+        if self.reject.load(Ordering::SeqCst) {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid policy",
+            ))
+        } else {
+            Ok(())
+        }
+    }
     fn apply(&self, entries: &[AllowEntry]) -> io::Result<()> {
         if self.fail.load(Ordering::SeqCst) {
             return Err(io::Error::other("injected ACL failure"));
@@ -26,6 +37,59 @@ impl AllowListSink for Sink {
         *self.entries.lock().unwrap() = entries.to_vec();
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn deterministic_acl_validation_failure_does_not_commit() {
+    let sink = Arc::new(Sink::default());
+    let f = Fixture::with_allow_list_sink(Some(sink.clone())).await;
+    sink.reject.store(true, Ordering::SeqCst);
+    assert!(
+        f.service
+            .set_allow_list(request(replacement(), Role::Admin))
+            .await
+            .is_err()
+    );
+    assert_eq!(f.ledger.desired().await.unwrap().0, 1);
+    assert!(
+        f.service
+            .snapshot(request(SnapshotRequest {}, Role::Viewer))
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn unavailable_native_adapter_rejects_new_start_before_commit() {
+    let mut fixture = Fixture::new().await;
+    fixture.service = fixture
+        .service
+        .with_start_blocker(Some("native adapters unavailable".into()));
+    let response = fixture
+        .service
+        .apply(request(
+            ApplyRequest {
+                header: Some(MutationHeader {
+                    request_id: "blocked-apply".into(),
+                    expected_revision: 1,
+                }),
+                instance_id: INSTANCE.into(),
+                spec: Some(NetworkSpec::default()),
+                desired: Desired::Running as i32,
+            },
+            Role::Admin,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(code(response), ErrorCode::FeatureRejected);
+    assert_eq!(fixture.ledger.desired().await.unwrap().0, 1);
+    assert!(
+        fixture
+            .service
+            .snapshot(request(SnapshotRequest {}, Role::Admin))
+            .await
+            .is_ok()
+    );
 }
 
 fn replacement() -> SetAllowListRequest {

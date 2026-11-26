@@ -36,6 +36,11 @@ pub struct ContractService {
 /// allow-list is synchronous: a successful reply must never precede the ACL
 /// update. An error leaves contract authorization disabled until recovery.
 pub trait AllowListSink: Send + Sync {
+    /// Check deterministic policy errors before committing the mutation.
+    /// OS publication can still fail afterwards and is retried fail-closed.
+    fn validate(&self, _entries: &[AllowEntry]) -> std::io::Result<()> {
+        Ok(())
+    }
     fn apply(&self, entries: &[AllowEntry]) -> std::io::Result<()>;
 }
 
@@ -52,6 +57,7 @@ struct Inner {
     install_key: InstallKey,
     authorizer: Arc<AllowListAuthorizer>,
     allow_list_sink: Arc<dyn AllowListSink>,
+    start_blocker: Option<String>,
     store: Arc<dyn CoreStore>,
     handle: OrchestratorHandle,
     journal: EventJournal,
@@ -138,6 +144,7 @@ impl ContractService {
                 install_key,
                 authorizer,
                 allow_list_sink,
+                start_blocker: None,
                 store,
                 handle,
                 journal,
@@ -146,6 +153,14 @@ impl ContractService {
                 capabilities,
             }),
         }
+    }
+    /// The composition root may expose diagnostics and maintenance while
+    /// refusing new starts if required native effect adapters are absent.
+    pub fn with_start_blocker(mut self, reason: Option<String>) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("configure before cloning the contract service")
+            .start_blocker = reason;
+        self
     }
     /// Called by the composition root when IPC connections or user-host
     /// leases change. Subscribe streams track their own presence.
@@ -397,6 +412,16 @@ impl ContractService {
         m: &Mutation,
         desired: &[DesiredInstance],
     ) -> Result<(Change, Option<Planned>), Status> {
+        if let Some(reason) = &self.inner.start_blocker
+            && matches!(
+                m,
+                Mutation::Apply(..)
+                    | Mutation::Desired(_, Desired::Running)
+                    | Mutation::RetryStart(_)
+            )
+        {
+            return Err(rejection(ErrorCode::FeatureRejected, reason.clone()));
+        }
         let find = |id: &str| desired.iter().find(|v| v.instance_id == id);
         let known = |id: &str| -> Result<InstanceId, Status> {
             let instance = instance_id(id)?;
@@ -518,6 +543,10 @@ impl ContractService {
                 }) {
                     return Err(invalid("Invalid allow-list entry"));
                 }
+                self.inner
+                    .allow_list_sink
+                    .validate(entries)
+                    .map_err(|_| invalid("Invalid listener allow-list policy"))?;
                 (Change::SetAllowList(entries.clone()), None)
             }
             Mutation::Select(version) => {

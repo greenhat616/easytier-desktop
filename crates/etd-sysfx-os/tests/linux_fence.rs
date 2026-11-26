@@ -82,7 +82,8 @@ async fn store_image_under_second_account_allows_removal() {
     assert_eq!(std::env::var("ETD_O2_PRIVILEGED").as_deref(), Ok("1"));
     let dir = tempfile::tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-    let image = dir.path().join("listener-fixture");
+    // A multicall coreutils binary dispatches on its executable basename.
+    let image = dir.path().join("sleep");
     std::fs::copy("/bin/sleep", &image).unwrap();
     let account = nix::unistd::User::from_name("etd_o2_probe")
         .unwrap()

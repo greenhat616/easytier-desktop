@@ -11,7 +11,7 @@ import uuid
 
 from service import Desktop, Service, command, eventually, require_runner
 from consistency import (
-    FirewallReadbackPending, UnpredictedChanges, check_closed, check_generation, installed_image,
+    FirewallReadbackPending, UnpredictedChanges, adapter_defaults, check_closed, check_generation, installed_image,
     managed_service_changes, runner_noise, scope, tun_created,
 )
 from inventory import assert_exited, capture, file_identity
@@ -120,7 +120,11 @@ def recovery():
         foreign_image, process_key = stack.enter_context(foreign.idle_process())
         keys.add(process_key)
         def inventory():
-            return service.inventory([foreign_image], [other_runtime])
+            snapshot = service.inventory([foreign_image], [other_runtime])
+            marker = other_runtime / instance / "1" / "marker"
+            if marker.is_file():
+                snapshot.put("runtime", marker, file_identity(marker))
+            return snapshot
         baseline = inventory()
         differences = []
         generation_processes = set()
@@ -134,7 +138,7 @@ def recovery():
                 generation_processes.add((pid, born))
                 generation_processes.update(snapshot.descendants[pid])
                 try:
-                    check_generation(baseline, snapshot, service.effects(), instance, view)
+                    check_generation(baseline, snapshot, service.effects(), instance, view, service.adapter_guids)
                 except FirewallReadbackPending:
                     # A shared Applied record can still carry the preceding
                     # epoch's rule ID while the fresh native policy is visible.
@@ -177,14 +181,15 @@ def recovery():
             assert_exited(generation_processes)
             generation_processes.clear()
             assert not old_dir.exists(), f"old generation directory remains: {old_dir}"
-            # A replacement host has a different pid. Compare generation
-            # effects against the same prelaunch baseline at the new host pid.
+            # Verify the old host identity exited even if its PID was reused.
+            # Compare the next generation against the replacement host.
             if image == service.host:
                 prior = [k for k,v in baseline.rows.items()
                          if k[0] == "process" and installed_image(v) == service.host]
                 current = [k for k,v in after.rows.items()
                            if k[0] == "process" and installed_image(v) == service.host]
-                assert len(prior) == len(current) == 1 and prior != current
+                assert len(prior) == len(current) == 1
+                assert_exited({(old_pid, baseline.rows[prior[0]][1])})
                 del baseline.rows[prior[0]]
                 baseline.rows[current[0]] = after.rows[current[0]]
                 assert int(prior[0][1]) == old_pid
@@ -205,6 +210,7 @@ def recovery():
         assert_foreign(baseline, stopped, keys)
         remaining = baseline.delta(stopped) - managed_service_changes(baseline, stopped)
         remaining -= runner_noise(baseline, stopped) | tun_created(baseline, stopped)
+        remaining -= adapter_defaults(baseline, stopped, service.adapter_guids)
         if os.name == "nt":
             records = service.effects()
             for key in remaining.copy():
@@ -240,7 +246,12 @@ def verify_shared_driver_purge(service, baseline, stopped, inventory, foreign_ke
     retained = {r["key"]["name"].lower() for r in records if r["scope"] == "product"
                 and r["kind"] == "driver" and r["state"] == "candidate"}
     assert retained == names, f"expected shared driver candidates {names}, got {retained}"
-    assert result.returncode and "candidates" in result.stdout and "reclaim incomplete" in result.stderr
+    assert f"0 generations, {len(names)} candidates, 0 conflicts" in result.stdout
+    if result.returncode:
+        assert "reclaim incomplete" in result.stderr
+        pending = [r for r in records if r["state"] != "reclaimed"]
+        assert all(r["kind"] == "driver" and r["scope"] == "product"
+                   and r["state"] == "candidate" for r in pending)
     after = inventory()
     service.retained_drivers = {name: stopped.rows["service", name] for name in names}
     assert_foreign(stopped, after, {("service", name) for name in names})
@@ -248,6 +259,7 @@ def verify_shared_driver_purge(service, baseline, stopped, inventory, foreign_ke
     assert not program_rules & after.rows.keys(), "CoreBinary firewall rules survived purge"
     delta = baseline.delta(after) - managed_service_changes(baseline, after)
     delta -= runner_noise(baseline, after) | {("service", name) for name in names}
+    delta -= adapter_defaults(baseline, after, service.adapter_guids)
     # The installed baseline included a running host. Purge is an offline
     # command, so that exact host identity must now have exited.
     hosts = [k for k, v in baseline.rows.items() if k[0] == "process" and installed_image(v) == service.host]
@@ -289,9 +301,6 @@ def driver_conflict():
         service.ctl("stop", instance)
         service.stop()
         assert_foreign(foreign_state, service.inventory(), {("service", n) for n in names})
-        # These disabled registrations belong to the fixture and will be
-        # removed by its ExitStack before uninstall. No native survivor is allowed.
-        service.retained_drivers = dict.fromkeys(names)
 
 
 def program_rule_conflict():

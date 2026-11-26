@@ -282,7 +282,7 @@ impl CoreIdentity {
 
 // The launch planner passes an absolute configuration path with -c. Read
 // exactly argc arguments, never interpret environment strings as arguments.
-fn generation_config(pid: i32) -> io::Result<Option<PathBuf>> {
+pub(super) fn generation_config(pid: i32) -> io::Result<Option<PathBuf>> {
     let mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
     let mut size = 0usize;
     // SAFETY: read-only sysctl, first size then a buffer of that size.

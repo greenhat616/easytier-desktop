@@ -55,6 +55,12 @@ pub struct LifecycleConfig {
     /// Session-form host: how long no client may hold a lease before the
     /// host stops its instances and exits.
     pub lease_grace: Duration,
+    /// Once the host winds down (shutdown, lease or handle closed): how long
+    /// it waits for its supervisors to stop their kernels and reclaim. When
+    /// it runs out, the host exits anyway; whatever is still open stays in
+    /// the ledger for the next start's self-check (or the uninstaller's
+    /// purge) to reclaim. Kept well below the uninstaller's 60 s stop wait.
+    pub shutdown_budget: Duration,
 }
 
 impl Default for LifecycleConfig {
@@ -67,6 +73,7 @@ impl Default for LifecycleConfig {
             reclaim_retry: Duration::from_secs(2),
             log_lines: 1000,
             lease_grace: Duration::from_secs(30),
+            shutdown_budget: Duration::from_secs(35),
         }
     }
 }
@@ -209,6 +216,8 @@ impl Orchestrator {
             purge_wait: None,
             purge: None,
             ending: None,
+            ending_since: None,
+            ending_deadline: None,
             shutdown_replies: Vec::new(),
         };
         actor.run().await
@@ -255,6 +264,9 @@ struct Actor {
     /// A PurgeAll ticket waits for every supervisor to end.
     purge: Option<String>,
     ending: Option<Ending>,
+    /// When the wind-down began and when its budget runs out.
+    ending_since: Option<Instant>,
+    ending_deadline: Option<Instant>,
     shutdown_replies: Vec<oneshot::Sender<()>>,
 }
 
@@ -293,18 +305,45 @@ impl Actor {
             let boot = boot::self_check(self.ctx.clone());
             tokio::pin!(boot);
             loop {
+                let clock = self.ctx.deps.clock.clone();
+                let deadline = match self.ending_deadline {
+                    Some(at) => clock.sleep(at.saturating_duration_since(clock.now())),
+                    None => Box::pin(std::future::pending()),
+                };
                 tokio::select! {
                     biased;
-                    out = &mut boot => break out,
+                    out = &mut boot => break Some(out),
                     cmd = self.commands.recv(), if !self.commands_closed => match cmd {
                         Some(cmd) => self.on_command_not_serving(cmd),
-                        None => self.commands_closed = true,
+                        None => {
+                            self.commands_closed = true;
+                            self.mark_ending(Ending::Closed);
+                        }
                     },
+                    // Asked to stop during the self-check: it is not waited
+                    // for past the budget (its records stay open; the next
+                    // start runs it again).
+                    () = deadline => break None,
                 }
             }
         };
+        let Some(outcome) = outcome else {
+            let end = self.ending.unwrap_or(Ending::Closed);
+            tracing::warn!(
+                stage = "shutdown.budget_exceeded",
+                during = "self-check",
+                budget_ms = millis(self.ctx.config.shutdown_budget),
+                "host shutdown: self-check abandoned; open records stay in the ledger"
+            );
+            return self.finish(end).await;
+        };
         self.after_boot(outcome).await;
-        if self.commands_closed && self.ending.is_none() {
+        // A shutdown (or a closed handle) received during the self-check
+        // only marked the ending: the supervisors `after_boot` just started
+        // must be told to stop too, or the host would wait for them forever.
+        if let Some(end) = self.ending {
+            self.begin_ending(end);
+        } else if self.commands_closed {
             self.begin_ending(Ending::Closed);
         }
         loop {
@@ -322,6 +361,7 @@ impl Actor {
             let resweep_sleep = until(self.resweep_due);
             let lease_sleep = until(self.lease_deadline);
             let purge_sleep = until(self.purge_due);
+            let ending_sleep = until(self.ending_deadline);
             tokio::select! {
                 biased;
                 report = self.reports_rx.recv() => {
@@ -358,6 +398,11 @@ impl Actor {
                     self.lease_deadline = None;
                     self.host_log("no client holds a lease: stopping instances and exiting".into());
                     self.begin_ending(Ending::Lease);
+                }
+                () = ending_sleep => {
+                    let end = self.ending.unwrap_or(Ending::Closed);
+                    self.abandon_supervisors();
+                    return self.finish(end).await;
                 }
             }
         }
@@ -534,6 +579,9 @@ impl Actor {
 
     async fn on_report(&mut self, report: Report) {
         let at = self.now_ms();
+        if self.ending.is_some() {
+            self.trace_ending(&report);
+        }
         match report {
             Report::Status(status) => {
                 let id = InstanceId(status.instance_id.clone());
@@ -655,9 +703,7 @@ impl Actor {
             }
             Command::Shutdown { reply } => {
                 self.shutdown_replies.push(reply);
-                if self.ending.is_none() {
-                    self.ending = Some(Ending::Shutdown);
-                }
+                self.mark_ending(Ending::Shutdown);
             }
         }
     }
@@ -764,10 +810,102 @@ impl Actor {
         }
     }
 
-    fn begin_ending(&mut self, end: Ending) {
-        if self.ending.is_none() {
-            self.ending = Some(end);
+    /// Record the first reason to wind down and start its budget.
+    fn mark_ending(&mut self, end: Ending) {
+        if self.ending.is_some() {
+            return;
         }
+        let now = self.ctx.deps.clock.now();
+        self.ending = Some(end);
+        self.ending_since = Some(now);
+        self.ending_deadline = Some(now + self.ctx.config.shutdown_budget);
+        tracing::info!(
+            stage = "shutdown.begin",
+            reason = ?end,
+            instances = self.supervisors.len(),
+            budget_ms = millis(self.ctx.config.shutdown_budget),
+            "host shutdown: stopping instances"
+        );
+    }
+
+    fn ending_elapsed_ms(&self) -> u64 {
+        self.ending_since.map_or(0, |since| {
+            millis(self.ctx.deps.clock.now().saturating_duration_since(since))
+        })
+    }
+
+    /// Progress of the wind-down, per instance, into the host log file: a
+    /// stop must show where its time goes.
+    fn trace_ending(&self, report: &Report) {
+        let elapsed_ms = self.ending_elapsed_ms();
+        match report {
+            Report::Status(status) => tracing::info!(
+                stage = "shutdown.instance_state",
+                instance = %status.instance_id,
+                state = ?status.state(),
+                epoch = status.epoch,
+                open_residues = status.open_residues,
+                message = %status.message,
+                elapsed_ms,
+                "host shutdown: instance state"
+            ),
+            Report::Exited(exited) => tracing::info!(
+                stage = "shutdown.kernel_exited",
+                instance = %exited.instance_id,
+                epoch = exited.epoch,
+                elapsed_ms,
+                "host shutdown: kernel exited"
+            ),
+            Report::Reclaimed(g) => tracing::info!(
+                stage = "shutdown.reclaimed",
+                instance = %g.instance,
+                epoch = g.epoch.0,
+                outcome = ?g.outcome,
+                residues = g.residues.len(),
+                elapsed_ms,
+                "host shutdown: generation reclaim finished"
+            ),
+            Report::Gone(id) => tracing::info!(
+                stage = "shutdown.instance_done",
+                instance = %id,
+                remaining = self.supervisors.len().saturating_sub(1),
+                elapsed_ms,
+                "host shutdown: instance supervisor ended"
+            ),
+            Report::Notice(_) => {}
+        }
+    }
+
+    /// The wind-down budget ran out: stop waiting for the supervisors still
+    /// running. Nothing is closed or deleted here; their open records stay
+    /// in the ledger, and the next start's self-check (or the uninstaller's
+    /// purge) reclaims them. Their tasks end with the host's runtime.
+    fn abandon_supervisors(&mut self) {
+        let pending: Vec<String> = self
+            .supervisors
+            .keys()
+            .map(|id| match self.statuses.get(id) {
+                Some(s) => format!("{id} ({:?}: {})", s.state(), s.message),
+                None => id.to_string(),
+            })
+            .collect();
+        let pending = pending.join(", ");
+        tracing::warn!(
+            stage = "shutdown.budget_exceeded",
+            budget_ms = millis(self.ctx.config.shutdown_budget),
+            elapsed_ms = self.ending_elapsed_ms(),
+            pending = %pending,
+            "host shutdown: budget exhausted; open records stay in the ledger for the next start"
+        );
+        self.host_log(format!(
+            "shutdown budget exhausted; left for the next start: {pending}"
+        ));
+        self.supervisors.clear();
+        self.ending_deadline = None;
+    }
+
+    fn begin_ending(&mut self, end: Ending) {
+        self.mark_ending(end);
         if self.phase != HostPhase::ShuttingDown {
             self.set_phase(HostPhase::ShuttingDown);
         }
@@ -781,6 +919,12 @@ impl Actor {
         if self.phase != HostPhase::ShuttingDown {
             self.set_phase(HostPhase::ShuttingDown);
         }
+        tracing::info!(
+            stage = "shutdown.orchestrator_done",
+            reason = ?end,
+            elapsed_ms = self.ending_elapsed_ms(),
+            "host shutdown: orchestrator finished"
+        );
         for reply in self.shutdown_replies.drain(..) {
             let _ = reply.send(());
         }
@@ -1116,6 +1260,10 @@ impl Actor {
             self.retry_tickets();
         }
     }
+}
+
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn unknown(instance: &InstanceId) -> ErrorDetail {

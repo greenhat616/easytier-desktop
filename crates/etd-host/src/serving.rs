@@ -7,7 +7,7 @@ use etd_contract::{
 use etd_host_core::{
     api::{Command, HostDeps, HostView, orchestrator_channel},
     auth::allow_list::AllowListAuthorizer,
-    lifecycle::Orchestrator,
+    lifecycle::{LifecycleConfig, Orchestrator},
     service::{AllowListSink, ContractService},
     stub::host_service_server::HostServiceServer,
 };
@@ -22,6 +22,7 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context as TaskContext, Poll},
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -29,6 +30,12 @@ use tokio::{
 };
 
 const CAPACITY: usize = 256;
+/// Past the orchestrator's own `shutdown_budget`, how long the listener
+/// still waits for it before abandoning it.
+const SHUTDOWN_BACKSTOP_MARGIN: Duration = Duration::from_secs(5);
+/// How long final replies may take to reach clients once the orchestrator
+/// has ended.
+const SERVER_DRAIN: Duration = Duration::from_secs(3);
 
 pub(crate) struct LayoutLock {
     _guard: HostLock,
@@ -211,12 +218,44 @@ pub(crate) async fn serve_with_deps(
         result = &mut server => { Some(result?.map_err(anyhow::Error::from)) },
         result = shutdown_signal(&mut managed_stop) => { result?; Some(Ok(())) },
     };
+    let started = Instant::now();
     if let Some(outcome) = outcome {
+        tracing::info!(
+            stage = "shutdown.requested",
+            "host shutdown: asking the orchestrator to stop"
+        );
+        // The orchestrator bounds its own wind-down (`shutdown_budget`);
+        // this backstop also covers an actor stuck inside an await, so the
+        // host always exits. Open records stay in the ledger either way.
+        let backstop = LifecycleConfig::default().shutdown_budget + SHUTDOWN_BACKSTOP_MARGIN;
         let (reply, acknowledged) = oneshot::channel();
-        if handle.send(Command::Shutdown { reply }).await.is_ok() {
-            let _ = acknowledged.await;
+        let drained = tokio::time::timeout(backstop, async {
+            if handle.send(Command::Shutdown { reply }).await.is_ok() {
+                let _ = acknowledged.await;
+            }
+            (&mut orchestration).await
+        })
+        .await;
+        match drained {
+            Ok(result) => {
+                let run = result?;
+                tracing::info!(
+                    stage = "shutdown.orchestrator_joined",
+                    outcome = ?run,
+                    elapsed_ms = millis(started.elapsed()),
+                    "host shutdown: orchestrator ended"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    stage = "shutdown.backstop",
+                    backstop_ms = millis(backstop),
+                    "host shutdown: orchestrator did not end in time; abandoning it, open records stay in the ledger"
+                );
+                orchestration.abort();
+                let _ = orchestration.await;
+            }
         }
-        orchestration.await?;
         outcome?;
     }
     let _ = stop_server.send(());
@@ -224,7 +263,7 @@ pub(crate) async fn serve_with_deps(
         // Give the final ReleaseLease/Shutdown reply time to reach the
         // client after the orchestrator exits. Long-lived subscriptions must
         // not pin the listener or singleton lock indefinitely.
-        if tokio::time::timeout(std::time::Duration::from_secs(3), &mut server)
+        if tokio::time::timeout(SERVER_DRAIN, &mut server)
             .await
             .is_err()
         {
@@ -233,7 +272,16 @@ pub(crate) async fn serve_with_deps(
         }
     }
     drop(guard);
+    tracing::info!(
+        stage = "shutdown.done",
+        elapsed_ms = millis(started.elapsed()),
+        "host shutdown: listener closed and lock released"
+    );
     Ok(())
+}
+
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 async fn shutdown_signal(managed: &mut Option<watch::Receiver<bool>>) -> io::Result<()> {

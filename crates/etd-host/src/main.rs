@@ -17,6 +17,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use etd_contract::HostMode;
 use std::process::ExitCode;
 
+/// How long a finished host waits for blocking work still running in its
+/// runtime (a system query past its own deadline) before exiting anyway.
+const RUNTIME_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[derive(Parser)]
 #[command(
     name = "etd-host",
@@ -116,9 +120,12 @@ fn execute(cli: Cli) -> Result<()> {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            runtime
-                .block_on(host::run_until(HostMode::Service, Some(stop)))
-                .map_err(|error| std::io::Error::other(format!("{error:#}")))
+            let result = runtime.block_on(host::run_until(HostMode::Service, Some(stop)));
+            // Dropping a runtime waits for every blocking task without
+            // limit; one stuck in a system call must not keep the service
+            // from reporting STOPPED.
+            runtime.shutdown_timeout(RUNTIME_SHUTDOWN);
+            result.map_err(|error| std::io::Error::other(format!("{error:#}")))
         })
         .context("Windows service dispatcher");
     }
@@ -127,7 +134,11 @@ fn execute(cli: Cli) -> Result<()> {
         .build()?;
     match command {
         Action::Doctor => host::doctor(),
-        Action::Run { mode } => runtime.block_on(host::run(mode.into())),
+        Action::Run { mode } => {
+            let result = runtime.block_on(host::run(mode.into()));
+            runtime.shutdown_timeout(RUNTIME_SHUTDOWN);
+            result
+        }
         Action::Reclaim { mode, all, purge } => {
             runtime.block_on(host::reclaim(mode.into(), all, purge))
         }

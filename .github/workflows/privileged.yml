@@ -47,6 +47,12 @@ jobs:
             suite: clean
           - os: windows-latest
             suite: stop
+          - os: ubuntu-latest
+            suite: takeover
+          - os: macos-latest
+            suite: takeover
+          - os: windows-latest
+            suite: takeover
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -88,6 +94,16 @@ jobs:
           filter = 'test(=installed_kernel_and_host_crash_recovery) | test(=installed_network_uninstall_restores_machine) | test(=service_stop_with_a_running_network_is_bounded)'
           slow-timeout = { period = "120s", terminate-after = 15 }
           '@ | Add-Content -LiteralPath .config/nextest.toml
+      - name: Allow for the takeover generations and native cleanup
+        if: matrix.suite == 'takeover'
+        shell: bash
+        run: |
+          cat >> .config/nextest.toml <<'EOF'
+
+          [[profile.privileged.overrides]]
+          filter = 'test(/^takeover_/)'
+          slow-timeout = { period = "120s", terminate-after = 20 }
+          EOF
       # Qualify the native probes independently of the packaged host.
       - name: Qualify independent Windows inventory
         if: runner.os == 'Windows' && matrix.suite == 'recovery'
@@ -123,13 +139,18 @@ jobs:
       - name: Pre-existing inactive program rule (fresh administrator runner)
         if: matrix.suite == 'program'
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=preexisting_program_rule_blocks_start)' --success-output immediate
+      - name: Management port takeover (administrator)
+        if: runner.os == 'Windows' && matrix.suite == 'takeover'
+        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(/^takeover_/)' --success-output immediate
       - name: Installed service tests (root)
         if: runner.os != 'Windows'
         shell: bash
+        env:
+          ETD_G2_FILTER: ${{ matrix.suite == 'takeover' && 'test(/^takeover_/)' || 'not test(/^takeover_/)' }}
         run: |
           cargo nextest archive --locked -p etd-testkit --test tier3 --archive-file "$RUNNER_TEMP/tier3.tar.zst"
           sudo env "PATH=$PATH" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}" "RUNNER_TEMP=$RUNNER_TEMP" "GITHUB_WORKSPACE=$GITHUB_WORKSPACE" \
             "ETD_G2_CI=$ETD_G2_CI" "GITHUB_ACTIONS=$GITHUB_ACTIONS" "RUNNER_ENVIRONMENT=$RUNNER_ENVIRONMENT" \
             "ETD_G2_PYTHON=$ETD_G2_PYTHON" "ETD_G2_BIN=$ETD_G2_BIN" "ETD_G2_SHA=$ETD_G2_SHA" \
-            "$(command -v cargo-nextest)" nextest run --profile privileged --run-ignored only --archive-file "$RUNNER_TEMP/tier3.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" --no-fail-fast --success-output immediate
+            "$(command -v cargo-nextest)" nextest run --profile privileged --run-ignored only --archive-file "$RUNNER_TEMP/tier3.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" -E "$ETD_G2_FILTER" --no-fail-fast --success-output immediate

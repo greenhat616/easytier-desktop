@@ -259,6 +259,7 @@ def driver_conflict():
         except AssertionError:
             service.report_effects(instance)
             raise
+        print(f"SCM preflight conflicts recorded for {sorted(names)}", flush=True)
         service.ctl("stop", instance)
         service.stop()
         assert_foreign(foreign_state, service.inventory(), {("service", n) for n in names})

@@ -1,8 +1,11 @@
 //! ProcessKit adapter. All backend types remain private to this module.
+#[cfg(windows)]
+use crate::console_host;
 use crate::{identity, parent_death, *};
 use async_trait::async_trait;
 use std::{
     collections::HashMap,
+    ffi::{OsStr, OsString},
     io,
     path::{Path, PathBuf},
     pin::Pin,
@@ -442,13 +445,101 @@ fn unlisted_candidate(
         "PID {pid} ({name}) is missing from the process snapshot: {reason}"
     )))
 }
+/// The children of a process that is about to be, or has just been, killed.
+#[derive(Default)]
+struct Children {
+    /// Possible descendants outside any verified containment.
+    blocking: Vec<u32>,
+    /// The target's own console host (see `console_host`), pinned.
+    #[cfg(windows)]
+    console_hosts: Vec<(u32, identity::Pin)>,
+}
+
+#[cfg(windows)]
+fn start_time_of(token: &str) -> Option<u64> {
+    token.parse().ok()
+}
+
+/// Whether any live process is a child of `parent`; `None` when a candidate
+/// cannot be read.
+#[cfg(windows)]
+fn has_children(snapshot: &sysinfo::System, parent: u32, parent_created: u64) -> Option<bool> {
+    for p in snapshot.processes().values() {
+        if p.parent() != Some(identity::pid(parent))
+            || matches!(p.status(), ProcessStatus::Zombie | ProcessStatus::Dead)
+        {
+            continue;
+        }
+        match read_token(p.pid().as_u32()) {
+            Ok(None) => {}
+            // An older process names an earlier holder of the PID.
+            Ok(Some(token)) => {
+                if start_time_of(&token)? >= parent_created {
+                    return Some(true);
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    Some(false)
+}
+
+/// Pins `pid` and returns the pin if it is the console host of `id`. The caller
+/// holds a pin on `id`. The child's facts are read while it is pinned.
+#[cfg(windows)]
+fn pin_console_host(
+    snapshot: &sysinfo::System,
+    id: &ProcessIdentity,
+    parent_created: u64,
+    pid: u32,
+    token: &str,
+) -> Option<identity::Pin> {
+    let system_image = console_host::system_image().ok()?;
+    let pin = identity::Pin::open(pid, true).ok()?;
+    if read_token(pid).ok()??.as_str() != token {
+        return None;
+    }
+    let created = start_time_of(token);
+    let observed = console_host::Observed {
+        image: pin.image().ok().and_then(|image| image.canonicalize().ok()),
+        parent: identity::snapshot(ProcessesToUpdate::Some(&[identity::pid(pid)]))
+            .ok()?
+            .process(identity::pid(pid))
+            .and_then(|p| p.parent())
+            .map(|parent| parent.as_u32()),
+        created,
+        has_children: created.and_then(|created| has_children(snapshot, pid, created)),
+    };
+    console_host::is_console_host_of(&observed, id.pid, parent_created, &system_image)
+        .then_some(pin)
+}
+
+/// A console host normally exits with its client; this does not wait for that.
+#[cfg(windows)]
+fn end_console_hosts(parent: u32, hosts: &[(u32, identity::Pin)]) {
+    for (pid, pin) in hosts {
+        if pin.gone() {
+            continue;
+        }
+        match pin.stop() {
+            Ok(()) => tracing::info!(parent, pid, "ended the console host of a killed orphan"),
+            Err(error) if pin.gone() => {
+                tracing::debug!(parent, pid, %error, "console host had already exited");
+            }
+            Err(error) => {
+                tracing::warn!(parent, pid, %error, "could not end a killed orphan's console host");
+            }
+        }
+    }
+}
+
 /// A stale Windows PPID is not ancestry: a real child cannot predate
 /// its parent. Unreadable candidate metadata is an uncertainty, not absence.
 fn possible_children(
     snapshot: &sysinfo::System,
     id: &ProcessIdentity,
-) -> Result<Vec<u32>, ProcessError> {
-    let mut children = Vec::new();
+) -> Result<Children, ProcessError> {
+    let mut children = Children::default();
     for p in snapshot.processes().values() {
         if p.parent() != Some(identity::pid(id.pid))
             || matches!(p.status(), ProcessStatus::Zombie | ProcessStatus::Dead)
@@ -471,10 +562,18 @@ fn possible_children(
             if child_time < parent_time {
                 continue;
             }
+            if let Some(pin) = pin_console_host(snapshot, id, parent_time, pid, &token) {
+                children.console_hosts.push((pid, pin));
+                continue;
+            }
+            // It may have exited while it was being examined.
+            if read_token(pid)?.is_none() {
+                continue;
+            }
         }
         #[cfg(not(windows))]
         let _ = token;
-        children.push(pid);
+        children.blocking.push(pid);
     }
     Ok(children)
 }
@@ -524,7 +623,7 @@ fn orphan_recheck(
     domain: Option<OrphanDomain>,
 ) -> Result<KillOutcome, ProcessError> {
     let after = identity::snapshot(ProcessesToUpdate::All)?;
-    if !possible_children(&after, id)?.is_empty() {
+    if !possible_children(&after, id)?.blocking.is_empty() {
         return Ok(KillOutcome::Uncertain);
     }
     #[cfg(unix)]
@@ -635,10 +734,10 @@ fn kill_orphan(
         return Ok(KillOutcome::Uncertain);
     }
     let children = possible_children(&before, id)?;
-    if !children.is_empty() {
+    if !children.blocking.is_empty() {
         tracing::warn!(
             parent = id.pid,
-            ?children,
+            children = ?children.blocking,
             "orphan descendants lack verified containment"
         );
         return Ok(KillOutcome::Uncertain);
@@ -663,7 +762,12 @@ fn kill_orphan(
     }
     for _ in 0..100 {
         if pin.gone() {
-            return orphan_recheck(&before, id, marker, domain);
+            let outcome = orphan_recheck(&before, id, marker, domain)?;
+            #[cfg(windows)]
+            if outcome == KillOutcome::Killed {
+                end_console_hosts(id.pid, &children.console_hosts);
+            }
+            return Ok(outcome);
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -687,7 +791,7 @@ fn kill_orphan(
     let before = identity::snapshot(ProcessesToUpdate::All)?;
     let group = identity::process_group(id.pid)?;
     let own_group = group == i32::try_from(id.pid).map_err(io::Error::other)?;
-    let children = possible_children(&before, id)?;
+    let children = possible_children(&before, id)?.blocking;
     if !children.is_empty() {
         if !own_group {
             return Ok(KillOutcome::Uncertain);
@@ -909,6 +1013,93 @@ async fn rollback_started(
         ))),
     }
 }
+/// Which environment rules apply. Only the host's variant is built outside
+/// tests; the unit tests check both on every host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum EnvPlatform {
+    Unix,
+    Windows,
+}
+
+impl EnvPlatform {
+    #[cfg(windows)]
+    const HOST: Self = Self::Windows;
+    #[cfg(not(windows))]
+    const HOST: Self = Self::Unix;
+}
+
+/// Fixed search path for children on Unix hosts. Upstream easytier-core
+/// shells out to system tools (`ifconfig`, `route`, `ip`) by bare name.
+const UNIX_CHILD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+/// Windows search path, each entry relative to the Windows directory
+/// reported by the OS (`trusted_system_root`).
+const WINDOWS_CHILD_PATH: [&str; 4] = [
+    r"\System32",
+    "",
+    r"\System32\Wbem",
+    r"\System32\WindowsPowerShell\v1.0",
+];
+
+/// Builds the complete child environment. The engine starts every child
+/// from an empty environment and owns a small set of variables: `PATH` (a
+/// fixed trusted search path, never the host's own) and, on Windows,
+/// `SystemRoot`/`windir`. A caller-supplied value for an owned variable is
+/// dropped with a warning rather than rejected: the engine's value is the
+/// one the child must see, so honoring the rest of the command is safe, and
+/// a stray inherited key must not turn into a kernel that cannot start.
+fn compose_env(
+    platform: EnvPlatform,
+    extra: Vec<(OsString, OsString)>,
+    // Windows only: the OS-reported Windows directory.
+    system_root: Option<OsString>,
+) -> Result<Vec<(OsString, OsString)>, String> {
+    let owned: &[&str] = match platform {
+        EnvPlatform::Unix => &["PATH"],
+        EnvPlatform::Windows => &["PATH", "SystemRoot", "windir"],
+    };
+    let is_owned = |key: &OsStr| {
+        let key = key.to_string_lossy();
+        owned.iter().any(|name| match platform {
+            EnvPlatform::Unix => key == *name,
+            EnvPlatform::Windows => key.eq_ignore_ascii_case(name),
+        })
+    };
+    let mut env: Vec<_> = extra
+        .into_iter()
+        .filter(|(key, _)| {
+            let keep = !is_owned(key);
+            if !keep {
+                tracing::warn!(
+                    key = %key.to_string_lossy(),
+                    "ignoring engine-owned variable in launch command environment"
+                );
+            }
+            keep
+        })
+        .collect();
+    match platform {
+        EnvPlatform::Unix => env.push(("PATH".into(), UNIX_CHILD_PATH.into())),
+        EnvPlatform::Windows => {
+            let root = system_root
+                .filter(|root| !root.is_empty())
+                .ok_or_else(|| "Windows system directory is unavailable".to_owned())?;
+            let mut path = OsString::new();
+            for (index, suffix) in WINDOWS_CHILD_PATH.iter().enumerate() {
+                if index > 0 {
+                    path.push(";");
+                }
+                path.push(&root);
+                path.push(suffix);
+            }
+            env.push(("SystemRoot".into(), root.clone()));
+            env.push(("windir".into(), root));
+            env.push(("PATH".into(), path));
+        }
+    }
+    Ok(env)
+}
+
 async fn launch(
     cmd: Command,
     tx: &mpsc::Sender<ProcessEvent>,
@@ -931,13 +1122,24 @@ async fn launch(
     let group =
         processkit::ProcessGroup::new().map_err(|e| ProcessError::Containment(e.to_string()))?;
     let kind = containment(&group)?;
+    // The Windows directory comes from the OS, never from this host's own
+    // (caller-controlled) SystemRoot/windir environment.
     #[cfg(windows)]
-    let env = cmd.env.into_iter().filter(|(key, _)| {
-        let key = key.to_string_lossy();
-        !key.eq_ignore_ascii_case("SystemRoot") && !key.eq_ignore_ascii_case("windir")
-    });
+    let system_root = match crate::trusted_system_root() {
+        Ok(root) => Some(root),
+        Err(error) => {
+            tracing::warn!(%error, "Windows system directory is unavailable");
+            None
+        }
+    };
     #[cfg(not(windows))]
-    let env = cmd.env;
+    let system_root = None;
+    let env = compose_env(EnvPlatform::HOST, cmd.env, system_root).map_err(|message| {
+        ProcessError::Spawn {
+            executable: executable.clone(),
+            message,
+        }
+    })?;
     let mut backend = processkit::Command::new(&executable)
         .args(cmd.args)
         .env_clear()
@@ -954,17 +1156,6 @@ async fn launch(
             stderr: true,
             dropped: false,
         });
-    #[cfg(windows)]
-    {
-        let root = std::env::var_os("SystemRoot")
-            .or_else(|| std::env::var_os("windir"))
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| ProcessError::Spawn {
-                executable: executable.clone(),
-                message: "host SystemRoot is unavailable".into(),
-            })?;
-        backend = backend.env("SystemRoot", &root).env("windir", &root);
-    }
     if let Some(cwd) = cmd.cwd {
         backend = backend.current_dir(cwd);
     }
@@ -1252,6 +1443,7 @@ mod audit_tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn unreaped_zombie_missing_from_snapshot_is_not_a_live_candidate() {
+        // no-window: macOS only
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--help")
             .stdout(std::process::Stdio::null())
@@ -1390,5 +1582,123 @@ mod audit_tests {
         assert_eq!(exit.code, Some(0));
         assert!(exit.abnormal());
         assert!(group.members().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+
+    fn pairs(env: &[(OsString, OsString)]) -> Vec<(String, String)> {
+        env.iter()
+            .map(|(k, v)| (k.to_string_lossy().into(), v.to_string_lossy().into()))
+            .collect()
+    }
+
+    fn var(key: &str, value: &str) -> (OsString, OsString) {
+        (key.into(), value.into())
+    }
+
+    #[test]
+    fn unix_child_gets_the_fixed_system_path() {
+        let env = compose_env(EnvPlatform::Unix, vec![var("RUST_LOG", "info")], None).unwrap();
+        assert_eq!(
+            pairs(&env),
+            [
+                ("RUST_LOG".into(), "info".into()),
+                ("PATH".into(), "/usr/bin:/bin:/usr/sbin:/sbin".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn unix_command_path_cannot_override_the_engine_path() {
+        let env = compose_env(
+            EnvPlatform::Unix,
+            vec![var("PATH", "/tmp/evil"), var("A", "1")],
+            Some("ignored".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            pairs(&env),
+            [
+                ("A".into(), "1".into()),
+                ("PATH".into(), "/usr/bin:/bin:/usr/sbin:/sbin".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn unix_variable_names_stay_case_sensitive() {
+        let env = compose_env(EnvPlatform::Unix, vec![var("Path", "x")], None).unwrap();
+        assert_eq!(
+            pairs(&env),
+            [
+                ("Path".into(), "x".into()),
+                ("PATH".into(), "/usr/bin:/bin:/usr/sbin:/sbin".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_child_path_is_built_from_system_root() {
+        let env = compose_env(
+            EnvPlatform::Windows,
+            vec![var("RUST_LOG", "info")],
+            Some(r"C:\Windows".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            pairs(&env),
+            [
+                ("RUST_LOG".into(), "info".into()),
+                ("SystemRoot".into(), r"C:\Windows".into()),
+                ("windir".into(), r"C:\Windows".into()),
+                (
+                    "PATH".into(),
+                    r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0"
+                        .into()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_command_cannot_override_owned_variables_in_any_case() {
+        let env = compose_env(
+            EnvPlatform::Windows,
+            vec![
+                var("Path", r"C:\evil"),
+                var("path", r"C:\evil"),
+                var("SYSTEMROOT", r"C:\evil"),
+                var("WinDir", r"C:\evil"),
+                var("A", "1"),
+            ],
+            Some(r"C:\Windows".into()),
+        )
+        .unwrap();
+        let env = pairs(&env);
+        assert_eq!(env[0], ("A".into(), "1".into()));
+        assert_eq!(env.len(), 4);
+        assert!(env.iter().all(|(_, v)| !v.contains("evil")));
+    }
+
+    /// The root is the OS-reported Windows directory, whatever this
+    /// process's own SystemRoot says.
+    #[cfg(windows)]
+    #[test]
+    fn host_windows_root_comes_from_the_os() {
+        let root = crate::trusted_system_root().unwrap();
+        assert!(Path::new(&root).join("System32").is_dir(), "{root:?}");
+        let env = compose_env(EnvPlatform::HOST, Vec::new(), Some(root.clone())).unwrap();
+        let path = &env.iter().find(|(k, _)| k == "PATH").unwrap().1;
+        let first = path.to_string_lossy().split(';').next().unwrap().to_owned();
+        assert_eq!(Path::new(&first), Path::new(&root).join("System32"));
+    }
+
+    #[test]
+    fn windows_without_system_root_fails_closed() {
+        assert!(compose_env(EnvPlatform::Windows, Vec::new(), None).is_err());
+        assert!(compose_env(EnvPlatform::Windows, Vec::new(), Some(OsString::new())).is_err());
     }
 }

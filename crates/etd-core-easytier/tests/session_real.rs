@@ -59,6 +59,8 @@ async fn real_kernel_identify_launch_ready_query() {
     if let Some(root) = std::env::var_os("SystemRoot") {
         command.env("SystemRoot", root);
     }
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     drop(port);
     let mut child = command.spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);

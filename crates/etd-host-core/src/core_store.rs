@@ -1,8 +1,8 @@
 //! Frozen kernel-store interface (F0). The manifest-backed implementation
-//! (manifest with version, SHA-256 and proto revision; hash checked before
+//! (manifest with version, SHA-256 and proto revision; bundle hashes checked before
 //! every use) is `core_store/manifest.rs` (H2).
 //!
-//! Layout: one directory per binary, named by its SHA-256 (lower-case hex),
+//! Layout: one directory per bundle, named by the executable SHA-256 (lower-case hex),
 //! under `HostDirs::core_store_dir`; a binary is never replaced in place.
 //! The kernel path (which the program firewall rule names contain) is
 //! therefore unique per hash, and `EffectScope::CoreBinary` records of
@@ -38,7 +38,7 @@ pub enum CoreUsage {
     LifecycleOnly,
 }
 
-/// A kernel whose hash matched its manifest entry just now.
+/// A kernel whose bundle hashes matched the embedded release table just now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedCore {
     pub binary: PathBuf,
@@ -62,7 +62,7 @@ pub enum StoreError {
     #[error("kernel store I/O error: {0}")]
     Io(String),
     /// An open generation still uses this kernel.
-    #[error("kernel {version} is in use")]
+    #[error("kernel {version} is in use (busy; running or referenced by a driver service)")]
     InUse { version: String },
 }
 
@@ -72,7 +72,7 @@ pub enum StoreError {
 /// treats `usage` as the single source for launches.
 #[async_trait::async_trait]
 pub trait CoreStore: Send + Sync {
-    /// Verify and return the kernel to launch.
+    /// Verify every pinned bundle file and return the kernel to launch.
     async fn resolve(&self, want: &CoreSelector) -> Result<VerifiedCore, StoreError>;
     /// Every kernel in the store with its support level, for ListCores.
     async fn list(&self) -> Result<Vec<CoreEntry>, StoreError>;

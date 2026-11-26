@@ -4,7 +4,7 @@
 //! executable named `etd-host`: each test runs itself again from such a copy.
 use assert_cmd::Command;
 use etd_ipc::{Endpoint, HostForm, ListenerPolicy, platform::LocalListener, tonic_io::incoming};
-use etd_testkit::scripted_server::ScriptedHost;
+use etd_testkit::{no_window::NoWindow, scripted_server::ScriptedHost};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -29,6 +29,7 @@ pub fn run_as_host(test: &str) -> bool {
     let host = install.path().join(host_name());
     std::fs::copy(exe, &host).unwrap();
     let mut command = std::process::Command::new(host);
+    command.no_window();
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -143,7 +144,9 @@ impl Run {
 
 /// Runs `etd-ctl` with exactly `args`, feeding it `stdin`.
 pub fn ctl(args: &[&str], stdin: &str) -> Run {
-    let output = Command::new(CTL)
+    let mut command = std::process::Command::new(CTL);
+    command.no_window();
+    let output = Command::from_std(command)
         .args(args)
         .env_remove("RUST_LOG")
         .write_stdin(stdin)

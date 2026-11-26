@@ -9,6 +9,7 @@ use etd_contract::{
         ReclaimStatus, Residue, ResidueState,
     },
 };
+use etd_testkit::no_window::NoWindow;
 use etd_testkit::scripted_server::rejection;
 use serde_json::json;
 use std::{
@@ -324,6 +325,7 @@ host_test!(logs_are_printed_without_secrets_or_control_codes, |host| {
 
     // `--follow` prints lines while the stream stays open.
     let mut child = Command::new(CTL)
+        .no_window()
         .args(host.flags())
         .args(["logs", "-f"])
         .stdout(Stdio::piped())

@@ -1,14 +1,20 @@
-use assert_cmd::cargo::cargo_bin_cmd;
+use etd_testkit::no_window::NoWindow;
 use predicates::prelude::*;
+
+fn etd_host() -> assert_cmd::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_etd-host"));
+    command.no_window();
+    assert_cmd::Command::from_std(command)
+}
 
 #[test]
 fn help_and_doctor_are_unprivileged() {
-    cargo_bin_cmd!("etd-host")
+    etd_host()
         .arg("--help")
         .assert()
         .success()
         .stdout(predicate::str::contains("reclaim"));
-    cargo_bin_cmd!("etd-host")
+    etd_host()
         .arg("doctor")
         .assert()
         .success()
@@ -17,15 +23,9 @@ fn help_and_doctor_are_unprivileged() {
 
 #[test]
 fn rejects_unknown_command_and_partial_purge() {
-    cargo_bin_cmd!("etd-host")
-        .arg("unknown-command")
-        .assert()
-        .failure();
-    cargo_bin_cmd!("etd-host")
-        .args(["reclaim", "--purge"])
-        .assert()
-        .failure();
-    cargo_bin_cmd!("etd-host")
+    etd_host().arg("unknown-command").assert().failure();
+    etd_host().args(["reclaim", "--purge"]).assert().failure();
+    etd_host()
         .args(["run", "--mode", "elevated-session"])
         .assert()
         .failure();

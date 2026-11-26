@@ -1,6 +1,7 @@
 mod common;
 use common::*;
 use etd_ipc::{Connector, Endpoint};
+use etd_testkit::no_window::NoWindow;
 use std::process::Stdio;
 use tokio::io::AsyncReadExt;
 use tokio::{
@@ -89,6 +90,7 @@ async fn rejects_another_process_before_writing() {
         .join(format!("impostor{}", std::env::consts::EXE_SUFFIX));
     std::fs::copy(std::env::current_exe().unwrap(), &decoy).unwrap();
     let mut child = Command::new(decoy)
+        .no_window()
         .args(["--exact", "impostor_process", "--nocapture"])
         .env("ETD_TEST_IMPOSTOR_SOCKET", endpoint_arg(&f.ep))
         .kill_on_drop(true)

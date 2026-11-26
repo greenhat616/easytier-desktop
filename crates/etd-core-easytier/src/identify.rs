@@ -274,6 +274,11 @@ mod tests {
             parse("easytier-core 2.7.1-c97f36b8~-20261124"),
             ("2.7.1".into(), "c97f36b8~".into())
         );
+        // The official v2.7.1 release archives (packaging/cores.toml).
+        assert_eq!(
+            parse("easytier-core 2.7.1-0d9c52b1-20261115\n"),
+            ("2.7.1".into(), "0d9c52b1".into())
+        );
     }
 
     #[test]
@@ -284,12 +289,12 @@ mod tests {
         ] {
             assert!(crate::profiles::profile_for(&parse_version_output(text).unwrap()).is_none());
         }
-        assert!(
-            crate::profiles::profile_for(
-                &parse_version_output("easytier-core 2.7.1-c97f36b8-20261124").unwrap()
-            )
-            .is_some()
-        );
+        for text in [
+            "easytier-core 2.7.1-c97f36b8-20261124",
+            "easytier-core 2.7.1-0d9c52b1-20261115",
+        ] {
+            assert!(crate::profiles::profile_for(&parse_version_output(text).unwrap()).is_some());
+        }
     }
 
     #[test]

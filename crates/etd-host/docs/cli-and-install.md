@@ -88,7 +88,9 @@ becomes an admin allow-list entry.
 5. Install the bundled kernels: for each row of the embedded table, copy
    `<installer dir>/cores/<version>/` into `<cores>/<sha256>/`, hashing inside the
    protected destination, check that the kernel identifies as that version, and write
-   the manifest. With an empty table no kernel is installed.
+   the manifest. Every row must have its bundle, so with the current release table
+   `install` fails without `<installer dir>/cores/2.7.1/` (stage it with
+   `cargo xtask fetch-cores --target host --bundle <installer dir>/cores`).
 6. Open the ledger and commit the seed allow list. Windows: LocalSystem and the
    Administrators group as admin. Unix: UID 0 as admin and the `easytier-desk` group
    as control. Plus the `--allow-user` entries.

@@ -1,4 +1,4 @@
-//! Adapter profiles (first: 2.7.1-c97f36b). Owned by E1.
+//! Adapter profiles (2.7.1-c97f36b, 2.7.1-0d9c52b). Owned by E1.
 //!
 //! A profile pairs one exact kernel build with what the adapter knows about
 //! it: how its configuration is written, which side effects it causes and
@@ -29,8 +29,20 @@ pub const EASYTIER_2_7_1_C97F36B: Profile = Profile {
     deny_all_verified: false,
 };
 
-/// Every profile this adapter ships, newest last.
-pub const ALL: &[Profile] = &[EASYTIER_2_7_1_C97F36B];
+/// Upstream release `v2.7.1` (`0d9c52b`, 2026-11-15), the bundled kernel
+/// (`packaging/cores.toml`). Its management proto, CLI and TOML schema are
+/// byte-identical to `c97f36b`, so it shares that profile's planning.
+pub const EASYTIER_2_7_1_0D9C52B: Profile = Profile {
+    id: "2.7.1-0d9c52b",
+    version: "2.7.1",
+    revision: "0d9c52b169dc2112687ddefcf571cd01d383193c",
+    deny_all_verified: false,
+};
+
+/// Every profile this adapter ships, newest last. `c97f36b` stays for the
+/// source-built development kernels the existing fixtures and privileged
+/// suites pin; release packaging trusts only `cores.lock` digests.
+pub const ALL: &[Profile] = &[EASYTIER_2_7_1_C97F36B, EASYTIER_2_7_1_0D9C52B];
 
 /// Shortest revision prefix accepted as a match (git's default abbreviation).
 const MIN_REVISION_PREFIX: usize = 7;
@@ -91,15 +103,23 @@ mod tests {
         assert!(profile_for(&core("2.7.2", "c97f36b")).is_none());
         assert!(profile_for(&core("2.7.1", "0123456")).is_none());
         assert!(profile_for(&core("2.7.1", "")).is_none());
+        assert_eq!(
+            profile_for(&core("2.7.1", "0d9c52b1")).map(|p| p.id),
+            Some("2.7.1-0d9c52b".to_owned())
+        );
+        assert!(profile_for(&core("2.7.0", "0d9c52b1")).is_none());
+        assert!(profile_for(&core("2.7.1", "0d9c52b1~")).is_none());
     }
 
     #[test]
     fn deny_all_is_unverified_until_privileged_tests_pass() {
-        assert!(
-            !profile_for(&core("2.7.1", "c97f36b"))
-                .unwrap()
-                .deny_all_verified
-        );
+        for revision in ["c97f36b", "0d9c52b"] {
+            assert!(
+                !profile_for(&core("2.7.1", revision))
+                    .unwrap()
+                    .deny_all_verified
+            );
+        }
     }
 
     #[test]

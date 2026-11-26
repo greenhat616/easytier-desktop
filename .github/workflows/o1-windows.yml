@@ -34,22 +34,8 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --locked -p etd-sysfx-os --all-targets -- -D warnings
       - run: cargo nextest run --locked -p etd-sysfx-os --lib
-      - name: Fetch the S2-pinned upstream core and bundled Wintun
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $zip = Join-Path $env:RUNNER_TEMP 'o1-core.zip'
-          $dir = Join-Path $env:RUNNER_TEMP 'o1-core'
-          gh api repos/EasyTier/EasyTier/actions/artifacts/14959009694/zip > $zip
-          if ($LASTEXITCODE -ne 0) { throw 'Core download failed' }
-          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($hash -ne '7fbabdaa80e37d32add40bd8933056dcb7bd6c7b83c35f01f09fd84da4a167c3') { throw 'Core artifact digest mismatch' }
-          Expand-Archive $zip $dir
-          $exe = Get-ChildItem $dir -Recurse -Filter easytier-core.exe | Select-Object -First 1
-          if (-not $exe) { throw 'Core binary missing' }
-          "ETD_O1_CORE=$($exe.FullName)" >> $env:GITHUB_ENV
+      - name: Fetch the bundled release core and its Wintun
+        run: cargo xtask fetch-cores --target host --bundle "${{ runner.temp }}/o1-core" --github-env ETD_O1_CORE
       - name: Reclaim with real objects and same-name conflict
         run: cargo nextest run --locked --profile privileged -p etd-sysfx-os --run-ignored only --test windows_reclaim --success-output immediate
       - name: WFP SYSTEM and second-account test

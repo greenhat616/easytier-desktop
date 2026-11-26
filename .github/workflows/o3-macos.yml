@@ -36,6 +36,8 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.152
+      - name: Fetch the release kernel beside the host image
+        run: cargo xtask fetch-cores --target host --bundle target/debug/cores
       - name: Build tests as the runner
         run: |
           cargo test --locked -p etd-core-easytier --test plan_classify --no-run --message-format json > "$RUNNER_TEMP/planner.jsonl"

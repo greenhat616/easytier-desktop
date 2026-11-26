@@ -64,14 +64,14 @@ checks every workflow for this.
 
 | Test | Covers | Runner |
 | --- | --- | --- |
-| `etd-host --test install_roundtrip` | Install, service start, peer identity and roles, uninstall leaves no service, directory or group | `ci.yml` job `privileged-install`, all three OSes |
+| `etd-host --test install_roundtrip` | Install (including the bundled release kernel staged beside the test image), service start, peer identity and roles, uninstall leaves no service, directory or group | `ci.yml` job `privileged-install`, all three OSes |
 | `etd-sysfx-os --test windows_reclaim`, `windows_fence` | Real wintun, firewall and registry objects, same-name conflicts; WFP fence against a second account | `o1-windows.yml` |
 | `etd-sysfx-os --test linux_reclaim`, `linux_fence` | netlink adapters, systemd-resolved, nftables fence by uid, distribution parsers | `o2-linux.yml` |
 | `etd-sysfx-os --test macos_reclaim`, `macos_fence`, `macos_resolver` | utun ownership, PF anchor fence against a second account, foreign resolver files untouched | `o3-macos.yml` |
 | `etd-ipc --test unix_service`, `stale_endpoint` | Root-owned service sockets, second-account rejection, stale endpoint recovery | Root runner; not yet wired into a workflow |
 | `etd-ipc --test pipe_acl` | Windows pipe ACL with a temporary second account. Not `#[ignore]`: the account case runs only with `ETD_IPC_CI_ACCOUNTS=1` and an elevated token. Never set that variable on a desktop | `ci.yml` `check` job on Windows |
 | `etd-testkit --test tier2` (ignored case) | UI crash against a service-form test host | Root / LocalSystem with `ETD_G1_SERVICE_RUNTIME`; not yet wired into a workflow |
-| `etd-core-easytier --test session_real` | Identify, start, readiness and queries against the pinned native kernel | Needs `ETD_EASYTIER_CORE`; not yet wired into a workflow |
+| `etd-core-easytier --test session_real` | Identify, start, readiness and queries against the bundled v2.7.1 release kernel | Unprivileged; `ci.yml` `check` job on all three OSes (`--profile ci --run-ignored only`, kernel from `cargo xtask fetch-cores`) |
 
 `o1-windows.yml`, `o2-linux.yml` and `o3-macos.yml` run on pushes to their adapter
 branches and on manual dispatch (`workflow_dispatch`); run them by hand after changing
@@ -85,8 +85,8 @@ placeholders today.
 
 | Workflow | Trigger | Jobs |
 | --- | --- | --- |
-| `ci.yml` | Every push and pull request | `boundaries` (rustfmt, `check-boundaries`); `check` on Windows, macOS and Linux (Clippy `-D warnings`, `nextest --profile ci`, doc tests); `privileged-install` on all three; `dependencies` (`cargo deny`) |
-| `o1-windows.yml` | Windows adapter branch, manual | Windows privileged adapters with the pinned upstream kernel and Wintun |
+| `ci.yml` | Every push and pull request | `boundaries` (rustfmt, `check-boundaries`); `check` on Windows, macOS and Linux (Clippy `-D warnings`, `nextest --profile ci`, `session_real` against the release kernel, doc tests); `privileged-install` on all three; `dependencies` (`cargo deny`) |
+| `o1-windows.yml` | Windows adapter branch, manual | Windows privileged adapters with the bundled release kernel and its Wintun |
 | `o2-linux.yml` | Linux adapter branch, manual | Linux privileged adapters, distribution parser matrix (Debian 12, Fedora), kernel capability check |
 | `o3-macos.yml` | macOS adapter branch, manual | macOS PF, utun, resolver and service reinstall |
 

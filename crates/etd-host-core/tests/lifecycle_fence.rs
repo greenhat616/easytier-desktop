@@ -309,3 +309,27 @@ async fn unverifiable_fence_checks_never_kill_and_are_reported_once() {
     assert_eq!(world.engine.liveness(&kernel).await, Liveness::Same);
     assert_eq!(notices(&mut h, "fence.unverifiable"), 1);
 }
+
+#[tokio::test]
+async fn a_fence_the_adapter_reports_missing_twice_kills_and_restarts() {
+    let world = World::new();
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.apply("a", spec("net"), Desired::Running).await;
+    h.wait_state("a", S::ReadyFull).await;
+    let kernel = world.last_kernel();
+
+    // The adapter's query succeeds and shows our fence gone, twice in a row.
+    world.verify_errors.lock().unwrap().extend([
+        etd_sysfx::FenceError::Missing("filter gone".into()),
+        etd_sysfx::FenceError::Missing("filter gone".into()),
+    ]);
+    h.until("restarted", |h| {
+        h.status("a")
+            .is_some_and(|s| s.epoch == 2 && s.state() == S::ReadyFull)
+    })
+    .await;
+    assert!(world.kernel.calls_kill(&kernel));
+    assert_eq!(notices(&mut h, "fence.lost"), 1);
+    assert_eq!(notices(&mut h, "fence.unverifiable"), 0);
+}

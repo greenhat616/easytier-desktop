@@ -2,8 +2,9 @@
 
 Each one runs as its own process, takes one native object the installed
 product must never use or touch, and publishes what reached it as JSON in
---status. It releases the object once --stop exists. Only takeover.py
-starts it, on a disposable hosted runner. Standard library plus psutil.
+--status. It releases the object once --stop exists or the test process
+(--parent-pid) is gone. Only takeover.py starts it, on a disposable hosted
+runner. Standard library plus psutil.
 """
 
 import argparse
@@ -42,6 +43,24 @@ def alive(pid, born):
         return False
 
 
+class Stop:
+    """True once the stop file exists or the parent test process exited."""
+
+    def __init__(self, path, parent, born):
+        self.path, self.parent, self.born = Path(path), parent, born
+        self.checked = 0.0
+
+    def __call__(self):
+        if self.path.exists():
+            return True
+        now = time.monotonic()
+        if now - self.checked >= 0.5:
+            self.checked = now
+            if not alive(self.parent, self.born):
+                return True
+        return False
+
+
 def bind(port, reuse):
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -72,8 +91,9 @@ def serve(server, port, report, stop):
     server.setblocking(False)
     peers, open_peers = [], {}
     report.publish(state="bound", port=port, bound_at=time.time(), connections=0, bytes=0, peers=peers)
-    while not stop.exists():
-        ready, _, _ = select.select([server, *open_peers], [], [], 0.2)
+
+    def pump(timeout):
+        ready, _, _ = select.select([server, *open_peers], [], [], timeout)
         for sock in ready:
             if sock is server:
                 try:
@@ -97,6 +117,13 @@ def serve(server, port, report, stop):
                     del open_peers[sock]
                     sock.close()
             report.publish(connections=len(peers), bytes=sum(p["bytes"] for p in peers), peers=peers)
+        return bool(ready)
+
+    while not stop():
+        pump(0.2)
+    # Count whatever arrived since the last round, queued or unread.
+    while pump(0):
+        pass
     for sock in open_peers:
         sock.close()
     server.close()
@@ -107,7 +134,7 @@ def squat(args, report, stop):
     """Bind the port the moment its holder lets go."""
     deadline = time.monotonic() + args.retry_for
     attempts = 0
-    while True:
+    while not stop():
         # Windows SO_REUSEADDR could share a live socket: only use it once
         # the previous holder has exited, to pass a lingering TIME_WAIT.
         released = args.holder_pid is None or not alive(args.holder_pid, args.holder_born)
@@ -126,6 +153,8 @@ def squat(args, report, stop):
                 report.publish(state="timeout", attempts=attempts, error=error.errno)
                 return
             time.sleep(0.001)
+    else:
+        return
     report.publish(attempts=attempts, reuse=reuse)
     serve(server, args.port, report, stop)
 
@@ -138,7 +167,7 @@ def race(args, report, stop):
     needle = args.instance.encode()
     deadline = time.monotonic() + args.timeout
     report.publish(state="watching", after=args.after)
-    while time.monotonic() < deadline and not stop.exists():
+    while time.monotonic() < deadline and not stop():
         try:
             rows = db.execute("SELECT payload FROM effects WHERE instr(payload, ?) > 0 AND instr(payload, ?) > 0",
                               (needle, b'"fence"')).fetchall()
@@ -178,7 +207,7 @@ def utun(args, report, stop):
     import struct
     deadline = time.monotonic() + args.retry_for
     attempts = 0
-    while True:
+    while not stop():
         control = socket.socket(socket.PF_SYSTEM, socket.SOCK_DGRAM, socket.SYSPROTO_CONTROL)
         try:
             info = fcntl.ioctl(control.fileno(), CTLIOCGINFO, struct.pack("I96s", 0, UTUN_CONTROL))
@@ -197,6 +226,8 @@ def utun(args, report, stop):
                 report.publish(state="timeout", attempts=attempts)
                 return
             time.sleep(0.002)
+    else:
+        return
 
     def name():
         raw = control.getsockopt(socket.SYSPROTO_CONTROL, UTUN_OPT_IFNAME, 16)
@@ -207,7 +238,7 @@ def utun(args, report, stop):
                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
     report.publish(state="held", name=held, index=socket.if_nametoindex(held), attempts=attempts,
                    held_at=time.time())
-    while not stop.exists():
+    while not stop():
         time.sleep(0.2)
     report.publish(state="released", name_at_release=name(), index_at_release=socket.if_nametoindex(held))
     control.close()
@@ -218,6 +249,8 @@ def main():
     parser.add_argument("mode", choices=["squat", "race", "utun"])
     parser.add_argument("--status", required=True)
     parser.add_argument("--stop", required=True)
+    parser.add_argument("--parent-pid", type=int, required=True)
+    parser.add_argument("--parent-born", type=float, required=True)
     parser.add_argument("--port", type=int)
     parser.add_argument("--holder-pid", type=int)
     parser.add_argument("--holder-born", type=float)
@@ -231,7 +264,7 @@ def main():
     parser.add_argument("--peer")
     args = parser.parse_args()
     report = Reporter(args.status)
-    {"squat": squat, "race": race, "utun": utun}[args.mode](args, report, Path(args.stop))
+    {"squat": squat, "race": race, "utun": utun}[args.mode](args, report, Stop(args.stop, args.parent_pid, args.parent_born))
 
 
 if __name__ == "__main__":

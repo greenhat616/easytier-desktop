@@ -19,7 +19,7 @@ import tempfile
 import time
 import uuid
 
-from service import Service, eventually, require_runner
+from service import Service, command, eventually, require_runner
 from consistency import (
     FirewallReadbackPending, UnpredictedChanges, check_closed, check_generation, installed_image,
     management_processes, runner_noise, scope, tun_created, adapter_defaults, managed_service_changes,
@@ -64,12 +64,16 @@ class Impostor:
 
 @contextmanager
 def impostor(mode, *args):
+    import psutil
     with tempfile.TemporaryDirectory(prefix="g2-takeover-") as directory:
         status, stop = Path(directory) / "status.json", Path(directory) / "stop"
         script = Path(__file__).with_name("impostor.py")
+        # The impostor also exits on its own if this process is killed.
+        parent = psutil.Process()
         proc = subprocess.Popen(
             [sys.executable, "-B", "-u", str(script), mode, *map(str, args),
-             "--status", str(status), "--stop", str(stop)],
+             "--status", str(status), "--stop", str(stop),
+             "--parent-pid", str(parent.pid), "--parent-born", repr(parent.create_time())],
             stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         try:
             yield Impostor(proc, status, stop)
@@ -98,6 +102,14 @@ def kernel_listener(service, port):
     process = psutil.Process(holders.pop())
     assert installed_image([process.exe()]) == service.core, f"port {port} is held by {process.exe()}"
     return process.pid, process.create_time()
+
+
+def host_notices(service, instance, code):
+    """Notices of one instance the host wrote to its own log."""
+    result = command(service.client, "--json", "logs", "--tail", "2000")
+    prefix = f"[{instance}] {code}: "
+    return [entry["text"].removeprefix(prefix) for entry in map(json.loads, result.stdout.splitlines())
+            if entry.get("text", "").startswith(prefix)]
 
 
 def kernels(service):
@@ -190,7 +202,9 @@ def management_port():
         pid, born = kernel_listener(service, old_port)
         print(f"epoch {first['epoch']}: kernel {pid} serves management on 127.0.0.1:{old_port}", flush=True)
 
-        # A. The crashed kernel's port, taken in the window before the restart.
+        # A. No reuse of the old port or its records: an impostor takes the
+        # crashed kernel's port before the restart. The new generation plans
+        # a fresh port, so this does not reach the fence check; B does.
         with impostor("squat", "--port", old_port, "--holder-pid", pid, "--holder-born", born) as squatter:
             armed = squatter.wait("armed impostor", lambda s: s.get("state") in ("waiting", "bound", "error"))
             assert armed["state"] == "waiting" and armed["holder_alive"], f"kernel did not hold its port: {armed}"
@@ -211,11 +225,13 @@ def management_port():
             hold(service, instance, second, squatter, 35, "while it held the old port")
             final = squatter.release()
             assert final.get("connections") == 0 and final.get("bytes") == 0, final
-            print(f"epoch {second['epoch']} serves 127.0.0.1:{new_port}; the impostor on {old_port} "
-                  f"received {final['connections']} connections and {final['bytes']} bytes", flush=True)
+            print(f"no reuse of the old port: epoch {second['epoch']} serves 127.0.0.1:{new_port}; the impostor "
+                  f"on {old_port} received {final['connections']} connections and {final['bytes']} bytes", flush=True)
         hold(service, instance, second, None, 5, "after it exited")
 
-        # B. The next generation's port, taken between plan and kernel bind.
+        # B. Fence evidence: the next generation's planned port is taken
+        # between plan commit and kernel bind, so the impostor is the listener
+        # the host finds on the fenced port.
         current = second
         ledger = service.state / "ledger.sqlite3"
         for attempt in range(1, 5):
@@ -244,7 +260,14 @@ def management_port():
                       f"management={result.get('management')} message={result.get('message')!r}", flush=True)
                 check_closed(service, instance, epoch)
                 racer.silent("behind the refused generation")
+                # The refusal came from the fence's listener check naming the
+                # impostor, not from another start failure.
+                listener = f"management port 127.0.0.1:{port} is held by pid {outcome['pid']}, not the kernel"
+                fence = [text for text in host_notices(service, instance, "fence.failed") if listener in text]
+                print(f"fence.failed notices naming the impostor: {fence}", flush=True)
+                assert fence, f"no fence.failed notice names the impostor on {port}: "                               f"{host_notices(service, instance, 'fence.failed')}"
                 if result["state"] == "gave_up":
+                    assert "DenyAll" in result.get("message", ""), result
                     # Deny-all is unverified for the pinned kernel, so no
                     # privileged generation starts after a fence failure.
                     assert not kernels(service), "a kernel runs after the host gave up"

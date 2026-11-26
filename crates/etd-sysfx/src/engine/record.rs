@@ -141,8 +141,27 @@ impl Ctx<'_> {
         Ok(())
     }
 
-    /// One reclaim step for an open record.
+    /// One reclaim step for an open record. Each step that reaches the
+    /// system is logged with its duration: a slow stop or start must show
+    /// which records its time went to.
     pub async fn step(&mut self, e: &Effect) -> Result<RecordOutcome, LedgerError> {
+        let started = std::time::Instant::now();
+        let outcome = self.step_record(e).await;
+        if e.state != EffectState::Reclaimed {
+            tracing::info!(
+                stage = "reclaim.record",
+                kind = %e.kind,
+                key = ?report::lookup_key(e),
+                from = ?e.state,
+                outcome = ?outcome.as_ref().map_err(ToString::to_string),
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "reclaim step"
+            );
+        }
+        outcome
+    }
+
+    async fn step_record(&mut self, e: &Effect) -> Result<RecordOutcome, LedgerError> {
         match e.state {
             EffectState::Reclaimed => Ok(RecordOutcome::Closed),
             _ if record_only(e.persistence) => self.close_record_only(e).await,

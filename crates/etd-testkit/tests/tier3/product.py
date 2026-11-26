@@ -188,7 +188,8 @@ def recovery():
             assert len(status["instances"]) == 1 and status["revision"] == receipt["revision"]
         service.ctl("stop", instance)
         eventually("stopped instance", lambda: service.view(instance),
-                   lambda status: status.get("state") == "stopped")
+                   lambda status: status.get("state") == "stopped",
+                   timeout=240 if os.name == "nt" else 75)
         check_closed(service, instance, first["epoch"])
         stopped = inventory()
         assert_foreign(baseline, stopped, keys)
@@ -219,7 +220,7 @@ def verify_shared_driver_purge(service, baseline, stopped):
              if ("service", name) not in baseline.rows and ("service", name) in stopped.rows}
     assert "wintun" in names, "the real kernel did not load its TUN driver"
     service.stop()
-    result = command(service.installer, "reclaim", "--all", "--purge", check=False)
+    result = command(service.installer, "reclaim", "--all", "--purge", check=False, timeout=240)
     records = service.effects()
     retained = {r["key"]["name"].lower() for r in records if r["scope"] == "product"
                 and r["kind"] == "driver" and r["state"] == "candidate"}

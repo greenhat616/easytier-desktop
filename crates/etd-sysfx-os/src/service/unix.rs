@@ -37,35 +37,6 @@ fn protect_creation() {
 pub(super) fn elevated() -> io::Result<bool> {
     Ok(Uid::effective().is_root())
 }
-pub(super) fn user_temp_runtime() -> io::Result<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::unix::ffi::OsStringExt;
-        let size =
-            unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, std::ptr::null_mut(), 0) };
-        if size == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut bytes = vec![0u8; size];
-        let actual = unsafe {
-            libc::confstr(
-                libc::_CS_DARWIN_USER_TEMP_DIR,
-                bytes.as_mut_ptr().cast(),
-                size,
-            )
-        };
-        if actual == 0 || actual > size {
-            return Err(io::Error::last_os_error());
-        }
-        bytes.truncate(actual - 1);
-        Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes))
-            .canonicalize()?
-            .join("easytier-desk"))
-    }
-    #[cfg(target_os = "linux")]
-    Ok(PathBuf::from("/tmp").join(format!("easytier-desk-{}", Uid::effective().as_raw())))
-}
-
 fn check(path: &Path, directory: bool) -> io::Result<()> {
     let meta = fs::symlink_metadata(path)?;
     if meta.uid() != 0

@@ -68,10 +68,6 @@ pub(super) fn program_data() -> io::Result<PathBuf> {
 pub(super) fn program_files() -> io::Result<PathBuf> {
     known(&FOLDERID_ProgramFiles)
 }
-pub(super) fn user_temp_runtime() -> io::Result<PathBuf> {
-    Ok(local_app_data()?.join("EasyTierDesk"))
-}
-
 pub(super) fn elevated() -> io::Result<bool> {
     let mut token = HANDLE::default();
     // SAFETY: query our live process token, and free its handle afterwards.

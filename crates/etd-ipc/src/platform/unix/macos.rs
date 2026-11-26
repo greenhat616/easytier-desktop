@@ -8,6 +8,30 @@ use std::{
 
 type AclPtr = *mut c_void;
 
+/// The system-owned per-account temporary directory, not a predictable
+/// shared /tmp name. Canonicalize its system aliases for IPC identity checks.
+pub fn user_runtime_dir() -> io::Result<PathBuf> {
+    let size = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, ptr::null_mut(), 0) };
+    if size == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut bytes = vec![0u8; size];
+    let actual = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            bytes.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if actual == 0 || actual > size {
+        return Err(io::Error::last_os_error());
+    }
+    bytes.truncate(actual - 1);
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes))
+        .canonicalize()?
+        .join("easytier-desk"))
+}
+
 // Darwin Libc sys/acl.h, membership.h and libproc.h.
 unsafe extern "C" {
     fn mbr_uid_to_uuid(uid: u32, uuid: *mut u8) -> c_int;

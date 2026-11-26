@@ -32,7 +32,6 @@ mod os;
 #[path = "macos.rs"]
 mod os;
 
-#[cfg(target_os = "linux")]
 pub use os::user_runtime_dir;
 
 fn path(endpoint: &Endpoint) -> io::Result<&Path> {

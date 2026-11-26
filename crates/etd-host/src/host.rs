@@ -83,7 +83,7 @@ fn layout(mode: HostMode) -> Result<HostLayout> {
             #[cfg(target_os = "linux")]
             let runtime = Some(platform::user_runtime_dir());
             #[cfg(target_os = "macos")]
-            let runtime = Some(etd_sysfx_os::service::user_temp_runtime()?);
+            let runtime = Some(platform::user_runtime_dir()?);
             #[cfg(windows)]
             let runtime: Option<std::path::PathBuf> = None;
             Ok(NativeHostFilesystem.user_layout(None, runtime.as_deref())?)

@@ -181,9 +181,6 @@ impl ServiceManager for NativeServiceManager {
     }
 }
 
-pub fn user_temp_runtime() -> io::Result<PathBuf> {
-    native::user_temp_runtime()
-}
 pub fn current_exe() -> io::Result<PathBuf> {
     std::env::current_exe()?.canonicalize()
 }

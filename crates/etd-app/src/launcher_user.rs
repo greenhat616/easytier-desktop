@@ -140,14 +140,11 @@ fn user_endpoint(_: &etd_ipc::OsUserId) -> io::Result<Endpoint> {
     ))
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-fn user_endpoint(user: &etd_ipc::OsUserId) -> io::Result<Endpoint> {
-    match user {
-        etd_ipc::OsUserId::UnixUid(uid) => Ok(Endpoint::UnixSocket(
-            format!("/private/tmp/easytier-desk-{uid}/host.sock").into(),
-        )),
-        _ => Err(io::Error::other("the current user has no uid")),
-    }
+#[cfg(target_os = "macos")]
+fn user_endpoint(_: &etd_ipc::OsUserId) -> io::Result<Endpoint> {
+    Ok(Endpoint::UnixSocket(
+        etd_ipc::platform::user_runtime_dir()?.join("host.sock"),
+    ))
 }
 
 /// Creates the private directory of a user socket if it is missing. An

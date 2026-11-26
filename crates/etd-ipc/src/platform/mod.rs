@@ -15,7 +15,7 @@ mod native;
 #[cfg(unix)]
 #[path = "unix/mod.rs"]
 mod native;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub use native::user_runtime_dir;
 pub use native::{LocalListener, PolicyHandle};
 

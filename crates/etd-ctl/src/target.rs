@@ -38,21 +38,23 @@ fn user_endpoint() -> Result<Endpoint, CtlError> {
     ))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn user_endpoint() -> Result<Endpoint, CtlError> {
+    let dir = etd_ipc::platform::user_runtime_dir()
+        .map_err(|error| CtlError::internal(format!("cannot locate user runtime: {error}")))?;
+    Ok(Endpoint::UnixSocket(dir.join("host.sock")))
+}
+
+#[cfg(windows)]
 fn user_endpoint() -> Result<Endpoint, CtlError> {
     use etd_ipc::OsUserId;
     let user = etd_ipc::platform::current_user().map_err(|error| {
         CtlError::internal(format!("cannot identify the current user: {error}"))
     })?;
     match user {
-        #[cfg(windows)]
         OsUserId::WindowsSid(sid) => Ok(Endpoint::NamedPipe(format!(
             r"\\.\pipe\easytier-desk-user-{sid}"
         ))),
-        #[cfg(target_os = "macos")]
-        OsUserId::UnixUid(uid) => Ok(Endpoint::UnixSocket(
-            format!("/private/tmp/easytier-desk-{uid}/host.sock").into(),
-        )),
         _ => Err(CtlError::internal("unexpected kind of user id".to_owned())),
     }
 }
@@ -77,20 +79,7 @@ fn own_dir() -> Result<PathBuf, CtlError> {
         .ok_or_else(|| CtlError::internal("cannot locate etd-ctl's own directory".to_owned()))
 }
 
-// These mirror the layout the host installer uses.
-#[cfg(windows)]
 fn service_install_dir() -> Result<PathBuf, CtlError> {
-    // A forged variable cannot widen trust: the service form also requires
-    // the pipe to be owned by SYSTEM.
-    std::env::var_os("ProgramFiles")
-        .map(|root| PathBuf::from(root).join("EasyTierDesk"))
-        .ok_or_else(|| CtlError::internal("ProgramFiles is not set; pass --host-dir".to_owned()))
-}
-#[cfg(target_os = "linux")]
-fn service_install_dir() -> Result<PathBuf, CtlError> {
-    Ok("/usr/local/lib/easytier-desk".into())
-}
-#[cfg(target_os = "macos")]
-fn service_install_dir() -> Result<PathBuf, CtlError> {
-    Ok("/Library/Application Support/easytier-desk".into())
+    etd_sysfx_os::service::installed_host_dir()
+        .map_err(|error| CtlError::internal(format!("cannot locate installed service: {error}")))
 }

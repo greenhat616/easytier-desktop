@@ -2318,6 +2318,7 @@ dependencies = [
  "etd-client",
  "etd-contract",
  "etd-ipc",
+ "etd-sysfx-os",
  "etd-testkit",
  "futures-util",
  "jiff",

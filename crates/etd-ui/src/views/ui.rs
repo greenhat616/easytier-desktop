@@ -174,17 +174,23 @@ impl gpui::RenderOnce for FluentButton {
             .focus_ring(false)
             .disabled(style.disabled || style.loading)
             .on_click(move |ev, window, cx| (self.on_click)(ev, window, cx));
-        if !matches!(
-            style.variant,
-            ButtonVariant::Ghost | ButtonVariant::Link | ButtonVariant::Text
-        ) {
-            btn = btn.border_b_2();
-        }
         if style.outline {
             btn = btn.outline();
         }
         if style.loading {
-            btn = btn.child(progress_ring("button-progress", "Working", Size::XSmall));
+            let (fill, ink) = loading_button_colors(style, cx);
+            // Kit's disabled state normally fades the fill to 15%; a busy
+            // button is non-activatable but should keep its readable fill.
+            btn = btn
+                .bg(fill)
+                .border_color(fill)
+                .text_color(ink)
+                .child(progress_ring_colored(
+                    "button-progress",
+                    "Working",
+                    Size::Small,
+                    ink,
+                ));
         } else if let Some(path) = style.icon {
             btn = btn.icon(Icon::default().path(path));
         }
@@ -194,6 +200,8 @@ impl gpui::RenderOnce for FluentButton {
         btn = btn.child(
             div()
                 .id("fluent-button-label")
+                .min_w_0()
+                .truncate()
                 .group_active(group.clone(), move |s| {
                     s.opacity(if style.disabled || style.loading {
                         1.
@@ -203,11 +211,67 @@ impl gpui::RenderOnce for FluentButton {
                 })
                 .child(self.label),
         );
+        let elevate = !style.disabled
+            && !style.loading
+            && !matches!(
+                style.variant,
+                ButtonVariant::Ghost | ButtonVariant::Link | ButtonVariant::Text
+            );
         div()
             .relative()
             .group(group)
             .child(btn)
+            .children(elevate.then(|| button_elevation_line(cx)))
             .children(focus_visual(focus.is_focused(window), window, cx))
+    }
+}
+
+/// A one-pixel non-layout bevel: the bottom is darker in light mode,
+/// while dark mode catches a subtle highlight along the top edge.
+fn button_elevation_line(cx: &App) -> AnyElement {
+    let dark = cx.theme().is_dark();
+    let line = div()
+        .absolute()
+        .left(px(3.))
+        .right(px(3.))
+        .h(px(1.))
+        .rounded_full()
+        .bg(if dark {
+            Hsla::from(rgb(0xFFFFFF)).opacity(0.10)
+        } else {
+            Hsla::from(rgb(0x000000)).opacity(0.16)
+        });
+    if dark {
+        line.top_0().into_any_element()
+    } else {
+        line.bottom_0().into_any_element()
+    }
+}
+
+fn loading_button_colors(style: BtnStyle, cx: &App) -> (Hsla, Hsla) {
+    let t = cx.theme();
+    if style.outline {
+        let ink = match style.variant {
+            ButtonVariant::Primary => t.primary,
+            ButtonVariant::Danger => t.danger,
+            ButtonVariant::Warning => t.warning,
+            ButtonVariant::Success => t.success,
+            ButtonVariant::Info => t.info,
+            ButtonVariant::Secondary => t.secondary_foreground,
+            _ => t.button_foreground,
+        };
+        return (t.popover, ink);
+    }
+    match style.variant {
+        ButtonVariant::Primary => (t.button_primary, t.button_primary_foreground),
+        ButtonVariant::Secondary => (t.button_secondary, t.button_secondary_foreground),
+        ButtonVariant::Danger => (t.button_danger, t.button_danger_foreground),
+        ButtonVariant::Warning => (t.button_warning, t.button_warning_foreground),
+        ButtonVariant::Success => (t.button_success, t.button_success_foreground),
+        ButtonVariant::Info => (t.button_info, t.button_info_foreground),
+        ButtonVariant::Default => (t.button, t.button_foreground),
+        ButtonVariant::Link => (t.popover, t.link),
+        _ => (t.popover, t.foreground),
     }
 }
 
@@ -228,6 +292,21 @@ pub fn progress_ring(
     ProgressCircle::new(id)
         .loading(true)
         .with_size(size)
+        .accessibility_label(label)
+        .into_any_element()
+}
+
+#[inline(never)]
+pub fn progress_ring_colored(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    size: Size,
+    color: Hsla,
+) -> AnyElement {
+    ProgressCircle::new(id)
+        .loading(true)
+        .with_size(size)
+        .color(color)
         .accessibility_label(label)
         .into_any_element()
 }
@@ -426,7 +505,7 @@ fn switch_paint(checked: bool, disabled: bool, cx: &App) -> SwitchPaint {
         }
     } else {
         SwitchPaint {
-            track: t.background,
+            track: t.transparent,
             border: t.muted_foreground,
             thumb: t.muted_foreground,
         }
@@ -441,7 +520,7 @@ impl RenderOnce for FluentSwitch {
         let disabled = self.disabled;
         let focus = focus_for(&id, window, cx);
         let paint = switch_paint(checked, disabled, cx);
-        let thumb_size = px(if checked { 14. } else { 12. });
+        let thumb_size = px(12.);
         let thumb_x = spring(
             (id.clone(), "fluent-thumb"),
             if checked {
@@ -477,12 +556,12 @@ impl RenderOnce for FluentSwitch {
                     }
                 })
                 .group_active(group.clone(), move |s| {
-                    let s = s.w(thumb_size + px(4.));
+                    let s = s.w(px(17.)).h(px(14.));
                     if checked {
                         if rtl {
-                            s.right(-px(4.))
+                            s.right(-px(5.))
                         } else {
-                            s.left(-px(4.))
+                            s.left(-px(5.))
                         }
                     } else {
                         s
@@ -649,18 +728,33 @@ impl SidebarItem for FluentNavItem {
         } else {
             btn.px_3()
         };
-        btn = btn.child(Icon::default().path(icon).with_size(Size::Small));
+        btn = btn.child(
+            Icon::default()
+                .path(icon)
+                .with_size(Size::Medium)
+                .text_color(if selected {
+                    t.primary
+                } else {
+                    t.sidebar_foreground
+                }),
+        );
         if !collapsed {
-            btn = btn.child(div().min_w_0().truncate().child(self.label));
+            let label = div().min_w_0().truncate().child(self.label);
+            btn = btn.child(if selected {
+                label.font_semibold()
+            } else {
+                label
+            });
         }
         if selected {
             btn = btn.child(pill);
         }
-        div().relative().w_full().child(btn).children(focus_visual(
-            focus.is_focused(window),
-            window,
-            cx,
-        ))
+        div()
+            .relative()
+            .w_full()
+            .my_0p5()
+            .child(btn)
+            .children(focus_visual(focus.is_focused(window), window, cx))
     }
 }
 
@@ -674,7 +768,7 @@ pub enum InfoSeverity {
     Error,
 }
 
-fn info_colors(severity: InfoSeverity, cx: &App) -> (Hsla, Hsla, Hsla) {
+fn info_colors(severity: InfoSeverity, cx: &App) -> (Hsla, Hsla) {
     let t = cx.theme();
     let color = match severity {
         InfoSeverity::Informational => t.info,
@@ -683,12 +777,7 @@ fn info_colors(severity: InfoSeverity, cx: &App) -> (Hsla, Hsla, Hsla) {
         InfoSeverity::Error => t.danger,
     };
     let bg = Hsla::from(t.popover.to_rgb().blend(color.opacity(0.10).to_rgb()));
-    let badge_ink = if t.is_dark() {
-        rgb(0x141414).into()
-    } else {
-        rgb(0xFFFFFF).into()
-    };
-    (bg, color, badge_ink)
+    (bg, color)
 }
 
 pub struct FluentInfoBar {
@@ -730,38 +819,44 @@ impl FluentInfoBar {
 
     #[inline(never)]
     pub fn render(self, cx: &App) -> AnyElement {
-        let (bg, semantic, ink) = info_colors(self.severity, cx);
+        let (bg, semantic) = info_colors(self.severity, cx);
         let icon = match self.severity {
-            InfoSeverity::Informational => "fluent/info.svg",
-            InfoSeverity::Success => "fluent/checkmark.svg",
-            InfoSeverity::Warning => "fluent/warning.svg",
-            InfoSeverity::Error => "fluent/error-circle.svg",
+            InfoSeverity::Informational => "fluent/info-filled.svg",
+            InfoSeverity::Success => "fluent/checkmark-circle-filled.svg",
+            InfoSeverity::Warning => "fluent/warning-filled.svg",
+            InfoSeverity::Error => "fluent/error-circle-filled.svg",
         };
         let badge = div()
             .id("infobar-severity")
             .test_support()
             .size(px(20.))
-            .rounded_full()
             .flex_shrink_0()
             .flex()
             .items_center()
             .justify_center()
-            .bg(semantic)
             .child(
                 Icon::default()
                     .path(icon)
-                    .with_size(Size::XSmall)
-                    .text_color(ink),
+                    .with_size(Size::Large)
+                    .text_color(semantic),
             );
+        let actions = (!self.actions.is_empty()).then(|| {
+            div()
+                .flex_row_dir(cx)
+                .flex_shrink_0()
+                .gap_2()
+                .children(self.actions)
+        });
+
         div()
             .id(self.id)
             .role(self.role)
             .test_support()
             .aria_label(self.message.clone())
             .mx_3()
-            .my_1()
+            .my_0p5()
             .px_3()
-            .py_2()
+            .py_1()
             .rounded(px(4.))
             .border_1()
             .border_color(cx.theme().border)
@@ -773,13 +868,7 @@ impl FluentInfoBar {
             .gap_3()
             .child(badge)
             .child(div().min_w_0().flex_1().child(self.message))
-            .child(
-                div()
-                    .flex_row_dir(cx)
-                    .flex_shrink_0()
-                    .gap_2()
-                    .children(self.actions),
-            )
+            .children(actions)
             .children(self.close)
             .into_any_element()
     }
@@ -790,7 +879,7 @@ mod tests {
     use super::*;
     use gpui_kit::{
         AppContext as _, Context, Render, TestAppContext, WindowOptions, size,
-        test::{TestAppContextExt as _, TestWindowExt as _},
+        test::{TestAppContextExt as _, TestEventExt as _, TestWindowExt as _},
     };
 
     struct ControlDemo {
@@ -889,7 +978,10 @@ mod tests {
             let progress = window.find("button-progress");
             assert_eq!(progress.role(), Some(Role::ProgressIndicator));
             assert_eq!(progress.label(), Some("Working"));
-            assert_eq!(progress.indeterminate(), Some(true));
+            // Indeterminate progress omits aria_numeric_value; indeterminate() is checkbox metadata.
+            assert!(progress.value().is_none());
+            assert_eq!(progress.bounds().size.width, progress.bounds().size.height);
+            assert!(progress.bounds().size.width >= px(10.));
             assert!(window.try_find("fluent-focus-visual").is_none());
             window.press("tab", cx);
             window.render_frame(cx);
@@ -897,8 +989,29 @@ mod tests {
             window.click("demo-button", cx);
             assert_eq!(view.read(cx).activated, 1);
             assert!(window.try_find("fluent-focus-visual").is_none());
-            window.click("demo-switch", cx);
-            assert_eq!(window.find("demo-switch").checked(), Some(true));
+            let center = window
+                .within("demo-switch")
+                .find("fluent-switch-track")
+                .bounds()
+                .center();
+            for expected in [true, false] {
+                window.pointer_move(center, None, cx);
+                let hovered = window
+                    .within("demo-switch")
+                    .find("fluent-switch-thumb")
+                    .bounds()
+                    .size;
+                assert_eq!(hovered, size(px(14.), px(14.)));
+                window.pointer_down(center, gpui_kit::MouseButton::Left, cx);
+                let pressed = window
+                    .within("demo-switch")
+                    .find("fluent-switch-thumb")
+                    .bounds()
+                    .size;
+                assert_eq!(pressed, size(px(17.), px(14.)));
+                window.pointer_up(center, gpui_kit::MouseButton::Left, cx);
+                assert_eq!(window.find("demo-switch").checked(), Some(expected));
+            }
             window.click("demo-disabled", cx);
             assert_eq!(window.find("demo-disabled").checked(), Some(false));
             window.click("demo-loading", cx);
@@ -939,21 +1052,31 @@ mod tests {
                     InfoSeverity::Warning,
                     InfoSeverity::Error,
                 ] {
-                    let (bg, badge, ink) = info_colors(severity, cx);
+                    let (bg, badge) = info_colors(severity, cx);
                     assert!(
                         contrast(t.foreground, bg) >= 4.5,
                         "InfoBar body {mode:?} {severity:?}"
                     );
                     assert!(
-                        contrast(badge, ink) >= 4.5,
+                        contrast(badge, bg) >= 3.,
                         "InfoBar badge {mode:?} {severity:?}"
                     );
                 }
                 for checked in [false, true] {
                     let paint = switch_paint(checked, false, cx);
                     assert!(
-                        contrast(paint.track, paint.thumb) >= 3.,
+                        contrast(if checked { paint.track } else { t.popover }, paint.thumb) >= 3.,
                         "switch thumb {mode:?} {checked}"
+                    );
+                }
+                for outline in [false, true] {
+                    let mut style =
+                        BtnStyle::new(ButtonVariant::Primary, Size::Small).loading(true);
+                    style.outline = outline;
+                    let (fill, ink) = loading_button_colors(style, cx);
+                    assert!(
+                        contrast(fill, ink) >= 4.5,
+                        "loading ring {mode:?} outline={outline}"
                     );
                 }
                 let (outer, inner) = focus_colors(t.is_dark());

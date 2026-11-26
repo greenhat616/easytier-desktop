@@ -46,3 +46,7 @@ Copyright (c) 2020 Microsoft Corporation; MIT license in `LICENSE.txt`. The file
 
 - `globe-filled.svg` — `assets/Globe/SVG/ic_fluent_globe_24_filled.svg`
 - `shield-filled.svg` — `assets/Shield/SVG/ic_fluent_shield_24_filled.svg`
+- `info-filled.svg` — `assets/Info/SVG/ic_fluent_info_24_filled.svg`
+- `checkmark-circle-filled.svg` — `assets/Checkmark Circle/SVG/ic_fluent_checkmark_circle_24_filled.svg`
+- `warning-filled.svg` — `assets/Warning/SVG/ic_fluent_warning_24_filled.svg`
+- `error-circle-filled.svg` — `assets/Error Circle/SVG/ic_fluent_error_circle_24_filled.svg`

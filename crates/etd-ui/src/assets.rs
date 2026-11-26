@@ -85,6 +85,22 @@ const FLUENT: &[(&str, &[u8])] = &[
     ),
     ("eye.svg", include_bytes!("../assets/fluent/eye.svg")),
     ("folder.svg", include_bytes!("../assets/fluent/folder.svg")),
+    (
+        "error-circle-filled.svg",
+        include_bytes!("../assets/fluent/error-circle-filled.svg"),
+    ),
+    (
+        "warning-filled.svg",
+        include_bytes!("../assets/fluent/warning-filled.svg"),
+    ),
+    (
+        "checkmark-circle-filled.svg",
+        include_bytes!("../assets/fluent/checkmark-circle-filled.svg"),
+    ),
+    (
+        "info-filled.svg",
+        include_bytes!("../assets/fluent/info-filled.svg"),
+    ),
     ("globe.svg", include_bytes!("../assets/fluent/globe.svg")),
     (
         "globe-filled.svg",

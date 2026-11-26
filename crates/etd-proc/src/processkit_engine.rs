@@ -1252,6 +1252,7 @@ mod audit_tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn unreaped_zombie_missing_from_snapshot_is_not_a_live_candidate() {
+        // no-window: macOS only
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--help")
             .stdout(std::process::Stdio::null())

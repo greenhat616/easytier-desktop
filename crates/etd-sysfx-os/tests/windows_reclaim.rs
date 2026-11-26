@@ -6,11 +6,13 @@ use etd_sysfx_os::{OsConfig, adapters};
 use etd_testkit::{
     conformance::ledger::{changes, plan, put},
     fakes::ledger::MemoryLedger,
+    no_window::NoWindow,
 };
 use std::{process::Command, sync::Arc};
 
 fn ps(script: &str) -> String {
     let output = Command::new("powershell.exe")
+        .no_window()
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
         .unwrap();
@@ -34,7 +36,7 @@ impl RepairIndexStore for Index {
 struct Rule(String);
 impl Drop for Rule {
     fn drop(&mut self) {
-        let _ = Command::new("powershell.exe").args(["-NoProfile","-NonInteractive","-Command",&format!("Get-NetFirewallRule -PolicyStore PersistentStore | Where-Object Name -eq '{}' | Remove-NetFirewallRule",self.0)]).output();
+        let _ = Command::new("powershell.exe").no_window().args(["-NoProfile","-NonInteractive","-Command",&format!("Get-NetFirewallRule -PolicyStore PersistentStore | Where-Object Name -eq '{}' | Remove-NetFirewallRule",self.0)]).output();
     }
 }
 
@@ -42,7 +44,7 @@ struct RegistryFixture(Vec<String>);
 impl Drop for RegistryFixture {
     fn drop(&mut self) {
         for path in &self.0 {
-            let _=Command::new("powershell.exe").args(["-NoProfile","-NonInteractive","-Command",&format!("Remove-Item -LiteralPath '{path}' -Recurse -Force -ErrorAction SilentlyContinue")]).output();
+            let _=Command::new("powershell.exe").no_window().args(["-NoProfile","-NonInteractive","-Command",&format!("Remove-Item -LiteralPath '{path}' -Recurse -Force -ErrorAction SilentlyContinue")]).output();
         }
     }
 }
@@ -334,6 +336,7 @@ async fn registry_and_magic_dns() {
         .unwrap();
         let mut child = Child(
             Command::new(image)
+                .no_window()
                 .args(["/d", "/c", "pause"])
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::null())
@@ -605,6 +608,7 @@ async fn real_wintun_after_kill() {
         .unwrap();
     let mut core = Child(
         Command::new(&exe)
+            .no_window()
             .current_dir(exe.parent().unwrap())
             .args([
                 "--network-name",

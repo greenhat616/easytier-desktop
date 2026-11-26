@@ -11,6 +11,7 @@ use etd_ipc::{
 use etd_sysfx_os::service::{
     HostFilesystem, NativeHostFilesystem, NativeServiceManager, ServiceManager,
 };
+use etd_testkit::no_window::NoWindow;
 use std::{
     process::{Command, Stdio},
     sync::Arc,
@@ -19,6 +20,12 @@ use std::{
 
 #[cfg(windows)]
 use etd_sysfx_os::service::ci_fixture::{StandardAccount, assert_query_only};
+
+fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command.no_window();
+    command
+}
 
 #[cfg(windows)]
 fn standard_user_handshake(
@@ -126,7 +133,7 @@ async fn install_connect_uninstall() {
     let layout = NativeHostFilesystem.service_layout().unwrap();
     assert!(!layout.state.exists());
     assert!(!layout.executable.exists());
-    let mut install = Command::new(binary);
+    let mut install = command(binary);
     install.arg("install");
     #[cfg(windows)]
     let account = {
@@ -207,12 +214,9 @@ async fn install_connect_uninstall() {
     #[cfg(windows)]
     let after_revoke = standard_user_handshake(&account, connector.clone(), endpoint.clone());
     #[cfg(windows)]
-    let cleanup = Command::new(&installed_image)
-        .arg("uninstall")
-        .output()
-        .unwrap();
+    let cleanup = command(&installed_image).arg("uninstall").output().unwrap();
     #[cfg(unix)]
-    let cleanup = Command::new(binary).arg("uninstall").output().unwrap();
+    let cleanup = command(binary).arg("uninstall").output().unwrap();
     assert!(
         cleanup.status.success(),
         "{}",
@@ -230,7 +234,7 @@ async fn install_connect_uninstall() {
     })
     .await
     .expect("uninstall helper did not finish removing product directories");
-    let replay = Command::new(binary).arg("uninstall").output().unwrap();
+    let replay = command(binary).arg("uninstall").output().unwrap();
     assert!(
         replay.status.success(),
         "{}",
@@ -299,7 +303,7 @@ async fn install_connect_uninstall() {
     assert!(!std::path::Path::new("/Library/LaunchDaemons/easytier-desk-host.plist").exists());
     #[cfg(windows)]
     assert_eq!(
-        Command::new("sc.exe")
+        command("sc.exe")
             .args(["query", "easytier-desk-host"])
             .output()
             .unwrap()
@@ -311,7 +315,7 @@ async fn install_connect_uninstall() {
         "uninstall reclaimed the ledger and removed service registration, owned directories and group"
     );
     let spawn_install = || {
-        Command::new(binary)
+        command(binary)
             .arg("install")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -328,7 +332,7 @@ async fn install_connect_uninstall() {
         String::from_utf8_lossy(&first.stderr),
         String::from_utf8_lossy(&second.stderr)
     );
-    let cleanup = Command::new(binary).arg("uninstall").output().unwrap();
+    let cleanup = command(binary).arg("uninstall").output().unwrap();
     assert!(
         cleanup.status.success(),
         "{}",
@@ -347,7 +351,7 @@ async fn install_connect_uninstall() {
     })
     .await
     .expect("racing install never began");
-    let uninstall = Command::new(binary).arg("uninstall").output().unwrap();
+    let uninstall = command(binary).arg("uninstall").output().unwrap();
     let installed = install.wait_with_output().unwrap();
     assert!(
         installed.status.success(),
@@ -360,7 +364,7 @@ async fn install_connect_uninstall() {
         String::from_utf8_lossy(&uninstall.stderr)
     );
     assert!(!layout.state.exists() && !layout.executable.parent().unwrap().exists());
-    let status = Command::new(binary)
+    let status = command(binary)
         .args(["uninstall", "--status"])
         .output()
         .unwrap();

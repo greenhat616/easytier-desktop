@@ -6,6 +6,7 @@ use etd_sysfx::{
     *,
 };
 use etd_testkit::conformance::ledger::{changes, plan, put, request};
+use etd_testkit::no_window::NoWindow;
 use proptest::prelude::*;
 use std::{
     path::Path,
@@ -89,6 +90,7 @@ fn kill_and_reopen(stage: usize, count: usize) {
             .unwrap();
     });
     let mut child = Command::new(std::env::current_exe().unwrap())
+        .no_window()
         .args(["--exact", "crash_child", "--nocapture"])
         .env("ETD_LEDGER_CRASH_DB", &path)
         .env("ETD_LEDGER_CRASH_MARKER", &marker)

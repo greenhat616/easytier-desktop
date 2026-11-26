@@ -17,18 +17,49 @@ const PROGRAM: &str = "easytier-core";
 const MAX_OUTPUT: usize = 4096;
 
 pub async fn identify(binary: &Path) -> Result<CoreDescriptor, CoreError> {
-    let mut command = tokio::process::Command::new(binary);
+    // The executable and its companions live in the verified bundle.
+    // Do not inherit the installer/maintenance caller's working directory:
+    // Windows may search it for DLLs after the executable/system directories.
+    let binary = std::fs::canonicalize(binary)
+        .map_err(|error| CoreError::Identify(format!("cannot resolve kernel: {error}")))?;
+    let bundle = binary
+        .parent()
+        .ok_or_else(|| CoreError::Identify("kernel has no bundle directory".into()))?;
+    let mut command = tokio::process::Command::new(&binary);
     command
+        .current_dir(bundle)
         .arg("--version")
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    // The C runtime and Winsock need SystemRoot even for `--version`.
+    // Match the fixed launch environment (etd-proc): never inherit PATH.
+    // Windows OS DLLs and trusted system tools are the platform exception
+    // to the bundle's pinned companion inventory.
+    #[cfg(unix)]
+    command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
     #[cfg(windows)]
-    if let Some(root) = std::env::var_os("SystemRoot") {
-        command.env("SystemRoot", root);
+    {
+        let root = std::env::var_os("SystemRoot")
+            .filter(|value| !value.is_empty())
+            .or_else(|| std::env::var_os("windir").filter(|value| !value.is_empty()))
+            .ok_or_else(|| CoreError::Identify("missing Windows system root".into()))?;
+        let root_path = std::path::PathBuf::from(&root);
+        let path = std::env::join_paths([
+            root_path.join("System32"),
+            root_path.clone(),
+            root_path.join("System32").join("Wbem"),
+            root_path
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0"),
+        ])
+        .map_err(|error| CoreError::Identify(format!("invalid Windows system PATH: {error}")))?;
+        command
+            .env("SystemRoot", &root)
+            .env("windir", &root)
+            .env("PATH", path);
     }
     let output = tokio::time::timeout(VERSION_TIMEOUT, command.output())
         .await

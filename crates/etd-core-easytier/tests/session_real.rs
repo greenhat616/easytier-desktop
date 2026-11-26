@@ -1,5 +1,6 @@
 //! Opt-in check against the pinned native binary (not the portable library).
-//! Set ETD_EASYTIER_CORE to the absolute path to a c97f36b build.
+//! Set ETD_EASYTIER_CORE to the absolute path of the bundled release kernel
+//! (`cargo xtask fetch-cores --target host`); CI runs this on all three OSes.
 #[path = "plan_fixtures.rs"]
 mod fixtures;
 

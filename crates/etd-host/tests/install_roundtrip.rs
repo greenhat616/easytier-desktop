@@ -51,6 +51,34 @@ fn standard_user_handshake(
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(15), async {
                 let (_, identity) = connector.connect(&endpoint).await?;
+                // Verify the query-only grant without taking any action on
+                // the service process. A handle for a sensitive right is a
+                // failure, even if the process would reject our RPCs.
+                use windows::Win32::{
+                    Foundation::{CloseHandle, ERROR_ACCESS_DENIED},
+                    System::Threading::{
+                        OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_TERMINATE, PROCESS_VM_READ,
+                    },
+                };
+                for access in [
+                    PROCESS_TERMINATE,
+                    PROCESS_VM_READ,
+                    PROCESS_ACCESS_RIGHTS(0x0004_0000),
+                ] {
+                    match unsafe { OpenProcess(access, false, identity.peer.pid) } {
+                        Ok(handle) => {
+                            let _ = unsafe { CloseHandle(handle) };
+                            anyhow::bail!(
+                                "standard token unexpectedly acquired process right {:#x}",
+                                access.0
+                            );
+                        }
+                        Err(error) => anyhow::ensure!(
+                            error.code() == ERROR_ACCESS_DENIED.to_hresult(),
+                            "unexpected sensitive process access error: {error}"
+                        ),
+                    }
+                }
                 let channel = tonic::transport::Endpoint::from_static("http://localhost")
                     .connect_with_connector(ClientIo::new(connector, endpoint))
                     .await?;
@@ -74,6 +102,63 @@ fn standard_user_handshake(
     .map_err(|_| anyhow::anyhow!("standard-user handshake thread panicked"))?
 }
 
+#[cfg(windows)]
+async fn revoke_user(
+    connector: Arc<LocalConnector>,
+    endpoint: Endpoint,
+    sid: &str,
+) -> anyhow::Result<()> {
+    use etd_contract::v1::{
+        GetAllowListRequest, MutationHeader, SetAllowListRequest, os_principal::Id,
+    };
+    fn request<T>(body: T) -> tonic::Request<T> {
+        let mut request = tonic::Request::new(body);
+        request.metadata_mut().insert(
+            VERSION_METADATA_KEY,
+            version_metadata_value().parse().unwrap(),
+        );
+        request
+    }
+    let channel = tonic::transport::Endpoint::from_static("http://localhost")
+        .connect_with_connector(ClientIo::new(connector, endpoint))
+        .await?;
+    let mut client = HostServiceClient::new(channel);
+    let existing = client
+        .get_allow_list(request(GetAllowListRequest {}))
+        .await?
+        .into_inner();
+    let mut entries = existing.entries;
+    let prior = entries.len();
+    entries.retain(|entry| !matches!(entry.principal.as_ref().and_then(|principal| principal.id.as_ref()), Some(Id::WindowsUserSid(user)) if user == sid));
+    anyhow::ensure!(
+        entries.len() + 1 == prior,
+        "initial durable enrollment is absent or duplicated"
+    );
+    let response = client
+        .set_allow_list(request(SetAllowListRequest {
+            header: Some(MutationHeader {
+                request_id: "ci-revoke-user".into(),
+                expected_revision: existing.revision,
+            }),
+            entries: entries.clone(),
+        }))
+        .await?
+        .into_inner();
+    anyhow::ensure!(
+        response.receipt.is_some(),
+        "allow-list change has no durable receipt"
+    );
+    let actual = client
+        .get_allow_list(request(GetAllowListRequest {}))
+        .await?
+        .into_inner();
+    anyhow::ensure!(
+        actual.entries == entries,
+        "post-update ledger and RPC allow-list differ"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires a disposable elevated CI runner and ETD_HOST_CI_INSTALL=1"]
 async fn install_connect_uninstall() {
@@ -91,12 +176,12 @@ async fn install_connect_uninstall() {
     let mut install = Command::new(binary);
     install.arg("install");
     #[cfg(windows)]
-    let token = {
+    let (token, enrolled_sid) = {
         let (token, etd_ipc::OsUserId::WindowsSid(sid)) = windows_account::logon() else {
             panic!("expected Windows SID")
         };
         install.args(["--allow-user", &sid]);
-        token
+        (token, sid)
     };
     let result = install.output().unwrap();
     assert!(
@@ -161,7 +246,18 @@ async fn install_connect_uninstall() {
     })
     .await;
     #[cfg(windows)]
-    let standard = standard_user_handshake(token, connector.clone(), endpoint.clone());
+    let standard = token
+        .try_clone()
+        .map_err(anyhow::Error::from)
+        .and_then(|token| standard_user_handshake(token, connector.clone(), endpoint.clone()));
+    #[cfg(windows)]
+    let revoked = tokio::time::timeout(
+        Duration::from_secs(15),
+        revoke_user(connector.clone(), endpoint.clone(), &enrolled_sid),
+    )
+    .await;
+    #[cfg(windows)]
+    let after_revoke = standard_user_handshake(token, connector.clone(), endpoint.clone());
     let cleanup = Command::new(binary).arg("uninstall").output().unwrap();
     assert!(
         cleanup.status.success(),
@@ -200,6 +296,21 @@ async fn install_connect_uninstall() {
         );
         println!(
             "standard user verified LocalSystem pipe and protected image; role Control while elevated admin role Admin"
+        );
+        revoked
+            .expect("live ACL update timed out")
+            .expect("SetAllowList failed to revoke the enrolled SID");
+        let denied = after_revoke
+            .expect_err("revoked user connected after the durable SetAllowList receipt");
+        assert_eq!(
+            denied
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::PermissionDenied),
+            "expected kernel pipe ACL denial, got {denied:#}"
+        );
+        println!(
+            "SetAllowList receipt returned with the durable snapshot and live pipe ACL updated; revoked standard user refused"
         );
     }
     assert!(!layout.state.exists());

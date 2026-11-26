@@ -3,7 +3,7 @@
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-$q = ConvertFrom-Json $env:ETD_OS_REQUEST
+$q = if ($env:ETD_OS_SERVE -eq '1') { $null } else { ConvertFrom-Json $env:ETD_OS_REQUEST }
 $nrpt = 'SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig'
 $profiles = 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles'
 $signatures = 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Signatures\Unmanaged'
@@ -150,6 +150,23 @@ function Execute-Request {
         }
         default { throw 'Unknown OS operation' }
     }
+}
+if ($env:ETD_OS_SERVE -eq '1') {
+    # Serve mode: one ASCII JSON request per stdin line, one compressed JSON
+    # response per stdout line, until stdin closes. A failed request answers
+    # {error} and the worker serves on.
+    try {
+        while ($null -ne ($line = [Console]::In.ReadLine())) {
+            $response = try {
+                $script:q = ConvertFrom-Json $line
+                $result = Execute-Request
+                @{result=@($result | Where-Object { $null -ne $_ })}
+            } catch { @{error=[string]$_.Exception.Message} }
+            [Console]::Out.WriteLine((ConvertTo-Json -InputObject $response -Depth 20 -Compress))
+            [Console]::Out.Flush()
+        }
+    } finally { $hklm.Dispose() }
+    exit 0
 }
 try {
     $result = Execute-Request

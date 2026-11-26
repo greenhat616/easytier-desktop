@@ -62,6 +62,78 @@ impl SharedGate {
     }
 }
 
+/// Kinds whose records are independent objects, each reclaimed by its own
+/// system calls (on Windows: one management query per probe, delete and
+/// verify): records of one such kind within a rank are stepped together, a
+/// few at a time, instead of one after another. Every other kind, and every
+/// kind that edits a shared table, stays sequential.
+const CONCURRENT_KINDS: &[EffectKind] = &[
+    EffectKind::WinFirewallRule,
+    EffectKind::WinProgramFirewallRule,
+    EffectKind::WinNrptRule,
+    EffectKind::WinRegistryValue,
+];
+/// Records of one kind stepped at the same time.
+const CONCURRENCY: usize = 4;
+
+/// Step the records of one rank: kinds in [`CONCURRENT_KINDS`] in chunks of
+/// [`CONCURRENCY`], all others one by one. Ranks order the reclaim; within a
+/// rank records do not depend on each other.
+async fn step_rank(
+    ctx: &mut Ctx<'_>,
+    records: &[Effect],
+) -> Result<Vec<RecordOutcome>, LedgerError> {
+    let (together, alone): (Vec<&Effect>, Vec<&Effect>) = records
+        .iter()
+        .partition(|e| CONCURRENT_KINDS.contains(&e.kind));
+    let mut outcomes = Vec::with_capacity(records.len());
+    for e in alone {
+        outcomes.push(ctx.step(e).await?);
+    }
+    let mut kinds: Vec<EffectKind> = together.iter().map(|e| e.kind).collect();
+    kinds.sort_by_key(|k| k.to_string());
+    kinds.dedup();
+    for kind in kinds {
+        let same: Vec<&Effect> = together
+            .iter()
+            .copied()
+            .filter(|e| e.kind == kind)
+            .collect();
+        for chunk in same.chunks(CONCURRENCY) {
+            let (ledger, reclaimers, boot, closed_at) = (
+                ctx.ledger,
+                ctx.reclaimers,
+                ctx.boot.clone(),
+                ctx.process_closed_at,
+            );
+            let mut notes: Vec<Vec<String>> = chunk.iter().map(|_| Vec::new()).collect();
+            let results = futures_util::future::join_all(chunk.iter().zip(notes.iter_mut()).map(
+                |(e, notes)| {
+                    let boot = boot.clone();
+                    async move {
+                        let mut child = Ctx {
+                            ledger,
+                            reclaimers,
+                            boot,
+                            notes,
+                            process_closed_at: closed_at,
+                        };
+                        child.step(e).await
+                    }
+                },
+            ))
+            .await;
+            for n in notes {
+                ctx.notes.extend(n);
+            }
+            for r in results {
+                outcomes.push(r?);
+            }
+        }
+    }
+    Ok(outcomes)
+}
+
 pub struct ReclaimEngineImpl {
     deps: ReclaimDeps,
     reclaimers: HashMap<EffectKind, Arc<dyn Reclaimer>>,
@@ -180,8 +252,7 @@ impl ReclaimEngineImpl {
             if blocked {
                 break;
             }
-            for e in &records[i..end] {
-                let outcome = ctx.step(e).await?;
+            for outcome in step_rank(ctx, &records[i..end]).await? {
                 if outcome.blocks() {
                     blocked = true;
                 }

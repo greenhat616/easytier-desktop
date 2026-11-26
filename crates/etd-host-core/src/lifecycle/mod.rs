@@ -55,6 +55,12 @@ pub struct LifecycleConfig {
     /// Session-form host: how long no client may hold a lease before the
     /// host stops its instances and exits.
     pub lease_grace: Duration,
+    /// Once the host winds down (shutdown, lease or handle closed): how long
+    /// it waits for its supervisors to stop their kernels and reclaim. When
+    /// it runs out, the host exits anyway; whatever is still open stays in
+    /// the ledger for the next start's self-check (or the uninstaller's
+    /// purge) to reclaim. Kept well below the uninstaller's 60 s stop wait.
+    pub shutdown_budget: Duration,
     /// While a fenced kernel runs, its fence is verified again this often
     /// (a firewall reload can drop the rule under a running kernel).
     pub fence_recheck: Duration,
@@ -77,6 +83,7 @@ impl Default for LifecycleConfig {
             reclaim_retry: Duration::from_secs(2),
             log_lines: 1000,
             lease_grace: Duration::from_secs(30),
+            shutdown_budget: Duration::from_secs(30),
             fence_recheck: Duration::from_secs(30),
             fence_retry: Duration::from_secs(2),
             fence_unverifiable_retry: Duration::from_secs(10),
@@ -96,6 +103,9 @@ pub(crate) struct Ctx {
     /// until a sweep of their own run directories proves no kernel of
     /// theirs is alive (RetryReclaim).
     pub excluded: std::sync::Mutex<std::collections::BTreeSet<InstanceId>>,
+    /// Every supervisor task started, so a host that stops waiting for them
+    /// can still end them before it gives up its lock.
+    pub tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// Held by a generation from the check of its kernel's program firewall
     /// rules before the spawn until their read-back after basic readiness
     /// (or the end of the generation). The kernel deletes and recreates
@@ -173,6 +183,48 @@ pub enum RunOutcome {
     Closed,
 }
 
+/// The supervisor tasks of an orchestrator ([`Orchestrator::supervisor_tasks`]).
+#[derive(Clone)]
+pub struct SupervisorTasks(Arc<Ctx>);
+
+impl SupervisorTasks {
+    /// Abort every supervisor task still running and wait up to `wait`
+    /// (real time) for them to end. A task aborted mid-reclaim leaves its
+    /// records as the ledger has them: open ones stay open for the next
+    /// start. Returns how many had to be aborted; `Err` with how many did
+    /// not end in time.
+    pub async fn abort_and_wait(&self, wait: Duration) -> Result<usize, usize> {
+        let tasks: Vec<_> = std::mem::take(
+            &mut *self
+                .0
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_iter()
+        .filter(|t| !t.is_finished())
+        .collect();
+        let aborted = tasks.len();
+        for task in &tasks {
+            task.abort();
+        }
+        let mut left = tasks;
+        let until = tokio::time::Instant::now() + wait;
+        while !left.is_empty() {
+            left.retain(|t| !t.is_finished());
+            if left.is_empty() || tokio::time::Instant::now() >= until {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if left.is_empty() {
+            Ok(aborted)
+        } else {
+            Err(left.len())
+        }
+    }
+}
+
 /// The lifecycle orchestrator (H1's side of the frozen handle).
 pub struct Orchestrator {
     ctx: Arc<Ctx>,
@@ -195,10 +247,22 @@ impl Orchestrator {
                 config,
                 hold: std::sync::Mutex::new(None),
                 excluded: std::sync::Mutex::new(Default::default()),
+                tasks: std::sync::Mutex::new(Vec::new()),
                 program_rules: Arc::new(tokio::sync::Mutex::new(())),
             }),
             port,
         }
+    }
+
+    /// How long the wind-down waits for the supervisors.
+    pub fn shutdown_budget(&self) -> Duration {
+        self.ctx.config.shutdown_budget
+    }
+
+    /// The supervisor tasks of this orchestrator, to end them once it has
+    /// returned or been abandoned.
+    pub fn supervisor_tasks(&self) -> SupervisorTasks {
+        SupervisorTasks(self.ctx.clone())
     }
 
     /// Self-check, then serve until shut down.
@@ -230,6 +294,8 @@ impl Orchestrator {
             purge_wait: None,
             purge: None,
             ending: None,
+            ending_since: None,
+            ending_deadline: None,
             shutdown_replies: Vec::new(),
         };
         actor.run().await
@@ -276,6 +342,9 @@ struct Actor {
     /// A PurgeAll ticket waits for every supervisor to end.
     purge: Option<String>,
     ending: Option<Ending>,
+    /// When the wind-down began and when its budget runs out.
+    ending_since: Option<Instant>,
+    ending_deadline: Option<Instant>,
     shutdown_replies: Vec<oneshot::Sender<()>>,
 }
 
@@ -314,18 +383,45 @@ impl Actor {
             let boot = boot::self_check(self.ctx.clone());
             tokio::pin!(boot);
             loop {
+                let clock = self.ctx.deps.clock.clone();
+                let deadline = match self.ending_deadline {
+                    Some(at) => clock.sleep(at.saturating_duration_since(clock.now())),
+                    None => Box::pin(std::future::pending()),
+                };
                 tokio::select! {
                     biased;
-                    out = &mut boot => break out,
+                    out = &mut boot => break Some(out),
                     cmd = self.commands.recv(), if !self.commands_closed => match cmd {
                         Some(cmd) => self.on_command_not_serving(cmd),
-                        None => self.commands_closed = true,
+                        None => {
+                            self.commands_closed = true;
+                            self.mark_ending(Ending::Closed);
+                        }
                     },
+                    // Asked to stop during the self-check: it is not waited
+                    // for past the budget (its records stay open; the next
+                    // start runs it again).
+                    () = deadline => break None,
                 }
             }
         };
+        let Some(outcome) = outcome else {
+            let end = self.ending.unwrap_or(Ending::Closed);
+            tracing::warn!(
+                stage = "shutdown.budget_exceeded",
+                during = "self-check",
+                budget_ms = millis(self.ctx.config.shutdown_budget),
+                "host shutdown: self-check abandoned; open records stay in the ledger"
+            );
+            return self.finish(end).await;
+        };
         self.after_boot(outcome).await;
-        if self.commands_closed && self.ending.is_none() {
+        // A shutdown (or a closed handle) received during the self-check
+        // only marked the ending: the supervisors `after_boot` just started
+        // must be told to stop too, or the host would wait for them forever.
+        if let Some(end) = self.ending {
+            self.begin_ending(end);
+        } else if self.commands_closed {
             self.begin_ending(Ending::Closed);
         }
         loop {
@@ -343,6 +439,7 @@ impl Actor {
             let resweep_sleep = until(self.resweep_due);
             let lease_sleep = until(self.lease_deadline);
             let purge_sleep = until(self.purge_due);
+            let ending_sleep = until(self.ending_deadline);
             tokio::select! {
                 biased;
                 report = self.reports_rx.recv() => {
@@ -380,6 +477,11 @@ impl Actor {
                     self.host_log("no client holds a lease: stopping instances and exiting".into());
                     self.begin_ending(Ending::Lease);
                 }
+                () = ending_sleep => {
+                    let end = self.ending.unwrap_or(Ending::Closed);
+                    self.abandon_supervisors();
+                    return self.finish(end).await;
+                }
             }
         }
     }
@@ -407,10 +509,27 @@ impl Actor {
             self.resweep_due = Some(self.ctx.deps.clock.now() + self.ctx.config.reclaim_retry);
         }
         let mut initial = outcome.initial;
+        // Asked to stop during the self-check: launch nothing. Only an open
+        // generation gets a supervisor, told to stop before it does anything
+        // else, so it reclaims within what is left of the budget.
+        let ending = self.ending.is_some();
         for desired in outcome.desired {
             let id = InstanceId(desired.instance_id.clone());
             let init = initial.remove(&id).unwrap_or(Initial::Idle);
-            self.spawn_supervisor(id, Box::new(desired), init, None);
+            if !ending {
+                self.spawn_supervisor(id, Box::new(desired), init, None);
+            } else if !matches!(init, Initial::Idle) {
+                let (reply, _) = oneshot::channel();
+                let first = SupCmd::Shutdown { reply };
+                self.spawn_supervisor(id, Box::new(desired), init, Some(first));
+            }
+        }
+        if ending {
+            let at = self.now_ms();
+            for notice in outcome.notices {
+                self.publisher.notice(at, notice);
+            }
+            return;
         }
 
         self.set_phase(HostPhase::Serving);
@@ -541,7 +660,15 @@ impl Actor {
             self.presence.subscribe(),
             logs,
         );
-        tokio::spawn(sup.run());
+        let task = tokio::spawn(sup.run());
+        let mut tasks = self
+            .ctx
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tasks.retain(|t| !t.is_finished());
+        tasks.push(task);
+        drop(tasks);
         self.supervisors.insert(id, SupHandle { tx });
     }
 
@@ -555,6 +682,9 @@ impl Actor {
 
     async fn on_report(&mut self, report: Report) {
         let at = self.now_ms();
+        if self.ending.is_some() {
+            self.trace_ending(&report);
+        }
         match report {
             Report::Status(status) => {
                 let id = InstanceId(status.instance_id.clone());
@@ -676,9 +806,7 @@ impl Actor {
             }
             Command::Shutdown { reply } => {
                 self.shutdown_replies.push(reply);
-                if self.ending.is_none() {
-                    self.ending = Some(Ending::Shutdown);
-                }
+                self.mark_ending(Ending::Shutdown);
             }
         }
     }
@@ -785,10 +913,114 @@ impl Actor {
         }
     }
 
-    fn begin_ending(&mut self, end: Ending) {
-        if self.ending.is_none() {
-            self.ending = Some(end);
+    /// Record the first reason to wind down and start its budget.
+    fn mark_ending(&mut self, end: Ending) {
+        if self.ending.is_some() {
+            return;
         }
+        let now = self.ctx.deps.clock.now();
+        self.ending = Some(end);
+        self.ending_since = Some(now);
+        self.ending_deadline = Some(now + self.ctx.config.shutdown_budget);
+        tracing::info!(
+            stage = "shutdown.begin",
+            reason = ?end,
+            instances = self.supervisors.len(),
+            budget_ms = millis(self.ctx.config.shutdown_budget),
+            "host shutdown: stopping instances"
+        );
+    }
+
+    fn ending_elapsed_ms(&self) -> u64 {
+        self.ending_since.map_or(0, |since| {
+            millis(self.ctx.deps.clock.now().saturating_duration_since(since))
+        })
+    }
+
+    /// Progress of the wind-down, per instance, into the host log file: a
+    /// stop must show where its time goes.
+    fn trace_ending(&self, report: &Report) {
+        let elapsed_ms = self.ending_elapsed_ms();
+        match report {
+            Report::Status(status) => tracing::info!(
+                stage = "shutdown.instance_state",
+                instance = %status.instance_id,
+                state = ?status.state(),
+                epoch = status.epoch,
+                open_residues = status.open_residues,
+                message = %status.message,
+                elapsed_ms,
+                "host shutdown: instance state"
+            ),
+            Report::Exited(exited) => tracing::info!(
+                stage = "shutdown.kernel_exited",
+                instance = %exited.instance_id,
+                epoch = exited.epoch,
+                elapsed_ms,
+                "host shutdown: kernel exited"
+            ),
+            Report::Reclaimed(g) => tracing::info!(
+                stage = "shutdown.reclaimed",
+                instance = %g.instance,
+                epoch = g.epoch.0,
+                outcome = ?g.outcome,
+                residues = g.residues.len(),
+                elapsed_ms,
+                "host shutdown: generation reclaim finished"
+            ),
+            Report::Gone(id) => tracing::info!(
+                stage = "shutdown.instance_done",
+                instance = %id,
+                remaining = self.supervisors.len().saturating_sub(1),
+                elapsed_ms,
+                "host shutdown: instance supervisor ended"
+            ),
+            Report::Notice(_) => {}
+        }
+    }
+
+    /// The wind-down budget ran out: stop waiting for the supervisors still
+    /// running. Nothing is closed or deleted here; their open records stay
+    /// in the ledger, and the next start's self-check (or the uninstaller's
+    /// purge) reclaims them. Their tasks end with the host's runtime.
+    fn abandon_supervisors(&mut self) {
+        let pending: Vec<String> = self
+            .supervisors
+            .keys()
+            .map(|id| match self.statuses.get(id) {
+                Some(s) => format!("{id} ({:?}: {})", s.state(), s.message),
+                None => id.to_string(),
+            })
+            .collect();
+        let pending = pending.join(", ");
+        tracing::warn!(
+            stage = "shutdown.budget_exceeded",
+            budget_ms = millis(self.ctx.config.shutdown_budget),
+            elapsed_ms = self.ending_elapsed_ms(),
+            pending = %pending,
+            "host shutdown: budget exhausted; open records stay in the ledger for the next start"
+        );
+        self.host_log(format!(
+            "shutdown budget exhausted; left for the next start: {pending}"
+        ));
+        // Their tasks are aborted here; whoever holds the host's lock waits
+        // for them to end (`SupervisorTasks::abort_and_wait`) before
+        // releasing it.
+        self.supervisors.clear();
+        for task in self
+            .ctx
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+        {
+            task.abort();
+        }
+        self.ending_deadline = None;
+    }
+
+    fn begin_ending(&mut self, end: Ending) {
+        self.mark_ending(end);
         if self.phase != HostPhase::ShuttingDown {
             self.set_phase(HostPhase::ShuttingDown);
         }
@@ -802,6 +1034,12 @@ impl Actor {
         if self.phase != HostPhase::ShuttingDown {
             self.set_phase(HostPhase::ShuttingDown);
         }
+        tracing::info!(
+            stage = "shutdown.orchestrator_done",
+            reason = ?end,
+            elapsed_ms = self.ending_elapsed_ms(),
+            "host shutdown: orchestrator finished"
+        );
         for reply in self.shutdown_replies.drain(..) {
             let _ = reply.send(());
         }
@@ -1137,6 +1375,10 @@ impl Actor {
             self.retry_tickets();
         }
     }
+}
+
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn unknown(instance: &InstanceId) -> ErrorDetail {

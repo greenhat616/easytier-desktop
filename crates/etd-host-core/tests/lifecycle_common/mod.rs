@@ -605,6 +605,9 @@ pub struct World {
     pub mode: HostMode,
     pub fence: bool,
     pub config: LifecycleConfig,
+    /// While set, generation reclaims never finish (a reclaim stuck in a
+    /// system call), as in the Windows service stop of topic#45.
+    pub reclaim_hangs: Arc<AtomicBool>,
     /// Errors the fence's next `verify` calls return, in order, before the
     /// fake answers again ([`TestFence`]).
     pub verify_errors: Arc<Mutex<VecDeque<FenceError>>>,
@@ -677,6 +680,7 @@ impl World {
             reclaim_retry: Duration::from_millis(500),
             log_lines: 100,
             lease_grace: Duration::from_secs(30),
+            shutdown_budget: Duration::from_secs(30),
             fence_recheck: Duration::from_secs(30),
             fence_retry: Duration::from_secs(2),
             fence_unverifiable_retry: Duration::from_secs(10),
@@ -696,6 +700,7 @@ impl World {
             mode,
             fence,
             config,
+            reclaim_hangs: Arc::new(AtomicBool::new(false)),
             verify_errors: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
@@ -735,7 +740,10 @@ impl World {
             clock: Arc::new(self.clock.clone()),
             ledger: self.ledger.clone(),
             repair_index: self.index.clone(),
-            reclaim: self.reclaim_engine(),
+            reclaim: Arc::new(HangGate {
+                inner: self.reclaim_engine(),
+                hang: self.reclaim_hangs.clone(),
+            }),
             boot_id: self.sys.boot_id_source(),
             install_key: InstallKey([7; 32]),
             observer: self.sys.observer(),
@@ -850,6 +858,54 @@ impl World {
             .open_effects(&ScopeFilter::instance(instance.into()))
             .await
             .unwrap()
+    }
+}
+
+/// The real engine, except that generation reclaims hang while `hang` is
+/// set (only entered, never returning).
+struct HangGate {
+    inner: Arc<dyn ReclaimEngine>,
+    hang: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl ReclaimEngine for HangGate {
+    async fn reclaim_generation(
+        &self,
+        instance: &etd_contract::InstanceId,
+        epoch: Epoch,
+    ) -> Result<GenerationReport, LedgerError> {
+        if self.hang.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        self.inner.reclaim_generation(instance, epoch).await
+    }
+    async fn reclaim_all(&self, scope: ReclaimScope) -> Result<ReclaimReport, LedgerError> {
+        self.inner.reclaim_all(scope).await
+    }
+    async fn retry(
+        &self,
+        instance: &etd_contract::InstanceId,
+    ) -> Result<GenerationReport, LedgerError> {
+        self.inner.retry(instance).await
+    }
+    async fn resolve(
+        &self,
+        decisions: &[etd_contract::CandidateDecision],
+    ) -> Result<ReclaimReport, LedgerError> {
+        self.inner.resolve(decisions).await
+    }
+    async fn recover_without_ledger(&self) -> Result<ReclaimReport, ReclaimError> {
+        self.inner.recover_without_ledger().await
+    }
+    async fn diagnose(&self) -> Result<ReclaimReport, ReclaimError> {
+        self.inner.diagnose().await
+    }
+    async fn reclaim_core(&self, sha256: &str) -> Result<ReclaimReport, LedgerError> {
+        self.inner.reclaim_core(sha256).await
+    }
+    async fn report(&self) -> Result<ReclaimReport, LedgerError> {
+        self.inner.report().await
     }
 }
 

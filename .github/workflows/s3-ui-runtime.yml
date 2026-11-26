@@ -18,19 +18,22 @@ env:
 jobs:
   linux-x11:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Install Linux build, X11, SNI panel, and Vulkan software renderer deps
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo -E apt-get install -y --no-install-recommends \
             build-essential clang cmake pkg-config libssl-dev \
             libfontconfig1-dev libfreetype6-dev \
             libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev libxcb-dri3-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libdbus-1-dev \
             mesa-vulkan-drivers vulkan-tools \
-            xvfb openbox xfce4-panel dbus-x11 libglib2.0-bin \
+            xvfb xauth openbox xfce4-panel dbus-x11 libglib2.0-bin \
             imagemagick x11-utils fonts-dejavu-core
       - name: Install pinned protoc
         shell: pwsh
@@ -130,7 +133,7 @@ jobs:
             READY_FILE="$PWD/artifacts/linux-x11/ready.txt"
             rm -f "$READY_FILE"
             cargo run --locked -p ui-runtime-spike -- \
-              --cycles 50 --hold-ms 4000 \
+              --cycles 50 --hold-ms 6000 \
               --expect-compositor X11 --require-tray \
               --ready-file "$READY_FILE" \
               > artifacts/linux-x11/spike-hold.log 2>&1 &
@@ -183,10 +186,11 @@ jobs:
                 --dest "$ITEM_BUS" \
                 --object-path /MenuBar \
                 --method com.canonical.dbusmenu.GetLayout \
-                0 -1 "[]"
+                -- 0 -1 "[]"
             } | tee -a artifacts/linux-x11/dbus-evidence.txt
 
             import -window root artifacts/linux-x11/linux-x11-desktop.png
+            kill -0 "$REAL_PID"
             convert artifacts/linux-x11/linux-x11-desktop.png -crop 1280x64+0+0 +repage artifacts/linux-x11/linux-x11-panel.png
             convert artifacts/linux-x11/linux-x11-desktop.png -crop 240x64+1040+0 +repage -scale 300% artifacts/linux-x11/linux-x11-tray-zoom.png
 
@@ -223,12 +227,15 @@ jobs:
 
   linux-wayland:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Install Linux build, Wayland headless compositor, SNI bar, and Vulkan software renderer deps
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo -E apt-get install -y --no-install-recommends \
             build-essential clang cmake pkg-config libssl-dev \
             libfontconfig1-dev libfreetype6-dev \
             libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev \
@@ -354,7 +361,7 @@ jobs:
             READY_FILE="$PWD/artifacts/linux-wayland/ready.txt"
             rm -f "$READY_FILE"
             cargo run --locked -p ui-runtime-spike -- \
-              --cycles 50 --hold-ms 4000 \
+              --cycles 50 --hold-ms 6000 \
               --expect-compositor Wayland --require-tray \
               --ready-file "$READY_FILE" \
               > artifacts/linux-wayland/spike-hold.log 2>&1 &
@@ -407,10 +414,11 @@ jobs:
                 --dest "$ITEM_BUS" \
                 --object-path /MenuBar \
                 --method com.canonical.dbusmenu.GetLayout \
-                0 -1 "[]"
+                -- 0 -1 "[]"
             } | tee -a artifacts/linux-wayland/dbus-evidence.txt
 
             grim artifacts/linux-wayland/linux-wayland-desktop.png
+            kill -0 "$REAL_PID"
             convert artifacts/linux-wayland/linux-wayland-desktop.png -crop 1280x64+0+0 +repage artifacts/linux-wayland/linux-wayland-panel.png
             convert artifacts/linux-wayland/linux-wayland-desktop.png -crop 240x64+1040+0 +repage -scale 300% artifacts/linux-wayland/linux-wayland-tray-zoom.png
 
@@ -447,6 +455,7 @@ jobs:
 
   macos:
     runs-on: macos-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Install pinned protoc
@@ -467,11 +476,31 @@ jobs:
           set -euo pipefail
           mkdir -p artifacts/macos
 
+          # Pre-compile tiny CoreGraphics window inspector so it runs instantaneously while the spike is live.
+          cat > /tmp/cg_windows.swift <<'EOF'
+          import CoreGraphics
+          import Foundation
+          let targetPid = Int32(CommandLine.arguments[1])!
+          if let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] {
+            for w in list {
+              if let ownerPid = w[kCGWindowOwnerPID as String] as? Int32, ownerPid == targetPid {
+                let wid = w[kCGWindowNumber as String] ?? -1
+                let layer = w[kCGWindowLayer as String] ?? -1
+                let name = w[kCGWindowName as String] ?? ""
+                let bounds = w[kCGWindowBounds as String] ?? [:]
+                let onScreen = w[kCGWindowIsOnscreen as String] ?? false
+                print("wid=\(wid) pid=\(ownerPid) layer=\(layer) onScreen=\(onScreen) name=\(name) bounds=\(bounds)")
+              }
+            }
+          }
+          EOF
+          swiftc -O /tmp/cg_windows.swift -o /tmp/cg_windows
+
           echo "=== Step A: 50 cycles with hold for NSStatusItem + CGWindowList + screencapture evidence ==="
           READY_FILE="$PWD/artifacts/macos/ready.txt"
           rm -f "$READY_FILE"
           cargo run --locked -p ui-runtime-spike -- \
-            --cycles 50 --hold-ms 4000 --require-tray \
+            --cycles 50 --hold-ms 8000 --require-tray \
             --ready-file "$READY_FILE" \
             > artifacts/macos/spike-hold.log 2>&1 &
           SPIKE_PID=$!
@@ -484,43 +513,27 @@ jobs:
               cat artifacts/macos/spike-hold.log
               exit 1
             fi
-            sleep 0.25
+            sleep 0.2
           done
           test -f "$READY_FILE"
-          sleep 0.8
+          sleep 0.5
 
           REAL_PID=$(grep "^pid=" "$READY_FILE" | cut -d= -f2)
+          kill -0 "$REAL_PID"
           {
             echo "=== Ready file ==="
             cat "$READY_FILE"
             echo "=== CGWindowListCopyWindowInfo for PID $REAL_PID ==="
-            swift -e "
-              import CoreGraphics
-              import Foundation
-              let pid = Int32(${REAL_PID})
-              if let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] {
-                for w in list {
-                  if let ownerPid = w[kCGWindowOwnerPID as String] as? Int32, ownerPid == pid {
-                    let layer = w[kCGWindowLayer as String] ?? -1
-                    let name = w[kCGWindowName as String] ?? \"\"
-                    let bounds = w[kCGWindowBounds as String] ?? [:]
-                    let onScreen = w[kCGWindowIsOnscreen as String] ?? false
-                    print(\"pid=\(ownerPid) layer=\(layer) onScreen=\(onScreen) name=\(name) bounds=\(bounds)\")
-                  }
-                }
-              }
-            "
+            /tmp/cg_windows "$REAL_PID"
           } | tee artifacts/macos/macos-evidence.txt
 
           screencapture -x artifacts/macos/macos-desktop.png || echo "screencapture full failed" >&2
           if [ -f artifacts/macos/macos-desktop.png ]; then
             sips -g pixelWidth -g pixelHeight artifacts/macos/macos-desktop.png | tee -a artifacts/macos/macos-evidence.txt
-            # Capture top menu bar strip directly via screencapture -R
             WIDTH=$(sips -g pixelWidth artifacts/macos/macos-desktop.png | awk '/pixelWidth/{print $2}')
             screencapture -x -R "0,0,${WIDTH},60" artifacts/macos/macos-menubar.png || true
           fi
 
-          # Also capture a tight crop around tray_rect_raw if reported
           RECT_LINE=$(grep "^tray_rect_raw=" "$READY_FILE" || true)
           if [ -n "$RECT_LINE" ]; then
             IFS=',' read -r RX RY RW RH <<< "${RECT_LINE#tray_rect_raw=}"
@@ -530,11 +543,18 @@ jobs:
             screencapture -x -R "${CX},${CY},260,60" artifacts/macos/macos-tray-crop.png || true
           fi
 
+          # Confirm the process was still alive throughout inspection & screenshot capture.
+          kill -0 "$REAL_PID"
+          echo "=== Verified PID $REAL_PID remained alive during screenshot capture ===" | tee -a artifacts/macos/macos-evidence.txt
+
           wait "$SPIKE_PID"
           cat artifacts/macos/spike-hold.log
           grep -q "ns_status_item_exists: Some(true)" artifacts/macos/spike-hold.log
           grep -q "tray_shell_registered: true" artifacts/macos/spike-hold.log
           grep -q "VERDICT: PASS" artifacts/macos/spike-hold.log
+
+          echo "=== CGWindowListCopyWindowInfo post-exit for PID $REAL_PID ===" | tee -a artifacts/macos/macos-evidence.txt
+          /tmp/cg_windows "$REAL_PID" | tee -a artifacts/macos/macos-evidence.txt
 
           echo "=== Step B: Exact acceptance command (cargo run -p ui-runtime-spike -- --cycles 50) ==="
           cargo run --locked -p ui-runtime-spike -- --cycles 50 | tee artifacts/macos/spike-exact.log

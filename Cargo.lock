@@ -2650,10 +2650,13 @@ dependencies = [
  "gpui-kit",
  "jiff",
  "muda",
+ "raw-window-handle",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "tray-icon",
+ "windows 0.62.2",
 ]
 
 [[package]]

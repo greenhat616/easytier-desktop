@@ -90,7 +90,7 @@ fn render_sidebar(
     cx: &mut Context<MainView>,
 ) -> AnyElement {
     let border = cx.theme().border;
-    let sidebar = cx.theme().sidebar;
+    let sidebar = crate::theme::chrome_fill(cx, cx.theme().sidebar);
     let reclaim_label = if reclaim_count > 0 {
         format!("Reclaim Report ({reclaim_count})")
     } else {
@@ -115,7 +115,8 @@ fn render_sidebar(
                 ButtonVariant::Ghost
             },
             Size::Small,
-        ),
+        )
+        .icon("fluent/globe.svg"),
         cx.listener(|this, _, _, cx| {
             this.controller.select_section(Section::Instances, cx);
         }),
@@ -130,7 +131,8 @@ fn render_sidebar(
                 ButtonVariant::Ghost
             },
             Size::Small,
-        ),
+        )
+        .icon("fluent/shield.svg"),
         cx.listener(|this, _, _, cx| {
             this.controller.select_section(Section::Reclaim, cx);
         }),
@@ -168,13 +170,14 @@ fn render_section_content(
         .flex_1()
         .h_full()
         .overflow_hidden()
+        .bg(cx.theme().popover)
         .child(inner)
         .into_any_element()
 }
 
 impl Render for MainView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let background = cx.theme().background;
+        let background = crate::theme::chrome_fill(cx, cx.theme().background);
         let foreground = cx.theme().foreground;
         let (active_section, instance_count, reclaim_count) = {
             let model = self.controller.model.read(cx);

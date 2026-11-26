@@ -156,7 +156,10 @@ impl TestHarness {
         installer: Arc<dyn ServiceInstaller>,
         is_elevated: bool,
     ) -> Self {
-        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            etd_ui::theme::install_palette(cx);
+        });
         let (cmd_tx, cmd_rx) = async_channel::unbounded();
         let (_state_tx, state_rx) = async_channel::bounded(1);
         let bridge = AppBridge {
@@ -959,7 +962,10 @@ async fn trayless_fallback_keeps_window_and_exit_gate_runs_before_quit(cx: &mut 
 
 #[gpui_kit::test]
 fn tray_hide_and_restore_preserves_state_and_exits_from_menu(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        etd_ui::theme::install_palette(cx);
+    });
     let (cmd_tx, _cmd_rx) = async_channel::unbounded();
     let (_state_tx, state_rx) = async_channel::bounded(1);
     let bridge = AppBridge {
@@ -1025,7 +1031,7 @@ fn tray_hide_and_restore_preserves_state_and_exits_from_menu(cx: &mut TestAppCon
 fn icon_asset_source_serves_eye_svg() {
     use gpui_kit::AssetSource as _;
 
-    let bytes = gpui_kit::assets::Assets
+    let bytes = etd_ui::assets::FluentAssets
         .load("icons/eye.svg")
         .expect("asset source should not error")
         .expect("icons/eye.svg must be embedded for Input::mask_toggle()");

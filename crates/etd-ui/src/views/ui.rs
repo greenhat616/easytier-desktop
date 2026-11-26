@@ -10,7 +10,7 @@ use gpui_kit::{
     AnyElement, App, ClickEvent, ElementId, Entity, IntoElement as _, ParentElement as _,
     SharedString, Styled as _, Window,
     component::{
-        ActiveTheme as _, Disableable as _, Sizable as _, Size,
+        ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size,
         button::{Button, ButtonVariant, ButtonVariants as _},
         input::{Input, InputContentType, InputState},
         switch::Switch,
@@ -25,6 +25,7 @@ pub struct BtnStyle {
     pub outline: bool,
     pub disabled: bool,
     pub loading: bool,
+    pub icon: Option<&'static str>,
 }
 
 impl BtnStyle {
@@ -35,7 +36,13 @@ impl BtnStyle {
             outline: false,
             disabled: false,
             loading: false,
+            icon: None,
         }
+    }
+
+    pub const fn icon(mut self, asset: &'static str) -> Self {
+        self.icon = Some(asset);
+        self
     }
 
     pub const fn outline(mut self) -> Self {
@@ -81,6 +88,9 @@ fn action_button_inner(
         .disabled(style.disabled)
         .loading(style.loading)
         .on_click(move |ev, window, cx| on_click(ev, window, cx));
+    if let Some(path) = style.icon {
+        btn = btn.icon(Icon::default().path(path));
+    }
     if style.outline {
         btn = btn.outline();
     }

@@ -13,7 +13,7 @@ import win32api
 import win32con
 import win32evtlog as events
 import win32security as security
-from inventory import command
+from service import command
 
 KEY = r"MACHINE\SYSTEM\CurrentControlSet\Services\IKEEXT"
 INFO = security.SACL_SECURITY_INFORMATION

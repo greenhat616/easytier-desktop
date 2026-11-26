@@ -33,6 +33,8 @@ tracing = { workspace = true, features = ["std"] }
 uuid = { workspace = true, features = ["std", "v4"] }
 
 [dev-dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
 assert_cmd = { workspace = true }
 insta = { workspace = true }
 mockall = { workspace = true }

@@ -35,6 +35,36 @@ fn spawn_directory(directory: &Path) -> std::path::PathBuf {
     }
 }
 
+#[cfg(windows)]
+async fn output_from_bundle(
+    command: &mut tokio::process::Command,
+    directory: &Path,
+    system_directory: &Path,
+) -> std::io::Result<std::process::Output> {
+    use std::path::{Component, Prefix};
+    // Both spawn attempts in this helper are windowless, including when
+    // the original working-directory creation fails.
+    command.creation_flags(0x0800_0000);
+    let result = command.spawn();
+    let verbatim = matches!(directory.components().next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(),
+            Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(_, _) | Prefix::Verbatim(_)));
+    // Windows CreateProcessW rejects some otherwise valid long/verbatim
+    // cwd paths (seen as ERROR_DIRECTORY on the hosted runner). Retry only
+    // if creation itself failed, from the trusted OS system directory.
+    // The verified absolute executable remains in the bundle, so its DLL
+    // directory is still searched; never fall back to the caller's cwd.
+    if verbatim
+        && result
+            .as_ref()
+            .is_err_and(|error| matches!(error.raw_os_error(), Some(267 | 206)))
+    {
+        command.current_dir(system_directory);
+        return command.spawn()?.wait_with_output().await;
+    }
+    result?.wait_with_output().await
+}
+
 pub async fn identify(binary: &Path) -> Result<CoreDescriptor, CoreError> {
     // The executable and its companions live in the verified bundle.
     // Do not inherit the installer/maintenance caller's working directory:
@@ -46,9 +76,11 @@ pub async fn identify(binary: &Path) -> Result<CoreDescriptor, CoreError> {
         .ok_or_else(|| CoreError::Identify("kernel has no bundle directory".into()))?;
     #[cfg(windows)]
     let bundle = spawn_directory(bundle);
+    #[cfg(not(windows))]
+    let bundle = bundle.to_owned();
     let mut command = tokio::process::Command::new(&binary);
     command
-        .current_dir(bundle)
+        .current_dir(&bundle)
         .arg("--version")
         .env_clear()
         .stdin(Stdio::null())
@@ -61,7 +93,7 @@ pub async fn identify(binary: &Path) -> Result<CoreDescriptor, CoreError> {
     #[cfg(unix)]
     command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
     #[cfg(windows)]
-    {
+    let system_directory = {
         let root = etd_proc::trusted_system_root().map_err(|error| {
             CoreError::Identify(format!("cannot query Windows system root: {error}"))
         })?;
@@ -80,8 +112,13 @@ pub async fn identify(binary: &Path) -> Result<CoreDescriptor, CoreError> {
             .env("SystemRoot", &root)
             .env("windir", &root)
             .env("PATH", path);
-    }
-    let output = tokio::time::timeout(VERSION_TIMEOUT, command.output())
+        root_path.join("System32")
+    };
+    #[cfg(windows)]
+    let execution = output_from_bundle(&mut command, &bundle, &system_directory);
+    #[cfg(not(windows))]
+    let execution = command.output();
+    let output = tokio::time::timeout(VERSION_TIMEOUT, execution)
         .await
         .map_err(|_| CoreError::Identify(format!("{} --version timed out", binary.display())))?
         .map_err(|error| {
@@ -168,9 +205,8 @@ mod tests {
     use super::*;
 
     #[cfg(windows)]
-    #[test]
-    fn spawn_directory_preserves_unc_and_long_verbatim_paths() {
-        use std::os::windows::process::CommandExt;
+    #[tokio::test]
+    async fn spawn_directory_preserves_unc_and_long_verbatim_paths() {
         use std::path::PathBuf;
         assert_eq!(
             spawn_directory(Path::new(r"\\?\C:\short\bundle")),
@@ -179,8 +215,9 @@ mod tests {
         let unc = Path::new(r"\\?\UNC\server\share\bundle");
         assert_eq!(spawn_directory(unc), unc);
 
-        // Verify CreateProcessW accepts the long verbatim cwd as well.
-        // This is an inert, windowless system command, never a kernel launch.
+        // Exercise actual CreateProcessW: prefer the long verbatim cwd,
+        // and if Windows rejects it, the same production helper retries
+        // from the OS system directory. No kernel is launched.
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path().canonicalize().unwrap();
         let mut long = root;
@@ -191,12 +228,22 @@ mod tests {
         let cwd = spawn_directory(&long);
         assert_eq!(cwd, long);
         let system = PathBuf::from(etd_proc::trusted_system_root().unwrap());
-        let output = std::process::Command::new(system.join("System32").join("whoami.exe"))
-            .current_dir(cwd)
+        let system_directory = system.join("System32");
+        let mut command = tokio::process::Command::new(system_directory.join("whoami.exe"));
+        command
+            .current_dir(&cwd)
             .creation_flags(0x0800_0000)
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let output = output_from_bundle(&mut command, &cwd, &system_directory)
+            .await
             .unwrap();
         assert!(output.status.success());
+        assert!(
+            matches!(command.as_std().get_current_dir(), Some(path) if path == cwd || path == system_directory)
+        );
     }
 
     fn parse(text: &str) -> (String, String) {

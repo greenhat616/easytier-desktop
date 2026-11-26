@@ -10,7 +10,12 @@ use etd_contract::{Desired, InstanceId, NetworkSpec, capability};
 use gpui_kit::{
     AnyElement, Context, InteractiveElement as _, IntoElement, ParentElement as _, Render,
     SharedString, Styled as _, TestSupportExt as _, Window,
-    component::{ActiveTheme as _, Size, button::ButtonVariant},
+    base::LogicalStyledExt as _,
+    component::{
+        ActiveTheme as _, Size,
+        button::ButtonVariant,
+        sidebar::{Sidebar, SidebarToggleButton},
+    },
     div, px,
 };
 
@@ -18,13 +23,14 @@ use crate::{
     controller::UiController,
     editor::{NetworkEditorState, render_editor},
     model::Section,
-    views::ui::{BtnStyle, action_button, theme_menu},
+    views::ui::{BtnStyle, FluentNavItem, action_button, theme_menu},
 };
 
 /// Main desktop window view.
 pub struct MainView {
     pub controller: UiController,
     pub editor: NetworkEditorState,
+    sidebar_collapsed: bool,
 }
 
 impl MainView {
@@ -32,7 +38,11 @@ impl MainView {
         cx.observe(&controller.model, |_, _, cx| cx.notify())
             .detach();
         let editor = NetworkEditorState::new(window, cx);
-        Self { controller, editor }
+        Self {
+            controller,
+            editor,
+            sidebar_collapsed: false,
+        }
     }
 
     pub fn open_new_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -87,6 +97,7 @@ fn render_sidebar(
     active_section: Section,
     instance_count: usize,
     reclaim_count: usize,
+    collapsed: bool,
     cx: &mut Context<MainView>,
 ) -> AnyElement {
     let border = cx.theme().border;
@@ -105,55 +116,54 @@ fn render_sidebar(
             this.open_new_editor(window, cx);
         }),
     );
-    let instances_btn = action_button(
+    let instances = FluentNavItem::new(
         "nav-instances",
         SharedString::from(format!("Instances ({instance_count})")),
-        BtnStyle::new(
-            if active_section == Section::Instances {
-                ButtonVariant::Secondary
-            } else {
-                ButtonVariant::Ghost
-            },
-            Size::Small,
-        )
-        .icon("fluent/globe.svg"),
-        cx.listener(|this, _, _, cx| {
-            this.controller.select_section(Section::Instances, cx);
-        }),
+        "fluent/globe.svg",
+        "fluent/globe-filled.svg",
+        active_section == Section::Instances,
+        cx.listener(|this, _, _, cx| this.controller.select_section(Section::Instances, cx)),
     );
-    let reclaim_btn = action_button(
+    let reclaim = FluentNavItem::new(
         "nav-reclaim",
         SharedString::from(reclaim_label),
-        BtnStyle::new(
-            if active_section == Section::Reclaim {
-                ButtonVariant::Secondary
-            } else {
-                ButtonVariant::Ghost
-            },
-            Size::Small,
-        )
-        .icon("fluent/shield.svg"),
-        cx.listener(|this, _, _, cx| {
-            this.controller.select_section(Section::Reclaim, cx);
-        }),
+        "fluent/shield.svg",
+        "fluent/shield-filled.svg",
+        active_section == Section::Reclaim,
+        cx.listener(|this, _, _, cx| this.controller.select_section(Section::Reclaim, cx)),
     );
-
-    div()
-        .id("sidebar-nav")
-        .w(px(210.))
-        .h_full()
+    let header = div()
         .flex()
         .flex_col()
+        .w_full()
         .gap_2()
-        .p_3()
-        .border_r_1()
-        .border_color(border)
+        .child(
+            SidebarToggleButton::new()
+                .collapsed(collapsed)
+                .accessibility_label(if collapsed {
+                    "Expand navigation"
+                } else {
+                    "Collapse navigation"
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.sidebar_collapsed = !this.sidebar_collapsed;
+                    cx.notify();
+                })),
+        )
+        .children((!collapsed).then_some(new_btn));
+    let mut sidebar = Sidebar::new("sidebar-nav")
+        .w(px(210.))
+        .h_full()
         .bg(sidebar)
-        .child(new_btn)
-        .child(instances_btn)
-        .child(reclaim_btn)
-        .child(theme_menu(cx))
-        .into_any_element()
+        .border_color(border)
+        .collapsed(collapsed)
+        .header(header)
+        .child(instances)
+        .child(reclaim);
+    if !collapsed {
+        sidebar = sidebar.footer(div().w_full().child(theme_menu(cx)));
+    }
+    sidebar.into_any_element()
 }
 
 #[inline(never)]
@@ -192,7 +202,13 @@ impl Render for MainView {
 
         let header = banners::render_header(self, cx);
         let banners = banners::render_banners(self, cx);
-        let nav = render_sidebar(active_section, instance_count, reclaim_count, cx);
+        let nav = render_sidebar(
+            active_section,
+            instance_count,
+            reclaim_count,
+            self.sidebar_collapsed,
+            cx,
+        );
         let content = render_section_content(self, active_section, cx);
 
         div()
@@ -209,7 +225,7 @@ impl Render for MainView {
                 div()
                     .flex_1()
                     .flex()
-                    .flex_row()
+                    .flex_row_dir(cx)
                     .min_h(px(0.))
                     .overflow_hidden()
                     .child(nav)

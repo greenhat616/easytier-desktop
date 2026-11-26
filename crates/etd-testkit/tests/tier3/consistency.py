@@ -19,6 +19,15 @@ def check_generation(base, live, records, instance, view):
     except (AssertionError, KeyError, OSError):
         for kind, key in sorted(base.delta(live)):
             print(f"native delta: {kind} {key}", flush=True)
+            if kind == "service":
+                old = base.rows.get((kind, key))
+                new = live.rows.get((kind, key))
+                if isinstance(old, dict) and isinstance(new, dict):
+                    for field in sorted(old.keys() | new.keys()):
+                        if old.get(field) != new.get(field):
+                            detail = (f"{old.get(field)} -> {new.get(field)}"
+                                      if field in {"Type", "Start", "ErrorControl"} else "changed")
+                            print(f"service {key} {field}: {detail}", flush=True)
         for row in records:
             if row["state"] != "reclaimed":
                 print(f"open intent: {row['kind']} {row['state']}", flush=True)

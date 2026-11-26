@@ -70,9 +70,22 @@ foreach ($tree in @("$system\Tcpip\Parameters\Interfaces","$system\Tcpip6\Parame
         }
     }
 }
-foreach ($class in 'Win32_Service','Win32_SystemDriver') {
-    foreach ($item in Get-CimInstance -ClassName $class -Property Name,PathName,StartMode,ServiceType) {
-        $inventory.service[$item.Name.ToLowerInvariant()] = @($item.PathName, $item.StartMode, $item.ServiceType)
+# Read the installed configuration. CIM's live service view can change when
+# Windows spins up a service host independently of a registration change.
+$serviceStore = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SYSTEM\CurrentControlSet\Services')
+$rawValue = [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
+try {
+    foreach ($name in $serviceStore.GetSubKeyNames()) {
+        $entry = $serviceStore.OpenSubKey($name)
+        if ($null -eq $entry) { continue }
+        try {
+            if ($null -eq $entry.GetValue('Type') -or $null -eq $entry.GetValue('Start')) { continue }
+            $values = @{}
+            foreach ($field in 'Type','Start','ImagePath','ErrorControl','DependOnService','ObjectName') {
+                $values[$field] = $entry.GetValue($field, $null, $rawValue)
+            }
+            $inventory.service[$name.ToLowerInvariant()] = $values
+        } finally { $entry.Dispose() }
     }
-}
+} finally { $serviceStore.Dispose() }
 ConvertTo-Json -InputObject $inventory -Depth 12 -Compress

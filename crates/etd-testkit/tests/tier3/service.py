@@ -172,14 +172,13 @@ class Service:
             # Shared driver candidates can legitimately prevent uninstall;
             # retain the native report, never delete drivers to pass cleanup.
             result = self.uninstall()
-            if result.returncode:
-                if sys.exc_info()[0] is None:
-                    pending = [r for r in self.effects() if r["state"] != "reclaimed"]
-                    if not self.retained_drivers or not all(
-                            r["kind"] == "driver" and r["scope"] == "product"
-                            and r["state"] in ("candidate", "conflict") for r in pending):
-                        raise RuntimeError("test service uninstall incomplete")
-                    assert {r["key"]["name"].lower() for r in pending} == self.retained_drivers
+            if result.returncode and sys.exc_info()[0] is None:
+                if "reclaim incomplete" not in result.stderr or not self.retained_drivers:
+                    raise RuntimeError("test service uninstall incomplete")
+                pending = [r for r in self.effects() if r["state"] != "reclaimed"]
+                assert all(r["kind"] == "driver" and r["scope"] == "product"
+                           and r["state"] in ("candidate", "conflict") for r in pending)
+                assert {r["key"]["name"].lower() for r in pending} == self.retained_drivers
 
     @staticmethod
     def call(*args):

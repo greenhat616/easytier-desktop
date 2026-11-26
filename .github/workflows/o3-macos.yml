@@ -1,0 +1,73 @@
+name: O3 macOS system adapter
+on:
+  push:
+    branches: [wbs/O3-macos]
+    paths:
+      - 'crates/etd-sysfx-os/src/macos/**'
+      - 'crates/etd-sysfx-os/src/service/unix.rs'
+      - 'crates/etd-sysfx-os/tests/macos_*.rs'
+      - '.github/workflows/o3-macos.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: o3-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  privileged:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    env:
+      CARGO_BUILD_JOBS: '4'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      ETD_O3_CI: '1'
+      ETD_HOST_CI_INSTALL: '1'
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned protoc
+        shell: pwsh
+        run: ./.github/scripts/setup-protoc.ps1
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          save-if: 'false'
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.152
+      - name: Build tests as the runner
+        run: |
+          cargo test --locked -p etd-core-easytier --test plan_classify --no-run --message-format json > "$RUNNER_TEMP/planner.jsonl"
+          planner=$(jq -r 'select(.target.name == "plan_classify" and .executable != null) | .executable' "$RUNNER_TEMP/planner.jsonl")
+          test -x "$planner"
+          echo "ETD_O3_PLAN_TEST=$planner" >> "$GITHUB_ENV"
+          cargo nextest list --locked -p etd-sysfx-os --profile privileged --run-ignored only
+          cargo nextest list --locked -p etd-host --profile privileged --run-ignored only --test install_roundtrip
+      - name: Create second local account
+        run: |
+          sudo sysadminctl -addUser etd_o3_probe -fullName "O3 PF probe" -password "$(uuidgen)"
+          test "$(id -u etd_o3_probe)" != 0
+      - name: Verify PF, utun, resolver and service reinstall
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=(sudo -E env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "$(command -v cargo)")
+          failed=0
+          "${root[@]}" nextest run --locked -p etd-sysfx-os --profile privileged --run-ignored only --lib -E 'test(missing_image_preserves_foreign_identity)' 2>&1 | tee "$RUNNER_TEMP/macos_holder_identity.log" || failed=1
+          for target in macos_resolver macos_reclaim macos_fence; do
+            "${root[@]}" nextest run --locked -p etd-sysfx-os --profile privileged --run-ignored only --test "$target" --no-fail-fast --success-output immediate 2>&1 | tee "$RUNNER_TEMP/$target.log" || failed=1
+          done
+          "${root[@]}" nextest run --locked -p etd-host --profile privileged --run-ignored only --test install_roundtrip --success-output immediate 2>&1 | tee "$RUNNER_TEMP/o3-service.log"
+          sudo test ! -e "/Library/Application Support/easytier-desk-maintenance/pf-reference"
+          exit "$failed"
+      - name: Upload runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: o3-macos-evidence
+          path: |
+            ${{ runner.temp }}/macos_*.log
+            ${{ runner.temp }}/o3-service.log
+          if-no-files-found: ignore
+

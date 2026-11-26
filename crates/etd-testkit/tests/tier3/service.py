@@ -74,13 +74,13 @@ class Service:
             result = command(self.installer, "uninstall", check=False)
             if result.returncode:
                 print(f"test service uninstall exited {result.returncode}: {result.stderr.strip()}")
-                pending = [r for r in self.effects() if r["state"] != "reclaimed"]
-                driver_names = {r["key"].get("name", "").lower() for r in pending}
-                retained = (pending and driver_names == self.retained_drivers
-                            and all(r["kind"] == "driver" and r["scope"] == "product"
-                                    and r["state"] in ("candidate", "conflict") for r in pending))
-                if sys.exc_info()[0] is None and not retained:
-                    raise RuntimeError("test service uninstall incomplete")
+                if sys.exc_info()[0] is None:
+                    pending = [r for r in self.effects() if r["state"] != "reclaimed"]
+                    if not self.retained_drivers or not all(
+                            r["kind"] == "driver" and r["scope"] == "product"
+                            and r["state"] in ("candidate", "conflict") for r in pending):
+                        raise RuntimeError("test service uninstall incomplete")
+                    assert {r["key"]["name"].lower() for r in pending} == self.retained_drivers
 
     @staticmethod
     def call(*args):

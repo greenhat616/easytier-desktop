@@ -178,8 +178,16 @@ def windows(inv):
     with tempfile.TemporaryDirectory() as directory:
         state = Path(directory) / "wfp.xml"
         command("netsh.exe", "wfp", "show", "state", f"file={state}")
-        tree = ElementTree.parse(state)
-        for item in tree.findall(".//item[filterKey]"):
+        # netsh can append IPsec diagnostics after the WFP document. Read
+        # the complete native filter table and validate its shape instead of
+        # interpreting that unrelated trailer as part of the XML document.
+        with state.open("rb") as stream:
+            items = next((node.findall("./item[filterKey]")
+                          for _, node in ElementTree.iterparse(stream)
+                          if node.tag == "filters" and node.find("./item/filterKey") is not None), None)
+        if not items:
+            raise ValueError("WFP state contains no native filter table")
+        for item in items:
             label = item.findtext("displayData/name", "")
             if label.startswith("etd-fence:"):
                 inv.put("firewall", "wfp/" + item.findtext("filterKey"),

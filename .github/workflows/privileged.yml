@@ -117,7 +117,16 @@ jobs:
             }
             $sidecars | Copy-Item -Destination (Split-Path -Parent $core) -Force
           }
-          $versionLine = & $core --version
+          $probe = [Diagnostics.ProcessStartInfo]::new($core)
+          $probe.UseShellExecute = $false
+          $probe.CreateNoWindow = $true
+          $probe.RedirectStandardOutput = $true
+          $probe.ArgumentList.Add('--version')
+          $child = [Diagnostics.Process]::Start($probe)
+          $versionLine = $child.StandardOutput.ReadToEnd().Trim()
+          $child.WaitForExit()
+          if ($child.ExitCode -ne 0) { throw "Source bundle version probe exited $($child.ExitCode)" }
+          $child.Dispose()
           if ($versionLine -notmatch '^easytier-core (2\.7\.1)-.*c97f36b8(?:-|$)') {
             throw "Unexpected pinned core version: $versionLine"
           }

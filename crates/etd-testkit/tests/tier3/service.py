@@ -232,7 +232,7 @@ class Service:
         try:
             self.verify_bundle()
             version = self.call(self.core, "--version").strip()
-            assert re.fullmatch(r"easytier-core 2\.7\.1-[^\s]*c97f36b8(?:-\S+)?", version), version
+            assert re.fullmatch(r"easytier-core 2\.7\.1-0d9c52b1(?:-\S+)?", version), version
             status = eventually("installed service self-check", lambda: self.ctl("status"),
                                 lambda body: body["host"]["phase"] == "serving")
             assert status["host"]["mode"] == "service" and status["host"]["role"] == "admin"

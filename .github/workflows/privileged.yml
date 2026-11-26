@@ -45,12 +45,6 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/checkout@v7.0.1
-        with:
-          repository: EasyTier/EasyTier
-          ref: c97f36b8d40f3bde7a95cc9ec99fe95fe35a6ff0
-          path: upstream
-          persist-credentials: false
       - name: Install Linux libraries and network inspection tools
         if: runner.os == 'Linux'
         run: |
@@ -67,9 +61,6 @@ jobs:
       - run: python -m pip install psutil==7.0.0
       - uses: Swatinem/rust-cache@v2.9.3
         with:
-          workspaces: |
-            .
-            upstream
           save-if: ${{ github.event_name != 'pull_request' }}
       - uses: taiki-e/install-action@v2
         with:
@@ -90,80 +81,16 @@ jobs:
         env:
           ETD_G2_PYTHON: ${{ steps.python.outputs.python-path }}
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=independent_inventory_detects_native_foreign_objects)' --success-output immediate
-      - name: Restore pinned upstream binary
-        id: core-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: upstream/target/debug/easytier-core${{ runner.os == 'Windows' && '.exe' || '' }}
-          key: g2-core-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('upstream/Cargo.lock','rust-toolchain.toml') }}-c97f36b8d40f3bde7a95cc9ec99fe95fe35a6ff0
-      - name: Build pinned upstream source
-        if: steps.core-cache.outputs.cache-hit != 'true'
-        working-directory: upstream
-        run: cargo build --locked -p easytier --bin easytier-core
-      - name: Cache built upstream binary
-        if: steps.core-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: upstream/target/debug/easytier-core${{ runner.os == 'Windows' && '.exe' || '' }}
-          key: ${{ steps.core-cache.outputs.cache-primary-key }}
-      # Release packaging input: embed the digest in the host at build time,
-      # and ship the *same bytes* beside the installer in cores/<version>/.
-      # Generate the table in a temporary copy of the checked-out product.
-      - name: Package host and verified kernel
+      - name: Fetch the verified release kernel beside the host image
+        run: cargo xtask fetch-cores --target host --bundle target/debug/cores --github-env ETD_G2_CORE
+      - name: Build the host with the committed release hashes
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          $stage = Join-Path $env:RUNNER_TEMP 'g2-release'
-          New-Item -ItemType Directory -Path $stage | Out-Null
-          $archive = Join-Path $env:RUNNER_TEMP 'g2-source.tar'
-          git archive --format=tar --output=$archive HEAD
-          tar -xf $archive -C $stage
-          $ext = if ($IsWindows) { '.exe' } else { '' }
-          $core = (Resolve-Path "upstream/target/debug/easytier-core$ext").Path
-          if ($IsWindows) {
-            # The upstream x64 distribution ships runtime libraries beside
-            # its executable. Keep them local to the release bundle so the
-            # installed host is tested with the actual service search path.
-            $sidecars = @('Packet.dll','wintun.dll','WinDivert64.sys') | ForEach-Object {
-              Get-Item -LiteralPath "upstream/easytier/third_party/x86_64/$_"
-            }
-            $sidecars | Copy-Item -Destination (Split-Path -Parent $core) -Force
-          }
-          $probe = [Diagnostics.ProcessStartInfo]::new($core)
-          $probe.UseShellExecute = $false
-          $probe.CreateNoWindow = $true
-          $probe.RedirectStandardOutput = $true
-          $probe.ArgumentList.Add('--version')
-          $child = [Diagnostics.Process]::Start($probe)
-          $versionLine = $child.StandardOutput.ReadToEnd().Trim()
-          $child.WaitForExit()
-          if ($child.ExitCode -ne 0) { throw "Source bundle version probe exited $($child.ExitCode)" }
-          $child.Dispose()
-          if ($versionLine -notmatch '^easytier-core (2\.7\.1)-.*c97f36b8(?:-|$)') {
-            throw "Unexpected pinned core version: $versionLine"
-          }
-          $version = $Matches[1]
-          $triple = ((rustc -vV | Select-String '^host: (\S+)$').Matches.Groups[1]).Value
-          if (!$triple) { throw 'Missing Rust host triple' }
-          $digest = (Get-FileHash -LiteralPath $core -Algorithm SHA256).Hash.ToLowerInvariant()
-          $lock = @("$triple $version $digest")
-          if ($IsWindows) {
-            foreach ($file in $sidecars) {
-              $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-              $lock += "$triple $version file:$($file.Name) $hash"
-            }
-          }
-          $lock | Set-Content -Encoding ascii "$stage/crates/etd-host/cores.lock"
-          # Share dependency artifacts with nextest. Its tier3 build targets
-          # etd-testkit, leaving the staged, digest-pinned host in target/debug.
-          $target = Join-Path $env:GITHUB_WORKSPACE 'target'
-          cargo build --manifest-path "$stage/Cargo.toml" --target-dir "$target" --locked -p etd-host -p etd-ctl
-          $bundle = New-Item -ItemType Directory "$target/debug/cores/$version" -Force
-          Copy-Item -LiteralPath $core -Destination $bundle.FullName
-          if ($IsWindows) { $sidecars | Copy-Item -Destination $bundle.FullName }
-          if (!$IsWindows) { chmod +x "$bundle/easytier-core" }
-          "ETD_G2_BIN=$target/debug" >> $env:GITHUB_ENV
+          cargo build --locked -p etd-host -p etd-ctl
+          $digest = (Get-FileHash -LiteralPath $env:ETD_G2_CORE -Algorithm SHA256).Hash.ToLowerInvariant()
+          "ETD_G2_BIN=$env:GITHUB_WORKSPACE/target/debug" >> $env:GITHUB_ENV
           "ETD_G2_SHA=$digest" >> $env:GITHUB_ENV
           "ETD_G2_PYTHON=$((Get-Command python -CommandType Application | Select-Object -First 1).Source)" >> $env:GITHUB_ENV
       - name: Compile runner as the build user

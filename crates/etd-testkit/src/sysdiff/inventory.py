@@ -100,11 +100,11 @@ def processes(inv, paths):
     roots = [path.resolve() for path in paths]
     psutil.process_iter.cache_clear()
     table = {p.pid: p.info for p in psutil.process_iter(["pid", "ppid", "exe", "create_time"])}
-    if sys.platform == "win32" and os.environ.get("RUNNER_TEMP"):
+    if sys.platform == "win32" and os.environ.get("GITHUB_WORKSPACE"):
         powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
-        script = Path(os.environ["RUNNER_TEMP"]) / "g2-release/crates/etd-sysfx-os/src/windows/system.ps1"
+        script = Path(os.environ["GITHUB_WORKSPACE"]) / "crates/etd-sysfx-os/src/windows/system.ps1"
         if script.is_file():
-            # Match the bytes included in the staged host binary, including
+            # Match the checkout bytes compiled into the installed host, including
             # its line endings. Retain only verified process identities.
             encoded = base64.b64encode(script.read_bytes().decode().encode("utf-16-le")).decode()
             args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded]

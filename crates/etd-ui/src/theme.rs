@@ -14,6 +14,8 @@ use gpui_kit::{
     transparent_black,
 };
 
+use crate::preferences::{ThemePreference, UiPreferencesStore};
+
 const PALETTE: &str = include_str!("../assets/fluent-theme.json");
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct SystemStyle {
@@ -28,6 +30,9 @@ struct FluentChrome {
     system: SystemStyle,
     font: Option<SharedString>,
     mica_active: bool,
+    preference: ThemePreference,
+    preferences: Option<UiPreferencesStore>,
+    preference_save_failed: bool,
 }
 
 impl Global for FluentChrome {}
@@ -62,8 +67,72 @@ pub fn install_palette(cx: &mut App) {
 /// Initialize production appearance after `gpui_kit::init`.
 pub fn init(cx: &mut App) {
     install_palette(cx);
+    let store = UiPreferencesStore::default_store();
+    let preference = store
+        .as_ref()
+        .map(|store| {
+            store.load().unwrap_or_else(|error| {
+            tracing::warn!(kind = ?error.kind(), "Could not read UI preferences; following system");
+            ThemePreference::default()
+        })
+        })
+        .unwrap_or_default();
+    let chrome = cx.global_mut::<FluentChrome>();
+    chrome.preference = preference;
+    chrome.preferences = store;
+    set_native_preference(preference, cx);
+    apply_theme(cx.window_appearance(), cx);
     #[cfg(target_os = "windows")]
     windows::init(cx);
+}
+
+pub(crate) fn preference(cx: &App) -> ThemePreference {
+    cx.try_global::<FluentChrome>()
+        .map(|chrome| chrome.preference)
+        .unwrap_or_default()
+}
+
+pub(crate) fn preference_save_failed(cx: &App) -> bool {
+    cx.try_global::<FluentChrome>()
+        .is_some_and(|chrome| chrome.preference_save_failed)
+}
+
+fn set_native_preference(preference: ThemePreference, cx: &App) {
+    // On macOS this toggles the application's native appearance override.
+    // GPUI's Windows implementation is a no-op; see sync_material instead.
+    cx.set_window_appearance(match preference {
+        ThemePreference::FollowSystem => None,
+        ThemePreference::Light => Some(WindowAppearance::Light),
+        ThemePreference::Dark => Some(WindowAppearance::Dark),
+    });
+}
+
+pub(crate) fn set_preference(preference: ThemePreference, window: &mut Window, cx: &mut App) {
+    let chrome = cx.global_mut::<FluentChrome>();
+    chrome.preference = preference;
+    // Only production init connects a store, so the headless palette is
+    // completely isolated from the user's real preference file.
+    chrome.preference_save_failed =
+        chrome
+            .preferences
+            .as_ref()
+            .is_some_and(|store| match store.save(preference) {
+                Ok(()) => false,
+                Err(error) => {
+                    tracing::warn!(kind = ?error.kind(), "Could not save UI preferences");
+                    true
+                }
+            });
+    set_native_preference(preference, cx);
+    // macOS's app appearance changes immediately, whereas its window's
+    // appearance callback may arrive later. Linux needs the window value.
+    let appearance = if cfg!(target_os = "macos") {
+        cx.window_appearance()
+    } else {
+        window.appearance()
+    };
+    apply_theme(appearance, cx);
+    sync_material(window, cx);
 }
 
 fn apply_theme(appearance: WindowAppearance, cx: &mut App) {
@@ -71,10 +140,12 @@ fn apply_theme(appearance: WindowAppearance, cx: &mut App) {
         return;
     }
     let chrome = cx.global::<FluentChrome>();
-    let dark = chrome
-        .system
-        .dark
-        .unwrap_or(ThemeMode::from(appearance).is_dark());
+    let dark = chrome.preference.is_dark(
+        chrome
+            .system
+            .dark
+            .unwrap_or(ThemeMode::from(appearance).is_dark()),
+    );
     let font = chrome.font.clone();
     let accent = if dark {
         chrome.system.dark_accent
@@ -177,11 +248,28 @@ pub(crate) fn bind_window(window: &mut Window, cx: &mut App) {
         .detach();
 }
 
+#[cfg(any(test, target_os = "windows"))]
+fn material_after_native_mode(
+    requested: WindowBackgroundAppearance,
+    native_mode_applied: bool,
+) -> WindowBackgroundAppearance {
+    if native_mode_applied {
+        requested
+    } else {
+        WindowBackgroundAppearance::Opaque
+    }
+}
+
 fn sync_material(window: &mut Window, cx: &mut App) {
     if window.root::<gpui_kit::base::Root>().flatten().is_none() {
         return;
     }
     let appearance = window_background(cx);
+    #[cfg(target_os = "windows")]
+    let appearance = material_after_native_mode(
+        appearance,
+        windows::set_dark_mode(window, Theme::global(cx).is_dark()),
+    );
     window.set_background_appearance(appearance);
     #[cfg(target_os = "windows")]
     let active =
@@ -272,13 +360,23 @@ fn readable_accent(ramp: AccentRamp, dark: bool) -> Option<AccentRamp> {
 #[cfg(target_os = "windows")]
 mod windows {
     use super::*;
-    use etd_sysfx_os::appearance::{AppearanceWatch, mica_backdrop_accepted};
+    use etd_sysfx_os::appearance::{AppearanceWatch, mica_backdrop_accepted, set_window_dark_mode};
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     fn read_style(watch: &AppearanceWatch) -> SystemStyle {
         let dcomp = !std::env::var("GPUI_DISABLE_DIRECT_COMPOSITION")
             .is_ok_and(|v| v == "1" || v == "true");
         system_style(watch.snapshot(), dcomp)
+    }
+
+    pub(super) fn set_dark_mode(window: &Window, dark: bool) -> bool {
+        let Ok(handle) = HasWindowHandle::window_handle(window) else {
+            return false;
+        };
+        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+            return false;
+        };
+        set_window_dark_mode(handle.hwnd, dark)
     }
 
     pub(super) fn mica_accepted(window: &Window) -> bool {
@@ -318,7 +416,8 @@ mod windows {
                     }
                     cx.global_mut::<FluentChrome>().system = next;
                     apply_theme(cx.window_appearance(), cx);
-                    if previous.mica_requested != next.mica_requested {
+                    if previous.mica_requested != next.mica_requested || previous.dark != next.dark
+                    {
                         for handle in cx.windows() {
                             let _ = handle.update(cx, |_, window, cx| sync_material(window, cx));
                         }
@@ -346,6 +445,15 @@ mod tests {
         assert!(system_style(supported, true).mica_requested);
         assert!(!system_style(supported, false).mica_requested);
         assert!(!system_style(AppearanceSnapshot::default(), true).mica_requested);
+    }
+
+    #[test]
+    fn native_mode_failure_disables_mica() {
+        use WindowBackgroundAppearance::{MicaBackdrop, Opaque};
+        assert_eq!(material_after_native_mode(MicaBackdrop, false), Opaque);
+        assert_eq!(material_after_native_mode(MicaBackdrop, true), MicaBackdrop);
+        assert_eq!(material_after_native_mode(Opaque, true), Opaque);
+        assert_eq!(material_after_native_mode(Opaque, false), Opaque);
     }
 
     #[test]
@@ -507,6 +615,56 @@ mod tests {
                 assert_eq!(rgb24(fill.to_rgb()), ramp.base);
                 assert!(fill.a > 0.09 && fill.a < 0.12);
             }
+        });
+    }
+
+    #[gpui_kit::test]
+    fn manual_theme_ignores_system_mode_but_uses_live_accent(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_palette(cx);
+            let light = AccentRamp {
+                base: 0x006822,
+                hover: 0x006022,
+                active: 0x00551B,
+            };
+            let dark = AccentRamp {
+                base: 0x60CDFF,
+                hover: 0x79D5FF,
+                active: 0x49B9ED,
+            };
+            let chrome = cx.global_mut::<FluentChrome>();
+            chrome.system = SystemStyle {
+                dark: Some(false),
+                light_accent: Some(light),
+                dark_accent: Some(dark),
+                ..Default::default()
+            };
+            chrome.preference = ThemePreference::Dark;
+            apply_theme(WindowAppearance::Light, cx);
+            assert!(Theme::global(cx).is_dark());
+            assert_eq!(rgb24(Theme::global(cx).primary.to_rgb()), dark.base);
+            // An OS accent change while manually dark reprojects the dark ramp.
+            let new_dark = AccentRamp {
+                base: 0x78D46B,
+                ..dark
+            };
+            cx.global_mut::<FluentChrome>().system.dark_accent = Some(new_dark);
+            apply_theme(WindowAppearance::Light, cx);
+            assert_eq!(rgb24(Theme::global(cx).primary.to_rgb()), new_dark.base);
+            let chrome = cx.global_mut::<FluentChrome>();
+            chrome.system.dark = Some(true);
+            chrome.preference = ThemePreference::Light;
+            apply_theme(WindowAppearance::Dark, cx);
+            assert!(!Theme::global(cx).is_dark());
+            assert_eq!(rgb24(Theme::global(cx).primary.to_rgb()), light.base);
+            cx.global_mut::<FluentChrome>().preference = ThemePreference::FollowSystem;
+            apply_theme(WindowAppearance::Dark, cx);
+            assert!(Theme::global(cx).is_dark());
+            assert_eq!(rgb24(Theme::global(cx).primary.to_rgb()), new_dark.base);
+            cx.global_mut::<FluentChrome>().system.dark = Some(false);
+            apply_theme(WindowAppearance::Light, cx);
+            assert!(!Theme::global(cx).is_dark());
         });
     }
 

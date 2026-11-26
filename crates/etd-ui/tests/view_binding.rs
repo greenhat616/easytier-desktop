@@ -295,6 +295,34 @@ fn make_entry(
 }
 
 #[gpui_kit::test]
+fn theme_menu_switches_live_without_reopening_window(cx: &mut TestAppContext) {
+    use gpui_kit::component::{Theme, ThemeMode};
+    let (tray, _, _) = FakeTray::available();
+    let (installer, _) = FakeInstaller::ok();
+    let harness = TestHarness::new(cx, Box::new(tray), installer, false);
+    harness.push_store(connected_store(&[capability::INSTANCES]), cx);
+
+    cx.update_window(harness.window, |_, window, cx| {
+        assert_eq!(window.find("theme-menu").label(), Some("Theme: System"));
+        let system_dark = ThemeMode::from(window.appearance()).is_dark();
+        for (item, choice, expected) in [
+            (2usize, "Dark", true),
+            (1usize, "Light", false),
+            (0usize, "System", system_dark),
+        ] {
+            window.click("theme-menu", cx);
+            assert!(window.find("popup-menu").visible());
+            window.within("popup-menu").click(item, cx);
+            assert_eq!(Theme::global(cx).is_dark(), expected);
+            window.render_frame(cx);
+            let label = format!("Theme: {choice}");
+            assert_eq!(window.find("theme-menu").label(), Some(label.as_str()));
+        }
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn instance_list_waiting_gave_up_and_cut_unconfirmed_bindings(cx: &mut TestAppContext) {
     let (tray, _, _) = FakeTray::available();
     let (installer, _) = FakeInstaller::ok();

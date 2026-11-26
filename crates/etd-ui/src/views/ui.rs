@@ -7,12 +7,13 @@
 //! entire enclosing render function, causing stack frames of 500–700 KiB.
 
 use gpui_kit::{
-    AnyElement, App, ClickEvent, ElementId, Entity, IntoElement as _, ParentElement as _,
+    Anchor, AnyElement, App, ClickEvent, ElementId, Entity, IntoElement as _, ParentElement as _,
     SharedString, Styled as _, Window,
     component::{
         ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size,
         button::{Button, ButtonVariant, ButtonVariants as _},
         input::{Input, InputContentType, InputState},
+        menu::{DropdownMenu, PopupMenuItem},
         switch::Switch,
     },
     div,
@@ -95,6 +96,44 @@ fn action_button_inner(
         btn = btn.outline();
     }
     btn.into_any_element()
+}
+
+/// Compact appearance picker in the app header. The checked item represents
+/// the saved choice, not merely the currently visible light/dark palette.
+#[inline(never)]
+pub fn theme_menu(cx: &App) -> AnyElement {
+    use crate::{preferences::ThemePreference, theme};
+    let current = theme::preference(cx);
+    let label = if theme::preference_save_failed(cx) {
+        "Theme (not saved)"
+    } else {
+        match current {
+            ThemePreference::FollowSystem => "Theme: System",
+            ThemePreference::Light => "Theme: Light",
+            ThemePreference::Dark => "Theme: Dark",
+        }
+    };
+    Button::new("theme-menu")
+        .with_size(Size::XSmall)
+        .with_variant(ButtonVariant::Ghost)
+        .label(label)
+        .dropdown_menu_with_anchor(Anchor::TopRight, |menu, _, cx| {
+            let current = theme::preference(cx);
+            [
+                ThemePreference::FollowSystem,
+                ThemePreference::Light,
+                ThemePreference::Dark,
+            ]
+            .into_iter()
+            .fold(menu, |menu, choice| {
+                menu.item(
+                    PopupMenuItem::new(choice.label())
+                        .checked(choice == current)
+                        .on_click(move |_, window, cx| theme::set_preference(choice, window, cx)),
+                )
+            })
+        })
+        .into_any_element()
 }
 
 /// Builds a labeled single-line [`Input`] in its own stack frame.

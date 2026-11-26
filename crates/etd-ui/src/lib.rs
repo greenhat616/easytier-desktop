@@ -9,6 +9,7 @@ pub mod composition;
 pub mod controller;
 pub mod editor;
 pub mod model;
+mod preferences;
 pub mod theme;
 pub mod tray;
 pub mod views;

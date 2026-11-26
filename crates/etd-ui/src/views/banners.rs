@@ -23,7 +23,7 @@ use crate::{
     model::InstallStatus,
     views::{
         MainView,
-        ui::{BtnStyle, action_button},
+        ui::{BtnStyle, action_button, theme_menu},
     },
 };
 
@@ -162,6 +162,7 @@ pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
         .child(svc_btn)
         .child(user_btn)
         .child(refresh_btn)
+        .child(theme_menu(cx))
         .child(exit_btn);
 
     div()

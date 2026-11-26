@@ -660,7 +660,17 @@ def upgrade_running():
             break
         print("upgrade with a running network: old generation closed, new generation matches its records",
               flush=True)
-        # Teardown uninstalls the upgraded service with the network running.
+        service.ctl("stop", instance)
+        eventually("stopped instance", lambda: service.view(instance),
+                   lambda status: status.get("state") == "stopped", timeout=240 if os.name == "nt" else 75)
+        check_closed(service, instance, view["epoch"])
+        if os.name == "nt":
+            # Shared drivers stay installed, as after any stopped network.
+            stopped = service.inventory()
+            service.retained_drivers = {
+                name: stopped.rows["service", name] for name in ("wintun", "windivert")
+                if ("service", name) not in baseline.rows and ("service", name) in stopped.rows
+            }
 
 
 if __name__ == "__main__":

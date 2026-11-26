@@ -12,9 +12,10 @@ etd-contract = { workspace = true }
 etd-ipc = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive", "error-context", "help", "std", "usage"] }
+futures-util = { workspace = true, features = ["std"] }
 jiff = { workspace = true, features = ["std"] }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 tracing = { workspace = true, features = ["std"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "std"] }
 uuid = { workspace = true, features = ["std", "v4"] }
@@ -23,7 +24,9 @@ uuid = { workspace = true, features = ["std", "v4"] }
 assert_cmd = { workspace = true }
 etd-testkit = { workspace = true }
 predicates = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+tonic = { workspace = true, features = ["router", "server"] }
 
 [lints]
 workspace = true

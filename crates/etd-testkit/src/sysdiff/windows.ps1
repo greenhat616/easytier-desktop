@@ -113,8 +113,13 @@ foreach ($tree in @("$system\Tcpip\Parameters\Interfaces","$system\Tcpip6\Parame
             $id = $key.Name.Replace('HKEY_LOCAL_MACHINE','HKLM') + '\' + $name
             if ($name -in @('RegistrationEnabled','DisableDynamicUpdate',
                 'MaxNumberOfAddressesToRegister','NetbiosOptions','SearchList','ProfileName','Category',
-                'NameServer','Domain','EnableDHCP')) {
-                $inventory.registry[$id] = @([string]$key.GetValueKind($name),$key.GetValue($name))
+                'NameServer','Domain','EnableDHCP','Dhcpv6State','Dhcpv6Iaid')) {
+                $type = [string]$key.GetValueKind($name)
+                $value = $key.GetValue($name)
+                if ($name -eq 'Dhcpv6Iaid' -and $type -eq 'DWord') {
+                    $value = ([long]$value) -band 4294967295L
+                }
+                $inventory.registry[$id] = @($type,$value)
             } elseif ($tree -eq "$system\Tcpip\Parameters\Interfaces" -or
                       $tree -eq "$system\Tcpip6\Parameters\Interfaces") {
                 # Include every other per-interface value in the strict diff.

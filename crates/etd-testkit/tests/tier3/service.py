@@ -101,7 +101,7 @@ class Service:
         self.core = self.cores / os.environ["ETD_G2_SHA"] / ("easytier-core" + ext)
         self.runtime = self.state / "run"
         self.retained_drivers = {}
-        self.adapter_guids = set()
+        self.adapter_indices = {}
 
     def verify_bundle(self):
         expected = {self.core.name: os.environ["ETD_G2_SHA"]}
@@ -201,7 +201,7 @@ class Service:
               f"{status.stdout.strip()} {status.stderr.strip()}", flush=True)
 
     @contextmanager
-    def installed(self):
+    def installed(self, *, fixture_tunnel=False):
         if self.state.exists() or self.host.exists() or self.cores.exists():
             raise RuntimeError("test needs a fresh service installation")
         before = self.inventory()
@@ -217,6 +217,22 @@ class Service:
             print(f"installed service handshake: serving, admin; kernel probe: {version}", flush=True)
             yield self
         finally:
+            if fixture_tunnel:
+                # The foreign IPv6 tunnel alone changes MpsSvc Quarantine
+                # even 180 s after its removal (45863459869). The full
+                # before-network -> after-purge comparison already covers
+                # this group with the tunnel present. Compare uninstall
+                # from its new, post-fixture baseline too. The clean-install
+                # job checks every group across the entire install lifetime.
+                group = "wfp-group/fwpm_provider_mpssvc_wf/fwpm_sublayer_mpssvc_quarantine"
+                key = ("firewall", group)
+                teardown = self.inventory()
+                for prior, current, name in ((before.rows, teardown.rows, key),
+                                             (before.policy_filters, teardown.policy_filters, group)):
+                    if name in current:
+                        prior[name] = current[name]
+                    else:
+                        prior.pop(name, None)
             # Inventory the result even when a failed uninstall retains files.
             result = self.uninstall()
             if not result.returncode:
@@ -228,7 +244,7 @@ class Service:
             after = self.inventory()
             delta = before.delta(after) - managed_service_changes(before, after)
             delta -= runner_noise(before, after) | tun_created(before, after)
-            delta -= adapter_defaults(before, after, self.adapter_guids)
+            delta -= adapter_defaults(before, after, self.adapter_indices)
             delta -= system_policy_changes(before, after, "uninstalled")
             if sys.platform == "darwin":
                 delta -= empty_pf_namespace(before, after)

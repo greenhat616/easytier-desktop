@@ -367,8 +367,8 @@ async fn serve_until(
     // The ledger's writer thread is joined before the lock can go: no
     // queued transition lands after another process owns the ledger.
     let closed = tokio::time::timeout(serving::LEDGER_CLOSE, async {
-        Arc::try_unwrap(sqlite)
-            .map_err(|_| anyhow::anyhow!("ledger still has active owners"))?
+        sole_owner(sqlite)
+            .await
             .close()
             .await
             .map_err(anyhow::Error::from)
@@ -393,7 +393,7 @@ async fn serve_until(
         Err(_) => {
             tracing::error!(
                 stage = "shutdown.ledger_closed",
-                "host shutdown: ledger close timed out; open records stay as they are"
+                "host shutdown: ledger still shared or its close timed out; open records stay as they are"
             );
             false
         }
@@ -404,6 +404,20 @@ async fn serve_until(
         quiescent: stopped.quiescent && ledger_closed,
         _logging: Some(logging),
     })
+}
+
+/// Wait until `shared` has no other owner. A mutation that was committing
+/// when its client went away runs on in a detached task holding the
+/// service, so the ledger; it ends once the orchestrator is gone. The
+/// caller bounds the wait.
+async fn sole_owner<T>(mut shared: Arc<T>) -> T {
+    loop {
+        match Arc::try_unwrap(shared) {
+            Ok(owned) => return owned,
+            Err(still) => shared = still,
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 fn logging(layout: &HostLayout) -> Result<tracing_appender::non_blocking::WorkerGuard> {
@@ -1813,7 +1827,7 @@ mod purge_flow_tests {
 
 #[cfg(test)]
 mod release_tests {
-    use super::release;
+    use super::{release, sole_owner};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct Lock<'a>(&'a AtomicBool);
@@ -1834,5 +1848,16 @@ mod release_tests {
             !released.load(Ordering::SeqCst),
             "kept until the process exits"
         );
+    }
+
+    #[tokio::test]
+    async fn the_ledger_closes_once_a_detached_owner_ends() {
+        let shared = std::sync::Arc::new(5);
+        let detached = shared.clone();
+        let (owned, ()) = tokio::join!(sole_owner(shared), async move {
+            tokio::task::yield_now().await;
+            drop(detached);
+        });
+        assert_eq!(owned, 5);
     }
 }

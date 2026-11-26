@@ -8,12 +8,13 @@ using System.Net;
 using System.Runtime.InteropServices;
 using System.Threading;
 
-public class Iface { public ulong Luid; public uint Index; public Guid Guid; public string Alias; public string Description; }
+// OperStatus is IF_OPER_STATUS: 1 up, 2 down, 6 not present.
+public class Iface { public ulong Luid; public uint Index; public Guid Guid; public string Alias; public string Description; public int OperStatus; }
 public class Node { public string Id; public bool Live; public bool Phantom; public uint Status; public uint Problem; }
 public class Sample
 {
     public int TargetMs; public long AtMs; public long TookMs;
-    public Iface[] Interfaces; public string[] Routes; public string[] Addresses; public Node[] Nodes;
+    public Iface[] Interfaces; public int IpInterfaces; public string[] Routes; public string[] Addresses; public Node[] Nodes;
 }
 
 public static class Probe
@@ -21,6 +22,7 @@ public static class Probe
     [DllImport("iphlpapi.dll")] static extern uint GetIfTable2(out IntPtr table);
     [DllImport("iphlpapi.dll")] static extern uint GetIpForwardTable2(ushort family, out IntPtr table);
     [DllImport("iphlpapi.dll")] static extern uint GetUnicastIpAddressTable(ushort family, out IntPtr table);
+    [DllImport("iphlpapi.dll")] static extern uint GetIpInterfaceTable(ushort family, out IntPtr table);
     [DllImport("iphlpapi.dll")] static extern void FreeMibTable(IntPtr table);
     [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)] static extern uint CM_Locate_DevNodeW(out uint devInst, string id, uint flags);
     [DllImport("cfgmgr32.dll")] static extern uint CM_Get_DevNode_Status(out uint status, out uint problem, uint devInst, uint flags);
@@ -48,7 +50,7 @@ public static class Probe
                 var g = new byte[16]; Marshal.Copy(IntPtr.Add(r, 12), g, 0, 16);
                 list.Add(new Iface {
                     Luid = (ulong)Marshal.ReadInt64(r), Index = (uint)Marshal.ReadInt32(r, 8), Guid = new Guid(g),
-                    Alias = Marshal.PtrToStringUni(IntPtr.Add(r, 28)), Description = Marshal.PtrToStringUni(IntPtr.Add(r, 542)) });
+                    Alias = Marshal.PtrToStringUni(IntPtr.Add(r, 28)), Description = Marshal.PtrToStringUni(IntPtr.Add(r, 542)), OperStatus = Marshal.ReadInt32(r, 1156) });
             }
             return list.ToArray();
         }
@@ -103,6 +105,47 @@ public static class Probe
         finally { FreeMibTable(t); }
     }
 
+    // MIB_IPINTERFACE_ROW: 168 bytes; interface LUID at 8. One row per address family.
+    public static int IpInterfaces(ulong luid)
+    {
+        IntPtr t; uint rc = GetIpInterfaceTable(0, out t);
+        if (rc != 0) throw new Exception("GetIpInterfaceTable " + rc);
+        try
+        {
+            int count = 0, n = Marshal.ReadInt32(t);
+            for (int i = 0; i < n; i++)
+                if ((ulong)Marshal.ReadInt64(IntPtr.Add(t, 8 + i * 168), 8) == luid) count++;
+            return count;
+        }
+        finally { FreeMibTable(t); }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct DevInfoData { public uint Size; public Guid Class; public uint DevInst; public IntPtr Reserved; }
+    [DllImport("setupapi.dll", SetLastError = true)] static extern IntPtr SetupDiCreateDeviceInfoList(IntPtr classGuid, IntPtr parent);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool SetupDiOpenDeviceInfoW(IntPtr set, string id, IntPtr parent, uint flags, ref DevInfoData data);
+    [DllImport("setupapi.dll")] static extern bool SetupDiDestroyDeviceInfoList(IntPtr set);
+    [DllImport("newdev.dll", SetLastError = true)] static extern bool DiUninstallDevice(IntPtr parent, IntPtr set, ref DevInfoData data, uint flags, out bool needReboot);
+
+    // Removes a device node, present or not. Returns whether Windows asks for a reboot.
+    public static bool Uninstall(string id)
+    {
+        IntPtr set = SetupDiCreateDeviceInfoList(IntPtr.Zero, IntPtr.Zero);
+        if (set == new IntPtr(-1)) throw new Exception("SetupDiCreateDeviceInfoList " + Marshal.GetLastWin32Error());
+        try
+        {
+            var data = new DevInfoData();
+            data.Size = (uint)Marshal.SizeOf(typeof(DevInfoData));
+            if (!SetupDiOpenDeviceInfoW(set, id, IntPtr.Zero, 0, ref data))
+                throw new Exception("SetupDiOpenDeviceInfoW 0x" + Marshal.GetLastWin32Error().ToString("X8"));
+            bool reboot;
+            if (!DiUninstallDevice(IntPtr.Zero, set, ref data, 0, out reboot))
+                throw new Exception("DiUninstallDevice 0x" + Marshal.GetLastWin32Error().ToString("X8"));
+            return reboot;
+        }
+        finally { SetupDiDestroyDeviceInfoList(set); }
+    }
+
     // Every SWD\Wintun device node, present or not (no CM_GETIDLIST_FILTER_PRESENT).
     public static Node[] WintunNodes()
     {
@@ -149,6 +192,7 @@ public static class Probe
             if (i.Luid == luid || i.Guid == guid || (i.Alias ?? "").StartsWith(name, StringComparison.OrdinalIgnoreCase))
                 matched.Add(i);
         s.Interfaces = matched.ToArray();
+        s.IpInterfaces = IpInterfaces(luid);
         s.Routes = Routes(luid);
         s.Addresses = Addresses(luid);
         s.Nodes = WintunNodes();

@@ -84,10 +84,10 @@ function Get-ToolCounts([uint32]$ifIndex) {
     }
 }
 
-function Start-Core([string]$tag) {
+function Start-Core([string]$tag, [string]$devName = $Name) {
     $arguments = @(
         '--network-name', "s2-spike-$([guid]::NewGuid().ToString('N'))",
-        '--ipv4', '10.144.144.1/24', '--dev-name', $Name, '--no-listener',
+        '--ipv4', '10.144.144.1/24', '--dev-name', $devName, '--no-listener',
         '--manual-routes', '10.200.77.0/24', '--rpc-portal', '127.0.0.1:15888')
     [Probe]::AllowCtrlC()
     # With redirected output and no -NoNewWindow the core gets its own console,
@@ -100,11 +100,11 @@ function Start-Core([string]$tag) {
 }
 
 # Waits for the adapter to carry its address and the on-link route, then lets it settle.
-function Wait-Adapter($process) {
+function Wait-Adapter($process, [string]$devName = $Name) {
     $deadline = (Get-Date).AddSeconds(60)
     while ((Get-Date) -lt $deadline) {
         if ($process.HasExited) { throw "easytier-core exited early with code $($process.ExitCode)" }
-        $found = [Probe]::Interfaces() | Where-Object { $_.Alias -eq $Name } | Select-Object -First 1
+        $found = [Probe]::Interfaces() | Where-Object { $_.Alias -eq $devName -and $_.OperStatus -ne 6 } | Select-Object -First 1
         if ($found -and ([Probe]::Addresses($found.Luid) -contains '10.144.144.1') -and
             ([Probe]::Routes($found.Luid) -contains '10.144.144.0/24')) {
             Start-Sleep -Seconds 5
@@ -112,7 +112,7 @@ function Wait-Adapter($process) {
         }
         Start-Sleep -Milliseconds 250
     }
-    throw "adapter $Name did not become ready within 60 s"
+    throw "adapter $devName did not become ready within 60 s"
 }
 
 function Format-Row($s) {
@@ -120,7 +120,8 @@ function Format-Row($s) {
     $state = if (-not $nodes) { 'none' } elseif ($nodes[0].Live) { 'live' } elseif ($nodes[0].Phantom) { 'phantom' } else { 'listed-unlocatable' }
     [pscustomobject]@{
         targetMs = $s.TargetMs; atMs = $s.AtMs; tookMs = $s.TookMs
-        interfaces = $s.Interfaces.Count; routes = $s.Routes.Count; addresses = $s.Addresses.Count
+        ifRows = $s.Interfaces.Count; ifPresent = @($s.Interfaces | Where-Object OperStatus -NE 6).Count
+        ifOper = (($s.Interfaces | ForEach-Object OperStatus) -join ','); ipIfs = $s.IpInterfaces; routes = $s.Routes.Count; addresses = $s.Addresses.Count
         devnode = $state; wintunNodes = $s.Nodes.Count
     }
 }
@@ -209,28 +210,75 @@ function Get-GoneAt($rows, [scriptblock]$present) {
 $summary = foreach ($r in $results) {
     [pscustomobject]@{
         run = $r.run; luid = $r.luid; ifIndex = $r.ifIndex; exitMs = $r.exitMs
-        interfaceGone = Get-GoneAt $r.timeline { param($x) $x.interfaces -gt 0 }
+        interfaceGone = Get-GoneAt $r.timeline { param($x) $x.ifPresent -gt 0 -or $x.ipIfs -gt 0 }
         routesGone    = Get-GoneAt $r.timeline { param($x) $x.routes -gt 0 -or $x.addresses -gt 0 }
         liveNodeGone  = Get-GoneAt $r.timeline { param($x) $x.devnode -eq 'live' }
         devnodeAt5s   = $r.timeline[-1].devnode
+        ifRowsAt5s    = "$($r.timeline[-1].ifRows) (oper $($r.timeline[-1].ifOper))"
     }
 }
 $summary | Format-Table -AutoSize | Out-String -Width 200
 $summary | ConvertTo-Json | Set-Content (Join-Path $OutDir 'summary.json')
 
 $killed = @($results | Where-Object mode -EQ 'kill')
-$survivors = @($killed | Where-Object { $_.timeline[-1].interfaces -gt 0 -or $_.timeline[-1].routes -gt 0 -or $_.timeline[-1].devnode -eq 'live' })
+$survivors = @($killed | Where-Object { $_.timeline[-1].ifPresent -gt 0 -or $_.timeline[-1].ipIfs -gt 0 -or $_.timeline[-1].routes -gt 0 -or $_.timeline[-1].devnode -eq 'live' })
 if ($survivors) { "VERDICT: adapter SURVIVES a hard kill in $($survivors.Count)/$($killed.Count) runs" }
-else { "VERDICT: interface, routes and live device node are gone within 5 s after TerminateProcess in $($killed.Count)/$($killed.Count) runs" }
+else { "VERDICT: present interface, IP interface, routes and live device node are gone within 5 s after TerminateProcess in $($killed.Count)/$($killed.Count) runs" }
 
-# If anything of the device is left (live or phantom), find a removal call that works.
-$node = [Probe]::Locate($predictedId)
-if ($node.Live -or $node.Phantom) {
-    "device node left: live=$($node.Live) phantom=$($node.Phantom); trying pnputil /remove-device"
-    pnputil /remove-device $predictedId
-    "pnputil exit code=$LASTEXITCODE"
-    $node = [Probe]::Locate($predictedId)
-    "after removal: live=$($node.Live) phantom=$($node.Phantom)"
+# --- Removing what is left, and whether LUID / instance id identify a generation.
+function Get-InstanceId([string]$devName) { "SWD\Wintun\$((Get-WintunGuid $devName).ToString('B').ToUpperInvariant())" }
+
+function Show-Residue([string]$devName) {
+    $g = Get-WintunGuid $devName
+    $node = [Probe]::Locate((Get-InstanceId $devName))
+    $rows = @([Probe]::Interfaces() | Where-Object { $_.Guid -eq $g -or $_.Alias -like "$devName*" })
+    $svc = 'HKLM:\SYSTEM\CurrentControlSet\Services'
+    $net = 'HKLM:\SYSTEM\CurrentControlSet\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}'
+    $b = $g.ToString('B')
+    "residue $devName`: node live=$($node.Live) phantom=$($node.Phantom); " +
+    "ifRows=$($rows.Count) [$(($rows | ForEach-Object { "luid=0x$($_.Luid.ToString('X16')) oper=$($_.OperStatus)" }) -join '; ')]; " +
+    "keys Control\Network=$(Test-Path -LiteralPath "$net\$b") Tcpip=$(Test-Path -LiteralPath "$svc\Tcpip\Parameters\Interfaces\$b") " +
+    "Tcpip6=$(Test-Path -LiteralPath "$svc\Tcpip6\Parameters\Interfaces\$b") NetBT=$(Test-Path -LiteralPath "$svc\NetBT\Parameters\Interfaces\Tcpip_$b"); " +
+    "firewall rules naming it=$(@(Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object DisplayName -Like "*$devName*").Count)"
 }
-else { 'no device node (live or phantom) left, nothing to remove' }
+
+function Invoke-Generation([string]$tag, [string]$devName) {
+    $p = Start-Core $tag $devName
+    try {
+        $a = Wait-Adapter $p $devName
+        "generation $tag $devName`: luid=0x$($a.Luid.ToString('X16')) ifIndex=$($a.Index) guid=$($a.Guid)"
+        [Probe]::HardKill($p.Handle)
+        if (-not $p.WaitForExit(30000)) { throw "$tag did not exit" }
+        Start-Sleep -Seconds 5
+    }
+    finally { if (-not $p.HasExited) { $p.Kill() } }
+}
+
+"`n===== removal and identity ====="
+$nameB = 'etd-00000000'; $nameC = 'etd-ffffffff'
+Show-Residue $Name
+'-- another name while the phantom of the first is still there'
+Invoke-Generation 'identity-b' $nameB
+Show-Residue $nameB
+$id = Get-InstanceId $Name
+"-- remove the first: pnputil /remove-device `"$id`""
+pnputil /remove-device $id
+if ($LASTEXITCODE -ne 0) { throw "pnputil /remove-device failed with $LASTEXITCODE" }
+'pnputil exit code=0'
+Show-Residue $Name
+$id = Get-InstanceId $nameB
+"-- remove the second: DiUninstallDevice($id)"
+"needReboot=$([Probe]::Uninstall($id))"
+Show-Residue $nameB
+'-- a third name after both are removed'
+Invoke-Generation 'identity-c' $nameC
+'-- the first name again, after its removal'
+Invoke-Generation 'identity-a-again' $Name
+foreach ($n in $nameC, $Name) {
+    "DiUninstallDevice $n needReboot=$([Probe]::Uninstall((Get-InstanceId $n)))"
+    Show-Residue $n
+}
+$left = @([Probe]::WintunNodes())
+"wintun nodes left=$($left.Count)"
+if ($left.Count) { throw 'device nodes remain after removal' }
 $global:LASTEXITCODE = 0

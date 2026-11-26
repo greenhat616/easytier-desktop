@@ -53,6 +53,7 @@ class Service:
         self.cores = base / "cores"
         self.core = self.cores / os.environ["ETD_G2_SHA"] / ("easytier-core" + ext)
         self.runtime = self.state / "run"
+        self.retained_drivers = set()
 
     @contextmanager
     def installed(self):
@@ -61,7 +62,8 @@ class Service:
         self.call(self.installer, "install")
         try:
             assert digest(self.core) == os.environ["ETD_G2_SHA"], "installed core digest"
-            status = self.ctl("status")
+            status = eventually("installed service self-check", lambda: self.ctl("status"),
+                                lambda body: body["host"]["phase"] == "serving")
             assert status["host"]["mode"] == "service" and status["host"]["role"] == "admin"
             assert status["default_core_version"] == "2.7.1", status
             yield self
@@ -71,7 +73,12 @@ class Service:
             result = command(self.installer, "uninstall", check=False)
             if result.returncode:
                 print(f"test service uninstall exited {result.returncode}: {result.stderr.strip()}")
-                if sys.exc_info()[0] is None:
+                pending = [r for r in self.effects() if r["state"] != "reclaimed"]
+                driver_names = {r["key"].get("name", "").lower() for r in pending}
+                retained = (pending and driver_names == self.retained_drivers
+                            and all(r["kind"] == "driver" and r["scope"] == "product"
+                                    and r["state"] in ("candidate", "conflict") for r in pending))
+                if sys.exc_info()[0] is None and not retained:
                     raise RuntimeError("test service uninstall incomplete")
 
     @staticmethod
@@ -114,12 +121,14 @@ class Service:
             db.close()
 
     def view(self, instance):
-        result = command(self.client, "--json", "--timeout", "2", "status", instance, check=False)
+        result = command(self.client, "--json", "--timeout", "2", "status", check=False)
         if result.returncode == 3:
             return {}
         if result.returncode:
             raise RuntimeError(result.stderr)
-        return json.loads(result.stdout)["instances"][0]["status"] or {}
+        body = json.loads(result.stdout)
+        return next((row["status"] or {} for row in body["instances"]
+                     if row["instance_id"] == instance), {})
 
     def ready(self, instance, after=0):
         return eventually("new ready generation", lambda: self.view(instance),
@@ -128,6 +137,25 @@ class Service:
 
     def inventory(self, extra=()):
         return capture(self.runtime, [self.host, self.cores, *extra])
+
+    def stop(self):
+        if os.name == "nt":
+            self.call("sc.exe", "stop", "easytier-desk-host")
+            eventually("SCM stopped", lambda: output("sc.exe", "query", "easytier-desk-host"),
+                       lambda text: "STOPPED" in text)
+        elif sys.platform == "darwin":
+            self.call("launchctl", "bootout", "system/easytier-desk-host")
+        else:
+            self.call("systemctl", "stop", "easytier-desk-host.service")
+
+    def start(self):
+        if os.name == "nt":
+            self.call("sc.exe", "start", "easytier-desk-host")
+        elif sys.platform == "darwin":
+            self.call("launchctl", "bootstrap", "system",
+                      "/Library/LaunchDaemons/easytier-desk-host.plist")
+        else:
+            self.call("systemctl", "start", "easytier-desk-host.service")
 
     def crash_installed(self, image):
         if image not in (self.host, self.core):
@@ -146,7 +174,7 @@ class Service:
         if image == self.host and os.name == "nt":
             eventually("SCM stopped", lambda: output("sc.exe", "query", "easytier-desk-host"),
                        lambda text: "STOPPED" in text)
-            self.call("sc.exe", "start", "easytier-desk-host")
+            self.start()
         return target.pid
 
 

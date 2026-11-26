@@ -21,7 +21,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            suite: recovery
+          - os: macos-latest
+            suite: recovery
+          - os: windows-latest
+            suite: recovery
+          - os: windows-latest
+            suite: preflight
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -122,10 +130,18 @@ jobs:
       - name: Compile runner as the build user
         run: cargo nextest list --locked --profile privileged --run-ignored only -p etd-testkit --test tier3
       - name: Installed service tests (administrator)
-        if: runner.os == 'Windows'
-        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 --no-fail-fast --success-output immediate
+        if: runner.os == 'Windows' && matrix.suite == 'recovery'
+        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=installed_kernel_and_host_crash_recovery)' --success-output immediate
+      - name: Pre-existing shared drivers (fresh administrator runner)
+        if: matrix.suite == 'preflight'
+        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=preexisting_shared_drivers_are_conflicts)' --success-output immediate
       - name: Installed service tests (root)
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          sudo -E env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "$(command -v cargo)" nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 --no-fail-fast --success-output immediate
+          cargo nextest archive --locked -p etd-testkit --test tier3 --archive-file "$RUNNER_TEMP/tier3.tar.zst"
+          sudo env "PATH=$PATH" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}" "RUNNER_TEMP=$RUNNER_TEMP" \
+            "ETD_G2_CI=$ETD_G2_CI" "GITHUB_ACTIONS=$GITHUB_ACTIONS" "RUNNER_ENVIRONMENT=$RUNNER_ENVIRONMENT" \
+            "ETD_G2_PYTHON=$ETD_G2_PYTHON" "ETD_G2_BIN=$ETD_G2_BIN" "ETD_G2_SHA=$ETD_G2_SHA" \
+            "$(command -v cargo-nextest)" nextest run --profile privileged --run-ignored only --archive-file "$RUNNER_TEMP/tier3.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" --no-fail-fast --success-output immediate

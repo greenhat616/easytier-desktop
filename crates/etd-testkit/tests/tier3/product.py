@@ -139,6 +139,50 @@ def recovery():
                                and r["key"].get("name") == name for r in records)
                     remaining.remove(key)
         assert not remaining, f"unreclaimed native objects or changed baseline: {sorted(remaining)}"
+        if os.name == "nt":
+            verify_shared_driver_purge(service, baseline, stopped)
+
+
+def verify_shared_driver_purge(service, baseline, stopped):
+    names = {name for name in ("wintun", "windivert")
+             if ("service", name) not in baseline.rows and ("service", name) in stopped.rows}
+    assert "wintun" in names, "the real kernel did not load its TUN driver"
+    service.stop()
+    result = command(service.installer, "reclaim", "--all", "--purge", check=False)
+    records = service.effects()
+    retained = {r["key"]["name"].lower() for r in records if r["scope"] == "product"
+                and r["kind"] == "driver" and r["state"] == "candidate"}
+    assert retained == names, f"expected shared driver candidates {names}, got {retained}"
+    assert result.returncode and "candidates" in result.stdout and "reclaim incomplete" in result.stderr
+    after = service.inventory()
+    assert_foreign(stopped, after, {("service", name) for name in names})
+    service.retained_drivers = names
+
+
+def driver_conflict():
+    service = Service()
+    with service.installed(), ExitStack() as stack:
+        names = {"wintun", "windivert"}
+        base = service.inventory()
+        for name in names:
+            assert ("service", name) not in base.rows, f"runner already owns {name}"
+            # Disabled SCM metadata only: no driver file is supplied or loaded.
+            missing = Path(os.environ["RUNNER_TEMP"]) / ("absent-g2-" + name + ".sys")
+            assert not missing.exists()
+            command("sc.exe", "create", name, "type=", "kernel", "start=", "disabled",
+                    "binPath=", missing)
+            stack.callback(command, "sc.exe", "delete", name)
+        foreign_state = service.inventory()
+        instance = str(uuid.uuid4())
+        service.apply(spec(), instance, str(uuid.uuid4()), str(service.ctl("status")["revision"]))
+        def conflicts():
+            return {r["key"]["name"].lower() for r in service.effects()
+                    if r["kind"] == "driver" and r["state"] == "conflict" and r["scope"] == "product"}
+        eventually("pre-existing driver conflicts", conflicts, lambda found: found == names)
+        service.ctl("stop", instance)
+        service.stop()
+        assert_foreign(foreign_state, service.inventory(), {("service", n) for n in names})
+        service.retained_drivers = names
 
 
 def magic_dns():
@@ -168,4 +212,4 @@ def magic_dns():
 
 if __name__ == "__main__":
     require_runner()
-    {"recovery": recovery, "magic_dns": magic_dns}[sys.argv[1]]()
+    {"recovery": recovery, "magic_dns": magic_dns, "driver_conflict": driver_conflict}[sys.argv[1]]()

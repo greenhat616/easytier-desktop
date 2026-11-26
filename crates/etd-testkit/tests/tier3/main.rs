@@ -34,3 +34,19 @@ fn installed_kernel_and_host_crash_recovery() {
 fn installed_host_refuses_magic_dns_and_preserves_resolvers() {
     run_case("magic_dns");
 }
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires fresh, disposable Windows SCM registrations"]
+fn preexisting_shared_drivers_are_conflicts() {
+    run_case("driver_conflict");
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "pending topic 40: H1 must reject a foreign same-name program firewall rule before spawn"]
+fn preexisting_program_rule_blocks_start() {
+    // Keep the pending gate visible in nextest's inventory. Selecting it
+    // explicitly must never report a successful unimplemented assertion.
+    panic!("pending H1 preflight and its installed-product acceptance case");
+}

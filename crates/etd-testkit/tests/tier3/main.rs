@@ -75,3 +75,10 @@ fn installed_network_uninstall_restores_machine() {
 fn preexisting_program_rule_blocks_start() {
     run_case("program_rule_conflict");
 }
+
+#[cfg(windows)]
+#[test]
+#[ignore = "installs the privileged service on a disposable hosted runner"]
+fn service_stop_with_a_running_network_is_bounded() {
+    run_case("stop_running");
+}

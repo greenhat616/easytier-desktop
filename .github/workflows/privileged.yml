@@ -34,6 +34,8 @@ jobs:
             suite: program
           - os: windows-latest
             suite: clean
+          - os: windows-latest
+            suite: stop
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -72,7 +74,7 @@ jobs:
           @'
 
           [[profile.privileged.overrides]]
-          filter = 'test(=installed_kernel_and_host_crash_recovery) | test(=installed_network_uninstall_restores_machine)'
+          filter = 'test(=installed_kernel_and_host_crash_recovery) | test(=installed_network_uninstall_restores_machine) | test(=service_stop_with_a_running_network_is_bounded)'
           slow-timeout = { period = "120s", terminate-after = 15 }
           '@ | Add-Content -LiteralPath .config/nextest.toml
       # Qualify the native probes independently of the packaged host.
@@ -98,6 +100,9 @@ jobs:
       - name: Installed service tests (administrator)
         if: runner.os == 'Windows' && matrix.suite == 'recovery'
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=installed_kernel_and_host_crash_recovery)' --success-output immediate
+      - name: Service STOP with a running network (administrator)
+        if: matrix.suite == 'stop'
+        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=service_stop_with_a_running_network_is_bounded)' --success-output immediate
       - name: Pre-existing shared drivers (fresh administrator runner)
         if: matrix.suite == 'preflight'
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=preexisting_shared_drivers_are_conflicts) | test(=preexisting_shared_drivers_survive_uninstall)' --success-output immediate

@@ -226,6 +226,18 @@ def check_generation(base, live, records, instance, view, adapter_indices, worke
         raise
 
 
+def record_windows_adapter(base, live, key, name, adapter_indices):
+    assert not key.get("name") or key["name"] == name
+    assert ("interface", name) not in base.rows
+    adapter = live.rows["interface", name]
+    guid = UUID(adapter["guid"])
+    assert all(UUID(v["guid"]) != guid for (cls, _), v in base.rows.items()
+               if cls == "interface" and v.get("guid"))
+    if key.get("guid"):
+        assert UUID(key["guid"]) == guid
+    adapter_indices[guid] = adapter["index"]
+
+
 def compare_generation(base, live, records, instance, view, adapter_indices, worker_keys):
     changed = base.delta(live)
     expected = set(worker_keys)
@@ -258,13 +270,7 @@ def compare_generation(base, live, records, instance, view, adapter_indices, wor
             assert not key.get("name") or key["name"] == name
             if kind == "win.tun":
                 assert record["scope"] == scope(instance, view["epoch"])
-                assert ("interface", name) not in base.rows
-                guid = UUID(live.rows["interface", name]["guid"])
-                assert all(UUID(v["guid"]) != guid for (cls, _), v in base.rows.items()
-                           if cls == "interface" and v.get("guid"))
-                if key.get("guid"):
-                    assert UUID(key["guid"]) == guid
-                adapter_indices[guid] = live.rows["interface", name]["index"]
+                record_windows_adapter(base, live, key, name, adapter_indices)
         elif key["type"] == "routes_via":
             matches = {("route", name)}
         elif key["type"] == "path" and kind == "run_dir":

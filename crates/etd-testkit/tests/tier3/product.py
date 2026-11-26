@@ -5,15 +5,17 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tempfile
+from threading import Event, Thread
 import time
 import uuid
 
 from service import Desktop, Service, assert_driver_notice, command, eventually, require_runner
 from consistency import (
     FirewallReadbackPending, UnpredictedChanges, adapter_defaults, check_closed, check_generation, installed_image,
-    managed_service_changes, management_processes, runner_noise, scope, system_policy_changes, tun_created,
+    managed_service_changes, management_processes, record_windows_adapter, runner_noise, scope, system_policy_changes, tun_created,
 )
 from inventory import assert_exited, capture, file_identity, native_application_id, native_interface_guid
 import foreign
@@ -471,9 +473,127 @@ def magic_dns():
         print("Installed service rejected magic_dns; resolver bytes, device and inode preserved")
 
 
+@contextmanager
+def following_logs(service):
+    received = Event()
+    with subprocess.Popen([str(service.client), "logs", "--follow"], stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                          creationflags=subprocess.CREATE_NO_WINDOW) as follower:
+        def drain():
+            for _ in follower.stdout:
+                received.set()
+
+        reader = Thread(target=drain, daemon=True)
+        reader.start()
+        try:
+            assert received.wait(30) and follower.poll() is None, "no connected log follower"
+            yield follower
+        finally:
+            if follower.poll() is None:
+                follower.kill()
+            follower.wait(timeout=10)
+            reader.join(timeout=10)
+
+
+def stop_running():
+    """SCM STOP while a network runs (topic#45): the host reports STOP_PENDING
+    with a moving checkpoint and reaches STOPPED inside the uninstaller's 60 s
+    wait; whatever its bounded shutdown left open is reclaimed by the next
+    start, which runs the instance again. Teardown then uninstalls with the
+    network running again."""
+    service = Service()
+    instance = str(uuid.uuid4())
+    with service.installed(), ExitStack() as clients:
+        baseline = service.inventory()
+        def ready(after=0):
+            view = service.ready(instance, after=after)
+            live = service.inventory()
+            tuns = [r for r in service.effects() if r["kind"] == "win.tun"
+                    and r["scope"] == scope(instance, view["epoch"]) and r["state"] != "reclaimed"]
+            assert len(tuns) == 1, "expected a single adapter record for the running generation"
+            record_windows_adapter(baseline, live, tuns[0]["key"], view["interface_name"], service.adapter_indices)
+            service.workers_seen.update(management_processes(baseline, live, service.host))
+            return view
+
+        service.apply(spec(), instance, str(uuid.uuid4()), str(service.ctl("status")["revision"]))
+        first = ready()
+        print(f"running before STOP: {first['state']} epoch={first['epoch']}", flush=True)
+        offsets = {p: p.stat().st_size for p in service.state.glob("host.log*")}
+        service.report_windows_state("before STOP with a running network")
+        # A client still streaming from the host when the service stops
+        # (opus msg#1535): the ledger must still close and the lock go.
+        follower = clients.enter_context(following_logs(service))
+        started = time.monotonic()
+        service.call("sc.exe", "stop", "easytier-desk-host")
+        checkpoints = []
+        while True:
+            text = command("sc.exe", "queryex", "easytier-desk-host", check=False).stdout
+            elapsed = time.monotonic() - started
+            if "STOPPED" in text:
+                break
+            if "STOP_PENDING" in text:
+                found = re.search(r"CHECKPOINT\s*:\s*0x([0-9a-fA-F]+)", text)
+                hint = re.search(r"WAIT_HINT\s*:\s*0x([0-9a-fA-F]+)", text)
+                if found:
+                    checkpoints.append((round(elapsed, 1), int(found.group(1), 16),
+                                        int(hint.group(1), 16) if hint else 0))
+            if elapsed > 58:
+                service.report_windows_state("STOP overran 58 s")
+                service.report_stop_logs(offsets)
+                raise AssertionError(f"service did not stop within 58 s; pending={checkpoints}")
+            time.sleep(0.5)
+        print(f"STOP took {elapsed:.1f}s; STOP_PENDING (t, checkpoint, wait_hint ms): {checkpoints}",
+              flush=True)
+        service.report_windows_state("after STOP")
+        service.report_stop_logs(offsets)
+        try:
+            follower.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            # The CLI may keep reconnecting; the host side is what is checked.
+            print("note: etd-ctl logs --follow still running 30 s after STOPPED", flush=True)
+        clients.close()
+        stop_log = ""
+        for path in sorted(service.state.glob("host.log*")):
+            with path.open("rb") as host_log:
+                host_log.seek(offsets.get(path, 0))
+                stop_log += host_log.read().decode("utf-8", "replace")
+        assert "host shutdown: ledger closed" in stop_log, "ledger not closed with a client streaming"
+        assert "shutdown.lock_kept" not in stop_log, "host not quiescent with a client streaming"
+        print("STOP with a log stream connected: ledger closed, lock released", flush=True)
+        assert elapsed <= 50, f"stop exceeded the host's bound: {elapsed:.1f}s"
+        if elapsed > 3:
+            assert checkpoints, "a stop taking seconds reported no STOP_PENDING"
+            values = [c for _, c, _ in checkpoints]
+            assert values == sorted(values) and values[-1] >= 1, checkpoints
+            assert all(h > 0 for _, _, h in checkpoints), checkpoints
+        stopped = service.inventory()
+        service.retained_drivers = {
+            name: stopped.rows["service", name] for name in ("wintun", "windivert")
+            if ("service", name) not in baseline.rows and ("service", name) in stopped.rows
+        }
+        # Next start: the self-check reclaims what the bounded stop left and
+        # runs the instance again.
+        service.start()
+        again = ready(after=first["epoch"])
+        check_closed(service, instance, first["epoch"])
+        print(f"restarted: {again['state']} epoch={again['epoch']}", flush=True)
+        # A plain instance stop runs the same generation reclaim: time it.
+        offsets = {p: p.stat().st_size for p in service.state.glob("host.log*")}
+        started = time.monotonic()
+        service.ctl("stop", instance)
+        eventually("stopped instance", lambda: service.view(instance),
+                   lambda status: status.get("state") == "stopped", timeout=240)
+        print(f"instance stop took {time.monotonic() - started:.1f}s", flush=True)
+        service.report_stop_logs(offsets)
+        check_closed(service, instance, again["epoch"])
+        service.ctl("start", instance)
+        ready(after=again["epoch"])
+        # Teardown verifies uninstall with the network running again.
+
+
 if __name__ == "__main__":
     require_runner()
     {"recovery": recovery, "clean_install": lambda: recovery(with_fixtures=False),
      "magic_dns": magic_dns, "inventory": inventory_case,
      "driver_conflict": driver_conflict, "driver_uninstall": lambda: driver_conflict(through_uninstall=True),
-     "program_rule_conflict": program_rule_conflict}[sys.argv[1]]()
+     "program_rule_conflict": program_rule_conflict, "stop_running": stop_running}[sys.argv[1]]()

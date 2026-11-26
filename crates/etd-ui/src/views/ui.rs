@@ -17,7 +17,7 @@ use gpui_kit::{
     },
     component::{
         ActiveTheme as _, Collapsible, Disableable as _, FocusableExt as _, Icon, Selectable as _,
-        Sizable as _, Size,
+        Sizable as _, Size, StyledExt as _,
         button::{Button, ButtonVariant, ButtonVariants as _},
         input::{Input, InputContentType, InputState},
         progress::ProgressCircle,

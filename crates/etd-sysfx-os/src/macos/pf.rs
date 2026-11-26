@@ -140,8 +140,18 @@ fn inventory(sweep: bool) -> io::Result<BTreeSet<Rule>> {
         }
     }
     let mut found = BTreeSet::new();
+    let mut labels = std::collections::BTreeMap::new();
+    let mut ports = std::collections::BTreeMap::new();
+    for rule in pairs.keys() {
+        *labels.entry(rule.label.clone()).or_insert(0usize) += 1;
+        *ports.entry(rule.port).or_insert(0usize) += 1;
+    }
     for (rule, count) in pairs {
-        if count == (1, 1) && !unknown.iter().any(|line| line.contains(&rule.label)) {
+        if count == (1, 1)
+            && labels[&rule.label] == 1
+            && ports[&rule.port] == 1
+            && !unknown.iter().any(|line| line.contains(&rule.label))
+        {
             found.insert(rule);
         } else {
             anomaly = true;
@@ -351,7 +361,10 @@ fn reference_live(token: &str) -> io::Result<bool> {
     references(&output(command(PF).args(["-s", "References"]))?, token)
 }
 fn references(list: &str, token: &str) -> io::Result<bool> {
-    let mut lines = list.lines().filter(|l| !l.trim().is_empty());
+    let mut lines = list.lines().filter(|l| !l.trim().is_empty()).peekable();
+    if lines.peek().is_some_and(|l| l.trim() == "TOKENS:") {
+        lines.next();
+    }
     let Some(header) = lines.next() else {
         return Ok(false);
     };
@@ -460,7 +473,7 @@ mod tests {
     #[test]
     fn reference_identity_uses_only_the_token_column() {
         let table = format!(
-            "{:<9}{:<29}{:<25}{}\n{:<9}{:<29}{:<25}{}\n",
+            "TOKENS:\n{:<9}{:<29}{:<25}{}\n{:<9}{:<29}{:<25}{}\n",
             "PID",
             "Process Name",
             "TOKEN",

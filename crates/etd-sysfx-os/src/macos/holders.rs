@@ -124,6 +124,64 @@ fn holder(pid: i32, sockets: BTreeSet<String>, root: &Path, core_uid: u32) -> io
 }
 
 impl CoreIdentity {
+    fn control_owners(
+        &self,
+        name: &str,
+        credential: &etd_sysfx::Credential,
+        run: &Path,
+        epoch: &Path,
+    ) -> io::Result<Vec<Holder>> {
+        let pids = super::observe::utun_holders(name)?;
+        if pids.is_empty() {
+            return Err(io::Error::other(
+                "present utun has no observable control socket owner",
+            ));
+        }
+        let root = self.store.canonicalize()?;
+        let mut owners = vec![];
+        for pid in pids {
+            let mut owner = holder(pid, BTreeSet::new(), &root, self.uid)?;
+            if !super::observe::owned(pid as u32)?
+                .iter()
+                .any(|i| i.name == name && &i.credential == credential)
+            {
+                return Err(io::Error::other("utun or control socket owner changed"));
+            }
+            if owner.protected
+                && let Some(config) = generation_config(pid)?
+            {
+                // An unrecognized profile stays protected. A -c file under
+                // another instance/epoch of this host identifies a replacement.
+                if let Some(parent) = config.parent()
+                    && parent.starts_with(run)
+                    && parent != epoch
+                {
+                    owner.protected = false;
+                }
+            }
+            owners.push(owner);
+        }
+        Ok(owners)
+    }
+    pub(super) fn foreign_utun(
+        &self,
+        name: &str,
+        credential: &etd_sysfx::Credential,
+        run: &Path,
+        epoch: &Path,
+    ) -> io::Result<bool> {
+        let first = self.control_owners(name, credential, run, epoch)?;
+        if first.iter().any(|p| p.protected) {
+            return Ok(false);
+        }
+        if self.control_owners(name, credential, run, epoch)? != first {
+            return Err(io::Error::other("utun changed during ownership check"));
+        }
+        for h in first {
+            tracing::warn!(interface=name,pid=h.pid,euid=h.uid,image=%h.image.display(),"previous utun is gone; replacement left untouched");
+        }
+        Ok(true)
+    }
     fn scan(&self, port: u16) -> io::Result<Vec<Holder>> {
         let owners = sockets(port)?;
         if owners.is_empty() {
@@ -150,4 +208,56 @@ impl CoreIdentity {
         }
         Ok(first)
     }
+}
+
+// The launch planner passes an absolute configuration path with -c. Read
+// exactly argc arguments, never interpret environment strings as arguments.
+fn generation_config(pid: i32) -> io::Result<Option<PathBuf>> {
+    let mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut size = 0usize;
+    // SAFETY: read-only sysctl, first size then a buffer of that size.
+    if unsafe {
+        libc::sysctl(
+            mib.as_ptr() as *mut _,
+            3,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut bytes = vec![0; size];
+    if unsafe {
+        libc::sysctl(
+            mib.as_ptr() as *mut _,
+            3,
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let invalid = || io::Error::other("invalid kernel argv snapshot");
+    let (argc, data) = bytes[..size].split_at_checked(4).ok_or_else(invalid)?;
+    let argc =
+        usize::try_from(i32::from_ne_bytes(argc.try_into().unwrap())).map_err(io::Error::other)?;
+    let data = &data[data.iter().position(|&b| b == 0).ok_or_else(invalid)?..];
+    let mut args = &data[data.iter().position(|&b| b != 0).ok_or_else(invalid)?..];
+    let mut config = false;
+    for _ in 0..argc {
+        let end = args.iter().position(|&b| b == 0).ok_or_else(invalid)?;
+        let arg = &args[..end];
+        if config {
+            return Ok(Some(PathBuf::from(std::ffi::OsStr::from_bytes(arg))));
+        }
+        config = arg == b"-c";
+        args = &args[end + 1..];
+    }
+    Ok(None)
 }

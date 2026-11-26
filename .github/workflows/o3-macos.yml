@@ -55,7 +55,7 @@ jobs:
           root=(sudo -E env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "$(command -v cargo)")
           failed=0
           for target in macos_resolver macos_reclaim macos_fence; do
-            "${root[@]}" nextest run --locked -p etd-sysfx-os --profile privileged --run-ignored only --test "$target" --success-output immediate 2>&1 | tee "$RUNNER_TEMP/$target.log" || failed=1
+            "${root[@]}" nextest run --locked -p etd-sysfx-os --profile privileged --run-ignored only --test "$target" --no-fail-fast --success-output immediate 2>&1 | tee "$RUNNER_TEMP/$target.log" || failed=1
           done
           "${root[@]}" nextest run --locked -p etd-host --profile privileged --run-ignored only --test install_roundtrip --success-output immediate 2>&1 | tee "$RUNNER_TEMP/o3-service.log"
           sudo test ! -e "/Library/Application Support/easytier-desk-maintenance/pf-reference"

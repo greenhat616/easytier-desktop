@@ -131,15 +131,22 @@ pub(super) fn fields(args: &[&str], empty_ok: bool) -> io::Result<Vec<String>> {
         })
         .collect())
 }
-fn owned(pid: u32) -> io::Result<Vec<InterfaceInfo>> {
-    // Darwin lsof decodes proc_pidinfo/PROC_PIDFDSOCKETINFO. Check the file
-    // type as well as the control name; a pathname is never a control socket.
-    let pid = pid.to_string();
+fn controls(pid: Option<u32>) -> io::Result<BTreeMap<u32, BTreeSet<String>>> {
+    let mut args = vec!["-nP", "-F0pftn"];
+    let selected = pid.map(|p| p.to_string());
+    if let Some(p) = selected.as_deref() {
+        args.extend(["-p", p]);
+    }
+    let mut names = BTreeMap::<u32, BTreeSet<String>>::new();
     let mut system = false;
-    let mut names = BTreeSet::new();
-    for field in fields(&["-nP", "-p", &pid, "-F0pftn"], false)? {
+    let mut process = None;
+    for field in fields(&args, false)? {
         match field.as_bytes()[0] {
-            b'f' | b'p' => system = false,
+            b'p' => {
+                system = false;
+                process = Some(field[1..].parse().map_err(io::Error::other)?);
+            }
+            b'f' => system = false,
             b't' => system = field[1..].eq_ignore_ascii_case("systm"),
             b'n' if system => {
                 if let Some(tail) = field.strip_prefix("n[ctl com.apple.net.utun_control id ") {
@@ -151,12 +158,26 @@ fn owned(pid: u32) -> io::Result<Vec<InterfaceInfo>> {
                             n.parse::<u32>().ok()?.checked_sub(1)
                         })
                         .ok_or_else(|| io::Error::other("invalid utun control unit"))?;
-                    names.insert(format!("utun{unit}"));
+                    names
+                        .entry(process.ok_or_else(|| io::Error::other("control has no PID"))?)
+                        .or_default()
+                        .insert(format!("utun{unit}"));
                 }
             }
             _ => {}
         }
     }
+    Ok(names)
+}
+pub(super) fn utun_holders(name: &str) -> io::Result<Vec<i32>> {
+    controls(None)?
+        .into_iter()
+        .filter(|(_, names)| names.contains(name))
+        .map(|(pid, _)| i32::try_from(pid).map_err(io::Error::other))
+        .collect()
+}
+pub(super) fn owned(pid: u32) -> io::Result<Vec<InterfaceInfo>> {
+    let names = controls(Some(pid))?.remove(&pid).unwrap_or_default();
     let mut all = interfaces()?;
     Ok(names.iter().filter_map(|n| all.remove(n)).collect())
 }

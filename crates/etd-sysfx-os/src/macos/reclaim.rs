@@ -31,7 +31,7 @@ impl Reclaimer for MacReclaimer {
             return Probe::Indeterminate("wrong effect kind".into());
         }
         match self.observer.observe(self.kind, concrete(e)).await {
-            Ok(Some(observed)) => Probe::Present(observed),
+            Ok(Some(observed)) => self.check_utun_owner(e, observed).await,
             Ok(None) => Probe::Absent,
             Err(err) => Probe::Indeterminate(err.to_string()),
         }
@@ -90,6 +90,48 @@ impl Reclaimer for MacReclaimer {
         Err(ReclaimError::Busy(
             "waiting for macOS to release the utun and its routes".into(),
         ))
+    }
+}
+
+impl MacReclaimer {
+    async fn check_utun_owner(&self, e: &Effect, observed: Observation) -> Probe {
+        let name = match (self.kind, concrete(e)) {
+            (
+                EffectKind::MacUtun,
+                ObjectKey::Interface {
+                    name: Some(name), ..
+                },
+            )
+            | (
+                EffectKind::Route,
+                ObjectKey::RoutesVia {
+                    interface: Some(name),
+                },
+            ) => name.clone(),
+            _ => return Probe::Present(observed),
+        };
+        let expected = e.observation.as_ref().and_then(|o| o.credential.as_ref());
+        let Some(cred @ Credential::UnixInterface { .. }) = expected else {
+            return Probe::Present(observed);
+        };
+        if observed.credential.as_ref() != Some(cred) {
+            return Probe::Present(observed);
+        }
+        let Some((instance, epoch)) = e.scope.generation() else {
+            return Probe::Indeterminate("utun record has no generation".into());
+        };
+        let cores = self.cores.clone();
+        let run = self.observer.run_dir.clone();
+        let marker = run.join(instance.as_str()).join(epoch.0.to_string());
+        let cred = cred.clone();
+        match tokio::task::spawn_blocking(move || cores.foreign_utun(&name, &cred, &run, &marker))
+            .await
+        {
+            Ok(Ok(true)) => Probe::Absent,
+            Ok(Ok(false)) => Probe::Present(observed),
+            Ok(Err(e)) => Probe::Indeterminate(e.to_string()),
+            Err(e) => Probe::Indeterminate(e.to_string()),
+        }
     }
 }
 

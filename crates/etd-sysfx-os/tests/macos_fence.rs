@@ -304,3 +304,70 @@ async fn removal_checks_store_image_and_effective_uid() {
         );
     }
 }
+
+#[tokio::test]
+#[ignore = "isolated PF anchor on a disposable macOS runner"]
+async fn incomplete_pair_fails_verification_and_sweep_still_reports_intact_generation() {
+    use std::io::Write;
+    assert_eq!(std::env::var("ETD_O3_CI").as_deref(), Ok("1"));
+    let dir = tempfile::tempdir().unwrap();
+    let os = system(dir.path());
+    let fence = os.fence.unwrap();
+    let v4 = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = v4.local_addr().unwrap().port();
+    let second_port = TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let a = spec(port, "partial", 9);
+    let b = spec(second_port, "intact", 10);
+    fence.install(&a).await.unwrap();
+    fence.install(&b).await.unwrap();
+    let key_a = fence.plan(&a).key;
+    let key_b = fence.plan(&b).key;
+    let etd_sysfx::ObjectKey::Fence {
+        container, rule, ..
+    } = &key_a
+    else {
+        panic!()
+    };
+    let original = pf(&["-a", container, "-sr"]);
+    assert_eq!(original.lines().count(), 4);
+    let load = |rules: &str| {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(rules.as_bytes()).unwrap();
+        let result = Command::new("/sbin/pfctl")
+            .args(["-a", container, "-R", "-f"])
+            .arg(f.path())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    };
+    let missing = format!("{rule}-v6");
+    let mut partial = original
+        .lines()
+        .filter(|l| !l.contains(&missing))
+        .collect::<Vec<_>>()
+        .join("\n");
+    partial.push_str("\nblock return out quick on lo0 inet proto tcp from any to 127.0.0.1 port = 7 label \"fixture-unrecognized\"\n");
+    load(&partial);
+    let verified = fence.verify(&a, std::process::id()).await;
+    let swept = os.sweeper.find_marked(None, &[]).await;
+    // Restore the private fixture before assertions, including on error paths.
+    load(&original);
+    drop(v4);
+    fence.remove(&a).await.unwrap();
+    fence.remove(&b).await.unwrap();
+    assert!(verified.is_err());
+    let swept = swept.unwrap();
+    assert_eq!(swept.len(), 1);
+    assert_eq!(swept[0].key, key_b);
+    println!(
+        "Incomplete dual-stack generation rejected; sweep retained only the intact generation"
+    );
+}

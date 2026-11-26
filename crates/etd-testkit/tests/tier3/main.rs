@@ -50,6 +50,13 @@ fn preexisting_shared_drivers_are_conflicts() {
 
 #[cfg(windows)]
 #[test]
+#[ignore = "holds disabled foreign SCM drivers from before install through completed uninstall"]
+fn preexisting_shared_drivers_survive_uninstall() {
+    run_case("driver_uninstall");
+}
+
+#[cfg(windows)]
+#[test]
 #[ignore = "requires a fresh Windows runner for the full pre-install to post-uninstall comparison"]
 fn installed_network_uninstall_restores_machine() {
     run_case("clean_install");

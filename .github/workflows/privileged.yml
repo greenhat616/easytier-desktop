@@ -66,6 +66,16 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.152
+      - name: Allow for three Windows service generations and native cleanup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          @'
+
+          [[profile.privileged.overrides]]
+          filter = 'test(=installed_kernel_and_host_crash_recovery)'
+          slow-timeout = { period = "120s", terminate-after = 15 }
+          '@ | Add-Content -LiteralPath .config/nextest.toml
       # Exercise all eight inventory classes even on a revision whose
       # packaged Windows host cannot install the upstream binary yet (CB).
       - name: Qualify independent Windows inventory

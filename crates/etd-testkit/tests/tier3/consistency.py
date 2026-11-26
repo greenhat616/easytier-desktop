@@ -120,6 +120,9 @@ def profile_metadata(base, live, profile_name_key, name, credential):
     connections = [c for c in live.profile_connections if c["index"] == nic["index"]]
     assert connections == [{"alias": name, "index": nic["index"], "matches": True}], "native NLA profile/adapter mismatch"
     print(f"active NLA profile {profile_guid}: adapter={name} GUID={nic['guid']} ifIndex={nic['index']}", flush=True)
+    for path, target in live.signature_profiles.items():
+        if target == profile_guid:
+            print(f"native NLA signature {path} points to active profile {target}", flush=True)
     # Windows NLA creates these only while this specific adapter's profile
     # exists. At stop and afterwards all five native values must disappear.
     included = set()

@@ -101,7 +101,7 @@ class Service:
         self.core = self.cores / os.environ["ETD_G2_SHA"] / ("easytier-core" + ext)
         self.runtime = self.state / "run"
         self.retained_drivers = {}
-        self.adapter_guids = set()
+        self.adapter_indices = {}
 
     def verify_bundle(self):
         expected = {self.core.name: os.environ["ETD_G2_SHA"]}
@@ -228,7 +228,7 @@ class Service:
             after = self.inventory()
             delta = before.delta(after) - managed_service_changes(before, after)
             delta -= runner_noise(before, after) | tun_created(before, after)
-            delta -= adapter_defaults(before, after, self.adapter_guids)
+            delta -= adapter_defaults(before, after, self.adapter_indices)
             delta -= system_policy_changes(before, after, "uninstalled")
             if sys.platform == "darwin":
                 delta -= empty_pf_namespace(before, after)

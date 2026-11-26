@@ -139,7 +139,7 @@ def recovery():
                 generation_processes.add((pid, born))
                 generation_processes.update(snapshot.descendants[pid])
                 try:
-                    check_generation(baseline, snapshot, service.effects(), instance, view, service.adapter_guids)
+                    check_generation(baseline, snapshot, service.effects(), instance, view, service.adapter_indices)
                 except FirewallReadbackPending:
                     # A shared Applied record can still carry the preceding
                     # epoch's rule ID while the fresh native policy is visible.
@@ -211,7 +211,7 @@ def recovery():
         assert_foreign(baseline, stopped, keys)
         remaining = baseline.delta(stopped) - managed_service_changes(baseline, stopped)
         remaining -= runner_noise(baseline, stopped) | tun_created(baseline, stopped)
-        remaining -= adapter_defaults(baseline, stopped, service.adapter_guids)
+        remaining -= adapter_defaults(baseline, stopped, service.adapter_indices)
         if os.name == "nt":
             records = service.effects()
             program_rules = {("firewall", "policy/" + json.loads(r["observation"]["credential"]["value"])["id"])
@@ -274,7 +274,7 @@ def verify_shared_driver_purge(service, baseline, stopped, inventory, foreign_ke
     assert not program_rules & after.rows.keys(), "CoreBinary firewall rules survived purge"
     delta = baseline.delta(after) - managed_service_changes(baseline, after)
     delta -= runner_noise(baseline, after) | {("service", name) for name in names}
-    delta -= adapter_defaults(baseline, after, service.adapter_guids)
+    delta -= adapter_defaults(baseline, after, service.adapter_indices)
     delta -= system_policy_changes(baseline, after, "purged")
     # The installed baseline included a running host. Purge is an offline
     # command, so that exact host identity must now have exited.

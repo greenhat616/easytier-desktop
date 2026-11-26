@@ -52,7 +52,5 @@ fn preexisting_shared_drivers_are_conflicts() {
 #[test]
 #[ignore = "pending topic 40: H1 must reject a foreign same-name program firewall rule before spawn"]
 fn preexisting_program_rule_blocks_start() {
-    // Keep the pending gate visible in nextest's inventory. Selecting it
-    // explicitly must never report a successful unimplemented assertion.
-    panic!("pending H1 preflight and its installed-product acceptance case");
+    run_case("program_rule_conflict");
 }

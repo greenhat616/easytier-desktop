@@ -267,6 +267,36 @@ def driver_conflict():
         service.retained_drivers = names
 
 
+def program_rule_conflict():
+    service = Service()
+    instance = str(uuid.uuid4())
+    with service.installed(), ExitStack() as stack:
+        rule_id = "G2-" + str(uuid.uuid4())
+        display_name = f"EasyTier {service.core} (Inbound)"
+        env = dict(os.environ, G2_RULE_ID=rule_id, G2_DISPLAY=display_name, G2_PROGRAM=str(service.core))
+        def policy(script):
+            command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                    "$ErrorActionPreference='Stop'; " + script, env=env)
+        # A disabled rule has no packet-handling effect. Its ID belongs to
+        # this fixture, and there is no prior product ownership record.
+        policy("New-NetFirewallRule -Name $env:G2_RULE_ID -DisplayName $env:G2_DISPLAY "
+               "-Group EasyTier -Direction Inbound -Action Block -Enabled False "
+               "-Program $env:G2_PROGRAM | Out-Null")
+        stack.callback(policy, "Remove-NetFirewallRule -Name $env:G2_RULE_ID")
+        key = ("firewall", "policy/" + rule_id)
+        baseline = service.inventory()
+        assert key in baseline.rows and baseline.rows[key][0] == display_name
+        service.apply(spec(), instance, str(uuid.uuid4()), str(service.ctl("status")["revision"]))
+        refused = eventually("pre-existing program rule refusal", lambda: service.view(instance),
+                             lambda v: v.get("state") == "gave_up", timeout=240)
+        assert display_name.casefold() in refused["message"].casefold(), refused["message"]
+        assert all(not r.get("observation") for r in service.effects() if r["kind"] == "process")
+        after = service.inventory()
+        assert_foreign(baseline, after, {key})
+        assert not any(installed_image(v) == service.core for k, v in after.rows.items() if k[0] == "process")
+        print("Installed host refused the unowned program rule; native rule configuration preserved.")
+
+
 def magic_dns():
     service = Service()
     with service.installed(), ExitStack() as stack:
@@ -295,4 +325,4 @@ def magic_dns():
 if __name__ == "__main__":
     require_runner()
     {"recovery": recovery, "magic_dns": magic_dns, "inventory": inventory_case,
-     "driver_conflict": driver_conflict}[sys.argv[1]]()
+     "driver_conflict": driver_conflict, "program_rule_conflict": program_rule_conflict}[sys.argv[1]]()

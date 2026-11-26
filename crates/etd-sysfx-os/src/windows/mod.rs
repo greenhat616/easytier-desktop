@@ -479,6 +479,14 @@ impl SystemObserver for WindowsObserver {
     ) -> Result<Option<Observation>, ObserveError> {
         let found = observe_kind(kind, key).await.map_err(WinError::observe)?;
         if let Some(o) = &found {
+            if kind == EffectKind::WinTunAdapter
+                && !matches!(o.credential, Some(Credential::WinAdapter { .. }))
+            {
+                return Err(WinError::invalid(
+                    "same-name interface is not a confirmed Wintun device",
+                )
+                .observe());
+            }
             if kind == EffectKind::WinProgramFirewallRule && !program_credential_matches(key, o) {
                 return Err(WinError::invalid("same-name program rule has a different application condition, group or direction").observe());
             }

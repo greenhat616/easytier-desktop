@@ -14,7 +14,8 @@ use ::windows::{
                 ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
             },
             DACL_SECURITY_INFORMATION, GetAce, GetSecurityDescriptorDacl, IsWellKnownSid,
-            PSECURITY_DESCRIPTOR, PSID, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+            OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, WinBuiltinAdministratorsSid,
+            WinLocalSystemSid,
         },
     },
     core::{BOOL, GUID, HSTRING, PCWSTR, PWSTR},
@@ -193,6 +194,7 @@ unsafe fn trusted_acl(dacl: *const ACL, system_only: bool) -> Result<bool, WinEr
 fn check_acl(e: &Engine, key: GUID, kind: &str) -> Result<(), WinError> {
     let mut dacl = null_mut();
     let mut sd = PSECURITY_DESCRIPTOR::default();
+    let mut owner = PSID::default();
     unsafe {
         let getter = match kind {
             "provider" => FwpmProviderGetSecurityInfoByKey0,
@@ -203,8 +205,8 @@ fn check_acl(e: &Engine, key: GUID, kind: &str) -> Result<(), WinError> {
             getter(
                 e.0,
                 Some(&key),
-                DACL_SECURITY_INFORMATION.0,
-                null_mut(),
+                DACL_SECURITY_INFORMATION.0 | OWNER_SECURITY_INFORMATION.0,
+                &mut owner,
                 null_mut(),
                 &mut dacl,
                 null_mut(),
@@ -213,8 +215,11 @@ fn check_acl(e: &Engine, key: GUID, kind: &str) -> Result<(), WinError> {
             "read WFP security descriptor",
         )?;
         let trusted = trusted_acl(dacl, false);
+        let trusted_owner = !owner.0.is_null()
+            && (IsWellKnownSid(owner, WinLocalSystemSid).as_bool()
+                || IsWellKnownSid(owner, WinBuiltinAdministratorsSid).as_bool());
         FwpmFreeMemory0(&mut sd.0);
-        if !trusted? {
+        if !trusted? || !trusted_owner {
             return Err(WinError::invalid(format!("untrusted {kind} WFP ACL")));
         }
     }
@@ -237,8 +242,14 @@ unsafe fn exact_conditions(filter: &FWPM_FILTER0, i: u8, port: u16) -> Result<bo
                 FWP_ACTION_BLOCK
             }
         || filter.flags.contains(FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT) == permit
+        || filter.flags.contains(FWPM_FILTER_FLAG_DISABLED)
         || filter.numFilterConditions != if permit { 4 } else { 3 }
         || filter.filterCondition.is_null()
+    {
+        return Ok(false);
+    }
+    if filter.weight.r#type != FWP_UINT8
+        || unsafe { filter.weight.Anonymous.uint8 } != if permit { 15 } else { 14 }
     {
         return Ok(false);
     }
@@ -480,7 +491,7 @@ pub fn install(key: &ObjectKey) -> Result<Observation, WinError> {
     let (id, port) = parts(key)?;
     let e = Engine::open()?;
     let match_system = Sd::new("D:P(A;;0x1;;;SY)")?;
-    let protected = Sd::new("D:P(A;;GA;;;SY)(A;;GA;;;BA)")?;
+    let protected = Sd::new("O:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)")?;
     e.transaction(|| {
         ensure_container(&e, &protected)?;
         let existing = matching(&e, id, port)?;
@@ -620,7 +631,7 @@ pub fn remove(key: &ObjectKey) -> Result<Reclaimed, WinError> {
             return Ok(Reclaimed::AlreadyAbsent);
         }
         // Confirm parent identities as well as each filter's membership.
-        let protected = Sd::new("D:P(A;;GA;;;SY)(A;;GA;;;BA)")?;
+        let protected = Sd::new("O:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)")?;
         ensure_container(&e, &protected)?;
         // Only delete the shared container when this is its entire filter
         // population; enumerate before removing because BFE can snapshot an
@@ -659,16 +670,18 @@ pub fn enumerate() -> Result<Vec<(ObjectKey, Observation)>, WinError> {
     let mut out = Vec::new();
     for f in filters(&e)? {
         let Some(rest) = f.label.strip_prefix("etd-fence:") else {
-            continue;
+            return Err(WinError::invalid(
+                "unrecognized object in WFP product container",
+            ));
         };
         let Some((id, port)) = rest.split_once(':') else {
-            continue;
+            return Err(WinError::invalid("unrecognized WFP fence label"));
         };
         let (Ok(id), Ok(port)) = (Uuid::parse_str(id), port.parse::<u16>()) else {
-            continue;
+            return Err(WinError::invalid("unrecognized WFP fence identifier"));
         };
         if !f.owned || !f.persistent || !(0..4).any(|i| child(id, i) == f.key) {
-            continue;
+            return Err(WinError::invalid("unrecognized WFP filter identity"));
         }
         let key = ObjectKey::Fence {
             container: CONTAINER.into(),
@@ -679,6 +692,31 @@ pub fn enumerate() -> Result<Vec<(ObjectKey, Observation)>, WinError> {
             && let Some(obs) = observe(&key)?
         {
             out.push((key, obs));
+        }
+    }
+    if out.is_empty() {
+        // Both parent objects are added/deleted transactionally with the
+        // filters. An empty but existing parent is unexpected residue, not
+        // evidence of a clean system; don't silently hide it from sysdiff.
+        unsafe {
+            let mut provider = null_mut();
+            let rc = FwpmProviderGetByKey0(e.0, &PROVIDER, &mut provider);
+            if rc == 0 {
+                FwpmFreeMemory0((&mut provider as *mut *mut FWPM_PROVIDER0).cast());
+                return Err(WinError::invalid("orphan WFP provider"));
+            }
+            if rc != FWP_E_PROVIDER_NOT_FOUND.0 as u32 {
+                check(rc, "look up WFP provider")?;
+            }
+            let mut sublayer = null_mut();
+            let rc = FwpmSubLayerGetByKey0(e.0, &SUBLAYER, &mut sublayer);
+            if rc == 0 {
+                FwpmFreeMemory0((&mut sublayer as *mut *mut FWPM_SUBLAYER0).cast());
+                return Err(WinError::invalid("orphan WFP sublayer"));
+            }
+            if rc != FWP_E_SUBLAYER_NOT_FOUND.0 as u32 {
+                check(rc, "look up WFP sublayer")?;
+            }
         }
     }
     Ok(out)

@@ -4,7 +4,8 @@ use super::{WinError, observation, opaque, owned_name, query};
 use ::windows::{
     Win32::{
         Devices::DeviceAndDriverInstallation::{
-            CM_LOCATE_DEVNODE_NORMAL, CM_Locate_DevNodeW, CR_NO_SUCH_DEVNODE, CR_SUCCESS,
+            CM_Get_Device_ID_Size, CM_Get_Device_IDW, CM_LOCATE_DEVNODE_NORMAL, CM_Locate_DevNodeW,
+            CR_NO_SUCH_DEVNODE, CR_SUCCESS,
         },
         NetworkManagement::IpHelper::{
             FreeMibTable, GetIfTable2, GetIpInterfaceTable, MIB_IF_TABLE2, MIB_IPINTERFACE_TABLE,
@@ -35,36 +36,42 @@ fn rows() -> Result<Vec<Row>, WinError> {
         if rc.0 != 0 {
             return Err(WinError::new(rc.0 as i64, "GetIpInterfaceTable"));
         }
-        let live: HashSet<_> =
-            std::slice::from_raw_parts((*ip).Table.as_ptr(), (*ip).NumEntries as usize)
-                .iter()
-                .map(|r| r.InterfaceLuid.Value)
-                .collect();
+        let live: HashSet<_> = std::slice::from_raw_parts(
+            std::ptr::addr_of!((*ip).Table)
+                .cast::<::windows::Win32::NetworkManagement::IpHelper::MIB_IPINTERFACE_ROW>(),
+            (*ip).NumEntries as usize,
+        )
+        .iter()
+        .map(|r| r.InterfaceLuid.Value)
+        .collect();
         FreeMibTable(ip.cast());
         let mut table: *mut MIB_IF_TABLE2 = null_mut();
         let rc = GetIfTable2(&mut table);
         if rc.0 != 0 {
             return Err(WinError::new(rc.0 as i64, "GetIfTable2"));
         }
-        let rows =
-            std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
+        let rows = std::slice::from_raw_parts(
+            std::ptr::addr_of!((*table).Table)
+                .cast::<::windows::Win32::NetworkManagement::IpHelper::MIB_IF_ROW2>(),
+            (*table).NumEntries as usize,
+        )
+        .iter()
+        .map(|r| {
+            let alias = &r.Alias[..r
+                .Alias
                 .iter()
-                .map(|r| {
-                    let alias = &r.Alias[..r
-                        .Alias
-                        .iter()
-                        .position(|c| *c == 0)
-                        .unwrap_or(r.Alias.len())];
-                    Row {
-                        name: String::from_utf16_lossy(alias),
-                        guid: Uuid::from_u128(r.InterfaceGuid.to_u128()),
-                        luid: r.InterfaceLuid.Value,
-                        index: r.InterfaceIndex,
-                        up: r.OperStatus.0 == 1,
-                        ip_live: live.contains(&r.InterfaceLuid.Value),
-                    }
-                })
-                .collect();
+                .position(|c| *c == 0)
+                .unwrap_or(r.Alias.len())];
+            Row {
+                name: String::from_utf16_lossy(alias),
+                guid: Uuid::from_u128(r.InterfaceGuid.to_u128()),
+                luid: r.InterfaceLuid.Value,
+                index: r.InterfaceIndex,
+                up: r.OperStatus.0 == 1,
+                ip_live: live.contains(&r.InterfaceLuid.Value),
+            }
+        })
+        .collect();
         FreeMibTable(table.cast());
         Ok(rows)
     }
@@ -75,7 +82,7 @@ fn guid_text(guid: Uuid) -> String {
 fn device_id(guid: Uuid) -> String {
     format!(r"SWD\Wintun\{}", guid_text(guid))
 }
-fn devnode_live(guid: Uuid) -> Result<bool, WinError> {
+fn devnode(guid: Uuid) -> Result<Option<u32>, WinError> {
     let mut dev = 0;
     let rc = unsafe {
         CM_Locate_DevNodeW(
@@ -85,19 +92,39 @@ fn devnode_live(guid: Uuid) -> Result<bool, WinError> {
         )
     };
     match rc {
-        CR_SUCCESS => Ok(true),
-        CR_NO_SUCH_DEVNODE => Ok(false),
+        CR_SUCCESS => Ok(Some(dev)),
+        CR_NO_SUCH_DEVNODE => Ok(None),
         _ => Err(WinError::new(rc.0 as i64, "CM_Locate_DevNodeW")),
     }
 }
-fn identity(row: &Row) -> Credential {
-    if owned_name(&row.name) && row.guid == naming::wintun_guid(&row.name) {
-        Credential::WinAdapter {
-            luid: row.luid,
-            device_instance_id: device_id(row.guid),
+fn devnode_live(guid: Uuid) -> Result<bool, WinError> {
+    Ok(devnode(guid)?.is_some())
+}
+fn identity(row: &Row) -> Result<Credential, WinError> {
+    if owned_name(&row.name)
+        && row.guid == naming::wintun_guid(&row.name)
+        && let Some(node) = devnode(row.guid)?
+    {
+        let mut size = 0;
+        let code = unsafe { CM_Get_Device_ID_Size(&mut size, node, 0) };
+        if code != CR_SUCCESS {
+            return Err(WinError::new(code.0 as i64, "CM_Get_Device_ID_Size"));
         }
+        let mut buf = vec![0u16; size as usize + 1];
+        let code = unsafe { CM_Get_Device_IDW(node, &mut buf, 0) };
+        if code != CR_SUCCESS {
+            return Err(WinError::new(code.0 as i64, "CM_Get_Device_IDW"));
+        }
+        let instance = String::from_utf16_lossy(&buf[..size as usize]);
+        if !instance.eq_ignore_ascii_case(&device_id(row.guid)) {
+            return Err(WinError::invalid("unexpected Wintun device identity"));
+        }
+        Ok(Credential::WinAdapter {
+            luid: row.luid,
+            device_instance_id: instance.to_uppercase(),
+        })
     } else {
-        opaque(format!("{}:{}", row.guid, row.luid))
+        Ok(opaque(format!("{}:{}", row.guid, row.luid)))
     }
 }
 fn key_matches(row: &Row, key: &ObjectKey) -> Result<bool, WinError> {
@@ -142,13 +169,15 @@ fn find(key: &ObjectKey) -> Result<Option<Row>, WinError> {
     Ok(out)
 }
 pub fn observe(key: &ObjectKey) -> Result<Option<Observation>, WinError> {
-    Ok(find(key)?.map(|r| {
-        observation(
-            Some(identity(&r)),
-            key.clone(),
-            format!("{} live LUID={}", r.name, r.luid),
-        )
-    }))
+    find(key)?
+        .map(|r| {
+            Ok(observation(
+                Some(identity(&r)?),
+                key.clone(),
+                format!("{} live LUID={}", r.name, r.luid),
+            ))
+        })
+        .transpose()
 }
 async fn addresses() -> Result<Vec<serde_json::Value>, WinError> {
     query(json!({"op":"ip_addresses"})).await
@@ -173,7 +202,7 @@ fn info_row(row: &Row, addresses: &[serde_json::Value]) -> Result<InterfaceInfo,
     out.sort();
     Ok(InterfaceInfo {
         name: row.name.clone(),
-        credential: identity(row),
+        credential: identity(row)?,
         addresses: out,
         up: row.up,
     })
@@ -182,7 +211,29 @@ pub async fn info(key: &ObjectKey) -> Result<Option<InterfaceInfo>, WinError> {
     let Some(row) = find(key)? else {
         return Ok(None);
     };
-    info_row(&row, &addresses().await?).map(Some)
+    // Observation deliberately locates by name *or* GUID to report a
+    // conflict. Readiness instead needs every supplied identity component.
+    let ObjectKey::Interface { name, guid } = key else {
+        return Err(WinError::invalid("not an interface key"));
+    };
+    if name
+        .as_ref()
+        .is_some_and(|n| !n.eq_ignore_ascii_case(&row.name))
+        || guid
+            .as_ref()
+            .is_some_and(|g| Uuid::parse_str(g).ok() != Some(row.guid))
+    {
+        return Err(WinError::invalid(
+            "interface identity differs from the expected name/GUID",
+        ));
+    }
+    let info = info_row(&row, &addresses().await?)?;
+    if owned_name(&row.name) && !matches!(info.credential, Credential::WinAdapter { .. }) {
+        return Err(WinError::invalid(
+            "Wintun is live but its device identity is not yet confirmed",
+        ));
+    }
+    Ok(Some(info))
 }
 pub async fn enumerate() -> Result<Vec<(ObjectKey, InterfaceInfo)>, WinError> {
     let addresses = addresses().await?;

@@ -169,9 +169,27 @@ async fn privileged_fence() {
         assert!(matches!(reclaim.probe(&effect).await, Probe::Present(_)));
         let verification = fence.verify(&spec, std::process::id()).await;
         let verdict = second();
+        let other_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other = FenceSpec {
+            instance: InstanceId::from("o1-other"),
+            epoch: Epoch(1),
+            address: other_listener.local_addr().unwrap(),
+        };
+        let other_key = fence.plan(&other).key;
+        fence.install(&other).await.unwrap();
         drop(listener);
         assert_eq!(reclaim.reclaim(&effect).await.unwrap(), Reclaimed::Removed);
         assert!(matches!(reclaim.probe(&effect).await, Probe::Absent));
+        assert!(
+            os.observer
+                .observe(EffectKind::WinFenceFilter, &other_key)
+                .await
+                .unwrap()
+                .is_some(),
+            "reclaim of one port must not remove another fence"
+        );
+        drop(other_listener);
+        assert_eq!(fence.remove(&other).await.unwrap(), Reclaimed::Removed);
         assert_wfp_container_absent();
         assert!(
             os.observer

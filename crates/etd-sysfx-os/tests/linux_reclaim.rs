@@ -1,0 +1,312 @@
+#![cfg(target_os = "linux")]
+use etd_contract::InstanceId;
+use etd_sysfx::*;
+use etd_sysfx_os::{OsConfig, adapters};
+use std::process::Command;
+
+fn command(exe: &str, args: &[&str]) -> String {
+    let out = Command::new(exe).args(args).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{exe} {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+fn record(kind: EffectKind, key: ObjectKey, obs: Observation) -> Effect {
+    Effect {
+        id: EffectId("o2".into()),
+        scope: EffectScope::Instance {
+            instance: InstanceId::from("integration"),
+            epoch: Epoch(1),
+        },
+        kind,
+        key,
+        undo: Undo::EnsureAbsent,
+        persistence: Persistence::WithProcess,
+        state: EffectState::Applied,
+        boot: BootId(
+            std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .unwrap()
+                .trim()
+                .into(),
+        ),
+        observation: Some(obs),
+        failures: 0,
+        last_error: None,
+        recorded_at: jiff::Timestamp::now(),
+    }
+}
+
+#[tokio::test]
+#[ignore = "changes Linux networking and resolved on a disposable runner"]
+async fn reclaim_real_link_route_and_dns() {
+    assert_eq!(std::env::var("ETD_O2_PRIVILEGED").as_deref(), Ok("1"));
+    let temp = tempfile::tempdir().unwrap();
+    let os = adapters(&OsConfig {
+        state_dir: temp.path().into(),
+        run_dir: temp.path().into(),
+        core_store_dir: temp.path().into(),
+    })
+    .unwrap();
+    let name = naming::interface_name(&InstallKey([3; 32]), &InstanceId::from("integration"));
+    let foreign = "etd-0badf00d";
+    let epoch_dir = temp.path().join("integration/7");
+    std::fs::create_dir_all(&epoch_dir).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let foreign_epoch = temp.path().join("shared/1");
+    std::fs::create_dir_all(&foreign_epoch).unwrap();
+    std::fs::set_permissions(&foreign_epoch, std::fs::Permissions::from_mode(0o777)).unwrap();
+    for name in [name.as_str(), foreign] {
+        command("ip", &["tuntap", "add", "dev", name, "mode", "tun"]);
+        command("ip", &["link", "set", name, "up"]);
+    }
+    command("ip", &["addr", "add", "192.0.2.1/30", "dev", &name]);
+    let key = ObjectKey::Interface {
+        name: Some(name.clone()),
+        guid: None,
+    };
+    let obs = os
+        .observer
+        .observe(EffectKind::LinuxTun, &key)
+        .await
+        .unwrap()
+        .unwrap();
+    let tun = record(EffectKind::LinuxTun, key.clone(), obs.clone());
+    let reclaim = |kind| {
+        os.reclaimers
+            .iter()
+            .find(|r| r.kind() == kind)
+            .unwrap()
+            .as_ref()
+    };
+    let rc = reclaim(tun.kind);
+    for wrong in [
+        None,
+        Some(Credential::UnixInterface {
+            index: 999999,
+            boot: tun.boot.clone(),
+        }),
+        obs.credential.as_ref().map(|c| {
+            let Credential::UnixInterface { index, .. } = c else {
+                panic!()
+            };
+            Credential::UnixInterface {
+                index: *index,
+                boot: BootId("other boot".into()),
+            }
+        }),
+    ] {
+        let mut stale = tun.clone();
+        stale.observation.as_mut().unwrap().credential = wrong;
+        assert_eq!(
+            rc.reclaim(&stale).await,
+            Err(ReclaimError::CredentialMismatch)
+        );
+        assert!(os.observer.interface(&key).await.unwrap().is_some());
+    }
+    let route_key = ObjectKey::RoutesVia {
+        interface: Some(name.clone()),
+    };
+    let routes = record(
+        EffectKind::Route,
+        route_key.clone(),
+        os.observer
+            .observe(EffectKind::Route, &route_key)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    let marked = os
+        .sweeper
+        .find_marked(
+            Some(&InstallKey([3; 32])),
+            &[InstanceId::from("integration")],
+        )
+        .await
+        .unwrap();
+    assert!(marked.iter().any(|o| o.key
+        == ObjectKey::Path {
+            path: epoch_dir.clone()
+        }
+        && o.origin == FoundBy::ExclusiveContainer));
+    assert!(!marked.iter().any(|o| o.key
+        == ObjectKey::Path {
+            path: foreign_epoch.clone()
+        }));
+    for class in [
+        SystemClass::Interfaces,
+        SystemClass::Routes,
+        SystemClass::DnsPolicy,
+        SystemClass::FirewallRules,
+        SystemClass::RegistryValues,
+        SystemClass::Services,
+        SystemClass::RuntimeDirs,
+        SystemClass::Processes,
+    ] {
+        let entries = os
+            .observer
+            .enumerate(class)
+            .await
+            .unwrap_or_else(|e| panic!("{class:?}: {e}"));
+        assert!(entries.iter().all(|entry| entry.class == class));
+        if class == SystemClass::Interfaces {
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e.key == key && e.identity == obs.credential)
+            );
+        }
+        if class == SystemClass::RuntimeDirs {
+            assert!(entries.iter().any(|e| e.key
+                == ObjectKey::Path {
+                    path: epoch_dir.clone()
+                }));
+        }
+    }
+    assert!(
+        marked
+            .iter()
+            .any(|m| m.key == key && matches!(m.origin, FoundBy::DerivedName { .. }))
+    );
+    assert!(marked.iter().any(|m| m.key
+        == ObjectKey::Interface {
+            name: Some(foreign.into()),
+            guid: None
+        }
+        && m.origin == FoundBy::PrefixOnly));
+
+    let dns_key = ObjectKey::ResolvedLink {
+        interface: name.clone(),
+    };
+    let dns_kind = EffectKind::LinuxResolvedLink;
+    let other_resolver = std::env::var_os("ETD_O2_NO_RESOLVED").is_some();
+    let resolv_conf = std::fs::read("/etc/resolv.conf").unwrap();
+    if other_resolver {
+        assert!(
+            os.observer
+                .observe(dns_kind, &dns_key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let old = record(dns_kind, dns_key.clone(), obs.clone());
+        if std::env::var_os("ETD_O2_NO_BUS").is_some() {
+            assert_eq!(reclaim(dns_kind).probe(&old).await, Probe::Absent);
+            println!("Missing system bus socket: no resolve1 effect");
+        } else {
+            assert!(matches!(
+                reclaim(dns_kind).probe(&old).await,
+                Probe::Indeterminate(_)
+            ));
+            assert!(matches!(
+                reclaim(dns_kind).reclaim(&old).await,
+                Err(ReclaimError::Indeterminate(_))
+            ));
+            let conn = zbus::Connection::system().await.unwrap();
+            let bus = zbus::fdo::DBusProxy::new(&conn).await.unwrap();
+            assert!(
+                bus.list_activatable_names()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|n| n.as_str() == "org.freedesktop.resolve1")
+            );
+            assert!(
+                !bus.name_has_owner("org.freedesktop.resolve1".try_into().unwrap())
+                    .await
+                    .unwrap()
+            );
+            println!(
+                "Activatable resolve1 stayed ownerless: DNS enumerated, previously observed effect held for retry"
+            );
+        }
+    } else {
+        command("resolvectl", &["dns", &name, "192.0.2.53"]);
+        command("resolvectl", &["domain", &name, "~o2.invalid"]);
+        let mut dns = record(
+            dns_kind,
+            dns_key.clone(),
+            os.observer
+                .observe(dns_kind, &dns_key)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let value = |s: &str| SettingValue::MultiString(vec![s.into()]);
+        dns.undo = Undo::RestoreIfOurs {
+            ours: value("192.0.2.54"),
+            original: value("192.0.2.55"),
+        };
+        assert_eq!(
+            reclaim(dns_kind).reclaim(&dns).await.unwrap(),
+            Reclaimed::LeftModified
+        );
+        assert!(command("resolvectl", &["dns", &name]).contains("192.0.2.53"));
+        dns.undo = Undo::RestoreIfOurs {
+            ours: value("192.0.2.53"),
+            original: value("192.0.2.55"),
+        };
+        assert_eq!(
+            reclaim(dns_kind).reclaim(&dns).await.unwrap(),
+            Reclaimed::Restored
+        );
+        assert!(command("resolvectl", &["dns", &name]).contains("192.0.2.55"));
+        assert!(command("resolvectl", &["domain", &name]).contains("~o2.invalid"));
+        dns.undo = Undo::EnsureAbsent;
+        assert_eq!(
+            reclaim(dns_kind).reclaim(&dns).await.unwrap(),
+            Reclaimed::Removed
+        );
+        assert_eq!(reclaim(dns_kind).probe(&dns).await, Probe::Absent);
+        dns.undo = Undo::RestoreIfOurs {
+            ours: SettingValue::Absent,
+            original: value("192.0.2.55"),
+        };
+        assert!(matches!(
+            reclaim(dns_kind).probe(&dns).await,
+            Probe::Present(_)
+        ));
+        assert_eq!(
+            reclaim(dns_kind).reclaim(&dns).await.unwrap(),
+            Reclaimed::Restored
+        );
+        assert!(command("resolvectl", &["dns", &name]).contains("192.0.2.55"));
+        // Leave new per-link settings live across RTM_DELLINK and check
+        // resolve1 independently, using its global server and domain lists.
+        command("resolvectl", &["dns", &name, "192.0.2.56"]);
+        command("resolvectl", &["domain", &name, "~o2-loss.invalid"]);
+        println!(
+            "resolve1 readback, preserve changed DNS, conditional restore and per-link revert passed"
+        );
+    }
+    assert_eq!(rc.reclaim(&tun).await.unwrap(), Reclaimed::Removed);
+    assert_eq!(rc.reclaim(&tun).await.unwrap(), Reclaimed::AlreadyAbsent);
+    assert_eq!(reclaim(routes.kind).probe(&routes).await, Probe::Absent);
+    let links = command("ip", &["-o", "link", "show"]);
+    assert!(!links.contains(&name));
+    assert!(links.contains(foreign));
+    for family in ["-4", "-6"] {
+        assert!(!command("ip", &[family, "route", "show", "table", "all"]).contains(&name));
+    }
+    if other_resolver {
+        assert_eq!(std::fs::read("/etc/resolv.conf").unwrap(), resolv_conf);
+    } else {
+        assert!(!command("resolvectl", &["dns"]).contains("192.0.2.56"));
+        assert!(!command("resolvectl", &["domain"]).contains("o2-loss.invalid"));
+        println!("Independent resolved global DNS and domain lists clean after link loss");
+    }
+    command("ip", &["link", "set", foreign, "down"]);
+    command("ip", &["link", "set", foreign, "name", &name]);
+    assert_eq!(
+        rc.reclaim(&tun).await,
+        Err(ReclaimError::CredentialMismatch)
+    );
+    let replacement = os.observer.interface(&key).await.unwrap().unwrap();
+    assert_ne!(Some(replacement.credential), obs.credential);
+    command("ip", &["link", "set", &name, "name", foreign]);
+    command("ip", &["link", "del", foreign]);
+    println!(
+        "Matched ifindex + boot; missing/stale credentials refused; independent ip link/route dumps clean, foreign same-prefix TUN survived"
+    );
+}

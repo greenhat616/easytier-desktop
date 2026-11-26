@@ -9,7 +9,7 @@ import tempfile
 import time
 import uuid
 
-from service import Desktop, Service, command, eventually, require_runner
+from service import Desktop, Service, assert_driver_notice, command, eventually, require_runner
 from consistency import (
     FirewallReadbackPending, UnpredictedChanges, adapter_defaults, check_closed, check_generation, installed_image,
     managed_service_changes, runner_noise, scope, tun_created,
@@ -247,13 +247,10 @@ def verify_shared_driver_purge(service, baseline, stopped, inventory, foreign_ke
                 and r["kind"] == "driver" and r["state"] == "candidate"}
     assert retained == names, f"expected shared driver candidates {names}, got {retained}"
     assert f"0 generations, {len(names)} candidates, 0 conflicts" in result.stdout
-    if result.returncode:
-        assert "reclaim incomplete" in result.stderr
-        pending = [r for r in records if r["state"] != "reclaimed"]
-        assert all(r["kind"] == "driver" and r["scope"] == "product"
-                   and r["state"] == "candidate" for r in pending)
+    assert result.returncode == 0, f"standalone purge exited {result.returncode}"
     after = inventory()
     service.retained_drivers = {name: stopped.rows["service", name] for name in names}
+    assert_driver_notice(result.stdout, service.retained_drivers)
     assert_foreign(stopped, after, {("service", name) for name in names})
     assert_foreign(baseline, after, foreign_keys)
     assert not program_rules & after.rows.keys(), "CoreBinary firewall rules survived purge"

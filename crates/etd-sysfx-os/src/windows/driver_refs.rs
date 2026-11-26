@@ -4,7 +4,7 @@ use ::windows::{
     Win32::{
         Foundation::{
             CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_NOT_ALL_ASSIGNED,
-            GetLastError, HANDLE, LUID,
+            ERROR_SERVICE_DOES_NOT_EXIST, GetLastError, HANDLE, LUID,
         },
         Security::{
             AdjustTokenPrivileges, ImpersonateSelf, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
@@ -87,6 +87,17 @@ fn service_image(manager: SC_HANDLE, name: &str) -> Result<String, WinError> {
         unsafe { OpenServiceW(manager, PCWSTR(name.as_ptr()), SERVICE_QUERY_CONFIG) }
             .map_err(WinError::windows)?,
     );
+    Ok(service_config(&service)?.image)
+}
+
+/// The SCM configuration of an open service.
+struct ServiceConfig {
+    service_type: u32,
+    start_type: u32,
+    image: String,
+}
+
+fn service_config(service: &ServiceHandle) -> Result<ServiceConfig, WinError> {
     let mut needed = 0;
     // SAFETY: documented size query with a valid output pointer.
     let first = unsafe { QueryServiceConfigW(service.0, None, 0, &mut needed) };
@@ -106,10 +117,137 @@ fn service_image(manager: SC_HANDLE, name: &str) -> Result<String, WinError> {
     .map_err(WinError::windows)?;
     // SAFETY: successful query wrote a QUERY_SERVICE_CONFIGW to the aligned buffer.
     let config = unsafe { &*buffer.as_ptr().cast::<QUERY_SERVICE_CONFIGW>() };
-    if config.lpBinaryPathName.0.is_null() {
-        Ok(String::new())
+    let image = if config.lpBinaryPathName.0.is_null() {
+        String::new()
     } else {
-        buffer_string(&buffer, config.lpBinaryPathName.0)
+        buffer_string(&buffer, config.lpBinaryPathName.0)?
+    };
+    Ok(ServiceConfig {
+        service_type: config.dwServiceType.0,
+        start_type: config.dwStartType.0,
+        image,
+    })
+}
+
+/// One registered service as the shared-driver observer reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DriverService {
+    pub name: String,
+    pub service_type: u32,
+    pub start_type: u32,
+    /// As registered (may be relative or unexpanded); the file need not
+    /// exist.
+    pub image: String,
+    pub state: u32,
+}
+
+impl DriverService {
+    /// Canonical detail recorded with the observation.
+    pub fn detail(&self) -> String {
+        let start = match self.start_type {
+            0 => "boot",
+            1 => "system",
+            2 => "auto",
+            3 => "demand",
+            4 => "disabled",
+            _ => "other",
+        };
+        let state = match self.state {
+            1 => "stopped",
+            2 => "start_pending",
+            3 => "stop_pending",
+            4 => "running",
+            5 => "continue_pending",
+            6 => "pause_pending",
+            7 => "paused",
+            _ => "other",
+        };
+        serde_json::json!({
+            "name": self.name,
+            "service_type": self.service_type,
+            "driver": self.service_type & SERVICE_DRIVER.0 != 0,
+            "start_type": start,
+            "image_path": self.image,
+            "state": state,
+        })
+        .to_string()
+    }
+}
+
+/// A service registration by name, from SCM (`OpenServiceW` +
+/// `QueryServiceConfigW` + `QueryServiceStatus`), whatever its start type
+/// and whether or not its image file exists, cross-checked with
+/// `HKLM\SYSTEM\CurrentControlSet\Services\<name>`. Absent from both:
+/// `None`. Present in only one, a type that differs, or SCM refusing the
+/// query: an error, never `None` (WMI `Win32_SystemDriver` omits disabled
+/// drivers without a file, G2 topic#42 msg#1126).
+pub(super) fn driver_service(name: &str) -> Result<Option<DriverService>, WinError> {
+    // SAFETY: null names select the local active SCM database.
+    let manager = ServiceHandle(
+        unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
+            .map_err(WinError::windows)?,
+    );
+    let wide_name = wide(name);
+    // SAFETY: the name is NUL-terminated and the manager is live.
+    let opened = unsafe {
+        OpenServiceW(
+            manager.0,
+            PCWSTR(wide_name.as_ptr()),
+            SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS,
+        )
+    };
+    let scm = match opened {
+        Ok(handle) => {
+            let service = ServiceHandle(handle);
+            let config = service_config(&service)?;
+            let mut status = SERVICE_STATUS::default();
+            // SAFETY: the handle is live and `status` is a valid output.
+            unsafe { QueryServiceStatus(service.0, &mut status) }.map_err(WinError::windows)?;
+            Some((config, status.dwCurrentState.0))
+        }
+        Err(e) if e.code() == ERROR_SERVICE_DOES_NOT_EXIST.to_hresult() => None,
+        Err(e) => return Err(WinError::windows(e)),
+    };
+    let services = Key::open(
+        HKEY_LOCAL_MACHINE,
+        r"SYSTEM\CurrentControlSet\Services",
+        KEY_READ,
+    )?
+    .ok_or_else(|| error("SCM registry database unavailable"))?;
+    let registered = match Key::open(services.0, name, KEY_QUERY_VALUE)? {
+        None => None,
+        Some(key) => match key.read("Type")? {
+            Some(kind) if kind.ty == REG_DWORD && kind.bytes.len() == 4 => Some(
+                u32::from_le_bytes(kind.bytes.try_into().expect("checked size")),
+            ),
+            _ => {
+                return Err(error(format!(
+                    "service registration {name} has no valid Type"
+                )));
+            }
+        },
+    };
+    match (scm, registered) {
+        (None, None) => Ok(None),
+        (Some((config, state)), Some(kind)) if kind == config.service_type => {
+            Ok(Some(DriverService {
+                name: name.into(),
+                service_type: config.service_type,
+                start_type: config.start_type,
+                image: config.image,
+                state,
+            }))
+        }
+        (Some((config, _)), Some(kind)) => Err(error(format!(
+            "service {name}: SCM type {:#x}, registry Type {kind:#x}",
+            config.service_type
+        ))),
+        (Some(_), None) => Err(error(format!(
+            "service {name} is known to SCM but has no registry key"
+        ))),
+        (None, Some(_)) => Err(error(format!(
+            "service {name} has a registry key but SCM does not know it (pending deletion or reboot)"
+        ))),
     }
 }
 

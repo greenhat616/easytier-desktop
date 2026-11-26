@@ -4,7 +4,7 @@ on:
     - cron: '27 19 * * *'
   workflow_dispatch:
   push:
-    branches: [wbs/G2-privileged]
+    branches: [wbs/G2-verify-integrated]
   pull_request:
     paths:
       - 'crates/**'
@@ -30,6 +30,8 @@ jobs:
             suite: recovery
           - os: windows-latest
             suite: preflight
+          - os: windows-latest
+            suite: program
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -169,6 +171,9 @@ jobs:
       - name: Pre-existing shared drivers (fresh administrator runner)
         if: matrix.suite == 'preflight'
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=preexisting_shared_drivers_are_conflicts)' --success-output immediate
+      - name: Pre-existing inactive program rule (fresh administrator runner)
+        if: matrix.suite == 'program'
+        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=preexisting_program_rule_blocks_start)' --success-output immediate
       - name: Installed service tests (root)
         if: runner.os != 'Windows'
         shell: bash

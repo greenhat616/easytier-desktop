@@ -11,7 +11,11 @@ use etd_ipc::{
 use etd_sysfx_os::service::{
     HostFilesystem, NativeHostFilesystem, NativeServiceManager, ServiceManager,
 };
-use std::{process::Command, sync::Arc, time::Duration};
+use std::{
+    process::{Command, Stdio},
+    sync::Arc,
+    time::Duration,
+};
 
 #[cfg(windows)]
 use etd_sysfx_os::service::ci_fixture::{StandardAccount, assert_query_only};
@@ -306,11 +310,23 @@ async fn install_connect_uninstall() {
     println!(
         "uninstall reclaimed the ledger and removed service registration, owned directories and group"
     );
-    let reinstall = Command::new(binary).arg("install").output().unwrap();
+    let spawn_install = || {
+        Command::new(binary)
+            .arg("install")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let first = spawn_install();
+    let second = spawn_install();
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
     assert!(
-        reinstall.status.success(),
-        "{}",
-        String::from_utf8_lossy(&reinstall.stderr)
+        first.status.success() ^ second.status.success(),
+        "exactly one racing install must succeed: first {}, second {}",
+        String::from_utf8_lossy(&first.stderr),
+        String::from_utf8_lossy(&second.stderr)
     );
     let cleanup = Command::new(binary).arg("uninstall").output().unwrap();
     assert!(
@@ -320,5 +336,43 @@ async fn install_connect_uninstall() {
     );
     assert!(!layout.state.exists() && !layout.executable.parent().unwrap().exists());
     assert!(layout.maintenance.join("host.lock").is_file());
-    println!("reinstall/uninstall succeeded through the same stable machine lock");
+    let install = spawn_install();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while etd_sysfx_os::service::LifecycleJournal::open(&layout)
+            .unwrap()
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("racing install never began");
+    let uninstall = Command::new(binary).arg("uninstall").output().unwrap();
+    let installed = install.wait_with_output().unwrap();
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    assert!(
+        uninstall.status.success(),
+        "{}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    assert!(!layout.state.exists() && !layout.executable.parent().unwrap().exists());
+    let status = Command::new(binary)
+        .args(["uninstall", "--status"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert!(String::from_utf8_lossy(&status.stdout).contains("No maintenance journal"));
+    assert!(
+        layout
+            .maintenance
+            .join("maintenance-command.lock")
+            .is_file()
+    );
+    println!(
+        "racing installs serialized; uninstall waited for installing handoff; completion status and stable locks verified"
+    );
 }

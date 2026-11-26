@@ -35,8 +35,8 @@ use etd_sysfx::{
 use etd_sysfx_os::{
     OsConfig, OsError,
     service::{
-        HostFilesystem, HostLayout, HostLock, LifecycleJournal, NativeHostFilesystem,
-        NativeServiceManager, Phase, Resource, ServiceManager,
+        DeferredOutcome, HostFilesystem, HostLayout, HostLock, LifecycleJournal, MaintenanceLock,
+        NativeHostFilesystem, NativeServiceManager, Phase, Resource, ServiceManager,
     },
 };
 use std::{
@@ -272,6 +272,9 @@ async fn dependencies(mode: HostMode, layout: &HostLayout) -> Result<Dependencie
     } else {
         sqlite.clone()
     };
+    if mode == HostMode::User {
+        storage::cleanup_user_core_orphans(&layout.cores)?;
+    }
     if mode == HostMode::User && !storage::manifest_exists(&layout.cores)? {
         storage::install_bundled_cores(
             layout
@@ -711,6 +714,13 @@ pub async fn install(users: &[String]) -> Result<()> {
         NativeServiceManager.entry_is_elevated()?,
         "administrator privileges required"
     );
+    let command = lock_install_command(&layout).await?;
+    if let Some(journal) = LifecycleJournal::open(&layout)? {
+        ensure!(
+            journal.phase() == Phase::Installing,
+            "service already installed or uninstall incomplete; run uninstall --status or retry uninstall first"
+        );
+    }
     let guard = LayoutLock::new(
         NativeHostFilesystem.lock(&layout)?,
         endpoint(mode, &layout)?,
@@ -762,8 +772,24 @@ pub async fn install(users: &[String]) -> Result<()> {
     // Register under the stable lock; the newly launched service must acquire
     // it itself, so release only after the journal records Installed.
     drop(guard);
-    if let Err(error) = start_and_verify(&layout).await {
-        if let Err(rollback) = uninstall().await {
+    let install_id = journal.install_id().to_owned();
+    finish_install_handoff(command, start_and_verify(&layout, &install_id), || {
+        uninstall_locked(&layout, Some(&install_id))
+    })
+    .await
+}
+
+async fn finish_install_handoff<F, Fut>(
+    _command: MaintenanceLock,
+    verify: impl std::future::Future<Output = Result<()>>,
+    rollback: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    if let Err(error) = verify.await {
+        if let Err(rollback) = rollback().await {
             bail!(
                 "service start failed: {error:#}; rollback incomplete: {rollback:#}; retry uninstall"
             );
@@ -773,8 +799,37 @@ pub async fn install(users: &[String]) -> Result<()> {
     Ok(())
 }
 
-async fn start_and_verify(layout: &HostLayout) -> Result<()> {
+async fn lock_install_command(layout: &HostLayout) -> Result<MaintenanceLock> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let guard = NativeHostFilesystem.lock_maintenance(layout)?;
+        let pending = LifecycleJournal::open(layout)?.is_some_and(|journal| {
+            journal.phase() == Phase::StateRemoved && matches!(journal.deferred(), Some(DeferredOutcome::Pending { pid }) if NativeServiceManager.deferred_worker_alive(*pid).unwrap_or(false))
+        });
+        if !pending || std::time::Instant::now() >= deadline {
+            return Ok(guard);
+        }
+        // The worker requires this mutex to finish; do not wait while holding it.
+        drop(guard);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+fn require_journal(layout: &HostLayout, install_id: &str) -> Result<LifecycleJournal> {
+    let journal = LifecycleJournal::open(layout)?.context("maintenance journal disappeared")?;
+    ensure!(
+        journal.install_id() == install_id,
+        "maintenance transaction changed"
+    );
+    Ok(journal)
+}
+
+async fn start_and_verify(layout: &HostLayout, install_id: &str) -> Result<()> {
     use etd_ipc::{Connector, ServerExpectation, platform::LocalConnector};
+    ensure!(
+        require_journal(layout, install_id)?.phase() == Phase::Installed,
+        "service is not in the installed phase"
+    );
     NativeServiceManager.start(layout)?;
     let connector = LocalConnector {
         expectation: ServerExpectation {
@@ -798,6 +853,7 @@ async fn start_and_verify(layout: &HostLayout) -> Result<()> {
     })
     .await
     .context("registered service never published a verified endpoint")?;
+    require_journal(layout, install_id)?;
     Ok(())
 }
 
@@ -819,6 +875,10 @@ fn rollback_install(
     guard: &LayoutLock,
     journal: LifecycleJournal,
 ) -> Result<()> {
+    ensure!(
+        require_journal(layout, journal.install_id())?.phase() == Phase::Installing,
+        "cannot roll back a different or committed installation"
+    );
     for resource in journal.rollback_resources() {
         match resource {
             Resource::Registration => NativeServiceManager.unregister(layout, true)?,
@@ -886,6 +946,11 @@ fn print_report(report: &ReclaimReport) {
 
 pub async fn reclaim(mode: HostMode, _all: bool, purge: bool) -> Result<()> {
     let layout = layout(mode)?;
+    let _command = if mode == HostMode::Service {
+        Some(NativeHostFilesystem.lock_maintenance(&layout)?)
+    } else {
+        None
+    };
     prepare(mode, &layout)?;
     let _guard = NativeHostFilesystem.lock(&layout)?;
     let deps = dependencies(mode, &layout).await?;
@@ -900,39 +965,63 @@ pub async fn uninstall() -> Result<()> {
         NativeServiceManager.entry_is_elevated()?,
         "administrator privileges required"
     );
-    NativeHostFilesystem.prepare_maintenance(&layout)?;
+    let _command = NativeHostFilesystem.lock_maintenance(&layout)?;
+    uninstall_locked(&layout, None).await
+}
+
+/// Caller holds the maintenance-command mutex until this returns, including
+/// if this is the rollback of install's start/verification handoff.
+async fn uninstall_locked(layout: &HostLayout, expected_id: Option<&str>) -> Result<()> {
+    let mode = HostMode::Service;
+    let first = LifecycleJournal::open(layout)?;
+    if let Some(id) = expected_id {
+        ensure!(
+            first
+                .as_ref()
+                .is_some_and(|journal| journal.install_id() == id),
+            "rollback transaction changed"
+        );
+    }
     // The running service itself holds the machine lock. Stopping and
     // disabling it is the only step that must precede acquiring that lock.
-    if let Some(journal) = LifecycleJournal::open(&layout)?
+    if let Some(journal) = &first
         && journal.phase() == Phase::Installed
     {
-        NativeServiceManager.stop_and_disable(&layout)?;
+        require_journal(layout, journal.install_id())?;
+        NativeServiceManager.stop_and_disable(layout)?;
     }
     let guard = LayoutLock::new(
-        NativeHostFilesystem.lock(&layout)?,
-        endpoint(mode, &layout)?,
+        NativeHostFilesystem.lock(layout)?,
+        endpoint(mode, layout)?,
         HostForm::Service,
     );
-    let Some(mut journal) = LifecycleJournal::open(&layout)? else {
+    let Some(mut journal) = LifecycleJournal::open(layout)? else {
+        ensure!(first.is_none(), "maintenance journal disappeared");
         // A second uninstall is success only if there are no foreign or
         // unjournaled resources; never adopt a name merely because it exists.
-        NativeServiceManager.preflight_install(&layout)?;
+        NativeServiceManager.preflight_install(layout)?;
         return Ok(());
     };
+    ensure!(
+        first
+            .as_ref()
+            .is_some_and(|first| first.install_id() == journal.install_id()),
+        "maintenance transaction changed during stop"
+    );
     if journal.phase() == Phase::Installing {
-        return rollback_install(&layout, &guard, journal);
+        return rollback_install(layout, &guard, journal);
     }
     journal.step(Phase::Disabled, || {
-        NativeServiceManager.stop_and_disable(&layout)
+        NativeServiceManager.stop_and_disable(layout)
     })?;
     if journal.phase() < Phase::Reclaimed {
         let result: Result<()> = async {
-            NativeHostFilesystem.validate_service(&layout)?;
+            NativeHostFilesystem.validate_service(layout)?;
             ensure!(
                 storage::ledger_exists(&layout.state)?,
                 "ownership ledger missing; refusing unverified purge"
             );
-            let deps = dependencies(mode, &layout).await?;
+            let deps = dependencies(mode, layout).await?;
             reclaim_locked(&deps.host, true).await?;
             deps.close().await?;
             Ok(())
@@ -942,27 +1031,38 @@ pub async fn uninstall() -> Result<()> {
         journal.advance(Phase::Reclaimed)?;
     }
     journal.step(Phase::Unregistered, || {
-        NativeServiceManager.unregister(&layout, false)
+        NativeServiceManager.unregister(layout, false)
     })?;
     if journal.phase() < Phase::IpcRemoved {
-        clean_ipc(&layout, &guard)?;
+        clean_ipc(layout, &guard)?;
         journal.advance(Phase::IpcRemoved)?;
     }
     let gid = journal.group_gid();
     journal.step(Phase::GroupRemoved, || {
-        NativeServiceManager.remove_group(&layout, gid)
+        NativeServiceManager.remove_group(layout, gid)
     })?;
     journal.step(Phase::StateRemoved, || {
-        NativeServiceManager.remove_state(&layout)
+        NativeServiceManager.remove_state(layout)
     })?;
     if journal.phase() < Phase::InstallRemoved {
-        if NativeServiceManager.defer_install_removal(&layout, journal.install_id())? {
+        let deferred = NativeServiceManager.defer_install_removal(layout, journal.install_id());
+        let deferred = match deferred {
+            Ok(value) => value,
+            Err(error) => {
+                journal.set_deferred(DeferredOutcome::Failed {
+                    error: error.to_string(),
+                })?;
+                return Err(error.into());
+            }
+        };
+        if let Some(pid) = deferred {
+            journal.set_deferred(DeferredOutcome::Pending { pid })?;
             println!(
-                "service and data removed; protected helper will finish the install directory after this process exits"
+                "service and data removed; protected helper will finish after this process exits; check etd-host uninstall --status (uninstall is complete when the journal is gone)"
             );
             return Ok(());
         }
-        NativeServiceManager.remove_install(&layout)?;
+        NativeServiceManager.remove_install(layout)?;
         journal.advance(Phase::InstallRemoved)?;
     }
     journal.clear()?;
@@ -970,9 +1070,14 @@ pub async fn uninstall() -> Result<()> {
 }
 
 #[cfg(windows)]
-pub fn finish_deferred_uninstall(install_id: &str) -> Result<()> {
+pub fn finish_deferred_uninstall(parent: u32, install_id: &str) -> Result<()> {
+    ensure!(
+        NativeServiceManager.entry_is_elevated()?,
+        "administrator privileges required"
+    );
+    let waited = etd_sysfx_os::service::wait_uninstall_parent(parent);
     let layout = layout(HostMode::Service)?;
-    let _guard = NativeHostFilesystem.lock(&layout)?;
+    let _command = NativeHostFilesystem.lock_maintenance(&layout)?;
     let Some(mut journal) = LifecycleJournal::open(&layout)? else {
         return Ok(()); // another maintenance process already completed it
     };
@@ -980,25 +1085,85 @@ pub fn finish_deferred_uninstall(install_id: &str) -> Result<()> {
         journal.can_finish_deferred(install_id),
         "deferred uninstall no longer matches its transaction and final phase"
     );
-    journal.step(Phase::InstallRemoved, || {
-        NativeServiceManager.remove_install(&layout)
-    })?;
-    journal.clear()?;
+    let guard = waited.and_then(|_| NativeHostFilesystem.lock(&layout));
+    let result = match &guard {
+        Ok(_) => journal.step(Phase::InstallRemoved, || {
+            NativeServiceManager.remove_install(&layout)
+        }),
+        Err(error) => Err(io::Error::other(error.to_string())),
+    };
+    if let Err(error) = result {
+        journal.set_deferred(DeferredOutcome::Failed {
+            error: error.to_string(),
+        })?;
+        return Err(error.into());
+    }
+    if let Err(error) = journal.clear() {
+        // If the marker remains, keep the failure observable; if deletion
+        // succeeded and only its directory sync failed, report that error.
+        if LifecycleJournal::open(&layout)?.is_some() {
+            journal.set_deferred(DeferredOutcome::Failed {
+                error: error.to_string(),
+            })?;
+        }
+        return Err(error.into());
+    }
     Ok(())
 }
 
 pub async fn resume_service() -> Result<()> {
+    ensure!(
+        NativeServiceManager.entry_is_elevated()?,
+        "administrator privileges required"
+    );
     let layout = layout(HostMode::Service)?;
+    let _command = NativeHostFilesystem.lock_maintenance(&layout)?;
     let guard = NativeHostFilesystem.lock(&layout)?;
     NativeHostFilesystem.validate_service(&layout)?;
     let mut journal = LifecycleJournal::open(&layout)?.context("no service installation")?;
+    let install_id = journal.install_id().to_owned();
     journal.resume_service()?;
     drop(guard);
-    start_and_verify(&layout).await
+    start_and_verify(&layout, &install_id).await
+}
+
+pub fn uninstall_status() -> Result<()> {
+    ensure!(
+        NativeServiceManager.entry_is_elevated()?,
+        "administrator privileges required"
+    );
+    let layout = layout(HostMode::Service)?;
+    NativeHostFilesystem.prepare_maintenance(&layout)?;
+    match LifecycleJournal::open(&layout)? {
+        None => println!("No maintenance journal: uninstall complete (or never installed)"),
+        Some(journal) => {
+            println!("Uninstall not complete: phase {:?}", journal.phase());
+            match journal.deferred() {
+                Some(DeferredOutcome::Pending { pid }) => println!(
+                    "Deferred helper {pid}: {}",
+                    if NativeServiceManager.deferred_worker_alive(*pid)? {
+                        "running"
+                    } else {
+                        "exited without completing; retry uninstall"
+                    }
+                ),
+                Some(DeferredOutcome::Failed { error }) => {
+                    println!("Deferred helper failed: {error}; retry uninstall")
+                }
+                None => (),
+            }
+        }
+    }
+    Ok(())
 }
 
 pub async fn remove_core(mode: HostMode, version: &str) -> Result<()> {
     let layout = layout(mode)?;
+    let _command = if mode == HostMode::Service {
+        Some(NativeHostFilesystem.lock_maintenance(&layout)?)
+    } else {
+        None
+    };
     prepare(mode, &layout)?;
     let _guard = NativeHostFilesystem.lock(&layout)?;
     let resources = dependencies(mode, &layout).await?;
@@ -1023,4 +1188,49 @@ pub async fn remove_core(mode: HostMode, version: &str) -> Result<()> {
     }
     deps.core_store.remove(version).await?;
     resources.close().await
+}
+
+#[cfg(test)]
+mod maintenance_handoff_tests {
+    use super::*;
+    #[tokio::test]
+    async fn failed_verification_rolls_back_before_waiting_maintenance_can_enter() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let guard = MaintenanceLock::acquire(dir.path()).unwrap();
+        let lifetime = HostLock::acquire(dir.path()).unwrap();
+        // The host can take its own lock independently during the handoff.
+        drop(lifetime);
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let witness = cleaned.clone();
+        let path = dir.path().to_owned();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _command = MaintenanceLock::acquire(&path).unwrap();
+            entered_tx.send(witness.load(Ordering::SeqCst)).unwrap();
+        });
+        started_rx.recv().unwrap();
+        let result = finish_install_handoff(
+            guard,
+            async {
+                assert!(entered_rx.recv_timeout(Duration::from_millis(50)).is_err());
+                bail!("injected verification failure")
+            },
+            || async {
+                assert!(entered_rx.recv_timeout(Duration::from_millis(50)).is_err());
+                cleaned.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(entered_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        waiter.join().unwrap();
+    }
 }

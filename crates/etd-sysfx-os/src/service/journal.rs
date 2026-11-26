@@ -43,6 +43,14 @@ struct Record {
     planned: Vec<Resource>,
     completed: Vec<Resource>,
     group_gid: Option<u32>,
+    #[serde(default)]
+    deferred: Option<DeferredOutcome>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DeferredOutcome {
+    Pending { pid: u32 },
+    Failed { error: String },
 }
 
 pub struct LifecycleJournal {
@@ -83,6 +91,7 @@ impl LifecycleJournal {
                 planned: vec![],
                 completed: vec![],
                 group_gid: None,
+                deferred: None,
             },
         };
         journal.save()?;
@@ -99,6 +108,18 @@ impl LifecycleJournal {
     pub fn can_finish_deferred(&self, install_id: &str) -> bool {
         self.record.install_id == install_id
             && matches!(self.phase(), Phase::StateRemoved | Phase::InstallRemoved)
+    }
+    pub fn deferred(&self) -> Option<&DeferredOutcome> {
+        self.record.deferred.as_ref()
+    }
+    pub fn set_deferred(&mut self, outcome: DeferredOutcome) -> io::Result<()> {
+        if !self.can_finish_deferred(self.install_id()) {
+            return Err(io::Error::other(
+                "deferred outcome outside final uninstall phase",
+            ));
+        }
+        self.record.deferred = Some(outcome);
+        self.save()
     }
     pub fn planned(&self, resource: Resource) -> bool {
         self.record.planned.contains(&resource)
@@ -187,7 +208,7 @@ impl LifecycleJournal {
         action()?;
         self.advance(phase)
     }
-    pub fn clear(self) -> io::Result<()> {
+    pub fn clear(&self) -> io::Result<()> {
         match fs::remove_file(&self.path) {
             Ok(()) => sync_parent(&self.path),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),

@@ -59,6 +59,9 @@ enum Action {
     },
     /// Stop, reclaim and remove the installed service.
     Uninstall {
+        /// Report the durable uninstall phase and deferred worker outcome.
+        #[arg(long, conflicts_with_all = ["wait_parent", "install_id"])]
+        status: bool,
         #[arg(long, hide = true, requires = "install_id")]
         wait_parent: Option<u32>,
         #[arg(long, hide = true, requires = "wait_parent")]
@@ -133,14 +136,17 @@ fn execute(cli: Cli) -> Result<()> {
         }
         Action::Install { allow_user } => runtime.block_on(host::install(&allow_user)),
         Action::Uninstall {
+            status,
             wait_parent,
             install_id,
         } => {
+            if status {
+                return host::uninstall_status();
+            }
             if let (Some(pid), Some(id)) = (wait_parent, install_id) {
                 #[cfg(windows)]
                 {
-                    etd_sysfx_os::service::wait_uninstall_parent(pid)?;
-                    return host::finish_deferred_uninstall(&id);
+                    return host::finish_deferred_uninstall(pid, &id);
                 }
                 #[cfg(not(windows))]
                 {

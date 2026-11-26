@@ -581,7 +581,10 @@ pub(super) fn remove_install(layout: &HostLayout) -> io::Result<()> {
     remove_owned_tree(layout.executable.parent().ok_or_else(denied)?, true)
 }
 
-pub(super) fn defer_install_removal(layout: &HostLayout, install_id: &str) -> io::Result<bool> {
+pub(super) fn defer_install_removal(
+    layout: &HostLayout,
+    install_id: &str,
+) -> io::Result<Option<u32>> {
     use ::windows::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW};
     use ::windows::core::PCWSTR;
     use sha2::{Digest, Sha256};
@@ -589,7 +592,7 @@ pub(super) fn defer_install_removal(layout: &HostLayout, install_id: &str) -> io
     if !layout.executable.try_exists()?
         || super::current_exe()? != layout.executable.canonicalize()?
     {
-        return Ok(false);
+        return Ok(None);
     }
     // The copy is made inside the protected, persistent maintenance root,
     // never in the invoking user's temp directory.
@@ -642,7 +645,7 @@ pub(super) fn defer_install_removal(layout: &HostLayout, install_id: &str) -> io
         .map_err(other)?;
     }
     let _keep = dir.keep();
-    std::process::Command::new(&helper)
+    let child = std::process::Command::new(&helper)
         .args([
             "uninstall",
             "--wait-parent",
@@ -651,7 +654,22 @@ pub(super) fn defer_install_removal(layout: &HostLayout, install_id: &str) -> io
             install_id,
         ])
         .spawn()?;
-    Ok(true)
+    Ok(Some(child.id()))
+}
+
+pub(super) fn deferred_worker_alive(pid: u32) -> io::Result<bool> {
+    use ::windows::Win32::{
+        Foundation::{ERROR_INVALID_PARAMETER, WAIT_TIMEOUT},
+        System::Threading::{OpenProcess, PROCESS_ACCESS_RIGHTS, WaitForSingleObject},
+    };
+    let handle = match unsafe { OpenProcess(PROCESS_ACCESS_RIGHTS(0x0010_0000), false, pid) } {
+        Ok(handle) => handle,
+        Err(error) if error.code() == ERROR_INVALID_PARAMETER.to_hresult() => return Ok(false),
+        Err(error) => return Err(other(error)),
+    };
+    let wait = unsafe { WaitForSingleObject(handle, 0) };
+    let _ = unsafe { CloseHandle(handle) };
+    Ok(wait == WAIT_TIMEOUT)
 }
 
 pub fn wait_uninstall_parent(pid: u32) -> io::Result<()> {

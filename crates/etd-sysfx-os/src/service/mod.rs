@@ -13,7 +13,7 @@ pub mod ci_fixture;
 mod journal;
 #[cfg(unix)]
 mod unix;
-pub use journal::{LifecycleJournal, Phase, Resource};
+pub use journal::{DeferredOutcome, LifecycleJournal, Phase, Resource};
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
@@ -43,27 +43,7 @@ pub struct HostLock {
 }
 impl HostLock {
     pub fn acquire(directory: &Path) -> io::Result<Self> {
-        let path = directory.join("host.lock");
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            options.custom_flags(0x00200000); // FILE_FLAG_OPEN_REPARSE_POINT
-        }
-        let file = options.open(path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || related_path(&metadata) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "invalid host lock file",
-            ));
-        }
+        let file = open_lock(directory, "host.lock")?;
         file.try_lock().map_err(|error| match error {
             std::fs::TryLockError::WouldBlock => io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -73,6 +53,45 @@ impl HostLock {
         })?;
         Ok(Self { files: vec![file] })
     }
+}
+
+/// Serialize whole maintenance commands, including the interval when the
+/// host lifetime lock must be released before starting the service.
+#[must_use]
+pub struct MaintenanceLock {
+    _file: File,
+}
+impl MaintenanceLock {
+    pub fn acquire(directory: &Path) -> io::Result<Self> {
+        let file = open_lock(directory, "maintenance-command.lock")?;
+        file.lock()?;
+        Ok(Self { _file: file })
+    }
+}
+
+fn open_lock(directory: &Path, name: &str) -> io::Result<File> {
+    let path = directory.join(name);
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x00200000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || related_path(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "invalid host lock file",
+        ));
+    }
+    Ok(file)
 }
 
 fn related_path(metadata: &fs::Metadata) -> bool {
@@ -100,6 +119,7 @@ pub trait HostFilesystem {
     fn prepare_maintenance(&self, layout: &HostLayout) -> io::Result<()>;
     fn is_installed_image(&self, layout: &HostLayout) -> io::Result<bool>;
     fn lock(&self, layout: &HostLayout) -> io::Result<HostLock>;
+    fn lock_maintenance(&self, layout: &HostLayout) -> io::Result<MaintenanceLock>;
 }
 
 /// Privileged changes are deliberately separated from composition. Only the
@@ -127,7 +147,12 @@ pub trait ServiceManager {
     fn remove_state(&self, layout: &HostLayout) -> io::Result<()>;
     fn remove_install(&self, layout: &HostLayout) -> io::Result<()>;
     /// Windows installed executable handoff for the last uninstall stage.
-    fn defer_install_removal(&self, layout: &HostLayout, install_id: &str) -> io::Result<bool>;
+    fn defer_install_removal(
+        &self,
+        layout: &HostLayout,
+        install_id: &str,
+    ) -> io::Result<Option<u32>>;
+    fn deferred_worker_alive(&self, pid: u32) -> io::Result<bool>;
     fn entry_is_elevated(&self) -> io::Result<bool>;
 }
 
@@ -173,8 +198,15 @@ impl ServiceManager for NativeServiceManager {
     fn remove_install(&self, layout: &HostLayout) -> io::Result<()> {
         native::remove_install(layout)
     }
-    fn defer_install_removal(&self, layout: &HostLayout, install_id: &str) -> io::Result<bool> {
+    fn defer_install_removal(
+        &self,
+        layout: &HostLayout,
+        install_id: &str,
+    ) -> io::Result<Option<u32>> {
         native::defer_install_removal(layout, install_id)
+    }
+    fn deferred_worker_alive(&self, pid: u32) -> io::Result<bool> {
+        native::deferred_worker_alive(pid)
     }
     fn entry_is_elevated(&self) -> io::Result<bool> {
         native::elevated()
@@ -308,6 +340,10 @@ impl HostFilesystem for NativeHostFilesystem {
             guard.files.extend(HostLock::acquire(runtime)?.files);
         }
         Ok(guard)
+    }
+    fn lock_maintenance(&self, layout: &HostLayout) -> io::Result<MaintenanceLock> {
+        native::prepare_maintenance(layout)?;
+        MaintenanceLock::acquire(&layout.maintenance)
     }
 }
 

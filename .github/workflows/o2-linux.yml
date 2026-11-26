@@ -106,23 +106,15 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: actions/checkout@v7.0.1
-        with:
-          repository: EasyTier/EasyTier
-          ref: c97f36b8d40f3bde7a95cc9ec99fe95fe35a6ff0
-          path: upstream
-      - name: Install pinned protoc
-        shell: pwsh
-        run: ./.github/scripts/setup-protoc.ps1
-      - name: Build the pinned TUN-enabled core
-        run: cargo build --manifest-path upstream/Cargo.toml --locked -p easytier --bin easytier-core --no-default-features --features tun,management
+      - name: Fetch the bundled TUN-enabled release core
+        run: cargo xtask fetch-cores --target host --bundle "${{ runner.temp }}/o2-core" --github-env ETD_O2_CORE
       - name: Start the core under each identity in a private network namespace
         shell: bash
         run: |
           set -euo pipefail
           work=$(mktemp -d)
           sudo useradd -M etd_o2_core
-          cp upstream/target/debug/easytier-core "$work/core"
+          cp "$ETD_O2_CORE" "$work/core"
           cat > "$work/config.toml" <<'EOF'
           instance_name = "etd-o2-cap"
           ipv4 = "192.0.2.5/30"

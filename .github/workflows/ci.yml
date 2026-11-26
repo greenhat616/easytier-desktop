@@ -69,6 +69,12 @@ jobs:
         env:
           ETD_IPC_CI_ACCOUNTS: ${{ runner.os == 'Windows' && '1' || '' }}
         run: cargo nextest run --locked --workspace --profile ci
+      # The bundled upstream release kernel (packaging/cores.toml), verified
+      # against crates/etd-host/cores.lock, drives E2's real-kernel session.
+      - name: Fetch the release kernel
+        run: cargo xtask fetch-cores --target host --bundle "${{ runner.temp }}/etd-cores" --github-env ETD_EASYTIER_CORE
+      - name: Real-kernel session
+        run: cargo nextest run --locked --profile ci -p etd-core-easytier --test session_real --run-ignored only --success-output immediate
       - name: Doc tests
         run: cargo test --locked --workspace --doc
   privileged-install:
@@ -98,6 +104,10 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.152
+      # `etd-host install` imports cores/<version> beside its image, here
+      # the test build's, as listed in crates/etd-host/cores.lock.
+      - name: Fetch the release kernel beside the host image
+        run: cargo xtask fetch-cores --target host --bundle target/debug/cores
       - name: Install roundtrip on Windows (administrator runner)
         if: runner.os == 'Windows'
         run: cargo nextest run --locked --profile privileged -p etd-host --run-ignored only --test install_roundtrip --success-output immediate

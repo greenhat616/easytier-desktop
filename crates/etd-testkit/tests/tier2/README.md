@@ -44,7 +44,8 @@ writes are not simulated as proof of clean native system state in this suite.
   grace. This case is ignored by the default suite.
 - `cargo nextest run --profile privileged -p etd-core-easytier --test session_real --run-ignored only`
   is the ignored native-kernel smoke test of `etd-core-easytier`; supply `ETD_EASYTIER_CORE`
-  as the absolute path to the pinned c97f36b native executable.
+  as the absolute path to the bundled release kernel (`cargo xtask fetch-cores
+  --target host`); CI's `check` job runs it on every OS.
 - The `etd-host --test install_roundtrip` privileged CI test (`ci.yml`)
   verifies actual installed image/LocalSystem peer, standard versus elevated
   role, durable SetAllowList, and native revocation. The existing

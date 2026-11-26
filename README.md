@@ -34,10 +34,11 @@ normal stop, a kernel crash, a host crash or a power cut.
 
 > [!WARNING]
 > EasyTier Desktop is in early development and has **no release yet**. The trusted
-> kernel table (`crates/etd-host/cores.lock`) in the repository is empty, so a build from
-> source cannot start a kernel until release packaging supplies one. Interfaces, on-disk
-> formats and the UI are still changing. Do not use it to manage networks you depend
-> on.
+> kernel table (`crates/etd-host/cores.lock`) lists the official EasyTier v2.7.1 release
+> kernels pinned in `packaging/cores.toml`; a build from source starts one only after
+> `cargo xtask fetch-cores` has put the matching `cores/2.7.1/` bundle beside the host
+> binary, and there are no installers yet. Interfaces, on-disk formats and the UI are
+> still changing. Do not use it to manage networks you depend on.
 
 ## Features
 
@@ -196,7 +197,7 @@ the [development standards](docs/development/README.md) first. Coding agents fol
 
 - [EasyTier](https://github.com/EasyTier/EasyTier), the mesh VPN this client manages.
   The adapter links its `easytier-proto` and `easytier-core` crates at a pinned
-  revision.
+  revision; the bundled kernel is the official v2.7.1 release.
 - [ProcessKit](https://crates.io/crates/processkit), for process groups and job
   objects.
 - [GPUI Kit](https://crates.io/crates/gpui-kit), [tray-icon and

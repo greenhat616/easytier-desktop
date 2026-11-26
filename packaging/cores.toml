@@ -1,0 +1,51 @@
+# The upstream EasyTier release bundled as the trusted kernel (human ruling,
+# topic#53: official v2.7.1, a GitHub prerelease, commit 0d9c52b1).
+#
+# `cargo xtask fetch-cores` downloads each archive below from the release,
+# checks it against the digest pinned here and the release's SHA256SUMS,
+# and extracts only the kernel and the listed companions. With
+# `--update-lock` it writes their SHA-256 into crates/etd-host/cores.lock;
+# without it, it checks the extracted files against that table.
+# Binaries are never committed.
+
+[release]
+repository = "EasyTier/EasyTier"
+tag = "v2.7.1"
+commit = "0d9c52b169dc2112687ddefcf571cd01d383193c"
+# What `easytier-core --version` prints before the first hyphen; names the
+# cores/<version> bundle directory and the cores.lock rows.
+version = "2.7.1"
+
+[[target]]
+triple = "x86_64-pc-windows-msvc"
+archive = "easytier-windows-x86_64-v2.7.1.zip"
+sha256 = "6279ce18906f345345780b2f0c507125fcae861a54c45cc62efe58d5312de46b"
+companions = ["Packet.dll", "WinDivert64.sys", "wintun.dll"]
+
+[[target]]
+triple = "aarch64-pc-windows-msvc"
+archive = "easytier-windows-arm64-v2.7.1.zip"
+sha256 = "5f6f72024df93c17fa98719569b769298cb72cf528e74378f343ac4d136a4003"
+# The archive's WinDivert64.sys is an 84-byte text placeholder: WinDivert
+# has no arm64 driver.
+companions = ["Packet.dll", "wintun.dll"]
+
+[[target]]
+triple = "x86_64-unknown-linux-gnu"
+archive = "easytier-linux-x86_64-v2.7.1.zip"
+sha256 = "8dc4f8576c7a4978c1f000630014b75ec88d172f6cb10935e72092ddd5ec7a9a"
+
+[[target]]
+triple = "aarch64-unknown-linux-gnu"
+archive = "easytier-linux-aarch64-v2.7.1.zip"
+sha256 = "7f4d78aefe7437d7f213089ac7184988665e9c4d1ff163b8ad08637c1c88bb0a"
+
+[[target]]
+triple = "x86_64-apple-darwin"
+archive = "easytier-macos-x86_64-v2.7.1.zip"
+sha256 = "26693f4aa684b4420c04dccfe282120df670dcb1100ead4ad82fe09c1a93ce15"
+
+[[target]]
+triple = "aarch64-apple-darwin"
+archive = "easytier-macos-aarch64-v2.7.1.zip"
+sha256 = "3a1f660237de475cba4a9644b95e04469c4f78c617c9a68e9cd7f41d9706f94d"

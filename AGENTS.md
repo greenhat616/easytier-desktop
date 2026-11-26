@@ -96,7 +96,7 @@ make it pass". For multi-step work, state a short plan with a check per step:
 | `etd-core-api` | Kernel adapter traits and plan model, independent of EasyTier |
 | `etd-core-easytier` | The only EasyTier adapter: launch plans, effect prediction, management session |
 | `etd-testkit` | Fakes, conformance suites, `fake-core`, tier-2/3 tests; test-only |
-| `xtask` | `cargo xtask check-boundaries` and repository tests |
+| `xtask` | `cargo xtask check-boundaries`, `cargo xtask fetch-cores` and repository tests |
 
 `cargo xtask check-boundaries` fails CI on any violation
 ([rules](docs/development/workflow.md#architecture-boundaries)). Restated because they
@@ -172,8 +172,8 @@ Follow [Development workflow](docs/development/workflow.md) and
   the UI never persists them.
 - Kernels come only from the trusted bundle table embedded at build time from
   `crates/etd-host/cores.lock`; a local manifest cannot add one, and clients never
-  choose a kernel path. Do not add rows to `cores.lock` except through release
-  packaging.
+  choose a kernel path. Never edit `cores.lock` by hand: it is generated from the
+  release pinned in `packaging/cores.toml` by `cargo xtask fetch-cores --update-lock`.
 - The host never reads files from user directories. Privileged code treats the user's
   environment, profile and `HKCU` as untrusted and resolves system paths through native
   APIs.

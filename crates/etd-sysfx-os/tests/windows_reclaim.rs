@@ -970,11 +970,12 @@ async fn a_foreign_program_rule_is_observed_not_an_error() {
         core_store_dir: dir.path().join("core"),
     })
     .unwrap();
-    let ours = dir.path().join(format!(
-        "core-{}.exe",
+    // Plain long paths (no 8.3 short names); neither file has to exist.
+    let ours = std::path::PathBuf::from(format!(
+        r"C:\ProgramData\etd-h1f-{}\easytier-core.exe",
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     ));
-    let other = dir.path().join("someone-else.exe");
+    let other = std::path::PathBuf::from(r"C:\Windows\System32\notepad.exe");
     let name = format!("EasyTier {} (Inbound)", ours.display());
     let key = ObjectKey::Rule {
         name: name.clone(),

@@ -8,6 +8,7 @@ import time
 import uuid
 import winreg
 
+from registry_writer import registry_audit
 from service import Service
 from product import foreign_runtime, spec
 import foreign
@@ -45,6 +46,7 @@ try:
         image, _ = stack.enter_context(foreign.idle_process())
         phase = "baseline native inventory"
         service.inventory([image], [sibling])
+        read_events, writer_records = stack.enter_context(registry_audit())
         baseline = settings()
         end = time.monotonic() + 150
         print(f"{case} before launch interval: {baseline}", flush=True)
@@ -52,12 +54,16 @@ try:
             phase = "apply network until ready"
             service.apply(spec(), instance, str(uuid.uuid4()), str(service.ctl("status")["revision"]))
             ready = service.ready(instance)
+            read_events()
             print(f"{case} {ready['state']} epoch={ready['epoch']}", flush=True)
         phase = "matched observation interval"
         time.sleep(max(0, end - time.monotonic()))
         phase = "second native inventory"
         service.inventory([image], [sibling])
         after = settings()
+        read_events()
+        if after[0] != baseline[0]:
+            assert writer_records, 'IKEEXT changed without a confirmed 4657 writer'
         phase = "fixture cleanup and uninstall"
         print(f"{case} final IKEEXT/BITS: {baseline} -> {after}", flush=True)
         assert after == baseline, f"{case} service Start changed: {baseline} -> {after}"

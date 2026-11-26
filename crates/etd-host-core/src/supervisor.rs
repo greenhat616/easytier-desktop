@@ -357,6 +357,18 @@ fn credential_less(e: &Effect) -> bool {
         )
 }
 
+/// A driver service shared by every kernel (wintun, WinDivert; product
+/// scope). Upstream exposes no creation credential for it, so the read-back
+/// records what was found without one: applied here means "absent before
+/// the spawn, loaded while our kernel ran", which keeps the next start from
+/// taking our own driver for a third party's. With no credential the record
+/// never authorizes a deletion: a purge lists it as a candidate (ruling
+/// topic#36 msg#932). One present before the spawn is flagged as a conflict
+/// by [`Supervisor::flag_preexisting`] and never read back.
+fn is_shared_driver(e: &Effect) -> bool {
+    e.kind == EffectKind::Driver && e.scope == EffectScope::Product
+}
+
 impl Supervisor {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -1663,8 +1675,11 @@ impl Supervisor {
             match obs {
                 // Applied means "we hold its creation credential": without
                 // one the record keeps waiting (a crash meanwhile leaves it a
-                // candidate, never deletable by name alone).
-                Some(o) if o.credential.is_some() || credential_less(&e) => {
+                // candidate, never deletable by name alone). Shared drivers
+                // have none to wait for.
+                Some(o)
+                    if o.credential.is_some() || credential_less(&e) || is_shared_driver(&e) =>
+                {
                     if let Err(err) = deps
                         .ledger
                         .transition(&e.id, EffectState::Applied, Some(o))

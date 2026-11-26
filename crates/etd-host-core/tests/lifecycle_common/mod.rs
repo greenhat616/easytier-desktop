@@ -158,6 +158,17 @@ pub struct PlanExtras {
     /// macOS: a system-assigned interface name (utun), found via the
     /// kernel's pid, with the routes recorded via that interface.
     pub assigned_name: bool,
+    /// Windows: the driver services every kernel shares (product scope),
+    /// which upstream reports without a creation credential.
+    pub shared_drivers: bool,
+}
+
+/// Keys of the shared driver services (as upstream names them).
+pub fn shared_driver_keys() -> Vec<ObjectKey> {
+    ["wintun", "WinDivert"]
+        .iter()
+        .map(|n| ObjectKey::Service { name: (*n).into() })
+        .collect()
 }
 
 /// Group of the program firewall rules (as upstream names it).
@@ -237,6 +248,17 @@ impl CoreDriver for TestDriver {
                         persistence: Persistence::Persistent,
                     });
                 }
+            }
+        }
+        if extras.shared_drivers {
+            for key in shared_driver_keys() {
+                plan.effects.push(EffectIntent {
+                    scope: EffectScope::Product,
+                    kind: EffectKind::Driver,
+                    key,
+                    undo: Undo::EnsureAbsent,
+                    persistence: Persistence::Persistent,
+                });
             }
         }
         self.plans
@@ -330,13 +352,19 @@ impl ProcessEngine for KernelSim {
                     if intent.kind == EffectKind::WinProgramFirewallRule {
                         while self.sys.vanish(intent.kind, &intent.key) {}
                     }
+                    // A driver service already registered is used as it is.
+                    if intent.kind == EffectKind::Driver
+                        && self.sys.find(intent.kind, &intent.key).is_some()
+                    {
+                        continue;
+                    }
                     let obs = self.sys.apply_intent_with_pid(intent, Some(id.pid));
                     if b.duplicate_program_rules
                         && intent.kind == EffectKind::WinProgramFirewallRule
                     {
                         self.sys.create_foreign(intent.kind, intent.key.clone());
                     }
-                    if b.no_credentials
+                    if (b.no_credentials || intent.kind == EffectKind::Driver)
                         && let Some(mut o) = self.sys.find(intent.kind, &intent.key)
                     {
                         self.sys.vanish(intent.kind, &intent.key);

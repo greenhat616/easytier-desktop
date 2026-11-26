@@ -27,6 +27,13 @@ fn other(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
 
+fn protect_creation() {
+    // Service state is private even when the installer inherited a permissive
+    // user-session umask. The explicitly public install/run directories get
+    // their exact mode in make(), after creation inside a trusted parent.
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
+}
+
 pub(super) fn elevated() -> io::Result<bool> {
     Ok(Uid::effective().is_root())
 }
@@ -48,7 +55,21 @@ fn check(path: &Path, directory: bool) -> io::Result<()> {
             !meta.is_file()
         })
     {
-        return Err(denied());
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "untrusted service path {} (uid {}, gid {}, mode {:04o}, expected {})",
+                path.display(),
+                meta.uid(),
+                meta.gid(),
+                meta.mode() & 0o7777,
+                if directory {
+                    "directory"
+                } else {
+                    "regular file"
+                }
+            ),
+        ));
     }
     Ok(())
 }
@@ -63,6 +84,16 @@ fn make(path: &Path, mode: u32) -> io::Result<()> {
     verify_parent(path)?;
     let mut builder = fs::DirBuilder::new();
     builder.mode(mode).create(path)?;
+    // A newly created directory in a validated root-owned parent is ours.
+    // Set its exact final group and mode rather than inheriting an installer
+    // session umask or the parent directory's group (e.g. macOS admin).
+    nix::unistd::chown(
+        path,
+        Some(Uid::from_raw(0)),
+        Some(nix::unistd::Gid::from_raw(0)),
+    )
+    .map_err(other)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     check(path, true)
 }
 fn verify_tree(path: &Path) -> io::Result<()> {
@@ -112,7 +143,14 @@ fn create_group(layout: &HostLayout) -> io::Result<()> {
         "/usr/sbin/dseditgroup",
         &["-o", "create", "-n", "/Local/Default", GROUP],
     )?;
-    fs::write(layout.state.join(GROUP_RECORD), group_id()?.to_string())?;
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let mut record = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(layout.state.join(GROUP_RECORD))?;
+    write!(record, "{}", group_id()?)?;
+    record.sync_all()?;
     Ok(())
 }
 
@@ -130,6 +168,13 @@ pub(super) fn prepare_install(layout: &HostLayout) -> io::Result<()> {
     if !elevated()? {
         return Err(denied());
     }
+    protect_creation();
+    // Open a stable source before any installation action. Linux exposes
+    // the executing image itself rather than re-resolving its old pathname.
+    #[cfg(target_os = "linux")]
+    let mut source = File::open("/proc/self/exe")?;
+    #[cfg(target_os = "macos")]
+    let mut source = File::open(super::current_exe()?)?;
     let install = layout.executable.parent().ok_or_else(denied)?;
     let socket = layout.socket_dir.as_ref().ok_or_else(denied)?;
     // Check collisions before any creation. On macOS /var/lib may not exist.
@@ -154,7 +199,15 @@ pub(super) fn prepare_install(layout: &HostLayout) -> io::Result<()> {
     make(&layout.run, 0o700)?;
     make(&layout.cores, 0o755)?;
     make(socket, 0o755)?;
-    fs::copy(super::current_exe()?, &layout.executable)?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut target = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&layout.executable)?;
+    io::copy(&mut source, &mut target)?;
+    target.sync_all()?;
+    drop(target);
     fs::set_permissions(&layout.executable, fs::Permissions::from_mode(0o755))?;
     create_group(layout)?;
     validate_service(layout)
@@ -164,6 +217,7 @@ pub(super) fn validate_service(layout: &HostLayout) -> io::Result<()> {
     if !elevated()? {
         return Err(denied());
     }
+    protect_creation();
     let install = layout.executable.parent().ok_or_else(denied)?;
     verify_parent(&layout.state)?;
     verify_parent(install)?;

@@ -4,6 +4,7 @@ from product import spec
 import os
 import time
 import uuid
+from itertools import combinations
 from collections import Counter
 from pathlib import Path
 from service import eventually
@@ -22,15 +23,47 @@ def compare(stage, base, current):
             old, new = set(old or []), set(new or [])
             detail = f"filters {len(old)} to {len(new)}, added {len(new-old)}, removed {len(old-new)}"
             prior, latest = base.wfp.get(key, {}), current.wfp.get(key, {})
-            for index, label in enumerate(("content", "withoutEffectiveWeight")):
-                old_content = Counter(value[0][index] for value in prior.values())
-                new_content = Counter(value[0][index] for value in latest.values())
-                lost, gained = old_content-new_content, new_content-old_content
-                detail += f" {label} removed={lost.total()} added={gained.total()}"
-                if index == 1:
-                    for values, counts, verb in [(prior,lost,"lost"),(latest,gained,"gained")]:
-                        summaries = {str(summary) for hashes,summary in values.values() if hashes[index] in counts}
-                        print(f"{group} {stage} {key} {verb} templates {sorted(summaries)[:12]}",flush=True)
+            left, right = base.fields.get(key,{}), current.fields.get(key,{})
+            labels = set().union(*(r.keys() for r in [*left.values(), *right.values()]))
+            def tuples(source, fields):
+                names = sorted(fields)
+                return Counter(tuple(rule.get(f) for f in names) for rule in source.values())
+            changing = set()
+            for field in sorted(labels):
+                left_field, right_field = tuples(left,{field}), tuples(right,{field})
+                removed, added = (left_field-right_field).total(),(right_field-left_field).total()
+                if removed or added:
+                    changing.add(field)
+                    print(f"{group} {stage} {key} leaf {field}: -{removed}/+{added}",flush=True)
+            def residual(drop):
+                a,b=tuples(left,labels-set(drop)),tuples(right,labels-set(drop))
+                return (a-b).total(),(b-a).total()
+            print(f"{group} {stage} {key} omit all changed leaves {sorted(changing)} -> {residual(changing)}",flush=True)
+            volatile = {f for f in labels if f.split("/")[0] in ("rawContext","providerContextKey","reserved","providerData","effectiveWeight","weight","displayData")}
+            best = None
+            for n in range(min(4,len(volatile))+1):
+                for drop in combinations(sorted(volatile),n):
+                    lost,gained=residual(drop)
+                    score=(min(lost,gained),len(drop),lost+gained)
+                    if best is None or score<best[0]:
+                        best=(score,drop,(lost,gained))
+                    if min(lost,gained)==0:
+                        break
+                if best[0][0]==0:
+                    break
+            drop=best[1]
+            print(f"{group} {stage} {key} best metadata omission {drop} unmatched {best[2]}",flush=True)
+            if min(best[2])==0 and best[2]!=(0,0):
+                a,b=tuples(left,labels-set(drop)),tuples(right,labels-set(drop))
+                names=sorted(labels-set(drop))
+                for source,full,unmatched,verb in [(left,prior,a-b,"removed"),(right,latest,b-a,"added")]:
+                    templates=Counter()
+                    for fid,rule in source.items():
+                        fp=tuple(rule.get(f) for f in names)
+                        if unmatched[fp]:
+                            templates[str(full[fid][1])] += 1
+                            unmatched[fp]-=1
+                    print(f"{group} {stage} {key} {verb} policy templates {sorted(templates.items())}",flush=True)
         elif kind == "registry" and key.rsplit(chr(92), 1)[-1] in ("NameServer","Domain","EnableDHCP"):
             def safe(value):
                 if value is None:
@@ -58,7 +91,7 @@ try:
             instance = str(uuid.uuid4())
             service.apply(spec(), instance, str(uuid.uuid4()), str(service.ctl("status")["revision"]))
             service.ready(instance)
-        for seconds in (90, 240, 480):
+        for seconds in (90, 180):
             time.sleep(max(0, start+seconds-time.monotonic()))
             compare(f"t{seconds}", base, service.inventory())
         if group == "start":

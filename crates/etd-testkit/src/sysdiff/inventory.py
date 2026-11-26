@@ -46,6 +46,7 @@ class Inventory:
     rows: dict = field(default_factory=dict)
     descendants: dict = field(default_factory=dict)
     wfp: dict = field(default_factory=dict)
+    fields: dict = field(default_factory=dict)
 
     def put(self, kind, key, value):
         entry = (kind, str(key))
@@ -253,6 +254,15 @@ def windows(inv):
             summary = (item.findtext("layerKey"), item.findtext("action/type"),
                        tuple(c.text for c in item.findall("filterCondition/item/fieldKey")))
             inv.wfp.setdefault("wfp-group/" + "/".join(group), {})[key] = (hashes, summary)
+            fields = {}
+            for child in item:
+                if child.tag in ("filterKey","filterId"):
+                    continue
+                parts = list(child) if child.tag in ("displayData","providerData","action","weight","effectiveWeight") else []
+                for part in parts or [child]:
+                    field = child.tag + "/" + part.tag if parts else child.tag
+                    fields[field] = hashlib.sha256(repr(semantic(part)).encode()).digest()
+            inv.fields.setdefault("wfp-group/" + "/".join(group), {})[key] = fields
             label = item.findtext("displayData/name", "").strip()
             if ("51e7d001-7bc3-43b9-a795-7b80c196382f" in group
                     or "51e7d002-7bc3-43b9-a795-7b80c196382f" in group):

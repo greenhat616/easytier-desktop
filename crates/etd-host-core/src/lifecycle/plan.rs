@@ -34,6 +34,13 @@ pub(crate) enum PlanFailure {
 impl PlanFailure {
     pub(crate) fn message(&self) -> String {
         match self {
+            // The host's kernel selection names a version this store no
+            // longer has (removed, or no longer trusted after an upgrade).
+            PlanFailure::Store(StoreError::NotFound(CoreSelector {
+                version: Some(version),
+            })) => format!(
+                "selected kernel {version} is not in this host's trusted kernel store; select another kernel"
+            ),
             PlanFailure::Store(e) => e.to_string(),
             PlanFailure::Core(e) => e.to_string(),
             PlanFailure::Ledger(e) => e.to_string(),
@@ -395,4 +402,25 @@ pub(crate) fn merge_secret(mut new: NetworkSpec, stored: Option<&NetworkSpec>) -
     }
     new.network_secret_set = false;
     new
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_selected_kernel_missing_from_the_store_asks_for_another() {
+        let failure = PlanFailure::Store(StoreError::NotFound(CoreSelector {
+            version: Some("2.6.0".into()),
+        }));
+        assert_eq!(
+            failure.message(),
+            "selected kernel 2.6.0 is not in this host's trusted kernel store; select another kernel"
+        );
+        let detail = failure.detail(&InstanceId("instance".into()));
+        assert_eq!(detail.code(), ErrorCode::CoreUnavailable);
+        // Without a selection the store's own error stays.
+        let failure = PlanFailure::Store(StoreError::NotFound(CoreSelector { version: None }));
+        assert!(failure.message().starts_with("no kernel matching"));
+    }
 }

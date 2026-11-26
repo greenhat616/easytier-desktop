@@ -74,10 +74,49 @@ class Service:
         print(f"instance epoch={state.get('epoch')} state={state.get('state')}", flush=True)
         for row in self.effects():
             print(f"{row['kind']} {row['state']}: {row.get('last_error') or ''}", flush=True)
+        if os.name == "nt":
+            self.report_windows_state("instance observation")
+
+    def report_windows_state(self, stage):
+        import psutil
+        print(f"Windows {stage} at {time.time():.3f}", flush=True)
+        for name in ("easytier-desk-host", "wintun", "WinDivert"):
+            result = command("sc.exe", "queryex", name, check=False)
+            fields = [line.strip() for line in result.stdout.splitlines()
+                      if re.match(r"\s*(STATE|PID|CHECKPOINT|WAIT_HINT)\s*:", line)]
+            print(f"SCM {name}: exit={result.returncode} {' '.join(fields)}", flush=True)
+        psutil.process_iter.cache_clear()
+        cores = [p.info["pid"] for p in psutil.process_iter(["pid", "exe"])
+                 if p.info["exe"] and Path(p.info["exe"]).name.lower() == self.core.name.lower()
+                 and self.core.is_file() and self.core.samefile(p.info["exe"])]
+        print(f"installed kernel PIDs: {cores}", flush=True)
+        if (self.state / "ledger.sqlite3").is_file():
+            for row in self.effects():
+                if row["kind"] == "driver":
+                    print("driver ledger: " + json.dumps(row, sort_keys=True), flush=True)
+
+    def report_stop_logs(self, offsets):
+        lines = 0
+        for path in sorted(self.state.glob("host.log*")):
+            with path.open("rb") as host_log:
+                host_log.seek(offsets.get(path, 0))
+                for data in host_log:
+                    line = data.decode("utf-8", "replace").strip()
+                    if re.search(r"secret|password|token|private.key|authorization", line, re.I):
+                        continue
+                    if re.search(r"stop|shut|reclaim|driver|supervisor|WARN|ERROR", line, re.I):
+                        print(f"host after uninstall request: {line[:600]}", flush=True)
+                        lines += 1
+        print(f"host shutdown log entries: {lines}", flush=True)
 
     def uninstall(self):
         # SCM and the product reclaimer may still be servicing the outstanding
         # lifecycle request. Read the durable phase even on a subprocess timeout.
+        offsets = {}
+        if os.name == "nt":
+            self.report_windows_state("before uninstall STOP")
+            offsets = {p: p.stat().st_size for p in self.state.glob("host.log*")}
+        started = time.monotonic()
         try:
             result = command(self.installer, "uninstall", check=False,
                              timeout=240 if os.name == "nt" else 60)
@@ -86,6 +125,12 @@ class Service:
                 print(f"uninstall {label}: {(data or b'').decode('utf-8', 'replace').strip()}")
             self.report_uninstall_phase()
             raise
+        finally:
+            if os.name == "nt":
+                print(f"uninstall elapsed: {time.monotonic() - started:.1f}s; "
+                      "test command deadline: 240s", flush=True)
+                self.report_windows_state("after uninstall")
+                self.report_stop_logs(offsets)
         if result.returncode:
             print(f"uninstall exited {result.returncode}; stdout={result.stdout.strip()} "
                   f"stderr={result.stderr.strip()}")
@@ -195,9 +240,15 @@ class Service:
 
     def stop(self):
         if os.name == "nt":
-            self.call("sc.exe", "stop", "easytier-desk-host")
-            eventually("SCM stopped", lambda: output("sc.exe", "query", "easytier-desk-host"),
-                       lambda text: "STOPPED" in text)
+            self.report_windows_state("before explicit STOP")
+            offsets = {p: p.stat().st_size for p in self.state.glob("host.log*")}
+            try:
+                self.call("sc.exe", "stop", "easytier-desk-host")
+                eventually("SCM stopped", lambda: output("sc.exe", "query", "easytier-desk-host"),
+                           lambda text: "STOPPED" in text)
+            finally:
+                self.report_windows_state("after explicit STOP")
+                self.report_stop_logs(offsets)
         elif sys.platform == "darwin":
             self.call("launchctl", "bootout", "system/easytier-desk-host")
         else:

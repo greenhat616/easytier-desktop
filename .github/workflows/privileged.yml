@@ -30,6 +30,8 @@ jobs:
             suite: recovery
           - os: windows-latest
             suite: preflight
+          - os: windows-latest
+            suite: clean
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -77,7 +79,7 @@ jobs:
           @'
 
           [[profile.privileged.overrides]]
-          filter = 'test(=installed_kernel_and_host_crash_recovery)'
+          filter = 'test(=installed_kernel_and_host_crash_recovery) | test(=installed_network_uninstall_restores_machine)'
           slow-timeout = { period = "120s", terminate-after = 15 }
           '@ | Add-Content -LiteralPath .config/nextest.toml
       # Qualify the native probes independently of the packaged host.
@@ -170,6 +172,9 @@ jobs:
       - name: Pre-existing shared drivers (fresh administrator runner)
         if: matrix.suite == 'preflight'
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=preexisting_shared_drivers_are_conflicts)' --success-output immediate
+      - name: Complete install and uninstall (fresh administrator runner)
+        if: matrix.suite == 'clean'
+        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=installed_network_uninstall_restores_machine)' --success-output immediate
       - name: Installed service tests (root)
         if: runner.os != 'Windows'
         shell: bash

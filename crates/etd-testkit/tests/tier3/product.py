@@ -110,22 +110,28 @@ def inventory_case():
             print(f"{kind}: {count} native entries, {sum(key[0] == kind for key in keys)} stable fixtures")
 
 
-def recovery():
+def recovery_fixtures(service, instance, stack):
+    other_runtime = stack.enter_context(foreign_runtime(service, instance))
+    natives = {"linux": foreign_linux, "darwin": foreign.macos, "win32": foreign.windows}
+    keys = stack.enter_context(natives[sys.platform]())
+    foreign_image, process_key = stack.enter_context(foreign.idle_process())
+    keys.add(process_key)
+    def inventory():
+        snapshot = service.inventory([foreign_image], [other_runtime])
+        marker = other_runtime / instance / "1" / "marker"
+        if marker.is_file():
+            snapshot.put("runtime", marker, file_identity(marker))
+        return snapshot
+    return inventory, keys
+
+
+def recovery(with_fixtures=True):
     service = Service()
     instance = str(uuid.uuid4())
     request = str(uuid.uuid4())
-    with service.installed(), ExitStack() as stack:
-        other_runtime = stack.enter_context(foreign_runtime(service, instance))
-        natives = {"linux": foreign_linux, "darwin": foreign.macos, "win32": foreign.windows}
-        keys = stack.enter_context(natives[sys.platform]())
-        foreign_image, process_key = stack.enter_context(foreign.idle_process())
-        keys.add(process_key)
-        def inventory():
-            snapshot = service.inventory([foreign_image], [other_runtime])
-            marker = other_runtime / instance / "1" / "marker"
-            if marker.is_file():
-                snapshot.put("runtime", marker, file_identity(marker))
-            return snapshot
+    with service.installed(fixture_tunnel=with_fixtures and os.name == "nt"), ExitStack() as stack:
+        inventory, keys = (recovery_fixtures(service, instance, stack) if with_fixtures
+                           else (service.inventory, set()))
         baseline = inventory()
         differences = []
         generation_processes = set()
@@ -163,14 +169,16 @@ def recovery():
         first = service.ready(instance)
         print(f"installed kernel ready: {first['state']} epoch={first['epoch']}", flush=True)
         wait_for_firewall_readback(service, instance, first["epoch"])
-        before = inventory()
-        before = verify_generation(before, first)
-        assert_foreign(baseline, before, keys)
-        with desktop.connected("hold"):
-            assert desktop.read("logs") > 0
-        time.sleep(31)
-        assert service.ready(instance)["epoch"] == first["epoch"], "client exit restarted service core"
-        for image in (service.core, service.host):
+        after = verify_generation(inventory(), first)
+        assert_foreign(baseline, after, keys)
+        crash_targets = ()
+        if with_fixtures:
+            with desktop.connected("hold"):
+                assert desktop.read("logs") > 0
+            time.sleep(31)
+            assert service.ready(instance)["epoch"] == first["epoch"], "client exit restarted service core"
+            crash_targets = (service.core, service.host)
+        for image in crash_targets:
             old_epoch = first["epoch"]
             old_dir = service.runtime / instance / str(old_epoch)
             old_pid = service.crash_installed(image)
@@ -381,5 +389,6 @@ def magic_dns():
 
 if __name__ == "__main__":
     require_runner()
-    {"recovery": recovery, "magic_dns": magic_dns, "inventory": inventory_case,
+    {"recovery": recovery, "clean_install": lambda: recovery(with_fixtures=False),
+     "magic_dns": magic_dns, "inventory": inventory_case,
      "driver_conflict": driver_conflict, "program_rule_conflict": program_rule_conflict}[sys.argv[1]]()

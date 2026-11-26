@@ -108,6 +108,7 @@ class Service:
         self.core = self.cores / os.environ["ETD_G2_SHA"] / ("easytier-core" + ext)
         self.runtime = self.state / "run"
         self.retained_drivers = {}
+        self.purged_drivers = False
         self.preexisting_drivers = {}
         self.recorded_driver_images = set()
         self.adapter_indices = {}
@@ -248,10 +249,12 @@ class Service:
                 eventually("uninstall journal closed",
                            lambda: self.call(self.installer, "uninstall", "--status"),
                            lambda status: status.startswith("No maintenance journal:"))
-                if self.retained_drivers:
+                if self.retained_drivers and (not self.purged_drivers or "left in place:" in result.stdout):
                     assert_driver_notice(result.stdout, self.retained_drivers)
                 if self.preexisting_drivers:
                     assert_driver_notice(result.stdout, self.preexisting_drivers, recorded=self.recorded_driver_images)
+                if (self.state / "ledger.sqlite3").exists():
+                    assert all(r["state"] == "reclaimed" for r in self.effects()), "open ledger effects after uninstall"
             after = self.inventory()
             delta = before.delta(after) - managed_service_changes(before, after)
             delta -= runner_noise(before, after) | tun_created(before, after)

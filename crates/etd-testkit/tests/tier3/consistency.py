@@ -111,9 +111,9 @@ def system_policy_changes(base, live, phase, retained_app=None):
     return allowed
 
 
-def check_generation(base, live, records, instance, view, adapter_indices):
+def check_generation(base, live, records, instance, view, adapter_indices, worker_keys):
     try:
-        return compare_generation(base, live, records, instance, view, adapter_indices)
+        return compare_generation(base, live, records, instance, view, adapter_indices, worker_keys)
     except FirewallReadbackPending:
         raise
     except (AssertionError, KeyError, OSError):
@@ -141,9 +141,9 @@ def check_generation(base, live, records, instance, view, adapter_indices):
         raise
 
 
-def compare_generation(base, live, records, instance, view, adapter_indices):
+def compare_generation(base, live, records, instance, view, adapter_indices, worker_keys):
     changed = base.delta(live)
-    expected = set()
+    expected = set(worker_keys)
     active = [r for r in records if r["state"] != "reclaimed"
               and (r["scope"] == scope(instance, view["epoch"]) or "instance" not in r["scope"])]
     kinds = {r["kind"] for r in active}

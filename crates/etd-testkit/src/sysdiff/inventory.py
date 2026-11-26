@@ -2,8 +2,10 @@
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+import base64
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import socket
@@ -52,6 +54,7 @@ class Inventory:
     rows: dict = field(default_factory=dict)
     descendants: dict = field(default_factory=dict)
     parents: dict = field(default_factory=dict)
+    management_workers: set = field(default_factory=set)
     policy_filters: dict = field(default_factory=dict)
     application_filters: dict = field(default_factory=dict)
 
@@ -88,7 +91,25 @@ def processes(inv, paths):
     import psutil
     roots = [path.resolve() for path in paths]
     psutil.process_iter.cache_clear()
-    table = {p.pid: p.info for p in psutil.process_iter(["pid", "ppid", "exe", "create_time"])}
+    table = {}
+    if sys.platform == "win32" and os.environ.get("RUNNER_TEMP"):
+        powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        script = Path(os.environ["RUNNER_TEMP"]) / "g2-release/crates/etd-sysfx-os/src/windows/system.ps1"
+        encoded = base64.b64encode(script.read_bytes().decode("utf-8").encode("utf-16-le")).decode() if script.is_file() else None
+    else:
+        encoded = None
+    for proc in psutil.process_iter(["pid", "ppid", "exe", "create_time"]):
+        row = proc.info
+        if encoded and row["exe"] and Path(row["exe"]) == powershell:
+            try:
+                argv = proc.cmdline()
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                argv = []
+            if (argv and Path(argv[0]) == powershell
+                    and argv[1:] == ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded]
+                    and proc.is_running()):
+                inv.management_workers.add((proc.pid, row["create_time"]))
+        table[proc.pid] = row
     children = defaultdict(list)
     for pid, row in table.items():
         if row["ppid"] != pid:

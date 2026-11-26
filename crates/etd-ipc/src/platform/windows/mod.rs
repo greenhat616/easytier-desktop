@@ -60,7 +60,7 @@ fn client_mask() -> u32 {
     (FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE).0
 }
 
-fn descriptor(policy: &ListenerPolicy) -> io::Result<identity::Allocation> {
+fn descriptor(form: HostForm, policy: &ListenerPolicy) -> io::Result<identity::Allocation> {
     if policy.unix_group.is_some() {
         return Err(invalid("Unix group on a Windows pipe"));
     }
@@ -71,8 +71,15 @@ fn descriptor(policy: &ListenerPolicy) -> io::Result<identity::Allocation> {
     // host account needs that bit and WRITE_DAC for live policy updates.
     let host_mask = 0x0012019f | 0x00040000; // FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC
     let rw = client_mask();
-    let mut acl =
-        format!("O:{host}D:P(A;;0x{host_mask:x};;;{host})(A;;0x{rw:x};;;SY)(A;;0x{rw:x};;;BA)");
+    let mut acl = format!("O:{host}D:P(A;;0x{host_mask:x};;;{host})");
+    match form {
+        HostForm::Service => acl.push_str(&format!("(A;;0x{rw:x};;;SY)(A;;0x{rw:x};;;BA)")),
+        HostForm::User => {
+            if !policy.allow_users.is_empty() || !policy.allow_groups.is_empty() {
+                return Err(invalid("user host pipe policy must be owner-only"));
+            }
+        }
+    }
     let mut add = |sid: &str| -> io::Result<()> {
         // Only numeric SIDs may be interpolated into SDDL. The OS parser
         // validates their structure and bounds.
@@ -118,13 +125,13 @@ fn duplicate(pipe: &NamedPipeServer) -> io::Result<OwnedHandle> {
 }
 
 #[derive(Clone)]
-pub struct PolicyHandle(Weak<Mutex<OwnedHandle>>);
+pub struct PolicyHandle(Weak<Mutex<OwnedHandle>>, HostForm);
 impl PolicyHandle {
     /// Replace the DACL of the live pipe. Existing connections retain their
     /// handles; per-RPC role checks observe the host's current allow list.
     pub fn update(&self, policy: &ListenerPolicy) -> io::Result<()> {
         let state = self.0.upgrade().ok_or(io::ErrorKind::NotConnected)?;
-        let sd = descriptor(policy)?;
+        let sd = descriptor(self.1, policy)?;
         let handle = state
             .lock()
             .map_err(|_| io::Error::other("pipe policy lock poisoned"))?;
@@ -173,6 +180,7 @@ impl PendingAccounts {
 }
 
 pub struct LocalListener {
+    form: HostForm,
     name: String,
     pipe: NamedPipeServer,
     policy: Arc<Mutex<OwnedHandle>>,
@@ -182,12 +190,12 @@ pub struct LocalListener {
 
 impl LocalListener {
     pub(super) fn bind_native(
-        _form: HostForm,
+        form: HostForm,
         endpoint: &Endpoint,
         policy: &ListenerPolicy,
     ) -> io::Result<Self> {
         let name = pipe_name(endpoint)?;
-        let sd = descriptor(policy)?;
+        let sd = descriptor(form, policy)?;
         let mut attrs = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: sd.0.0,
@@ -200,6 +208,7 @@ impl LocalListener {
         };
         let policy = Arc::new(Mutex::new(duplicate(&pipe)?));
         Ok(Self {
+            form,
             name: name.to_owned(),
             pipe,
             policy,
@@ -208,7 +217,7 @@ impl LocalListener {
         })
     }
     pub fn policy_handle(&self) -> PolicyHandle {
-        PolicyHandle(Arc::downgrade(&self.policy))
+        PolicyHandle(Arc::downgrade(&self.policy), self.form)
     }
 
     fn start_authentication(&mut self) -> io::Result<()> {

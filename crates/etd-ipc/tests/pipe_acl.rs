@@ -67,8 +67,8 @@ async fn first_instance_local_only_and_live_kernel_dacl() {
         allow_users: vec![OsUserId::WindowsSid(listed.into())],
         ..Default::default()
     };
-    let listener = LocalListener::bind(etd_ipc::HostForm::User, &f.ep, &policy).unwrap();
-    assert!(LocalListener::bind(etd_ipc::HostForm::User, &f.ep, &policy).is_err());
+    let listener = LocalListener::bind(etd_ipc::HostForm::Service, &f.ep, &policy).unwrap();
+    assert!(LocalListener::bind(etd_ipc::HostForm::Service, &f.ep, &policy).is_err());
     let remote = local
         .to_str()
         .unwrap()
@@ -102,6 +102,33 @@ async fn first_instance_local_only_and_live_kernel_dacl() {
         .update(&ListenerPolicy::default())
         .unwrap();
     expected.remove(listed);
+    assert_eq!(entries(&file), expected);
+}
+
+#[tokio::test]
+async fn user_form_dacl_is_owner_only_and_cannot_be_widened() {
+    let f = Fixture::new();
+    let listener =
+        LocalListener::bind(etd_ipc::HostForm::User, &f.ep, &ListenerPolicy::default()).unwrap();
+    let file = OpenOptions::new()
+        .access_mode(READ_CONTROL.0)
+        .read(true)
+        .open(endpoint_arg(&f.ep))
+        .unwrap();
+    let OsUserId::WindowsSid(owner) = current_user().unwrap() else {
+        unreachable!()
+    };
+    let expected = BTreeMap::from([(owner, 0x0016019f)]);
+    assert_eq!(entries(&file), expected);
+    assert!(
+        listener
+            .policy_handle()
+            .update(&ListenerPolicy {
+                allow_groups: vec![etd_ipc::OsGroupId::WindowsSid("S-1-5-32-544".into())],
+                ..Default::default()
+            })
+            .is_err()
+    );
     assert_eq!(entries(&file), expected);
 }
 
@@ -146,7 +173,12 @@ async fn second_account_denied_allowed_and_revoked_on_real_pipe() {
         return;
     }
     let f = Fixture::new();
-    let mut listener = f.listener();
+    let mut listener = LocalListener::bind(
+        etd_ipc::HostForm::Service,
+        &f.ep,
+        &ListenerPolicy::default(),
+    )
+    .unwrap();
     let (token, second_user) = windows_account::logon();
     let open = || {
         unsafe {
@@ -175,11 +207,21 @@ async fn second_account_denied_allowed_and_revoked_on_real_pipe() {
         .unwrap();
     let mut allowed = open().unwrap();
     allowed.write_all(&[1]).unwrap();
-    let (_stream, peer) = listener.accept().await.unwrap();
+    let (stream, peer) = listener.accept().await.unwrap();
     assert_eq!(peer.user, second_user);
     policy.update(&ListenerPolicy::default()).unwrap();
     assert_eq!(
         open().unwrap_err().kind(),
         std::io::ErrorKind::PermissionDenied
     );
+    drop(stream);
+    drop(allowed);
+    drop(listener);
+    let user =
+        LocalListener::bind(etd_ipc::HostForm::User, &f.ep, &ListenerPolicy::default()).unwrap();
+    assert_eq!(
+        open().unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    drop(user);
 }

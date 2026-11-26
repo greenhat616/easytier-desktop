@@ -28,13 +28,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let result = TcpStream::connect_timeout(&endpoint, Duration::from_secs(3));
         let status = match result {
             Ok(mut stream) => {
-                stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-                let mut bytes = vec![0; token.len()];
-                stream.read_exact(&mut bytes)?;
-                if bytes != token {
-                    return Err("wrong listener token".into());
+                // Darwin nonblocking connect can report readiness after a PF
+                // reject with no connected peer (getpeername returns ENOTCONN).
+                // A successful getpeername followed by missing challenge is
+                // deliberately NOT a denied connection.
+                match stream.peer_addr() {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotConnected => {
+                        println!("NO_CONNECTED_PEER {endpoint}: {e:?}");
+                        "denied"
+                    }
+                    Err(e) => return Err(e.into()),
+                    Ok(peer) => {
+                        assert_eq!(peer, endpoint);
+                        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+                        let mut bytes = vec![0; token.len()];
+                        stream.read_exact(&mut bytes)?;
+                        if bytes != token {
+                            return Err("wrong listener token".into());
+                        }
+                        "allowed"
+                    }
                 }
-                "allowed"
             }
             Err(e) => {
                 println!("CONNECT_ERROR {endpoint}: {e:?}");

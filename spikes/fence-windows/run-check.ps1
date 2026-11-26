@@ -31,7 +31,7 @@ function Wait-File($path) {
 }
 function Launch($suffix, $exe, $arguments, $identity) {
     $name = "etd-s1-$tag-$suffix"
-    $action = New-ScheduledTaskAction -Execute $exe -Argument $arguments
+    $action = New-ScheduledTaskAction -Execute $exe -Argument $arguments -WorkingDirectory $folder
     if ($identity -eq 'SYSTEM') {
         $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
         Register-ScheduledTask -TaskName $name -Action $action -Principal $principal | Out-Null
@@ -56,7 +56,16 @@ function Run-Probe($suffix, $endpoint, $expectation, $identity) {
     $marker = "$results/$suffix.done"
     $log = "$results/$suffix.log"
     $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}/probe.ps1" {1} {2} {3} "{4}" "{5}"' -f $folder,$endpoint,$token,$expectation,$log,$marker
-    Launch $suffix "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" $arguments $identity
+    $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if ($identity -eq 'SYSTEM') {
+        Launch $suffix $powershell $arguments SYSTEM
+    } else {
+        # CreateProcessWithLogonW, rather than depending on batch-logon rights.
+        $credential = [pscredential]::new($account,(ConvertTo-SecureString $password -AsPlainText -Force))
+        $probe = Start-Process -FilePath $powershell -ArgumentList $arguments -Credential $credential -WorkingDirectory $folder -WindowStyle Hidden -PassThru
+        if (!$probe.WaitForExit(20000)) { $probe.Kill(); throw "Second-user process timed out" }
+        if ($probe.ExitCode -ne 0) { throw "Second-user PowerShell exited $($probe.ExitCode)" }
+    }
     Wait-File $marker
     $content = Get-Content -LiteralPath $log -Raw
     Write-Host "=== $identity $endpoint $expectation ==="
@@ -87,6 +96,7 @@ try {
     New-LocalUser -Name $user -Password (ConvertTo-SecureString $password -AsPlainText -Force) -Description 'Disposable S1 probe' | Out-Null
     $created = $true
     Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $account
+    Start-Service seclogon
     & icacls $folder /inheritance:r /grant '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)' | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'fixture ownership ACL failed' }
     & icacls $folder /grant "${account}:(OI)(CI)(RX)" | Out-Null

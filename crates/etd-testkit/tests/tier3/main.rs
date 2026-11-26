@@ -28,6 +28,12 @@ fn installed_kernel_and_host_crash_recovery() {
     run_case("recovery");
 }
 
+#[test]
+#[ignore = "plants native fixtures only on a disposable hosted runner"]
+fn independent_inventory_detects_native_foreign_objects() {
+    run_case("inventory");
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "uses the installed service and native /etc/resolver on hosted macOS"]

@@ -10,17 +10,22 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
+from xml.etree import ElementTree
 
 
 CLASSES = ("interface", "route", "resolver", "firewall", "registry", "service", "runtime", "process")
 
 
 def command(*args, check=True, **kwargs):
-    return subprocess.run(
-        [str(arg) for arg in args], check=check, capture_output=True, text=True,
+    result = subprocess.run(
+        [str(arg) for arg in args], check=False, capture_output=True, text=True,
         encoding="utf-8", errors="replace", timeout=60,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), **kwargs,
     )
+    if check and result.returncode:
+        raise RuntimeError(f"{Path(args[0]).name} failed ({result.returncode}): {result.stderr.strip()}")
+    return result
 
 
 def output(*args):
@@ -77,9 +82,15 @@ def processes(inv, text, paths):
 
 def linux(inv, paths):
     links = json.loads(output("ip", "-j", "-d", "link", "show"))
+    addresses = {r["ifname"]: sorted((a["local"], a["prefixlen"]) for a in r["addr_info"])
+                 for r in json.loads(output("ip", "-j", "address", "show"))}
     for link in links:
-        inv.put("interface", link["ifname"],
-                [link.get(k) for k in ("ifindex", "link_type", "mtu", "address", "linkinfo")])
+        name = link["ifname"]
+        inv.put("interface", name, {
+            "index": link["ifindex"], "type": link.get("link_type"),
+            "mtu": link["mtu"], "mac": link.get("address"), "addresses": addresses[name],
+            "kind": link.get("linkinfo", {}).get("info_kind"),
+        })
     routes = defaultdict(list)
     for family in ("-4", "-6"):
         for row in json.loads(output("ip", "-j", family, "route", "show", "table", "all")):
@@ -118,8 +129,16 @@ def linux(inv, paths):
 
 
 def darwin(inv, paths):
+    addresses = defaultdict(list)
+    name = None
+    for line in output("/sbin/ifconfig", "-a").splitlines():
+        if line and not line[0].isspace():
+            name = line.split(":", 1)[0]
+        elif line.strip().startswith(("inet ", "inet6 ")):
+            fields = line.split()
+            addresses[name].append(fields[1])
     for index, name in socket.if_nameindex():
-        inv.put("interface", name, index)
+        inv.put("interface", name, {"index": index, "addresses": sorted(addresses[name])})
     routes = defaultdict(list)
     for family in ("inet", "inet6"):
         headers = None
@@ -157,6 +176,15 @@ def windows(inv, paths):
     for kind, entries in data.items():
         for key, value in entries.items():
             inv.put(kind, key, value)
+    with tempfile.TemporaryDirectory() as directory:
+        state = Path(directory) / "wfp.xml"
+        command("netsh.exe", "wfp", "show", "state", f"file={state}")
+        tree = ElementTree.parse(state)
+        for item in tree.findall(".//item[filterKey]"):
+            label = item.findtext("displayData/name", "")
+            if label.startswith("etd-fence:"):
+                inv.put("firewall", "wfp/" + item.findtext("filterKey"),
+                        [label, ElementTree.tostring(item, encoding="unicode")])
 
 
 def capture(run_dir, images):

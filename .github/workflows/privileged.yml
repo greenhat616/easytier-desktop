@@ -131,7 +131,7 @@ jobs:
         run: cargo nextest list --locked --profile privileged --run-ignored only -p etd-testkit --test tier3
       - name: Installed service tests (administrator)
         if: runner.os == 'Windows' && matrix.suite == 'recovery'
-        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=installed_kernel_and_host_crash_recovery)' --success-output immediate
+        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=installed_kernel_and_host_crash_recovery) | test(=independent_inventory_detects_native_foreign_objects)' --no-fail-fast --success-output immediate
       - name: Pre-existing shared drivers (fresh administrator runner)
         if: matrix.suite == 'preflight'
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=preexisting_shared_drivers_are_conflicts)' --success-output immediate

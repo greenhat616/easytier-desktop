@@ -86,6 +86,17 @@ def windows():
         def ps(script):
             return output("powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
                           "$ErrorActionPreference='Stop'; " + script).strip()
+        nic = "etd-" + tag[:8]
+        command("netsh.exe", "interface", "ipv6", "add", "v6v4tunnel",
+                "interface=" + nic, "localaddress=127.0.0.1", "remoteaddress=127.0.0.2")
+        stack.callback(command, "netsh.exe", "interface", "ipv6", "delete", "interface", nic)
+        # Use the loopback link, never the runner's management interface.
+        index = int(ps("(Get-NetIPAddress -IPAddress 127.0.0.1).InterfaceIndex"))
+        alias = ps(f"(Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex {index}).InterfaceAlias")
+        prefix = "198.51.100.241/32"
+        route = f"-InterfaceIndex {index} -DestinationPrefix '{prefix}' -NextHop 0.0.0.0 -PolicyStore ActiveStore"
+        ps(f"New-NetRoute {route} | Out-Null")
+        stack.callback(ps, f"Remove-NetRoute {route} -Confirm:$false")
         ps(f"New-NetFirewallRule -Name '{name}' -DisplayName 'EasyTier {name}' "
            "-Group EasyTier -Direction Inbound -Action Block -Enabled False | Out-Null")
         stack.callback(ps, f"Remove-NetFirewallRule -Name '{name}'")
@@ -93,5 +104,5 @@ def windows():
                   "-NameServers '192.0.2.53' -PassThru | Select-Object -ExpandProperty Name")
         assert uuid.UUID(rule.strip("{}"))
         stack.callback(ps, f"Remove-DnsClientNrptRule -Name '{rule}' -Force")
-        yield {("service", name), ("registry", "HKLM\\" + reg + "\\Foreign"),
+        yield {("service", name), ("interface", nic), ("route", alias), ("registry", "HKLM\\" + reg + "\\Foreign"),
                ("resolver", rule), ("firewall", "policy/" + name)}

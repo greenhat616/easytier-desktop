@@ -6,8 +6,23 @@ $inventory = @{}
 foreach ($class in 'interface','route','resolver','firewall','registry','service','process') {
     $inventory[$class] = @{}
 }
+$addresses = @{}
+Get-NetIPAddress -PolicyStore ActiveStore | Group-Object InterfaceIndex | ForEach-Object {
+    $addresses[[int]$_.Name] = @($_.Group | ForEach-Object { "$($_.IPAddress)/$($_.PrefixLength)" } | Sort-Object)
+}
 foreach ($nic in Get-NetAdapter -IncludeHidden) {
-    $inventory.interface[$nic.Name] = @($nic.ifIndex, $nic.InterfaceGuid, $nic.PnPDeviceID)
+    $inventory.interface[$nic.Name] = @{
+        index=$nic.ifIndex; guid=$nic.InterfaceGuid; device=$nic.PnPDeviceID
+        addresses=$addresses[[int]$nic.ifIndex]
+    }
+}
+# IPv6 tunnel and software loopback interfaces may have no NetAdapter row.
+foreach ($nic in Get-NetIPInterface) {
+    if (!$inventory.interface.ContainsKey($nic.InterfaceAlias)) {
+        $inventory.interface[$nic.InterfaceAlias] = @{
+            index=$nic.InterfaceIndex; addresses=$addresses[[int]$nic.InterfaceIndex]
+        }
+    }
 }
 Get-NetRoute -PolicyStore ActiveStore | Group-Object InterfaceAlias | ForEach-Object {
     $inventory.route[$_.Name] = @($_.Group | ForEach-Object {
@@ -26,20 +41,6 @@ foreach ($rule in Get-NetFirewallRule -PolicyStore ActiveStore | Where-Object {
         $rule.DisplayName, $rule.Group, [string]$rule.Direction, [string]$rule.Action,
         [string]$rule.Enabled, $app.Program, [string]$ports.Protocol, $ports.LocalPort
     )
-}
-$wfp = Join-Path $env:RUNNER_TEMP ("g2-wfp-{0}.xml" -f [guid]::NewGuid())
-try {
-    $null = & netsh.exe wfp show filters "file=$wfp" verbose=on
-    if ($LASTEXITCODE -ne 0) { throw "WFP inventory failed ($LASTEXITCODE)" }
-    [xml]$xml = Get-Content -Raw -LiteralPath $wfp
-    foreach ($filter in $xml.SelectNodes('//*[filterKey and displayData]')) {
-        $label = [string]$filter.displayData.name
-        if ($label.StartsWith('etd-fence:')) {
-            $inventory.firewall["wfp/$($filter.filterKey)"] = @($label, $filter.OuterXml)
-        }
-    }
-} finally {
-    if (Test-Path -LiteralPath $wfp) { Remove-Item -LiteralPath $wfp }
 }
 $system = 'HKLM:\SYSTEM\CurrentControlSet\Services'
 $network = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles'

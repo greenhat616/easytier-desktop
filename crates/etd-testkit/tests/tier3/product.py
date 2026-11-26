@@ -11,7 +11,7 @@ import uuid
 
 from service import Desktop, Service, command, eventually, require_runner
 from consistency import check_closed, check_generation, installed_image
-from inventory import file_identity
+from inventory import capture, file_identity
 import foreign
 
 
@@ -64,6 +64,23 @@ def assert_foreign(base, other, keys):
     for key in keys:
         assert key in base.rows, f"foreign fixture was never observed: {key}"
         assert other.rows.get(key) == base.rows[key], f"foreign fixture changed: {key}"
+
+
+def inventory_case():
+    with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+        root = Path(directory)
+        before = capture(root, [])
+        epoch = root / "etd-g2-foreign" / "42"
+        epoch.mkdir(parents=True)
+        natives = {"linux": foreign_linux, "darwin": foreign.macos, "win32": foreign.windows}
+        keys = stack.enter_context(natives[sys.platform]())
+        image, process_key = stack.enter_context(foreign.idle_process())
+        keys.update({("runtime", str(epoch)), process_key})
+        observed = capture(root, [image])
+        assert keys <= before.delta(observed), f"fixture invisible to inventory: {keys - before.delta(observed)}"
+        assert_foreign(observed, capture(root, [image]), keys)
+        for kind, count in observed.counts().items():
+            print(f"{kind}: {count} native entries, {sum(key[0] == kind for key in keys)} stable fixtures")
 
 
 def recovery():
@@ -212,4 +229,5 @@ def magic_dns():
 
 if __name__ == "__main__":
     require_runner()
-    {"recovery": recovery, "magic_dns": magic_dns, "driver_conflict": driver_conflict}[sys.argv[1]]()
+    {"recovery": recovery, "magic_dns": magic_dns, "inventory": inventory_case,
+     "driver_conflict": driver_conflict}[sys.argv[1]]()

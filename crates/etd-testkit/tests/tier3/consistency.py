@@ -1,8 +1,7 @@
 """Compare persisted launch intents with native observations, in both directions."""
 
 from pathlib import Path
-import os
-import re
+import stat
 
 
 def scope(instance, epoch):
@@ -89,13 +88,14 @@ def check_generation(base, live, records, instance, view):
     # Match the precise object and transition, never a registry subtree.
     exempt = set()
     tun = ("interface", "/dev/net/tun")
-    if tun not in base.rows and tun in live.rows:
+    if tun not in base.rows and tun in live.rows and stat.S_ISCHR(live.rows[tun][0]):
         exempt.add(tun)
     for kind, path in expected:
         if kind == "registry" and path.endswith("\\ProfileName"):
             category = ("registry", path.removesuffix("ProfileName") + "Category")
             if live.rows.get(category) == ["DWord", 1]:
                 exempt.add(category)
+    assert expected <= changed, f"predicted effects already present at baseline: {sorted(expected - changed)}"
     unexpected = changed - expected - exempt
     assert not unexpected, f"unpredicted native changes: {sorted(unexpected)}"
     for kind in sorted({k[0] for k in live.rows}):

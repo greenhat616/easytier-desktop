@@ -1,0 +1,108 @@
+name: Privileged product regression
+on:
+  schedule:
+    - cron: '27 19 * * *'
+  workflow_dispatch:
+  push:
+    branches: [wbs/G2-privileged]
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'Cargo.*'
+      - '.config/**'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/privileged.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  installed-product:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_BUILD_JOBS: '4'
+      ETD_G2_CI: '1'
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: EasyTier/EasyTier
+          ref: c97f36b8d40f3bde7a95cc9ec99fe95fe35a6ff0
+          path: upstream
+          persist-credentials: false
+      - name: Install Linux libraries and network inspection tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev libssl-dev nftables iproute2
+          sudo systemctl start systemd-resolved
+      - name: Install pinned protoc
+        shell: pwsh
+        run: ./.github/scripts/setup-protoc.ps1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install psutil==7.0.0
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          workspaces: |
+            .
+            upstream
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.152
+      - name: Build pinned upstream source
+        working-directory: upstream
+        run: cargo build --locked -p easytier --bin easytier-core
+      # Release packaging input: embed the digest in the host at build time,
+      # and ship the *same bytes* beside the installer in cores/<version>/.
+      # Generate the table in a temporary copy of the checked-out product.
+      - name: Package host and verified kernel
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $stage = Join-Path $env:RUNNER_TEMP 'g2-release'
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          $archive = Join-Path $env:RUNNER_TEMP 'g2-source.tar'
+          git archive --format=tar --output=$archive HEAD
+          tar -xf $archive -C $stage
+          $ext = if ($IsWindows) { '.exe' } else { '' }
+          $core = (Resolve-Path "upstream/target/debug/easytier-core$ext").Path
+          $versionLine = & $core --version
+          if ($versionLine -notmatch '^easytier-core (2\.7\.1)-.*c97f36b8(?:-|$)') {
+            throw "Unexpected pinned core version: $versionLine"
+          }
+          $version = $Matches[1]
+          $triple = ((rustc -vV | Select-String '^host: (\S+)$').Matches.Groups[1]).Value
+          if (!$triple) { throw 'Missing Rust host triple' }
+          $digest = (Get-FileHash -LiteralPath $core -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$triple $version $digest" | Set-Content -Encoding ascii "$stage/crates/etd-host/cores.lock"
+          $target = Join-Path $env:GITHUB_WORKSPACE 'target'
+          cargo build --manifest-path "$stage/Cargo.toml" --target-dir "$target" --locked -p etd-host -p etd-ctl
+          $bundle = New-Item -ItemType Directory "$target/debug/cores/$version" -Force
+          Copy-Item -LiteralPath $core -Destination $bundle.FullName
+          if (!$IsWindows) { chmod +x "$bundle/easytier-core" }
+          "ETD_G2_BIN=$target/debug" >> $env:GITHUB_ENV
+          "ETD_G2_SHA=$digest" >> $env:GITHUB_ENV
+          "ETD_G2_PYTHON=$((Get-Command python -CommandType Application | Select-Object -First 1).Source)" >> $env:GITHUB_ENV
+      - name: Compile runner as the build user
+        run: cargo nextest list --locked --profile privileged --run-ignored only -p etd-testkit --test tier3
+      - name: Installed service tests (administrator)
+        if: runner.os == 'Windows'
+        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 --no-fail-fast --success-output immediate
+      - name: Installed service tests (root)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          sudo -E env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "$(command -v cargo)" nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 --no-fail-fast --success-output immediate

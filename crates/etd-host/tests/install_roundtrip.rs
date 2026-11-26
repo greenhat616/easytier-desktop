@@ -847,6 +847,12 @@ async fn upgrade_rolls_back_when_the_new_host_is_not_ready() {
         text(&upgraded)
     );
     println!("{}", String::from_utf8_lossy(&upgraded.stderr).trim());
+    // The new host never opened the ledger: no migration warning.
+    assert!(
+        !String::from_utf8_lossy(&upgraded.stderr).contains("migrated"),
+        "{}",
+        text(&upgraded)
+    );
     assert!(
         image_after == service.original,
         "the previous image was not restored"

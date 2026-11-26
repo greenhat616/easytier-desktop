@@ -60,6 +60,7 @@ class Inventory:
     management_workers: set = field(default_factory=set)
     registry_values: dict = field(default_factory=dict)
     profile_connections: list = field(default_factory=list)
+    signature_profiles: dict = field(default_factory=dict)
     captured_at: float = field(default_factory=time.time)
     policy_filters: dict = field(default_factory=dict)
     quarantine_fields: dict = field(default_factory=dict)
@@ -385,18 +386,20 @@ def windows_registry(inv):
     import ctypes
     from ctypes import wintypes
     import winreg
+    from uuid import UUID
     query = ctypes.WinDLL("advapi32").RegQueryValueExW
     query.argtypes = [wintypes.HKEY, wintypes.LPCWSTR, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD),
                       ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
     query.restype = wintypes.LONG
     services = r"SYSTEM\CurrentControlSet\Services"
-    product = r"SOFTWARE\EasyTierDesk"
-    trees = [r"SOFTWARE\EasyTier", r"SOFTWARE\EasyTierDesk",
-             r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles",
+    network_list = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList"
+    signatures = network_list + r"\Signatures"
+    key_trees = (r"SOFTWARE\EasyTier", r"SOFTWARE\EasyTierDesk", signatures)
+    trees = [*key_trees, network_list + r"\Profiles",
              *(services + "\\" + stack + r"\Parameters\Interfaces" for stack in ("Tcpip", "Tcpip6", "NetBT"))]
 
-    def visit(key, path):
-        if path.casefold() == product.casefold() or path.casefold().startswith(product.casefold() + "\\"):
+    def visit(key, path, root):
+        if root in key_trees:
             inv.put("registry", "key/HKLM\\" + path, ["key"])
         children, values, _ = winreg.QueryInfoKey(key)
         for index in range(values):
@@ -428,6 +431,11 @@ def windows_registry(inv):
                     inv.registry_values[key_name] = ["String", ""]
                 elif name == "ProfileName":
                     inv.registry_values[key_name] = ["String", raw.decode("utf-16-le").removesuffix("\0")]
+                elif root == signatures and name.casefold() == "profileguid":
+                    try:
+                        inv.signature_profiles[key_name] = UUID(raw.decode("utf-16-le").removesuffix("\0"))
+                    except ValueError:
+                        pass  # Malformed references still have a typed fingerprint.
             elif name == "NameServerList" and kind.value == winreg.REG_MULTI_SZ and raw in (b"", b"\0\0", b"\0\0\0\0"):
                 inv.registry_values[key_name] = ["MultiString", []]
             elif name in ("DateCreated", "DateLastConnected") and kind.value == winreg.REG_BINARY and len(raw) == 16:
@@ -441,7 +449,7 @@ def windows_registry(inv):
         for index in range(children):
             name = winreg.EnumKey(key, index)
             with winreg.OpenKey(key, name) as child:
-                visit(child, path + "\\" + name)
+                visit(child, path + "\\" + name, root)
 
     for path in trees:
         try:
@@ -449,7 +457,7 @@ def windows_registry(inv):
         except FileNotFoundError:
             continue
         with key:
-            visit(key, path)
+            visit(key, path, path)
 
 
 def windows(inv):

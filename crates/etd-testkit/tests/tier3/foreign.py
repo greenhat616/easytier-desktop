@@ -86,11 +86,26 @@ def windows():
         command("sc.exe", "create", name, "start=", "disabled", "binPath=",
                 str(Path(os.environ["SystemRoot"]) / "System32" / "where.exe"))
         stack.callback(command, "sc.exe", "delete", name)
-        reg = r"SOFTWARE\EasyTier\G2-" + tag
+        root = r"SOFTWARE\EasyTier"
+        try:
+            winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, root).Close()
+        except FileNotFoundError:
+            winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, root).Close()
+
+            def remove_fixture_root():
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, root) as key:
+                    assert winreg.QueryInfoKey(key)[:2] == (0, 0), "fixture registry root gained unexpected contents"
+                winreg.DeleteKey(winreg.HKEY_LOCAL_MACHINE, root)
+
+            stack.callback(remove_fixture_root)
+        reg = root + "\\G2-" + tag
         key = winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, reg, access=winreg.KEY_WRITE)
+        stack.callback(winreg.DeleteKey, winreg.HKEY_LOCAL_MACHINE, reg)
         with key:
             winreg.SetValueEx(key, "Foreign", 0, winreg.REG_BINARY, tag.encode("ascii"))
-        stack.callback(winreg.DeleteKey, winreg.HKEY_LOCAL_MACHINE, reg)
+        empty = reg + "\\Empty"
+        winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, empty).Close()
+        stack.callback(winreg.DeleteKey, winreg.HKEY_LOCAL_MACHINE, empty)
         def ps(script):
             return output("powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
                           "$ErrorActionPreference='Stop'; " + script).strip()
@@ -124,4 +139,4 @@ def windows():
         assert uuid.UUID(rule.strip("{}"))
         stack.callback(ps, f"Remove-DnsClientNrptRule -Name '{rule}' -Force")
         yield {("service", name), ("interface", nic), ("route", alias), ("registry", "HKLM\\" + reg + "\\Foreign"),
-               ("resolver", rule), ("firewall", "policy/" + name)}
+               ("registry", "key/HKLM\\" + empty), ("resolver", rule), ("firewall", "policy/" + name)}

@@ -227,6 +227,9 @@ def recovery(with_fixtures=True):
         remaining -= runner_noise(baseline, stopped) | tun_created(baseline, stopped)
         remaining -= adapter_defaults(baseline, stopped, service.adapter_indices)
         if os.name == "nt":
+            for path, guid in stopped.signature_profiles.items():
+                if ("registry", path) in remaining:
+                    print(f"after stop: changed NLA signature {path} points to profile {guid}", flush=True)
             records = service.effects()
             program_rules = {("firewall", "policy/" + json.loads(r["observation"]["credential"]["value"])["id"])
                              for r in records if "core_binary" in r["scope"]

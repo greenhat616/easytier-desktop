@@ -75,6 +75,31 @@ impl Table {
         )
     }
 }
+/// Our generation table without its chain or both rules, in a listing
+/// that succeeded.
+#[derive(Debug)]
+struct Incomplete;
+impl std::fmt::Display for Incomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("incomplete fence table")
+    }
+}
+impl std::error::Error for Incomplete {}
+
+/// The fence as a successful listing shows it: an absent table, or one
+/// without its chain or rules, is positively missing
+/// ([`FenceError::Missing`]); a listing that failed stays an OS error.
+fn present(found: io::Result<Option<Table>>) -> Result<Table, FenceError> {
+    match found {
+        Ok(Some(table)) => Ok(table),
+        Ok(None) => Err(FenceError::Missing("fence table absent".into())),
+        Err(e) if e.get_ref().is_some_and(|inner| inner.is::<Incomplete>()) => {
+            Err(FenceError::Missing(e.to_string()))
+        }
+        Err(e) => Err(error(e)),
+    }
+}
+
 fn header<'a>(all: &'a [Value], name: &str) -> Option<&'a Value> {
     all.iter()
         .map(|row| &row["table"])
@@ -186,7 +211,7 @@ fn inspect(all: &[Value], name: &str, native: Option<&str>) -> io::Result<Option
         }
     }
     if !chain || rules.contains(&0) {
-        return Err(other("incomplete fence table"));
+        return Err(io::Error::other(Incomplete));
     }
     Ok(Some(Table {
         handle,
@@ -395,10 +420,7 @@ add rule inet {name} output ip6 daddr ::1 tcp dport {port} meta skuid != 0 count
         let addr = spec.address;
         let key = object(spec);
         let (name, _) = parts(&key).map_err(error)?;
-        let before = lookup(&ruleset().await.map_err(error)?, name)
-            .await
-            .map_err(error)?
-            .ok_or_else(|| error("missing fence"))?;
+        let before = present(lookup(&ruleset().await.map_err(error)?, name).await)?;
         let check = |found: io::Result<Option<ListenerInfo>>| match found {
             Ok(Some(l)) if l.pid == pid => ListenerCheck::Expected,
             Ok(Some(l)) => ListenerCheck::Other { pid: l.pid },
@@ -420,10 +442,7 @@ add rule inet {name} output ip6 daddr ::1 tcp dport {port} meta skuid != 0 count
         result.unprivileged = dropped(addr).await?;
         result.listener = check(blocking(move || network::listener(addr)).await);
         result.host = host(addr).await;
-        let after = lookup(&ruleset().await.map_err(error)?, name)
-            .await
-            .map_err(error)?
-            .ok_or_else(|| error("fence disappeared"))?;
+        let after = present(lookup(&ruleset().await.map_err(error)?, name).await)?;
         let slot = usize::from(addr.is_ipv6());
         if before.handle != after.handle
             || before.rules != after.rules
@@ -447,6 +466,35 @@ add rule inet {name} output ip6 daddr ::1 tcp dport {port} meta skuid != 0 count
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_listing_without_our_fence_is_missing_not_a_failed_query() {
+        let spec = FenceSpec {
+            instance: InstanceId::from("missing"),
+            epoch: Epoch(1),
+            address: ([127, 0, 0, 1], 15888).into(),
+        };
+        let key = object(&spec);
+        let (name, _) = parts(&key).unwrap();
+        // No table of ours in a successful listing.
+        assert!(matches!(
+            present(inspect(&[], name, None)),
+            Err(FenceError::Missing(_))
+        ));
+        // Our table, but its chain and rules are gone.
+        let header_only = vec![serde_json::json!({
+            "table": {"family": "inet", "name": name, "handle": 7, "comment": MARK}
+        })];
+        assert!(matches!(
+            present(inspect(&header_only, name, None)),
+            Err(FenceError::Missing(_))
+        ));
+        // A listing that failed proves nothing.
+        assert!(matches!(
+            present(Err(io::Error::other("nft exited with status 1"))),
+            Err(FenceError::Os { .. })
+        ));
+    }
 
     #[test]
     fn removal_rechecks_holders_of_the_same_socket() {

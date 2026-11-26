@@ -24,9 +24,9 @@ use etd_proc::{
     processkit_engine::ProcessKitEngine,
 };
 use etd_sysfx::{
-    BootId, Change, ChangeSet, EffectScope, GenerationOutcome, Ledger, ReclaimDeps, ReclaimReport,
-    ReclaimScope, RepairIndexStore, RequestDigest, RequestRecord, ScopeFilter,
-    engine::ReclaimEngineImpl, sqlite::SqliteLedger,
+    BootId, Change, ChangeSet, Effect, EffectKind, EffectScope, EffectState, GenerationOutcome,
+    Ledger, ObjectKey, Observation, ReclaimDeps, ReclaimReport, ReclaimScope, RepairIndexStore,
+    RequestDigest, RequestRecord, ScopeFilter, engine::ReclaimEngineImpl, sqlite::SqliteLedger,
 };
 use etd_sysfx_os::{
     OsConfig, OsError,
@@ -607,9 +607,56 @@ async fn reclaim_locked(deps: &HostDeps, purge: bool) -> Result<()> {
     } else {
         ScopeFilter::default()
     };
+    let open = deps.ledger.open_effects(&filter).await?;
+    for line in reclaim_outcome(&report, &open, purge)? {
+        println!("  {line}");
+    }
+    if let Some(receipt) = receipt {
+        deps.ledger.complete_ticket(&receipt.ticket).await?;
+    }
+    deps.ledger.compact().await?;
+    Ok(())
+}
+
+/// A driver service every kernel shares (wintun, WinDivert; product scope).
+/// The host never deletes one; a purge can only list it.
+fn shared_driver(kind: EffectKind, scope: Option<&EffectScope>) -> bool {
+    kind == EffectKind::Driver && scope == Some(&EffectScope::Product)
+}
+
+/// What to tell about a shared driver left in place.
+fn left_in_place(key: &ObjectKey, observation: Option<&Observation>) -> String {
+    let name = match key {
+        ObjectKey::Service { name } => name.clone(),
+        other => format!("{other:?}"),
+    };
+    let image = observation
+        .and_then(|o| o.detail.as_deref())
+        .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+        .and_then(|v| v["image_path"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into());
+    format!(
+        "left in place: shared driver service {name} image {image}; remove it yourself if no other software uses it"
+    )
+}
+
+/// Whether a reclaim is complete, and what to tell about what it left. A
+/// purge (uninstall) does not wait on shared driver services that are only
+/// candidates: they are never ours to delete, so they are listed and left
+/// in place (ruling topic#40 msg#1279). Any other candidate, any conflict,
+/// any other open record, an unclosed generation or a failed sweep still
+/// blocks, so ownership data stays for a retry.
+fn reclaim_outcome(report: &ReclaimReport, open: &[Effect], purge: bool) -> Result<Vec<String>> {
+    let (shared, candidates): (Vec<_>, Vec<_>) = report
+        .candidates
+        .iter()
+        .partition(|c| purge && shared_driver(c.kind, c.scope.as_ref()));
+    let open_blocking = open.iter().any(|e| {
+        !(purge && e.state == EffectState::Candidate && shared_driver(e.kind, Some(&e.scope)))
+    });
     ensure!(
-        deps.ledger.open_effects(&filter).await?.is_empty()
-            && report.candidates.is_empty()
+        !open_blocking
+            && candidates.is_empty()
             && report.conflicts.is_empty()
             && report
                 .generations
@@ -621,11 +668,10 @@ async fn reclaim_locked(deps: &HostDeps, purge: bool) -> Result<()> {
                 .any(|note| note.starts_with("sweep failed:")),
         "reclaim incomplete; keeping ownership data for retry"
     );
-    if let Some(receipt) = receipt {
-        deps.ledger.complete_ticket(&receipt.ticket).await?;
-    }
-    deps.ledger.compact().await?;
-    Ok(())
+    Ok(shared
+        .iter()
+        .map(|c| left_in_place(&c.key, c.observation.as_ref()))
+        .collect())
 }
 
 fn print_report(report: &ReclaimReport) {
@@ -741,6 +787,14 @@ async fn uninstall_locked(layout: &HostLayout, expected_id: Option<&str>) -> Res
         NativeServiceManager.remove_state(layout)
     })?;
     if journal.phase() < Phase::InstallRemoved {
+        // The service host's volatile boot marker (Windows HKLM; gone at
+        // the next boot anyway). Idempotent: a retry repeats it.
+        etd_sysfx_os::remove_service_boot_marker()
+            .map_err(anyhow::Error::from)
+            .context(
+                "uninstall incomplete: cannot remove the service boot marker \
+                 HKLM\\SOFTWARE\\EasyTierDesk\\Volatile; retry etd-host uninstall",
+            )?;
         let deferred = NativeServiceManager.defer_install_removal(layout, journal.install_id());
         let deferred = match deferred {
             Ok(value) => value,
@@ -933,5 +987,165 @@ mod maintenance_handoff_tests {
         assert!(result.is_err());
         assert!(entered_rx.recv_timeout(Duration::from_secs(5)).unwrap());
         waiter.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod reclaim_outcome_tests {
+    use super::*;
+    use etd_sysfx::{Candidate, CandidateSource, Conflict, EffectId, Persistence, Undo};
+
+    fn driver(name: &str) -> ObjectKey {
+        ObjectKey::Service { name: name.into() }
+    }
+
+    fn found(image: &str) -> Observation {
+        Observation {
+            credential: None,
+            key: None,
+            observed_at: "1970-01-01T00:00:00Z".parse().unwrap(),
+            detail: Some(serde_json::json!({ "image_path": image }).to_string()),
+        }
+    }
+
+    fn candidate(id: &str, kind: EffectKind, key: ObjectKey, scope: EffectScope) -> Candidate {
+        Candidate {
+            id: id.into(),
+            kind,
+            key,
+            scope: Some(scope),
+            observation: Some(found(r"\SystemRoot\System32\drivers\wintun.sys")),
+            source: CandidateSource::PlannedRecord {
+                effect: EffectId(id.into()),
+            },
+        }
+    }
+
+    fn record(id: &str, kind: EffectKind, key: ObjectKey, scope: EffectScope) -> Effect {
+        Effect {
+            id: EffectId(id.into()),
+            scope,
+            kind,
+            key,
+            undo: Undo::EnsureAbsent,
+            persistence: Persistence::Persistent,
+            state: EffectState::Candidate,
+            boot: BootId("boot".into()),
+            observation: Some(found(r"\SystemRoot\System32\drivers\wintun.sys")),
+            failures: 0,
+            last_error: None,
+            recorded_at: "1970-01-01T00:00:00Z".parse().unwrap(),
+        }
+    }
+
+    fn report(candidates: Vec<Candidate>) -> ReclaimReport {
+        ReclaimReport {
+            generated_at: "1970-01-01T00:00:00Z".parse().unwrap(),
+            generations: Vec::new(),
+            candidates,
+            conflicts: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_uninstall_with_only_a_shared_driver_candidate_completes() {
+        let wintun = driver("wintun");
+        let report = report(vec![candidate(
+            "1",
+            EffectKind::Driver,
+            wintun.clone(),
+            EffectScope::Product,
+        )]);
+        let open = [record(
+            "1",
+            EffectKind::Driver,
+            wintun,
+            EffectScope::Product,
+        )];
+        let lines = reclaim_outcome(&report, &open, true).unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                r"left in place: shared driver service wintun image \SystemRoot\System32\drivers\wintun.sys; remove it yourself if no other software uses it"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn any_other_candidate_conflict_or_open_record_still_blocks() {
+        let wintun = driver("wintun");
+        let shared = candidate(
+            "1",
+            EffectKind::Driver,
+            wintun.clone(),
+            EffectScope::Product,
+        );
+        let shared_open = record(
+            "1",
+            EffectKind::Driver,
+            wintun.clone(),
+            EffectScope::Product,
+        );
+
+        // Another kind of candidate.
+        let rule = ObjectKey::Rule {
+            name: "EasyTier x (Inbound)".into(),
+            group: Some("EasyTier".into()),
+        };
+        let core = EffectScope::CoreBinary {
+            sha256: "00".into(),
+        };
+        let other = candidate(
+            "2",
+            EffectKind::WinProgramFirewallRule,
+            rule.clone(),
+            core.clone(),
+        );
+        let other_open = record("2", EffectKind::WinProgramFirewallRule, rule, core);
+        assert!(
+            reclaim_outcome(
+                &report(vec![shared.clone(), other]),
+                &[shared_open.clone(), other_open.clone()],
+                true
+            )
+            .is_err()
+        );
+
+        // A driver record in an instance's scope is not a shared driver.
+        let instance = EffectScope::Instance {
+            instance: etd_contract::InstanceId::from("a"),
+            epoch: etd_sysfx::Epoch(1),
+        };
+        let scoped = candidate("3", EffectKind::Driver, wintun.clone(), instance.clone());
+        assert!(
+            reclaim_outcome(
+                &report(vec![scoped]),
+                &[record("3", EffectKind::Driver, wintun.clone(), instance)],
+                true
+            )
+            .is_err()
+        );
+
+        // A conflict (e.g. a driver registered before we started).
+        let mut with_conflict = report(vec![shared.clone()]);
+        with_conflict.conflicts.push(Conflict {
+            id: "c".into(),
+            effect: EffectId("4".into()),
+            kind: EffectKind::Driver,
+            key: wintun.clone(),
+            expected: None,
+            found: None,
+        });
+        assert!(reclaim_outcome(&with_conflict, std::slice::from_ref(&shared_open), true).is_err());
+
+        // An open record that is not a shared-driver candidate.
+        let mut applied = shared_open.clone();
+        applied.state = EffectState::Applied;
+        assert!(reclaim_outcome(&report(vec![shared.clone()]), &[applied], true).is_err());
+
+        // Outside a purge, even a shared driver candidate blocks.
+        assert!(reclaim_outcome(&report(vec![shared]), &[shared_open], false).is_err());
     }
 }

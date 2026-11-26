@@ -527,7 +527,10 @@ mod tests {
     #[test]
     fn committed_lock_covers_every_pinned_target() {
         let pin = parse_pin(&fs::read_to_string(repository(PIN)).unwrap()).unwrap();
-        let lock = fs::read_to_string(repository(LOCK)).unwrap();
+        // A Windows checkout may convert line endings.
+        let lock = fs::read_to_string(repository(LOCK))
+            .unwrap()
+            .replace("\r\n", "\n");
         assert!(lock.starts_with(LOCK_HEADER), "{LOCK} is not generated");
         let table = core_lock::parse(&lock).unwrap();
         let pinned: BTreeSet<_> = pin

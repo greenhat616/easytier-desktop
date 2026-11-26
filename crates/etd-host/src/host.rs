@@ -24,10 +24,10 @@ use etd_proc::{
     processkit_engine::ProcessKitEngine,
 };
 use etd_sysfx::{
-    BootId, Change, ChangeSet, Effect, EffectId, EffectKind, EffectScope, EffectState,
-    GenerationOutcome, Ledger, ObjectKey, Observation, ReclaimDeps, ReclaimReport, ReclaimScope,
-    RepairIndexStore, RequestDigest, RequestRecord, ScopeFilter, SystemObserver,
-    engine::ReclaimEngineImpl, sqlite::SqliteLedger,
+    BootId, Candidate, CandidateSource, Change, ChangeSet, Effect, EffectId, EffectKind,
+    EffectScope, EffectState, GenerationOutcome, Ledger, ObjectKey, Observation, ReclaimDeps,
+    ReclaimEngine, ReclaimReport, ReclaimScope, RepairIndexStore, RequestDigest, RequestRecord,
+    ScopeFilter, SystemObserver, engine::ReclaimEngineImpl, sqlite::SqliteLedger,
 };
 use etd_sysfx_os::{
     OsConfig, OsError,
@@ -591,48 +591,67 @@ fn rollback_install(
 }
 
 async fn reclaim_locked(deps: &HostDeps, purge: bool) -> Result<()> {
+    reclaim_with(
+        deps.ledger.as_ref(),
+        deps.reclaim.as_ref(),
+        deps.observer.as_ref(),
+        purge,
+    )
+    .await
+}
+
+/// [`reclaim_locked`] over its three dependencies (testable with fakes).
+async fn reclaim_with(
+    ledger: &dyn Ledger,
+    reclaim: &dyn ReclaimEngine,
+    observer: &dyn SystemObserver,
+    purge: bool,
+) -> Result<()> {
     let scope = if purge {
         ReclaimScope::Everything
     } else {
         ReclaimScope::Instances
     };
     let receipt = if purge {
-        Some(maintenance_change(deps.ledger.as_ref(), Change::PurgeAll).await?)
+        Some(maintenance_change(ledger, Change::PurgeAll).await?)
     } else {
         None
     };
-    let report = deps.reclaim.reclaim_all(scope).await?;
+    let report = reclaim.reclaim_all(scope).await?;
     print_report(&report);
     let filter = if purge {
         ScopeFilter::all()
     } else {
         ScopeFilter::default()
     };
-    let open = deps.ledger.open_effects(&filter).await?;
+    let open = ledger.open_effects(&filter).await?;
     let left = reclaim_outcome(&report, &open, purge)?;
     for item in &left {
-        let line = left_in_place(item, deps.observer.as_ref()).await;
+        let line = left_in_place(item, observer).await;
         println!("  {line}");
     }
-    if !left.is_empty() {
-        // Their records close: the drivers stay, never ours to delete.
-        let decisions: Vec<_> = left
-            .iter()
-            .map(|item| etd_contract::CandidateDecision {
-                candidate_id: item.id.clone(),
-                action: etd_contract::v1::CandidateAction::Keep as i32,
-            })
-            .collect();
-        deps.reclaim.resolve(&decisions).await?;
-        ensure!(
-            deps.ledger.open_effects(&filter).await?.is_empty(),
-            "reclaim incomplete; keeping ownership data for retry"
-        );
+    // Their records close: the drivers stay, never ours to delete. A
+    // swept driver has no record (nothing to close; found again next time
+    // and again left in place).
+    let decisions: Vec<_> = left
+        .iter()
+        .filter_map(|item| item.record.clone())
+        .map(|id| etd_contract::CandidateDecision {
+            candidate_id: id,
+            action: etd_contract::v1::CandidateAction::Keep as i32,
+        })
+        .collect();
+    if !decisions.is_empty() {
+        reclaim.resolve(&decisions).await?;
     }
+    ensure!(
+        ledger.open_effects(&filter).await?.is_empty(),
+        "reclaim incomplete; keeping ownership data for retry"
+    );
     if let Some(receipt) = receipt {
-        deps.ledger.complete_ticket(&receipt.ticket).await?;
+        ledger.complete_ticket(&receipt.ticket).await?;
     }
-    deps.ledger.compact().await?;
+    ledger.compact().await?;
     Ok(())
 }
 
@@ -656,8 +675,9 @@ fn image_path(observation: Option<&Observation>) -> Option<String> {
 /// other software).
 #[derive(Debug, Clone, PartialEq)]
 struct LeftInPlace {
-    /// Candidate or conflict id, for closing the record (KEEP).
-    id: String,
+    /// Candidate or conflict id of its record, for closing it (KEEP);
+    /// `None` for a driver the sweep found without a record.
+    record: Option<String>,
     key: ObjectKey,
     observation: Option<Observation>,
     preexisting: bool,
@@ -674,7 +694,12 @@ async fn left_in_place(item: &LeftInPlace, observer: &dyn SystemObserver) -> Str
         other => format!("{other:?}"),
     };
     // Informational only, a point-in-time observation: never authority
-    // to delete anything (topic#40 msg#1450).
+    // to delete anything (topic#40 msg#1450). The notice waits at most
+    // IMAGE_LOOKUP_DEADLINE; an SCM read stuck in spawn_blocking keeps
+    // running after that and can still hold process exit when the runtime
+    // drops.
+    // TODO(topic#45): SH's bounded runtime shutdown in main.rs also bounds
+    // that exit; nothing here waits for it.
     let image = match image_path(observation) {
         Some(image) => format!("{image} (as recorded)"),
         None => match tokio::time::timeout(
@@ -703,7 +728,8 @@ async fn left_in_place(item: &LeftInPlace, observer: &dyn SystemObserver) -> Str
     }
 }
 
-/// How long the uninstall notice waits for a driver's image path.
+/// How long the uninstall notice waits for a driver's image path (the
+/// notice only: see the TODO in `left_in_place`).
 const IMAGE_LOOKUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Whether a reclaim is complete, and which shared driver services it
@@ -720,10 +746,9 @@ fn reclaim_outcome(
     purge: bool,
 ) -> Result<Vec<LeftInPlace>> {
     let record = |id: &EffectId| open.iter().find(|e| &e.id == id);
-    let (shared, candidates): (Vec<_>, Vec<_>) = report
-        .candidates
-        .iter()
-        .partition(|c| purge && shared_driver(c.kind, c.scope.as_ref()));
+    let (shared, candidates): (Vec<_>, Vec<_>) = report.candidates.iter().partition(|c| {
+        purge && (shared_driver(c.kind, c.scope.as_ref()) || swept_shared_driver(c))
+    });
     let (preexisting, conflicts): (Vec<_>, Vec<_>) = report.conflicts.iter().partition(|c| {
         purge
             && record(&c.effect).is_some_and(|e| {
@@ -749,21 +774,53 @@ fn reclaim_outcome(
                 .any(|note| note.starts_with("sweep failed:")),
         "reclaim incomplete; keeping ownership data for retry"
     );
-    Ok(shared
+    let mut left: Vec<LeftInPlace> = preexisting
         .iter()
         .map(|c| LeftInPlace {
-            id: c.id.clone(),
-            key: c.key.clone(),
-            observation: c.observation.clone(),
-            preexisting: false,
-        })
-        .chain(preexisting.iter().map(|c| LeftInPlace {
-            id: c.id.clone(),
+            record: Some(c.id.clone()),
             key: c.key.clone(),
             observation: record(&c.effect).and_then(|e| e.observation.clone()),
             preexisting: true,
-        }))
-        .collect())
+        })
+        .collect();
+    for c in shared {
+        let item = LeftInPlace {
+            record: matches!(c.source, CandidateSource::PlannedRecord { .. }).then(|| c.id.clone()),
+            key: c.key.clone(),
+            observation: c.observation.clone(),
+            preexisting: false,
+        };
+        // A swept driver that a record already names is told once (service
+        // names are case-insensitive).
+        let named = |k: &ObjectKey| service_name(k).map(str::to_ascii_lowercase);
+        if item.record.is_none() && left.iter().any(|l| named(&l.key) == named(&item.key)) {
+            continue;
+        }
+        left.push(item);
+    }
+    Ok(left)
+}
+
+fn service_name(key: &ObjectKey) -> Option<&str> {
+    match key {
+        ObjectKey::Service { name } => Some(name),
+        _ => None,
+    }
+}
+
+/// A shared driver service (wintun, WinDivert) the sweep found without an
+/// open record: after its record was closed (KEEP), or under a name whose
+/// case differs from the record's. The sweep reports them for exactly this
+/// list of names (`etd-sysfx-os` Windows sweeper) and never deletes them.
+fn swept_shared_driver(c: &Candidate) -> bool {
+    c.kind == EffectKind::Driver
+        && c.scope.is_none()
+        && matches!(c.source, CandidateSource::Swept(_))
+        && service_name(&c.key).is_some_and(|name| {
+            ["wintun", "WinDivert"]
+                .iter()
+                .any(|shared| shared.eq_ignore_ascii_case(name))
+        })
 }
 
 fn print_report(report: &ReclaimReport) {
@@ -1161,7 +1218,7 @@ mod reclaim_outcome_tests {
         let left = reclaim_outcome(&report, &open, true).unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].key, driver("wintun"));
-        assert_eq!(left[0].id, "1");
+        assert_eq!(left[0].record.as_deref(), Some("1"));
         assert!(!left[0].preexisting);
     }
 
@@ -1201,7 +1258,7 @@ mod reclaim_outcome_tests {
 
     fn item(observation: Option<Observation>, preexisting: bool) -> LeftInPlace {
         LeftInPlace {
-            id: "1".into(),
+            record: Some("1".into()),
             key: driver("wintun"),
             observation,
             preexisting,
@@ -1285,7 +1342,11 @@ mod reclaim_outcome_tests {
         });
         let left = reclaim_outcome(&report, std::slice::from_ref(&held), true).unwrap();
         assert_eq!(left.len(), 1);
-        assert_eq!(left[0].id, "c7", "closed through its conflict id");
+        assert_eq!(
+            left[0].record.as_deref(),
+            Some("c7"),
+            "closed through its conflict id"
+        );
         assert!(left[0].preexisting);
         let unused = Drivers(Some(Err(ObserveError::Os {
             code: 1,
@@ -1375,5 +1436,274 @@ mod reclaim_outcome_tests {
 
         // Outside a purge, even a shared driver candidate blocks.
         assert!(reclaim_outcome(&report(vec![shared]), &[shared_open], false).is_err());
+    }
+
+    #[test]
+    fn a_swept_shared_driver_is_left_in_place_once_and_never_kept() {
+        let swept = |name: &str| Candidate {
+            id: format!("swept-{name}"),
+            kind: EffectKind::Driver,
+            key: driver(name),
+            scope: None,
+            observation: None,
+            source: CandidateSource::Swept(etd_sysfx::FoundBy::PrefixOnly),
+        };
+        // Its record was closed earlier (KEEP): nothing to close now.
+        let left = reclaim_outcome(&report(vec![swept("wintun")]), &[], true).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].record, None);
+        // A record names it already (another case): told once.
+        let mut held = record(
+            "7",
+            EffectKind::Driver,
+            driver("WinDivert"),
+            EffectScope::Product,
+        );
+        held.state = EffectState::Conflict;
+        let mut both = report(vec![swept("windivert")]);
+        both.conflicts.push(Conflict {
+            id: "c7".into(),
+            effect: EffectId("7".into()),
+            kind: EffectKind::Driver,
+            key: driver("WinDivert"),
+            expected: None,
+            found: None,
+        });
+        let left = reclaim_outcome(&both, std::slice::from_ref(&held), true).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].record.as_deref(), Some("c7"));
+        // Only the shared names, only in a purge.
+        assert!(reclaim_outcome(&report(vec![swept("tap0901")]), &[], true).is_err());
+        assert!(reclaim_outcome(&report(vec![swept("wintun")]), &[], false).is_err());
+    }
+}
+
+/// The purge/uninstall path end to end over the real engine and a fake
+/// machine (topic#40 msg#1503, msg#1506, msg#1507): shared driver services
+/// are left in place, their records closed, and a repeated purge or an
+/// uninstall after a purge succeeds too.
+#[cfg(test)]
+mod purge_flow_tests {
+    use super::*;
+    use etd_contract::InstanceId;
+    use etd_sysfx::{
+        EffectIntent, FoundBy, FoundObject, InstallKey, LedgerError, Persistence, Probe,
+        ReclaimError, Reclaimed, Reclaimer, RepairIndex, Sweeper, Undo,
+    };
+    use etd_testkit::fakes::{ledger::MemoryLedger, system::FakeSystem};
+    use futures_util::future::BoxFuture;
+    use std::sync::Mutex;
+
+    /// The Windows sweeper's view of shared drivers: every wintun/WinDivert
+    /// service, without a credential, besides what the fake marks.
+    struct Sweep(FakeSystem);
+    impl Sweeper for Sweep {
+        fn find_marked<'a>(
+            &'a self,
+            key: Option<&'a InstallKey>,
+            known: &'a [InstanceId],
+        ) -> BoxFuture<'a, Result<Vec<FoundObject>, ReclaimError>> {
+            Box::pin(async move {
+                let mut found = self.0.find_marked(key, known).await?;
+                for o in self.0.objects() {
+                    if o.kind == EffectKind::Driver
+                        && service_name(&o.key).is_some_and(|n| {
+                            ["wintun", "WinDivert"]
+                                .iter()
+                                .any(|s| s.eq_ignore_ascii_case(n))
+                        })
+                    {
+                        found.push(FoundObject {
+                            kind: o.kind,
+                            key: o.key.clone(),
+                            observation: Observation {
+                                credential: None,
+                                key: Some(o.key.clone()),
+                                observed_at: self.0.now(),
+                                detail: None,
+                            },
+                            origin: FoundBy::PrefixOnly,
+                        });
+                    }
+                }
+                Ok(found)
+            })
+        }
+    }
+
+    /// Like the Windows driver reclaimer: probes, never deletes.
+    struct NoDelete(Arc<dyn Reclaimer>);
+    #[async_trait::async_trait]
+    impl Reclaimer for NoDelete {
+        fn kind(&self) -> EffectKind {
+            self.0.kind()
+        }
+        fn rank(&self) -> u8 {
+            self.0.rank()
+        }
+        async fn probe(&self, e: &Effect) -> Probe {
+            self.0.probe(e).await
+        }
+        async fn reclaim(&self, _: &Effect) -> Result<Reclaimed, ReclaimError> {
+            Err(ReclaimError::Unsupported(EffectKind::Driver))
+        }
+    }
+
+    #[derive(Default)]
+    struct Index(Mutex<Option<RepairIndex>>);
+    impl RepairIndexStore for Index {
+        fn load(&self) -> Result<Option<RepairIndex>, LedgerError> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        fn store(&self, index: &RepairIndex) -> Result<(), LedgerError> {
+            *self.0.lock().unwrap() = Some(index.clone());
+            Ok(())
+        }
+    }
+
+    struct Machine {
+        sys: FakeSystem,
+        ledger: Arc<MemoryLedger>,
+        engine: ReclaimEngineImpl,
+    }
+
+    impl Machine {
+        fn new() -> Self {
+            let sys = FakeSystem::new();
+            let ledger = Arc::new(MemoryLedger::new(sys.boot()));
+            let reclaimers = EffectKind::ALL
+                .iter()
+                .map(|k| match k {
+                    EffectKind::Driver => {
+                        Arc::new(NoDelete(sys.reclaimer(*k))) as Arc<dyn Reclaimer>
+                    }
+                    k => sys.reclaimer(*k),
+                })
+                .collect();
+            let engine = ReclaimEngineImpl::new(ReclaimDeps {
+                ledger: ledger.clone(),
+                reclaimers,
+                sweeper: Arc::new(Sweep(sys.clone())),
+                boot_id: sys.boot_id_source(),
+                repair_index: Arc::new(Index::default()),
+            });
+            Self {
+                sys,
+                ledger,
+                engine,
+            }
+        }
+
+        fn intent(name: &str) -> EffectIntent {
+            EffectIntent {
+                scope: EffectScope::Product,
+                kind: EffectKind::Driver,
+                key: driver(name),
+                undo: Undo::EnsureAbsent,
+                persistence: Persistence::Persistent,
+            }
+        }
+
+        /// A kernel created the driver; read back without a credential.
+        async fn created(&self, name: &str) {
+            self.sys.create_ours(EffectKind::Driver, driver(name));
+            let e = self.ledger.record(Self::intent(name)).await.unwrap();
+            let read_back = Observation {
+                credential: None,
+                key: Some(driver(name)),
+                observed_at: self.sys.now(),
+                detail: None,
+            };
+            self.ledger
+                .transition(&e.id, EffectState::Applied, Some(read_back))
+                .await
+                .unwrap();
+        }
+
+        /// Other software registered it first (`system_name`, which may
+        /// differ in case); the start flagged our planned record.
+        async fn preexisting(&self, name: &str, system_name: &str) {
+            self.sys
+                .create_foreign(EffectKind::Driver, driver(system_name));
+            let e = self.ledger.record(Self::intent(name)).await.unwrap();
+            let found = Observation {
+                credential: None,
+                key: Some(driver(system_name)),
+                observed_at: self.sys.now(),
+                detail: None,
+            };
+            self.ledger
+                .transition(&e.id, EffectState::Reclaiming, None)
+                .await
+                .unwrap();
+            self.ledger
+                .transition(&e.id, EffectState::Conflict, Some(found))
+                .await
+                .unwrap();
+        }
+
+        async fn purge(&self) -> Result<()> {
+            let observer = self.sys.observer();
+            reclaim_with(self.ledger.as_ref(), &self.engine, observer.as_ref(), true).await
+        }
+
+        async fn open(&self) -> Vec<Effect> {
+            self.ledger.open_effects(&ScopeFilter::all()).await.unwrap()
+        }
+
+        fn untouched(&self, names: &[&str]) {
+            assert!(self.sys.deleted().is_empty(), "{:?}", self.sys.deleted());
+            for name in names {
+                assert!(
+                    self.sys.find(EffectKind::Driver, &driver(name)).is_some(),
+                    "{name} still registered"
+                );
+            }
+        }
+    }
+
+    fn driver(name: &str) -> ObjectKey {
+        ObjectKey::Service { name: name.into() }
+    }
+
+    #[tokio::test]
+    async fn purge_then_uninstall_both_succeed_and_leave_the_driver() {
+        let m = Machine::new();
+        m.created("wintun").await;
+        m.purge().await.unwrap();
+        assert!(m.open().await.is_empty());
+        // The uninstall's purge finds it again by the sweep only.
+        m.purge().await.unwrap();
+        m.purge().await.unwrap();
+        assert!(m.open().await.is_empty());
+        m.untouched(&["wintun"]);
+    }
+
+    #[tokio::test]
+    async fn preexisting_drivers_do_not_block_an_uninstall_without_a_prior_purge() {
+        let m = Machine::new();
+        m.preexisting("wintun", "wintun").await;
+        // Same service, another case than our planned key.
+        m.preexisting("WinDivert", "windivert").await;
+        m.purge().await.unwrap();
+        assert!(m.open().await.is_empty());
+        m.purge().await.unwrap();
+        m.untouched(&["wintun", "windivert"]);
+    }
+
+    #[tokio::test]
+    async fn any_other_leftover_still_blocks_the_purge() {
+        let m = Machine::new();
+        m.created("wintun").await;
+        // A non-shared object the sweep reports, with no record.
+        m.sys.create_foreign(
+            EffectKind::WinTunAdapter,
+            ObjectKey::Interface {
+                name: Some(format!("{}stray", etd_sysfx::naming::INTERFACE_PREFIX)),
+                guid: None,
+            },
+        );
+        assert!(m.purge().await.is_err());
+        m.untouched(&["wintun"]);
     }
 }

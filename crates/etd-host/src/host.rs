@@ -1951,10 +1951,7 @@ mod lock_after_stop_tests {
             .unwrap_err();
         assert!(started.elapsed() >= Duration::from_secs(10));
         assert!(started.elapsed() < Duration::from_secs(11));
-        assert!(
-            error.to_string().contains("retry etd-host uninstall"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("retry in a moment"), "{error}");
     }
 
     #[tokio::test(start_paused = true)]

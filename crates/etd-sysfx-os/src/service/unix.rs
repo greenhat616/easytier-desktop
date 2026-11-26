@@ -450,10 +450,11 @@ pub(super) fn start(layout: &HostLayout) -> io::Result<()> {
     {
         // A host that kept failing (a new image rolled back by upgrade)
         // can leave the unit start-limited; clear that before starting.
-        invoke(
+        // Best effort: systemctl refuses it for a unit not loaded now.
+        let _ = invoke(
             "/usr/bin/systemctl",
             &["reset-failed", "easytier-desk-host.service"],
-        )?;
+        );
         invoke(
             "/usr/bin/systemctl",
             &["enable", "--now", "easytier-desk-host.service"],

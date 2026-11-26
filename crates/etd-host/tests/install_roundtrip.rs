@@ -833,6 +833,7 @@ async fn upgrade_rolls_back_when_the_new_host_is_not_ready() {
     service.fault(Some("new-host-unready"));
     let upgraded = command(&new_image).arg("upgrade").output().unwrap();
     service.fault(None);
+    println!("upgrade with an unready new host: {}", text(&upgraded));
     let (identity, after) = service.served().await;
     let image_after = std::fs::read(&service.layout.executable).unwrap();
     let stage = service.journal().upgrade_stage();
@@ -887,6 +888,14 @@ async fn an_interrupted_upgrade_is_restored_by_upgrade_and_by_uninstall() {
         .unwrap();
     // The next upgrade restores the old state first, then completes.
     let recovered = command(&first_image).arg("upgrade").output().unwrap();
+    println!(
+        "crashed: {}
+resume-service: {}
+recovered: {}",
+        text(&crashed),
+        text(&resume),
+        text(&recovered)
+    );
     let (identity, after) = service.served().await;
     let image_after = std::fs::read(&service.layout.executable).unwrap();
     let stage_after = service.journal().upgrade_stage();

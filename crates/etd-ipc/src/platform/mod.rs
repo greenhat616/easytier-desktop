@@ -95,32 +95,35 @@ pub(super) struct Proof<'a> {
     /// The expected account; `None` means SYSTEM / root when `privileged`,
     /// else the current user.
     pub user: Option<&'a OsUserId>,
+    /// The current user's elevated session host (Windows): the server
+    /// token must be readable, be the current user's and be elevated.
+    #[cfg_attr(unix, expect(dead_code, reason = "Unix never sets it"))]
+    pub elevated: bool,
 }
 
-/// Call before opening the endpoint. The elevated session proof is not
-/// implemented yet, so that requirement fails closed.
+/// Call before opening the endpoint. The elevated session host exists only
+/// on Windows; elsewhere that requirement fails with `Unsupported`.
 pub(super) fn proof(expect: &ServerExpectation) -> io::Result<Proof<'_>> {
-    let (privileged, user) = match &expect.requirement {
-        ServerRequirement::Service => (true, None),
-        ServerRequirement::ServiceAccount(user) => (true, Some(user)),
-        ServerRequirement::CurrentUser => (false, None),
-        ServerRequirement::UserAccount(user) => (false, Some(user)),
-        ServerRequirement::CurrentUserElevated => return Err(elevated_unavailable()),
+    let (privileged, user, elevated) = match &expect.requirement {
+        ServerRequirement::Service => (true, None, false),
+        ServerRequirement::ServiceAccount(user) => (true, Some(user), false),
+        ServerRequirement::CurrentUser => (false, None, false),
+        ServerRequirement::UserAccount(user) => (false, Some(user), false),
+        #[cfg(windows)]
+        ServerRequirement::CurrentUserElevated => (false, None, true),
+        #[cfg(unix)]
+        ServerRequirement::CurrentUserElevated => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the elevated session host is Windows-only",
+            ));
+        }
     };
-    Ok(Proof { privileged, user })
-}
-
-#[cfg(windows)]
-fn elevated_unavailable() -> io::Error {
-    denied("elevated session host verification is not implemented")
-}
-
-#[cfg(unix)]
-fn elevated_unavailable() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        "the elevated session host is Windows-only",
-    )
+    Ok(Proof {
+        privileged,
+        user,
+        elevated,
+    })
 }
 
 fn verify_user(
@@ -155,20 +158,18 @@ fn verify_image(directory: &Path, image: &Path) -> io::Result<PathBuf> {
     Ok(host)
 }
 
-#[cfg(test)]
+// Windows implements both; the session tests in `tests/session_*.rs` cover it.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
     fn unused_endpoint() -> Endpoint {
         let leaf = format!("etd-ipc-no-elevated-{}", std::process::id());
-        #[cfg(windows)]
-        return Endpoint::NamedPipe(format!(r"\\.\pipe\{leaf}"));
-        #[cfg(unix)]
-        return Endpoint::UnixSocket(std::env::temp_dir().join(leaf).join("host.sock"));
+        Endpoint::UnixSocket(std::env::temp_dir().join(leaf).join("host.sock"))
     }
 
     #[tokio::test]
-    async fn an_elevated_session_requirement_fails_closed() {
+    async fn an_elevated_session_requirement_is_unsupported() {
         let connector = LocalConnector {
             expectation: ServerExpectation {
                 exe_dir: PathBuf::new(),
@@ -176,14 +177,11 @@ mod tests {
             },
         };
         let error = connector.connect(&unused_endpoint()).await.err().unwrap();
-        #[cfg(windows)]
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        #[cfg(unix)]
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     }
 
     #[test]
-    fn an_elevated_session_listener_is_not_implemented() {
+    fn an_elevated_session_listener_is_unsupported() {
         let error = LocalListener::bind(
             HostForm::ElevatedSession,
             &unused_endpoint(),

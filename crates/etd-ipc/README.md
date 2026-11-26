@@ -45,6 +45,7 @@ Implementation (`platform`, `tonic_io`):
 | --- | --- | --- | --- |
 | Service | `\\.\pipe\easytier-desk-host` | `/run/easytier-desk/host.sock` | `/Library/Application Support/easytier-desk/run/host.sock` |
 | User | `\\.\pipe\easytier-desk-user-<SID>` | `$XDG_RUNTIME_DIR/host.sock`, or `/tmp/easytier-desk-<uid>/host.sock` if the variable is unset or empty | `<per-user temp dir>/easytier-desk/host.sock` (`_CS_DARWIN_USER_TEMP_DIR`, canonicalized) |
+| Elevated session | `\\.\pipe\easytier-desk-session-<SID>` | — | — |
 
 This crate defines the service names and `user_runtime_dir()`. `etd-host`, `etd-app`
 and `etd-ctl` each compose the user-host names in the same way. A pipe name must be
@@ -57,20 +58,35 @@ socket path must be absolute, name a file and contain no `..`.
 is taken. Remote clients are rejected. The security descriptor has the host account as
 owner and a protected DACL (`D:P`, nothing inherited):
 
-- The host account gets read/write, `WRITE_DAC` and the right to create instances.
+- Service and user forms: the host account gets read/write, `WRITE_DAC` and the right
+  to create instances.
 - Service form: `SYSTEM` and `BUILTIN\Administrators` get client access (read/write
   data, read attributes, `READ_CONTROL`, `SYNCHRONIZE`), and so does every allow-listed
   user or group SID. Only numeric `S-1-...` SIDs are accepted.
 - User form: owner only. A policy with allow entries is refused (`InvalidInput`), as
   is `unix_group` on any Windows pipe.
+- Elevated session form (Windows only): the host and its non-elevated clients share
+  the user SID, so that SID gets client access only, and an `OWNER RIGHTS` entry with
+  client access replaces the owner's implicit `READ_CONTROL | WRITE_DAC`.
+  `BUILTIN\Administrators`, enabled only in elevated tokens, gets the remaining rights
+  the host needs to add instances (`FILE_CREATE_PIPE_INSTANCE`, read/write EA, write
+  attributes) and no data access. Nobody gets `WRITE_DAC` or `WRITE_OWNER`, and
+  instances are created without `WRITE_DAC`. The SACL holds an explicit Medium,
+  no-write-up mandatory label (`S:(ML;;NW;;;ME)`): a Medium UI can write, Low and
+  AppContainer processes cannot. Allow entries are refused (`InvalidInput`).
 
 `PolicyHandle::update` replaces the DACL of the live pipe object. Existing connections
-keep their handles, and new instances inherit the current DACL.
+keep their handles, and new instances inherit the current DACL. On the elevated session
+pipe it only accepts the empty policy and leaves the fixed DACL as it is.
 
 Before a connection is handed out, the client must send the marker byte `0x01` within
 2 s. The listener identifies the client account by impersonating it, and after the
 marker reads the full identity again; the account must not have changed. At most 8
-connections per account and 64 in total may be pending this step.
+connections per account and 64 in total may be pending this step. On the elevated
+session pipe that token must also be the host's own account in the host's Windows
+session, at least Medium integrity and not an AppContainer; otherwise the connection
+is refused. It reports `elevated` only for an elevated token at High integrity or
+above. The host decides the role afterwards from `PeerIdentity`.
 
 **Unix.** The service form requires euid 0. The socket's directory chain must pass the
 checks described under server verification. The socket is first bound inside a fresh
@@ -105,7 +121,7 @@ policy (user form). It does not set `unix_group`.
 | `groups` | Enabled token groups, deny-only excluded | `SO_PEERGROUPS` plus primary gid | `xucred` groups |
 | `pid` | `GetNamedPipeClientProcessId` | `SO_PEERCRED` pid; refused if 0 (other namespace) | `LOCAL_PEERPID` |
 | `session` | Token logon session | `None` | `None` |
-| `elevated` | `TokenElevation` | uid 0 | uid 0 |
+| `elevated` | `TokenElevation`; on the elevated session pipe also integrity High or above | uid 0 | uid 0 |
 
 ## Server verification (connector side)
 
@@ -123,9 +139,13 @@ opened: `PermissionDenied` on Windows, `Unsupported` on Unix.
   after 8.3 expansion, case-insensitively. Privileged: the pipe owner SID must be the
   expected SID. If the server token is readable, its user or one of its groups must
   contain that SID; if `TOKEN_QUERY` is denied, the owner proof is enough (no groups,
-  `elevated: false`). User form: the token user must match. Finally the server PID must
-  be unchanged and the process still running. Only then does the client send the marker
-  byte.
+  `elevated: false`). User form: the token user must match. Elevated session
+  (`CurrentUserElevated`): the server token must be readable, be the current user's, be
+  elevated and have integrity High or above (a restricted or lowered copy of an
+  elevated token still reports `TokenElevation`); there is no owner fallback, so a
+  token that cannot be queried is refused.
+  Finally the server PID must be unchanged and the process still running. Only then
+  does the client send the marker byte.
 - **Linux:** checks run before connecting. Every directory from `/` to the socket's
   parent must be a real directory (not a symlink), owned by root or the expected uid,
   and not group- or world-writable. The user form allows sticky ancestors, but not as
@@ -186,15 +206,19 @@ point `XDG_RUNTIME_DIR` at that directory.
 | `tonic_roundtrip.rs` | Handshake through tonic with native `connect_info` |
 | `stale_endpoint.rs` (Unix) | Recovery under the session lock; files and symlinks preserved |
 | `pipe_acl.rs` (Windows) | First instance, remote rejection, live DACL, owner-only user pipe |
+| `session_pipe_acl.rs` (Windows) | Session pipe DACL and label, first instance; no `WRITE_DAC`, `WRITE_OWNER` or new instance for a non-elevated copy |
+| `session_clients.rs` (Windows) | Restricted Medium copy admitted as not elevated; Low, AppContainer and second account refused |
+| `session_server_verify.rs` (Windows) | Elevated host accepted, tonic handshake; a non-elevated squatter running the trusted image refused before any write |
 | `unix_service.rs` (Unix) | Linux: user runtime path rules, writable service ancestor refused |
 | `macos_service_path.rs` | Protected directory chain of the macOS service path |
 
 These tests are privileged and `#[ignore]`d:
 `stale_endpoint::foreign_owned_stale_socket_is_preserved` and the three `privileged_*`
 tests in `unix_service.rs`. They need root, and some also need a second local account.
-Run them only as root in a disposable VM, with
-`--profile privileged --run-ignored only`. No CI workflow in this tree runs them at
-present.
+The `session_*.rs` tests are also ignored; `ci.yml` (`privileged-install`, Windows)
+runs them on the administrator runner with restricted and low-box copies of the
+runner's token. Run the Unix ones only as root in a disposable VM, with
+`--profile privileged --run-ignored only`; no CI workflow runs those yet.
 
 `pipe_acl::second_account_denied_allowed_and_revoked_on_real_pipe` creates a temporary
 local Windows account. It runs only with `ETD_IPC_CI_ACCOUNTS=1` and an elevated token,

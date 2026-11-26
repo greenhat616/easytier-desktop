@@ -523,16 +523,38 @@ fn checkout() -> Result<Worker, WinError> {
         }
         (pool.job.clone(), pool.generation)
     };
+    // Counted busy from here: shutdown waits for this spawn too.
     let spawned = match job {
         Some(job) => Worker::spawn(&job, generation),
         None => Err(WinError::invalid("management job missing")),
     };
-    if spawned.is_err() {
-        let mut pool = pool();
-        pool.busy -= 1;
-        CALLS_DONE.notify_all();
+    let worker = match spawned {
+        Ok(worker) => worker,
+        Err(e) => {
+            let mut pool = pool();
+            pool.busy -= 1;
+            CALLS_DONE.notify_all();
+            return Err(e);
+        }
+    };
+    if admits(&pool(), &worker) {
+        return Ok(worker);
     }
-    spawned
+    // Shutdown began while it was starting: it serves nothing. It is ended
+    // before the call counts as done, so shutdown's wait covers it.
+    let _ = worker.discard(WinError::invalid("shut down"));
+    let mut pool = pool();
+    pool.busy -= 1;
+    CALLS_DONE.notify_all();
+    Err(WinError::invalid(
+        "system management is shut down: the host is stopping",
+    ))
+}
+
+/// A freshly started worker serves only if shutdown has not begun since
+/// it was admitted (same generation, admission still open).
+fn admits(pool: &Pool, worker: &Worker) -> bool {
+    !pool.closed && worker.generation == pool.generation
 }
 
 /// Back to the pool (healthy, current job, room left) or ended.
@@ -591,8 +613,9 @@ pub fn run(request: Value) -> Result<Vec<Value>, WinError> {
 /// no request starts a worker or a job afterwards, and none is retried.
 /// Idle workers have stdin closed and are killed; calls in progress get
 /// [`DRAIN`] to finish; then the job is terminated and the exit of every
-/// process in it confirmed. `Err`: some may still run (the caller keeps the
-/// affected records open, as they are).
+/// process in it confirmed, and every admitted call (a worker still
+/// starting included) must have returned. `Err`: some may still run (the
+/// caller keeps the affected records open, as they are, and its lock).
 pub fn shutdown() -> Result<(), WinError> {
     let started = Instant::now();
     let (idle, job) = {
@@ -621,10 +644,12 @@ pub fn shutdown() -> Result<(), WinError> {
     }
     let busy = pool.busy;
     drop(pool);
-    let Some(job) = job else {
-        return Ok(());
-    };
-    let result = job.terminate(started + SHUTDOWN_WORST);
+    let deadline = started + SHUTDOWN_WORST;
+    let result = match job {
+        Some(job) => job.terminate(deadline),
+        None => Ok(()),
+    }
+    .and_then(|()| settle(deadline));
     match (&result, busy) {
         (Ok(()), 0) => {}
         (Ok(()), n) => tracing::warn!(
@@ -637,6 +662,27 @@ pub fn shutdown() -> Result<(), WinError> {
         ),
     }
     result
+}
+
+/// Wait until `deadline` for every admitted call to return: a call whose
+/// worker was terminated returns at once, a worker still starting ends
+/// itself (see [`admits`]).
+fn settle(deadline: Instant) -> Result<(), WinError> {
+    let mut pool = pool();
+    while pool.busy > 0 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(WinError::invalid(format!(
+                "{} management call(s) still in progress at shutdown",
+                pool.busy
+            )));
+        }
+        pool = CALLS_DONE
+            .wait_timeout(pool, left)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+    }
+    Ok(())
 }
 #[cfg(test)]
 mod tests {
@@ -722,16 +768,61 @@ mod tests {
         assert_eq!(run(serde_json::json!({"op":"magic"})).unwrap().len(), 1);
         let job = pool().job.clone().expect("a job for the first worker");
         assert!(job.active().unwrap() > 0, "the idle worker runs in the job");
+        // A call admitted before shutdown that returns only after the
+        // drain (and the job's termination): shutdown waits for it.
+        pool().busy += 1;
+        let late = std::thread::spawn(|| {
+            std::thread::sleep(DRAIN + Duration::from_secs(1));
+            checkin(None);
+        });
         let started = Instant::now();
         shutdown().unwrap();
-        assert!(started.elapsed() <= SHUTDOWN_WORST);
+        let took = started.elapsed();
+        assert!(took >= DRAIN + Duration::from_secs(1), "{took:?}");
+        assert!(took <= SHUTDOWN_WORST, "{took:?}");
+        late.join().unwrap();
         assert_eq!(job.active().unwrap(), 0);
         assert!(pool().idle.is_empty());
         // No new worker or job after shutdown.
         let refused = run(serde_json::json!({"op":"magic"})).unwrap_err();
         assert!(refused.message.contains("shut down"), "{}", refused.message);
         assert!(pool().job.is_none());
+        // A call that never returns: shutdown reports it at its deadline.
+        pool().busy += 1;
+        let started = Instant::now();
+        let stuck = shutdown().unwrap_err();
+        assert!(
+            stuck.message.contains("still in progress"),
+            "{}",
+            stuck.message
+        );
+        assert!(started.elapsed() <= SHUTDOWN_WORST + Duration::from_millis(500));
+        checkin(None);
         shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_worker_started_across_shutdown_is_not_admitted() {
+        let worker = fresh();
+        let closed = Pool {
+            closed: true,
+            generation: worker.generation,
+            ..Pool::default()
+        };
+        assert!(!admits(&closed, &worker), "refused once closed");
+        // A new generation (shutdown ran) refuses it too.
+        let newer = Pool {
+            generation: worker.generation.wrapping_add(1),
+            ..Pool::default()
+        };
+        assert!(!admits(&newer, &worker), "refused: stale generation");
+        // The same generation, admission open: it serves.
+        let current = Pool {
+            generation: worker.generation,
+            ..Pool::default()
+        };
+        assert!(admits(&current, &worker));
+        worker.end();
     }
 
     #[test]

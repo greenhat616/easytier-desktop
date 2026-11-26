@@ -1,95 +1,214 @@
-# EasyTier Desktop（接口冻结 freeze-v1）
+<h1 align="center">EasyTier Desktop</h1>
 
-使用 Rust 1.100.0、edition 2024、Cargo resolver 3。当前包含完整的契约、各层 trait
-与模型（已冻结）、按工作包归属拆好的空实现文件、开发检查以及 GPUI 空窗口。
-**不包含业务逻辑，不会启动内核、安装服务、修改系统网络或回收系统对象。**
+<p align="center">
+  A desktop client for the <a href="https://github.com/EasyTier/EasyTier">EasyTier</a>
+  mesh VPN that keeps the UI unprivileged and cleans up after every kernel exit.
+</p>
 
-## 目录和职责
+<p align="center">
+  <a href="docs/architecture/README.md">Architecture</a> ·
+  <a href="docs/development/README.md">Development standards</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a> ·
+  <a href="https://github.com/greenhat616/easytier-desktop/issues">Report an issue</a>
+</p>
 
-| crate | 职责 |
-| --- | --- |
-| etd-contract | 唯一 Protobuf 定义、生成消息、共享 DTO 与契约版本 |
-| etd-ipc | 本地 IPC 的连接、监听和对端身份抽象 |
-| etd-client | 宿主客户端 trait；仅生成客户端 gRPC 桩 |
-| etd-app | 状态仓库、宿主启动接口、配置/托盘抽象、跨线程消息 |
-| etd-ui | GPUI Kit 窗口及 UI 组合根 |
-| etd-ctl | CLI 组合根，依赖宿主客户端 |
-| etd-host | 宿主组合根，负责连接真实适配器 |
-| etd-host-core | 宿主编排、授权、内核存储接口；仅生成服务端 gRPC 桩 |
-| etd-proc | 进程、时钟、重启策略抽象；唯一 ProcessKit 适配器 |
-| etd-sysfx | 副作用记录、账本、回收 trait；SQLite 实现占位 |
-| etd-sysfx-os | 系统副作用适配器占位 |
-| etd-core-api | 内核适配 trait 与计划模型，不暴露 EasyTier 类型 |
-| etd-core-easytier | EasyTier 原型适配器，固定上游提交 |
-| etd-testkit | 测试替身、内存传输、fake-core 占位 |
-| xtask | 工作区依赖边界检查 |
+<p align="center">
+  <a href="https://github.com/greenhat616/easytier-desktop/actions/workflows/ci.yml">
+    <img src="https://github.com/greenhat616/easytier-desktop/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status" />
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/license-LGPL--3.0--or--later-blue" alt="License: LGPL-3.0-or-later" />
+  </a>
+  <a href="rust-toolchain.toml">
+    <img src="https://img.shields.io/badge/rust-1.100.0-orange?logo=rust" alt="Rust 1.100.0" />
+  </a>
+  <img src="https://img.shields.io/badge/status-pre--release-red" alt="Status: pre-release" />
+</p>
 
-消息由 etd-contract 使用 prost 生成；etd-client 和 etd-host-core 使用 tonic
-分别生成 client/server stubs（各自的 `stub` 模块），通过 extern_path 复用同一个
-消息类型。契约 `etd.v1` 已包含架构 v7 列出的全部方法，每个方法用
-`(etd.v1.required_role)` 自定义选项标注所需角色，`etd_contract::required_role`
-从描述符读出同一张表。契约 1.0 不含用户宿主的“远程”模式（连别处的 rpc-portal、不启动内核），以后作为兼容新增补上。
+EasyTier Desktop runs the upstream `easytier-core` kernel for you on Windows, Linux and
+macOS. The window and the command line never touch the kernel or the operating system
+directly: they talk to a small host process over a versioned, authenticated local
+contract. The host starts each network instance, writes down every system change the
+kernel is expected to make before it starts, and removes those changes again after a
+normal stop, a kernel crash, a host crash or a power cut.
 
-## 接口冻结与文件归属
+> [!WARNING]
+> EasyTier Desktop is in early development and has **no release yet**. The trusted
+> kernel table (`crates/etd-host/cores.lock`) in the repository is empty, so a build from
+> source cannot start a kernel until release packaging supplies one. Interfaces, on-disk
+> formats and the UI are still changing. Do not use it to manage networks you depend
+> on.
 
-冻结接口（改动走变更请求）：`crates/etd-contract/**`、`buf.yaml`、根及各 crate 的
-`Cargo.toml` 与 `lib.rs`、各 trait 与模型文件、`etd-testkit/src/lib.rs` 与
-`fakes/mod.rs`。每个实现文件开头写明归属的工作包（见 doc#7 归属表）。加字段、
-加枚举变体（枚举一律 `#[non_exhaustive]`，少数安全相关的判定枚举除外）、加默认
-实现的方法算兼容改动；签名改动算破坏。
+## Features
 
-契约描述符基线在 `crates/etd-contract/tests/baseline/etd.v1.txt`；兼容的新增
-用 `ETD_UPDATE_BASELINE=1 cargo nextest run -p etd-contract` 重新生成并随改动评审。
-各 crate 的依赖已按 doc#4 一次加齐，未使用的依赖由 `[workspace.lints.cargo]`
-暂时放行，第 1 波合并后再收紧。
+What exists in the code today:
 
-## 本地检查
+- **UI and host split.** The GPUI desktop app (`etd-ui`) and the CLI (`etd-ctl`) are
+  plain clients of `etd-host`. Neither has a dependency path to EasyTier; CI enforces
+  this.
+- **Versioned local contract.** gRPC (`etd.v1`) over a named pipe or Unix domain
+  socket, with a version handshake, capability flags, per-method roles (read, control,
+  admin) and peer credentials taken from the operating system. No shared secrets or
+  token files.
+- **Two host forms.** An installable system service (SCM, systemd, launchd) that keeps
+  networks up without a logged-in user, and a per-user host started by the UI for
+  networks without TUN.
+- **Ledger before action.** Every predicted side effect (TUN adapter, firewall rules,
+  registry values, DNS settings, the runtime directory, the kernel process) is
+  committed to a SQLite ledger in the same transaction as the request and the new
+  desired state, before the kernel is launched.
+- **One reclaim path.** Whether the kernel stopped, crashed or the machine lost power,
+  the host probes, removes and re-checks the recorded objects, and deletes an object
+  only when its creation credentials or an exclusive container prove it is ours.
+  Anything it cannot prove is reported as a candidate for the user to confirm.
+- **Fenced kernel management port.** The kernel's unauthenticated loopback RPC port is
+  closed to everyone but the host (Windows WFP, Linux nftables, macOS PF) and the fence
+  is verified in both directions before management pages are enabled.
+- **Idempotent requests.** Every change carries a client request id and an expected
+  revision; a lost reply is recovered from the host instead of being re-applied.
+- **Trusted kernel bundles.** The host runs only kernel binaries whose SHA-256 hashes
+  were embedded from `cores.lock` at build time; clients cannot choose a kernel path.
+- **Desktop UI.** Instance list and editor, node, route and traffic pages when the host
+  offers them, a reclaim report with per-item confirmation, an in-app offer to install
+  the service, tray integration, and a Fluent theme (light, dark or follow the system;
+  accent colour and Mica backdrop on Windows).
+- **Scriptable CLI.** `etd-ctl status | apply | start | stop | logs | reclaim-report`
+  with `--json` output and documented exit codes.
 
-准备 Rustup、平台 C/C++ 工具链、protoc 36.2。仓库中的 rust-toolchain.toml
-固定工具链及 rustfmt/clippy；Cargo.lock 固定解析后的依赖。
+Planned, not implemented: the Windows elevated session host (one UAC prompt per
+session, no service), installer packages, the simple "game lobby" mode, and further
+EasyTier options that need contract extensions.
 
-Windows 需要 MSVC 和 Windows SDK；macOS 需要 Xcode Command Line Tools；
-Linux 需要 GPUI 所需的原生构建、图形和窗口系统开发库，可参考 CI 的安装步骤。
+## Platform support
+
+| | Windows | Linux | macOS |
+| --- | --- | --- | --- |
+| Desktop UI and tray | Yes | Yes (X11; tray through StatusNotifierItem) | Yes |
+| User host (no TUN) | Yes | Yes | Yes |
+| System service host | Yes (SCM) | Yes (systemd) | Yes (launchd) |
+| Kernel port fence | WFP | nftables, by uid | PF, by user |
+| Magic DNS | One instance at a time | systemd-resolved | Disabled in the first release |
+| Elevated session host | Planned | No | No |
+| Installer package | Planned (MSI) | Planned (deb, rpm, Arch) | Not planned yet |
+
+Privileged behaviour on each platform is covered by CI jobs on disposable runners; see
+[Testing](docs/testing/README.md).
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph user["User session (unprivileged)"]
+        ui["etd-ui<br/>GPUI window + tray"]
+        ctl["etd-ctl<br/>CLI"]
+    end
+    subgraph host["etd-host (service or user host)"]
+        svc["contract service<br/>auth, roles, receipts"]
+        life["lifecycle<br/>supervisor, self-check"]
+        ledger[("SQLite ledger")]
+        reclaim["reclaim engine<br/>+ OS adapters"]
+    end
+    core["easytier-core<br/>one process per instance"]
+    os["Operating system<br/>TUN, routes, firewall, DNS"]
+
+    ui -- "gRPC etd.v1<br/>pipe / UDS" --> svc
+    ctl -- "gRPC etd.v1" --> svc
+    svc --> life
+    life --> ledger
+    life -- "spawn in process group<br/>config file" --> core
+    life -- "management RPC<br/>behind port fence" --> core
+    core -- "creates" --> os
+    reclaim -- "probe, remove, re-check" --> os
+    life --> reclaim
+```
+
+The UI only ever changes the desired state. The host pulls the actual state towards it,
+and every kernel exit goes through reclaim before the next generation may start. See
+the [architecture overview](docs/architecture/README.md) for the processes, crates,
+channels and state machines.
+
+## Build from source
+
+Prerequisites:
+
+- [rustup](https://rustup.rs). `rust-toolchain.toml` pins Rust 1.100.0 with rustfmt
+  and Clippy.
+- `protoc` 36.2 on `PATH`.
+- A platform C/C++ toolchain: MSVC and the Windows SDK on Windows, Xcode Command Line
+  Tools on macOS, and on Linux the native build, graphics and windowing libraries GPUI
+  needs (the `check` job in [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
+  lists the Debian packages).
+
+```sh
+cargo build --workspace --locked
+cargo run -p etd-ui                       # desktop app
+cargo run -p etd-host -- run --mode user  # a user host in the foreground
+cargo run -p etd-ctl -- --host user status
+```
+
+Checks that CI runs on every push:
 
 ```sh
 cargo fmt --all -- --check
-cargo build --workspace --locked
-cargo clippy --workspace --locked -- -D warnings
-cargo test --workspace --locked
 cargo xtask check-boundaries
-cargo run -p etd-ui
+cargo clippy --locked --workspace -- -D warnings
+cargo nextest run --locked --workspace --profile ci
+cargo test --locked --workspace --doc
+cargo deny --locked check
 ```
 
-若已安装 cargo-nextest，可用 `cargo nextest run --workspace --locked`，
-另运行 `cargo test --doc --workspace --locked`。依赖审计用 `cargo deny --locked check`；
-契约检查用 `buf lint` 和 `buf breaking --against '.git#tag=freeze-v1'`。
-这些是额外工具，不由本仓库自动安装。
+`cargo-nextest` and `cargo-deny` are separate installs. Privileged tests are marked
+`#[ignore]` and run only in CI or disposable VMs; never run them on your own desktop.
+See [Development workflow](docs/development/workflow.md) for the details.
 
-## 依赖边界
+## Project layout
 
-`cargo xtask check-boundaries` 读取 Cargo metadata 的实际解析图及声明：
+```text
+crates/
+  etd-contract       etd.v1 Protobuf contract, generated messages, role table
+  etd-ipc            named pipes / Unix sockets, peer identity, tonic transport
+  etd-client         HostClient trait and gRPC client (UI and CLI side)
+  etd-app            UI logic without GPUI: state store, bridge, exit gate, tray state
+  etd-ui             GPUI desktop app (binary)
+  etd-ctl            command-line client (binary)
+  etd-host           host composition root, install and maintenance commands (binary)
+  etd-host-core      host orchestration and contract service, traits only
+  etd-proc           process engine over ProcessKit, identity, restart policy
+  etd-sysfx          side-effect model, SQLite ledger, reclaim engine
+  etd-sysfx-os       Windows / Linux / macOS adapters, service installation
+  etd-core-api       kernel adapter traits, independent of EasyTier
+  etd-core-easytier  EasyTier adapter: launch plans, effect prediction, management RPC
+  etd-testkit        fakes, conformance suites, fake-core, integration tiers (test-only)
+xtask/               cargo xtask: architecture boundary check and repository tests
+docs/                architecture, development standards, testing
+skills/etd-ctl/      agent skill for operating a host with etd-ctl
+```
 
-1. etd-ui、etd-app、etd-client 的整个依赖闭包不得有 etd-core-easytier 或 easytier*。
-2. 工作区只有 etd-proc 可以直接依赖 ProcessKit；系统 API 绑定仅允许
-   etd-proc、etd-ipc、etd-sysfx-os 直接依赖（第三方库自己的传递依赖不算直接引用）。
-3. etd-host-core 只依赖公共契约及 trait 层，不直接引用真实系统/内核适配器。
-   测试可通过 dev-dependency 使用 etd-testkit，产品不得普通依赖 testkit。
+Each crate has a README describing its surface, boundaries and tests.
 
-检查包含 normal/build/dev，以及所有目标条件和工作区 feature；违反任何边界时
-以非零退出码告警，CI 失败。
+## Contributing
 
-## 依赖选择
+Bug reports and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) and
+the [development standards](docs/development/README.md) first. Coding agents follow
+[AGENTS.md](AGENTS.md).
 
-GPUI Kit 固定 0.11.0（上游 GPUI snapshot 0.3.14），不启用 Fast/Shell；
-Linux 托盘选择 ksni/snapshot，关闭 GTK 默认后端。ProcessKit 固定 3.3.4；
-prost/tonic 系列分别固定 0.14.6/0.14.9。SQLite 使用 bundled；
-时间戳使用 Jiff 1.0，单调时钟使用 std::time。
+## Acknowledgements
 
-EasyTier 原型固定上游提交 c97f36b8d40f3bde7a95cc9ec99fe95fe35a6ff0，
-关闭默认 features。未实现的业务不盲目引入候选依赖；按需增加，并统一写在
-workspace.dependencies 中。上游间接依赖版本不做全局覆盖。
+- [EasyTier](https://github.com/EasyTier/EasyTier), the mesh VPN this client manages.
+  The adapter links its `easytier-proto` and `easytier-core` crates at a pinned
+  revision.
+- [ProcessKit](https://crates.io/crates/processkit), for process groups and job
+  objects.
+- [GPUI Kit](https://crates.io/crates/gpui-kit), [tray-icon and
+  muda](https://github.com/tauri-apps/tray-icon), for the desktop UI.
+- [tonic](https://github.com/hyperium/tonic) and
+  [prost](https://github.com/tokio-rs/prost), for the local contract.
+- [Fluent UI System Icons](https://github.com/microsoft/fluentui-system-icons) (MIT).
+- [Clash Nyanpasu](https://github.com/libnyanpasu/clash-nyanpasu), whose process
+  identity and quarantine approach the host builds on.
 
-## 许可
+## License
 
-LGPL-3.0-or-later。见 LICENSE（LGPL 第 3 版）及 COPYING-GPL-3.0
-（LGPL 引用的 GPL 第 3 版全文）。第三方及独立发布的组件保留各自许可。
+Licensed under [LGPL-3.0-or-later](LICENSE). [COPYING-GPL-3.0](COPYING-GPL-3.0) holds
+the GPL version 3 text that the LGPL refers to. Third-party components keep their own
+licenses.

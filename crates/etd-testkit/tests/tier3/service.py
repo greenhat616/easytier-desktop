@@ -62,22 +62,29 @@ def empty_pf_namespace(before, after):
     return set()
 
 
-def assert_driver_notice(stdout, retained):
-    notices = re.findall(r"^[ \t]*left in place: shared driver service (\S+) image (.+?); "
-                         r"remove it yourself if no other software uses it\s*$", stdout, re.M | re.I)
+def assert_driver_notice(stdout, retained, *, recorded=None):
+    preexisting = recorded is not None
+    prefix = "pre-existing shared driver" if preexisting else "shared driver"
+    suffix = "it belongs to other software" if preexisting else "remove it yourself if no other software uses it"
+    notices = re.findall(rf"^[ \t]*left in place: {prefix} service (\S+) image (.+?); {suffix}\s*$",
+                         stdout, re.M | re.I)
     assert len(notices) == len(retained) and {name.lower() for name, _ in notices} == retained.keys()
     root = Path(os.environ["SystemRoot"])
-    for name, image in notices:
+    def driver_path(raw):
+        path = os.path.expandvars(raw.strip().strip('"')).removeprefix("\\??\\")
+        if path.lower().startswith("\\systemroot\\"):
+            return root / path[len("\\systemroot\\"):]
+        return root / path if not Path(path).is_absolute() else Path(path)
+    for name, description in notices:
+        source = "as recorded" if preexisting and name.lower() in recorded else "from SCM, now"
+        label = f" ({source})"
+        assert description.endswith(label), f"expected {source} for {name}: {description}"
+        image = description.removesuffix(label)
         config = retained[name.lower()]
         match = re.search(r"^\s*BINARY_PATH_NAME\s*:\s*(.+)$", config, re.M)
-        assert match and image != "unknown", f"missing shared driver image for {name}"
-        native = os.path.expandvars(match[1].strip().strip('"')).removeprefix("\\??\\")
-        if native.lower().startswith("\\systemroot\\"):
-            native = root / native[len("\\systemroot\\"):]
-        elif not Path(native).is_absolute():
-            native = root / native
-        assert Path(image).samefile(native), f"shared driver report differs from SCM for {name}"
-    print(f"native shared driver notices verified: {sorted(retained)}", flush=True)
+        assert match and not image.lower().startswith("unknown"), f"missing shared driver image for {name}"
+        assert driver_path(image).samefile(driver_path(match[1])), f"shared driver report differs from SCM for {name}"
+        print(f"native shared driver notice verified: {name} image {image} ({source})", flush=True)
 
 
 class Service:
@@ -101,6 +108,8 @@ class Service:
         self.core = self.cores / os.environ["ETD_G2_SHA"] / ("easytier-core" + ext)
         self.runtime = self.state / "run"
         self.retained_drivers = {}
+        self.preexisting_drivers = {}
+        self.recorded_driver_images = set()
         self.adapter_indices = {}
 
     def verify_bundle(self):
@@ -241,6 +250,8 @@ class Service:
                            lambda status: status.startswith("No maintenance journal:"))
                 if self.retained_drivers:
                     assert_driver_notice(result.stdout, self.retained_drivers)
+                if self.preexisting_drivers:
+                    assert_driver_notice(result.stdout, self.preexisting_drivers, recorded=self.recorded_driver_images)
             after = self.inventory()
             delta = before.delta(after) - managed_service_changes(before, after)
             delta -= runner_noise(before, after) | tun_created(before, after)

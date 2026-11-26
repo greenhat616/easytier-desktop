@@ -298,6 +298,24 @@ def native_application_id(path):
         free(ctypes.cast(ctypes.byref(ptr), free.argtypes[0]))
 
 
+def native_interface_guid(index):
+    import ctypes
+    from uuid import UUID
+    native = ctypes.WinDLL("iphlpapi")
+    luid = ctypes.c_uint64()
+    data = (ctypes.c_ubyte * 16)()
+    to_luid = native.ConvertInterfaceIndexToLuid
+    to_luid.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64)]
+    to_guid = native.ConvertInterfaceLuidToGuid
+    to_guid.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(type(data))]
+    rc = to_luid(index, ctypes.byref(luid))
+    if not rc:
+        rc = to_guid(ctypes.byref(luid), ctypes.byref(data))
+    if rc:
+        raise ctypes.WinError(rc)
+    return UUID(bytes_le=bytes(data))
+
+
 def windows(inv):
     data = json.loads(command("powershell.exe", "-NoProfile", "-NonInteractive", "-File",
                               Path(__file__).with_name("windows.ps1"), timeout=180).stdout)

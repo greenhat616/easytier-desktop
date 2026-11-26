@@ -46,10 +46,15 @@ Flows, locks, paths and the per-OS install steps are described in
 current Rust target (`TRUSTED_CORES`). `storage::trusted_cores()` hands that table to
 `ManifestCoreStore`. A kernel can be installed or launched only if its version and
 SHA-256 (and every companion file's hash) appear in this table; the on-disk manifest
-is an inventory, never a source of trust. **The checked-in `cores.lock` currently has
-no rows, so a build from this repository trusts no kernel and cannot start one.**
-Release packaging fills the table. Row format, accepted targets and validation rules
-are in the header of `cores.lock` and in `core_lock.rs`.
+is an inventory, never a source of trust. The checked-in `cores.lock` lists the
+official EasyTier v2.7.1 release kernels for x86_64/aarch64 Windows, Linux and macOS
+(Windows rows include `Packet.dll`, `wintun.dll` and, on x86_64, `WinDivert64.sys`).
+It is generated from `packaging/cores.toml` by `cargo xtask fetch-cores --update-lock`;
+never edit it by hand. Because the table is not empty, `install` (and a user host's
+first start) needs `cores/2.7.1/` beside the image: stage it with
+`cargo xtask fetch-cores --target host --bundle <image dir>/cores`. Row format,
+accepted targets and validation rules are in the header of `cores.lock` and in
+`core_lock.rs`.
 
 ## Dependencies and boundaries
 

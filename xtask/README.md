@@ -1,8 +1,9 @@
 # xtask
 
-Repository checks for the workspace (binary, not published). It has one command,
+Repository tasks for the workspace (binary, not published). It has two commands:
 `cargo xtask check-boundaries`, which enforces the architecture dependency rules, and
-two test-only checks that run as ordinary unit tests: the Windows `CREATE_NO_WINDOW`
+`cargo xtask fetch-cores`, which downloads and verifies the bundled upstream kernels.
+Two test-only checks that run as ordinary unit tests: the Windows `CREATE_NO_WINDOW`
 spawn check and the privileged CI profile check. The `cargo xtask` alias is defined in
 `.cargo/config.toml` (`run --package xtask --`).
 
@@ -46,6 +47,47 @@ their real package name, so renaming a dependency in `Cargo.toml` does not hide 
   builds the dev-dependencies of a dependency. Rule 3's library closure leaves out the
   root's dev-dependencies; its test closure includes them.
 
+## `cargo xtask fetch-cores`
+
+```sh
+cargo xtask fetch-cores                                   # every pinned target, check cores.lock
+cargo xtask fetch-cores --target host --bundle target/debug/cores
+cargo xtask fetch-cores --release v2.7.1 --update-lock    # regenerate cores.lock
+```
+
+`packaging/cores.toml` pins the bundled upstream release: repository, tag, commit, the
+kernel version `--version` prints, and per target triple one release archive with its
+SHA-256 and the companion files to keep (Windows: `Packet.dll`, `wintun.dll`, and on
+x86_64 `WinDivert64.sys`; the arm64 archive's `WinDivert64.sys` is a text placeholder
+and is left out). The command:
+
+1. downloads the release's `SHA256SUMS` and each selected archive with `curl -q`
+   (no curlrc; `https` only, redirects too; `CREATE_NO_WINDOW` on Windows; size
+   limits);
+2. requires each archive's digest to equal both the pin and `SHA256SUMS`, and fails
+   otherwise;
+3. extracts by exact file name only `easytier-core[.exe]` and the listed companions
+   (no directories, symlinks, unsafe paths, duplicates or oversize members; a missing
+   one fails) into a staging directory beside the destination, mode 0755 for the
+   kernel on Unix;
+4. by default checks the extracted SHA-256 against `crates/etd-host/cores.lock`
+   (parsed with `etd-host`'s own `core_lock.rs`); with `--update-lock` (every target,
+   never combined with `--target`/`--bundle`) it rewrites the table instead;
+5. only then replaces `<version>/` with the staging directory. On any failure the
+   staging directory is removed and nothing is published.
+
+| Option | Effect |
+| --- | --- |
+| `--release <tag>` | Must equal the pinned tag; a different release means editing `packaging/cores.toml` |
+| `--target <triple>` | Repeatable; `host` is the running machine. Default: every pinned target |
+| `--out <dir>` | Writes `<dir>/<triple>/<version>/`. Default: `<target dir>/etd-cores` |
+| `--bundle <dir>` | One target only: writes `<dir>/<version>/`, the `cores/` layout `etd-host install` imports from beside its image |
+| `--github-env <NAME>` | One target only: after verification appends `NAME=<absolute kernel path>` to `$GITHUB_ENV` |
+| `--update-lock` | Regenerates `cores.lock` from all pinned targets |
+
+CI uses it in `ci.yml` (`session_real` on every OS, `install_roundtrip` beside the test
+host image) and in the O1/O2/O3 workflows. Binaries are never committed.
+
 ## Test-only repository checks
 
 These live in `src/spawn_flags.rs` and `src/ci_config.rs`, compiled only under
@@ -87,7 +129,10 @@ workflow uses the profile.
 cargo nextest run -p xtask
 ```
 
-This runs the spawn-flag and CI-config checks over the real repository, plus the
+This runs the spawn-flag and CI-config checks over the real repository, the
+`fetch-cores` checks (the committed `cores.lock` covers exactly the pinned targets and
+companions, pin validation, `SHA256SUMS` parsing, extraction from a synthetic zip; no
+network), plus the
 boundary rule tests in `src/boundaries/tests.rs`. Those generate synthetic workspaces
 of empty path crates in a temporary directory and run `cargo metadata --offline` on
 them, so each rule is exercised with Cargo's real metadata shape (every dependency kind,
@@ -96,7 +141,9 @@ dependencies). Nothing is privileged and nothing needs the network.
 
 ## Dependencies and boundaries
 
-Depends on `anyhow`, `cargo_metadata`, `clap`, `serde_json` (`tempfile` for tests). It
-depends on no workspace crate and nothing depends on it. See
+Depends on `anyhow`, `cargo_metadata`, `clap`, `serde`, `serde_json`, `sha2`,
+`tempfile`, `toml` and `zip` (deflate only), and needs `curl` on `PATH` for
+`fetch-cores`. It depends on no workspace crate (it compiles `etd-host`'s `core_lock.rs`
+by path) and nothing depends on it. See
 [`../docs/development/workflow.md`](../docs/development/workflow.md) and
 [`../docs/architecture/README.md`](../docs/architecture/README.md).

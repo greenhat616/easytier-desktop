@@ -15,6 +15,11 @@ from the EasyTier git repository at revision
 root `Cargo.toml` with default features off. `PROTOTYPE_REVISION` holds the same hash.
 Upstream types never leave this crate.
 
+The kernel shipped beside the host is the official upstream release v2.7.1 (commit
+`0d9c52b169dc2112687ddefcf571cd01d383193c`, pinned in `packaging/cores.toml`). Its
+management proto, CLI and TOML schema are byte-identical to `c97f36b`, so the linked
+crates and this adapter serve both.
+
 ## Public surface
 
 `lib.rs` (frozen at `freeze-v1`) only wires `EasyTierDriver` to the modules below.
@@ -23,7 +28,7 @@ Upstream types never leave this crate.
 | --- | --- |
 | `EasyTierDriver` | `CoreDriver` implementation used by the host |
 | `identify::identify`, `parse_version_output` | Run `<binary> --version` and parse the version and commit |
-| `profiles::{Profile, ALL, profile_for, find, by_id}` | Adapter profiles; first and only: `2.7.1-c97f36b` |
+| `profiles::{Profile, ALL, profile_for, find, by_id}` | Adapter profiles: `2.7.1-c97f36b` (source-built development kernels, fixtures) and `2.7.1-0d9c52b` (the bundled release) |
 | `plan::{plan_launch, plan_for, Platform}` | Pure launch planning; `plan_for` plans for any platform (used by tests) |
 | `plan::spec::{Settings, redact_uri, kernel_instance_id, render_toml}` | Spec validation and TOML |
 | `plan::effects::{adapter_guid, interface_rule_names, program_rule_names, ...}` | Side-effect prediction helpers |
@@ -34,12 +39,14 @@ Upstream types never leave this crate.
 
 `identify` runs the binary with `--version` from its bundle directory, with an empty
 environment and a fixed system `PATH`, a 10 s timeout and a 4 KiB output limit, and
-parses forms such as `easytier-core 2.7.1-c97f36b8-20261124` or
-`2.7.1-v2.7.0-12-gc97f36b8-20261124`. A profile matches only the exact version and a
+parses forms such as `easytier-core 2.7.1-c97f36b8-20261124`,
+`2.7.1-v2.7.0-12-gc97f36b8-20261124` or the release's `2.7.1-0d9c52b1-20261115`. A profile matches only the exact version and a
 revision of at least seven hex digits that prefixes the profile's full hash; a dirty
 (`~`) or git-less build matches nothing. A privileged host refuses a kernel without a
-profile (`NoProfile`); a user host may run it lifecycle-only. The current profile has
-`deny_all_verified = false`, so a `DenyAll` guard cannot be planned yet.
+profile (`NoProfile`); a user host may run it lifecycle-only. A profile grants no
+trust: only binaries whose SHA-256 is in `etd-host`'s `cores.lock` can be installed or
+launched. Both profiles have `deny_all_verified = false`, so a `DenyAll` guard cannot be
+planned yet.
 
 ### `plan_launch`
 
@@ -131,7 +138,7 @@ cargo test --doc -p etd-core-easytier
 | `plan_identity.rs` | Derived interface name and Windows GUID against upstream vectors |
 | `plan_redaction.rs` | Secret only in the file; `Debug`, errors, logs and snapshots redacted |
 | `session_inproc.rs` | Session against an in-process RPC stub over loopback TCP |
-| `session_real.rs` | `#[ignore]`: identify, launch, ready and query against a real pinned kernel; needs `ETD_EASYTIER_CORE`; not run by any workflow |
+| `session_real.rs` | `#[ignore]`: identify, launch, ready and query against the bundled release kernel; needs `ETD_EASYTIER_CORE` (`cargo xtask fetch-cores --target host --github-env ETD_EASYTIER_CORE`); `ci.yml` `check` runs it on all three OSes |
 | `src/session/tests.rs`, `src/profiles` | Unit tests over upstream's in-process ring tunnel; profile matching |
 
 `plan_fixtures.rs` and `session_support/` are shared helpers. Update snapshots with

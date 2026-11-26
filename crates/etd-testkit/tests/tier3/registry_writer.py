@@ -94,6 +94,11 @@ def registry_audit():
         acl.AddAuditAccessAceEx(security.ACL_REVISION_DS, 0, winreg.KEY_SET_VALUE,
                                 security.ConvertStringSidToSid("S-1-1-0"), 1, 0)
         def restore_acl():
+            # Low-level registry setters otherwise clear AUTO_INHERITED.
+            # Request the original automatic-inheritance behavior on write.
+            old_control = original.GetSecurityDescriptorControl()[0]
+            if old_control & 0x0800:  # SE_SACL_AUTO_INHERITED
+                original.SetSecurityDescriptorControl(0x0a00, 0x0a00)
             win32api.RegSetKeySecurity(key, INFO, original)
             restored = read_sd()
             print(f"SACL restore control old/new: {original.GetSecurityDescriptorControl()}/"

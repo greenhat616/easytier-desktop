@@ -1,6 +1,7 @@
 //! The kernel anchor is the source of truth across writer and host restarts.
 //! Mutate only its filter rules and read them back before returning.
-use super::{command, output};
+use super::{boot, command, output};
+use crate::service::{HostFilesystem, NativeHostFilesystem};
 use etd_sysfx::{FenceSpec, ObjectKey};
 use nix::unistd::Uid;
 use std::{
@@ -10,7 +11,7 @@ use std::{
     os::{
         fd::AsRawFd,
         unix::{
-            fs::{MetadataExt, OpenOptionsExt},
+            fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
             process::CommandExt,
         },
     },
@@ -19,7 +20,7 @@ use std::{
 
 pub(super) const ANCHOR: &str = "com.apple/easytier-desk";
 const PF: &str = "/sbin/pfctl";
-const OWNER: &str = "/private/var/run/easytier-desk.pf-reference";
+const OWNER: &str = "pf-reference";
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) struct Rule {
@@ -134,22 +135,39 @@ pub(super) fn rules() -> io::Result<BTreeSet<Rule>> {
     Ok(v4)
 }
 
-// /private/var/run is a stable root-owned inode shared by service and elevated
-// sessions. Lock the directory itself so unlink/reinstall cannot split writers.
+// HR keeps the maintenance directory across uninstall. All privileged
+// sessions use its stable inode, independent of the generation's state dir.
 // Each mutating pfctl inherits the lock if its spawning host dies mid-command.
-struct Writer(File);
+struct Writer(File, std::path::PathBuf);
 impl Writer {
     fn lock() -> io::Result<Self> {
         if !Uid::effective().is_root() {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
-        let dir = File::open("/private/var/run")?;
+        let path = NativeHostFilesystem.service_layout()?.maintenance;
+        for parent in path.parent().unwrap().ancestors() {
+            let m = fs::symlink_metadata(parent)?;
+            if !m.is_dir() || m.uid() != 0 || m.mode() & 0o022 != 0 {
+                return Err(io::Error::other(format!(
+                    "untrusted PF maintenance parent {}",
+                    parent.display()
+                )));
+            }
+        }
+        match fs::DirBuilder::new().mode(0o700).create(&path) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            result => result?,
+        }
+        let dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(&path)?;
         let m = dir.metadata()?;
-        if !m.is_dir() || m.uid() != 0 || m.mode() & 0o022 != 0 {
-            return Err(io::ErrorKind::PermissionDenied.into());
+        if !m.is_dir() || m.uid() != 0 || m.mode() & 0o777 != 0o700 {
+            return Err(io::Error::other("untrusted PF maintenance directory"));
         }
         dir.lock()?;
-        Ok(Self(dir))
+        Ok(Self(dir, path.join(OWNER)))
     }
     fn pf(&self) -> io::Result<Command> {
         let mut cmd = command(PF);
@@ -194,7 +212,7 @@ impl Writer {
             return Err(io::Error::other("PF wildcard filter hook unavailable"));
         }
         let current = rules()?;
-        if let Some(token) = token()?
+        if let Some(token) = token(&self.1)?
             && reference_live(&token)?
         {
             return active();
@@ -206,20 +224,22 @@ impl Writer {
         }
         // pfctl writes its receipt directly to a protected boot-local file.
         // This also finishes if the host is killed during enable.
-        let receipt = OpenOptions::new()
+        let mut receipt = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(OWNER)?;
+            .open(&self.1)?;
+        writeln!(receipt, "boot {}", boot()?.0)?;
+        receipt.sync_all()?;
         let status = self
             .pf()?
             .arg("-E")
             .stdout(receipt.try_clone()?)
             .stderr(receipt)
             .status()?;
-        if !status.success() || token()?.is_none() {
+        if !status.success() || token(&self.1)?.is_none() {
             return Err(io::Error::other("PF enable failed"));
         }
         self.load(&current)?;
@@ -237,17 +257,18 @@ fn active() -> io::Result<()> {
     Ok(())
 }
 
-fn token() -> io::Result<Option<String>> {
-    let contents = match fs::read_to_string(OWNER) {
+fn token(path: &std::path::Path) -> io::Result<Option<String>> {
+    let m = match fs::symlink_metadata(path) {
         Ok(s) => s,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let m = fs::symlink_metadata(OWNER)?;
     if !m.is_file() || m.uid() != 0 || m.mode() & 0o077 != 0 {
         return Err(io::ErrorKind::PermissionDenied.into());
     }
-    if contents.trim().is_empty() {
+    let contents = fs::read_to_string(path)?;
+    let mut lines = contents.lines();
+    if lines.next() != Some(&format!("boot {}", boot()?.0)) || lines.all(|l| l.trim().is_empty()) {
         return Ok(None);
     }
     let token = contents
@@ -268,7 +289,7 @@ fn reference_live(token: &str) -> io::Result<bool> {
 const SERVICE_RECEIPT: &str = "installed-pf-reference";
 pub(crate) fn install_anchor(state: &std::path::Path) -> io::Result<()> {
     let writer = Writer::lock()?;
-    let inherited = match token()? {
+    let inherited = match token(&writer.1)? {
         Some(t) => reference_live(&t)?,
         None => false,
     };
@@ -288,7 +309,7 @@ pub(crate) fn uninstall_anchor(state: &std::path::Path, rollback: bool) -> io::R
     if !rules()?.is_empty() {
         return Err(io::Error::other("live generation rules remain in PF"));
     }
-    if let Some(t) = token()?
+    if let Some(t) = token(&writer.1)?
         && reference_live(&t)?
     {
         // Do not surface an enable token in diagnostics.
@@ -296,7 +317,7 @@ pub(crate) fn uninstall_anchor(state: &std::path::Path, rollback: bool) -> io::R
             return Err(io::Error::other("PF reference release failed"));
         }
     }
-    match fs::remove_file(OWNER) {
+    match fs::remove_file(&writer.1) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         result => result,
     }

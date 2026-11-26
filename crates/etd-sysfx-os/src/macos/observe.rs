@@ -1,12 +1,11 @@
 use super::{boot, command, observation, observe_error, output, pf};
 use async_trait::async_trait;
 use etd_sysfx::*;
-use nix::{ifaddrs::getifaddrs, net::if_::InterfaceFlags, sys::socket::SockaddrStorage};
 use sha2::{Digest, Sha256};
+use std::ffi::CStr;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
-    io::{self},
+    fs, io,
     net::{IpAddr, SocketAddr},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
@@ -16,35 +15,80 @@ pub(super) struct MacObserver {
     pub(super) run_dir: PathBuf,
 }
 
-fn ip(addr: Option<&SockaddrStorage>) -> Option<IpAddr> {
-    let addr = addr?;
-    addr.as_sockaddr_in()
-        .map(|a| IpAddr::V4(a.ip()))
-        .or_else(|| addr.as_sockaddr_in6().map(|a| IpAddr::V6(a.ip())))
+// Darwin shortens netmasks by omitting trailing zeroes and can leave
+// sa_family unspecified. Decode the prefix using the address's family.
+fn address_bytes(sa: &[u8], family: i32) -> Option<IpAddr> {
+    match family {
+        libc::AF_INET => Some(IpAddr::from(<[u8; 4]>::try_from(sa.get(4..8)?).ok()?)),
+        libc::AF_INET6 => Some(IpAddr::from(<[u8; 16]>::try_from(sa.get(8..24)?).ok()?)),
+        _ => None,
+    }
 }
 fn interfaces() -> io::Result<BTreeMap<String, InterfaceInfo>> {
     let boot = boot()?;
     let mut addresses = BTreeMap::<String, Vec<(IpAddr, u8)>>::new();
     let mut found = BTreeMap::new();
-    for addr in getifaddrs()? {
-        let name = addr.interface_name;
-        if let Some(link) = addr.address.as_ref().and_then(|a| a.as_link_addr()) {
+    let mut head = std::ptr::null_mut();
+    // SAFETY: getifaddrs initializes head on success. All pointers below
+    // stay within that snapshot, which the guard releases on every exit.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    struct Snapshot(*mut libc::ifaddrs);
+    impl Drop for Snapshot {
+        fn drop(&mut self) {
+            unsafe { libc::freeifaddrs(self.0) };
+        }
+    }
+    let _guard = Snapshot(head);
+    while !head.is_null() {
+        let row = unsafe { &*head };
+        head = row.ifa_next;
+        if row.ifa_addr.is_null() {
+            continue;
+        }
+        let name = unsafe { CStr::from_ptr(row.ifa_name) }
+            .to_str()
+            .map_err(io::Error::other)?
+            .to_owned();
+        let len = unsafe { usize::from(*row.ifa_addr.cast::<u8>()) };
+        // Read exactly sa_len bytes, including for compressed sockaddr_dl.
+        let bytes = unsafe { std::slice::from_raw_parts(row.ifa_addr.cast::<u8>(), len) };
+        let Some(&family) = bytes.get(1) else {
+            continue;
+        };
+        if i32::from(family) == libc::AF_LINK {
+            let index = u16::from_ne_bytes(
+                bytes
+                    .get(2..4)
+                    .ok_or_else(|| io::Error::other("short link address"))?
+                    .try_into()
+                    .unwrap(),
+            );
             found.insert(
                 name.clone(),
                 InterfaceInfo {
                     name,
                     credential: Credential::UnixInterface {
-                        index: u32::try_from(link.ifindex()).map_err(io::Error::other)?,
+                        index: u32::from(index),
                         boot: boot.clone(),
                     },
-                    addresses: Vec::new(),
-                    up: addr.flags.contains(InterfaceFlags::IFF_UP),
+                    addresses: vec![],
+                    up: row.ifa_flags & libc::IFF_UP as u32 != 0,
                 },
             );
-        } else if let (Some(ip), Some(mask)) =
-            (ip(addr.address.as_ref()), ip(addr.netmask.as_ref()))
-        {
-            let bits = match mask {
+        } else if let Some(ip) = address_bytes(bytes, i32::from(family)) {
+            if row.ifa_netmask.is_null() {
+                return Err(io::Error::other("missing interface netmask"));
+            }
+            let len = unsafe { usize::from(*row.ifa_netmask.cast::<u8>()) };
+            let input = unsafe { std::slice::from_raw_parts(row.ifa_netmask.cast::<u8>(), len) };
+            let mut padded = [0u8; std::mem::size_of::<libc::sockaddr_storage>()];
+            padded
+                .get_mut(..len)
+                .ok_or_else(|| io::Error::other("invalid netmask length"))?
+                .copy_from_slice(input);
+            let bits = match address_bytes(&padded, i32::from(family)).unwrap() {
                 IpAddr::V4(a) => a.to_bits().count_ones(),
                 IpAddr::V6(a) => a.to_bits().count_ones(),
             };

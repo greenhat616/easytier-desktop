@@ -2,8 +2,10 @@
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+import base64
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import socket
@@ -15,8 +17,8 @@ from xml.etree import ElementTree
 
 CLASSES = ("interface", "route", "resolver", "firewall", "registry", "service", "runtime", "process")
 WFP_WF = "wfp-group/fwpm_provider_mpssvc_wf/fwpm_sublayer_mpssvc_wf"
-WINDOWS_POLICY_GROUPS = {WFP_WF,
-    "wfp-group/fwpm_provider_mpssvc_wf/fwpm_sublayer_mpssvc_quarantine",
+WFP_QUARANTINE = "wfp-group/fwpm_provider_mpssvc_wf/fwpm_sublayer_mpssvc_quarantine"
+WINDOWS_POLICY_GROUPS = {WFP_WF, WFP_QUARANTINE,
     "wfp-group/fwpm_provider_mpssvc_wf/fwpm_sublayer_teredo",
     "wfp-group/fwpm_provider_mpssvc_wsh/fwpm_sublayer_mpssvc_wsh",
     "wfp-group/fwpm_provider_mpssvc_app_isolation/fwpm_sublayer_mpssvc_app_isolation"}
@@ -52,7 +54,9 @@ class Inventory:
     rows: dict = field(default_factory=dict)
     descendants: dict = field(default_factory=dict)
     parents: dict = field(default_factory=dict)
+    management_workers: set = field(default_factory=set)
     policy_filters: dict = field(default_factory=dict)
+    quarantine_fields: dict = field(default_factory=dict)
     application_filters: dict = field(default_factory=dict)
 
     def put(self, kind, key, value):
@@ -89,6 +93,29 @@ def processes(inv, paths):
     roots = [path.resolve() for path in paths]
     psutil.process_iter.cache_clear()
     table = {p.pid: p.info for p in psutil.process_iter(["pid", "ppid", "exe", "create_time"])}
+    if sys.platform == "win32" and os.environ.get("RUNNER_TEMP"):
+        powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        script = Path(os.environ["RUNNER_TEMP"]) / "g2-release/crates/etd-sysfx-os/src/windows/system.ps1"
+        if script.is_file():
+            # Match the bytes included in the staged host binary, including
+            # its line endings. Retain only verified process identities.
+            encoded = base64.b64encode(script.read_bytes().decode().encode("utf-16-le")).decode()
+            args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded]
+            for pid, row in table.items():
+                parent = table.get(row["ppid"])
+                if not row["exe"] or Path(row["exe"]) != powershell or not parent or not parent["exe"]:
+                    continue
+                parent_image = Path(parent["exe"])
+                if parent_image.name.lower() != "etd-host.exe" or parent_image not in roots:
+                    continue
+                try:
+                    proc = psutil.Process(pid)
+                    argv = proc.cmdline()
+                    if (argv and Path(argv[0]) == powershell and argv[1:] == args
+                            and proc.create_time() == row["create_time"] and proc.is_running()):
+                        inv.management_workers.add((pid, row["create_time"]))
+                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                    pass  # An unverified process never receives an exemption.
     children = defaultdict(list)
     for pid, row in table.items():
         if row["ppid"] != pid:
@@ -242,7 +269,7 @@ def darwin(inv):
         inv.put("service", file.name, file_identity(file))
 
 
-def wfp_policy_record(item):
+def wfp_policy_record(item, quarantine_fields=None):
     # Retain the entire record and its structure, except the exact MpsSvc
     # regeneration fields from run 45857049239, ruling msg#1353.
     def content(node):
@@ -251,7 +278,20 @@ def wfp_policy_record(item):
                          and not (node.tag == "providerData" and c.tag in {"data", "asString"}))
         value = node.text or ""
         return node.tag, value if value.strip() else "", tuple(sorted(node.attrib.items())), children
-    return hashlib.sha256(repr(content(item)).encode()).digest()
+    normalized = content(item)
+    fingerprint = hashlib.sha256(repr(normalized).encode()).digest()
+    if quarantine_fields is not None:
+        # Only field paths and hashes are kept for the two-sided diagnostic.
+        # Never publish policy values, provider data, or an application path.
+        fields = {}
+        def visit(node, path):
+            tag, value, attrs, children = node
+            fields[path] = hashlib.sha256(repr((value, attrs)).encode()).digest()
+            for index, child in enumerate(children):
+                visit(child, f"{path}/{child[0]}[{index}]")
+        visit(normalized, normalized[0])
+        quarantine_fields[fingerprint] = fields
+    return fingerprint
 
 
 def wf_application_rule(item):
@@ -348,7 +388,7 @@ def windows(inv):
             raw = ElementTree.tostring(item, encoding="utf-8")
             groups[group][key] = hashlib.sha256(raw).digest()
             if group_name in WINDOWS_POLICY_GROUPS:
-                fingerprint = wfp_policy_record(item)
+                fingerprint = wfp_policy_record(item, inv.quarantine_fields if group_name == WFP_QUARANTINE else None)
                 inv.policy_filters.setdefault(group_name, Counter())[fingerprint] += 1
                 if group_name == WFP_WF:
                     inv.application_filters[fingerprint] = wf_application_rule(item)

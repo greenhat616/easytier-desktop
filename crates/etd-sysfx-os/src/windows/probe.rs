@@ -25,6 +25,23 @@ impl Drop for Handle {
 }
 
 pub fn unprivileged_connect(address: SocketAddr) -> Result<DirectionResult, FenceError> {
+    // A transient local socket/resource error is not evidence of denial.
+    // Retry it once, but never retry a successful unauthorized connection.
+    let first = connect_once(address)?;
+    if let DirectionResult::Error(first_error) = first {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        match connect_once(address)? {
+            DirectionResult::Error(second_error) => Ok(DirectionResult::Error(format!(
+                "initial probe: {first_error}; retry: {second_error}"
+            ))),
+            verdict => Ok(verdict),
+        }
+    } else {
+        Ok(first)
+    }
+}
+
+fn connect_once(address: SocketAddr) -> Result<DirectionResult, FenceError> {
     let error = |e: ::windows::core::Error| FenceError::Probe(e.to_string());
     let mut token = HANDLE::default();
     // LogonUserW documents this exact built-in LocalService logon, which
@@ -49,7 +66,7 @@ pub fn unprivileged_connect(address: SocketAddr) -> Result<DirectionResult, Fenc
         "InterNetwork"
     };
     let code = format!(
-        "if ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -ne 'S-1-5-19') {{ exit 3 }}; $c = [Net.Sockets.TcpClient]::new([Net.Sockets.AddressFamily]::{family}); try {{ $c.Connect([ipaddress]'{}',{}); exit 0 }} catch {{ $e=$_.Exception; while ($e.InnerException) {{ $e=$e.InnerException }}; if ($e -is [Net.Sockets.SocketException] -and $e.SocketErrorCode -in @('AccessDenied','ConnectionRefused')) {{ exit 1 }}; exit 2 }} finally {{ $c.Dispose() }}",
+        "$ErrorActionPreference='Stop'; if ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -ne 'S-1-5-19') {{ exit 3 }}; $s=$null; try {{ $s=[Net.Sockets.Socket]::new([Net.Sockets.AddressFamily]::{family},[Net.Sockets.SocketType]::Stream,[Net.Sockets.ProtocolType]::Tcp); $s.Connect([ipaddress]'{}',{}); exit 0 }} catch {{ $e=$_.Exception; while ($e -and $e -isnot [Net.Sockets.SocketException]) {{ $e=$e.InnerException }}; if ($e) {{ exit ([int]$e.NativeErrorCode) }}; exit 2 }} finally {{ if ($s) {{ $s.Dispose() }} }}",
         address.ip(),
         address.port()
     );
@@ -105,7 +122,7 @@ pub fn unprivileged_connect(address: SocketAddr) -> Result<DirectionResult, Fenc
         GetExitCodeProcess(process_handle.0, &mut rc).map_err(error)?;
         match rc {
             0 => Ok(DirectionResult::Connected),
-            1 => Ok(DirectionResult::Refused),
+            10013 | 10061 => Ok(DirectionResult::Refused),
             _ => Ok(DirectionResult::Error(format!(
                 "unprivileged probe exit {rc}"
             ))),

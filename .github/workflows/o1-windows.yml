@@ -87,7 +87,7 @@ jobs:
             $verdict = 'connected'
           } catch {
             $errorObject = $_.Exception
-            while ($errorObject.InnerException) { $errorObject = $errorObject.InnerException }
+            while ($errorObject -and $errorObject -isnot [Net.Sockets.SocketException]) { $errorObject = $errorObject.InnerException }
             if ($errorObject -is [Net.Sockets.SocketException] -and $errorObject.SocketErrorCode -in @('AccessDenied','ConnectionRefused')) { $verdict = 'refused' }
             else { $verdict = "unexpected error: $errorObject" }
           } finally { $client.Dispose() }

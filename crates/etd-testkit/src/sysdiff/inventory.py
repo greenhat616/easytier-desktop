@@ -4,7 +4,6 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
 import socket
@@ -72,15 +71,19 @@ def directories(inv, root):
                 inv.put("runtime", epoch, (st.st_dev, st.st_ino, st.st_mode))
 
 
-def processes(inv, text, paths):
-    for row in text.splitlines():
-        pid, _, image = row.strip().partition(" ")
-        image = image.strip()
-        if any(image == str(path) or image.startswith(str(path) + os.sep) for path in paths):
-            inv.put("process", pid, image)
+def processes(inv, paths):
+    import psutil
+    roots = [path.resolve() for path in paths]
+    for process in psutil.process_iter(["pid", "exe", "create_time"]):
+        image = process.info["exe"]
+        if not image:
+            continue
+        path = Path(image).resolve()
+        if any(path == root or root in path.parents for root in roots):
+            inv.put("process", process.pid, [str(path), process.info["create_time"]])
 
 
-def linux(inv, paths):
+def linux(inv):
     links = json.loads(output("ip", "-j", "-d", "link", "show"))
     addresses = {r["ifname"]: sorted((a["local"], a["prefixlen"]) for a in r["addr_info"])
                  for r in json.loads(output("ip", "-j", "address", "show"))}
@@ -121,14 +124,13 @@ def linux(inv, paths):
                       "--no-pager", "--plain").splitlines():
         unit, state, *_ = row.split()
         inv.put("service", unit, state)
-    processes(inv, output("ps", "-eo", "pid=,exe=", "-ww"), paths)
     tun = Path("/dev/net/tun")
     if tun.exists():
         st = tun.stat()
         inv.put("interface", str(tun), (st.st_mode, st.st_rdev, st.st_ino))
 
 
-def darwin(inv, paths):
+def darwin(inv):
     addresses = defaultdict(list)
     name = None
     for line in output("/sbin/ifconfig", "-a").splitlines():
@@ -165,14 +167,11 @@ def darwin(inv, paths):
             inv.put("firewall", label[1] if label else line, (anchor, line))
     for file in Path("/Library/LaunchDaemons").glob("*.plist"):
         inv.put("service", file.name, file_identity(file))
-    processes(inv, output("ps", "-axww", "-o", "pid=,comm="), paths)
 
 
-def windows(inv, paths):
-    env = os.environ.copy()
-    env["ETD_G2_IMAGES"] = json.dumps([str(path) for path in paths])
+def windows(inv):
     data = json.loads(command("powershell.exe", "-NoProfile", "-NonInteractive", "-File",
-                              Path(__file__).with_name("windows.ps1"), env=env).stdout)
+                              Path(__file__).with_name("windows.ps1")).stdout)
     for kind, entries in data.items():
         for key, value in entries.items():
             inv.put(kind, key, value)
@@ -190,5 +189,6 @@ def windows(inv, paths):
 def capture(run_dir, images):
     inv = Inventory()
     directories(inv, run_dir)
-    {"linux": linux, "darwin": darwin, "win32": windows}[sys.platform](inv, images)
+    {"linux": linux, "darwin": darwin, "win32": windows}[sys.platform](inv)
+    processes(inv, images)
     return inv

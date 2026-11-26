@@ -71,15 +71,4 @@ foreach ($class in 'Win32_Service','Win32_SystemDriver') {
         $inventory.service[$item.Name.ToLowerInvariant()] = @($item.PathName, $item.StartMode, $item.ServiceType)
     }
 }
-$paths = @(ConvertFrom-Json $env:ETD_G2_IMAGES)
-foreach ($p in Get-CimInstance Win32_Process -Property ProcessId,ExecutablePath,CreationDate) {
-    if (!$p.ExecutablePath) { continue }
-    foreach ($path in $paths) {
-        if ($p.ExecutablePath -eq $path -or
-            $p.ExecutablePath.StartsWith("$path\",[StringComparison]::OrdinalIgnoreCase)) {
-            $inventory.process[[string]$p.ProcessId] = @($p.ExecutablePath, $p.CreationDate.ToString('o'))
-            break
-        }
-    }
-}
 ConvertTo-Json -InputObject $inventory -Depth 12 -Compress

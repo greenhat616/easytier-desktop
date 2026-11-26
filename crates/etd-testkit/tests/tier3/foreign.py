@@ -6,6 +6,7 @@ from pathlib import Path
 import plistlib
 import shutil
 import subprocess
+import sys
 import tempfile
 import uuid
 
@@ -15,7 +16,14 @@ from inventory import command, output
 @contextmanager
 def idle_process():
     with tempfile.TemporaryDirectory(prefix="g2-foreign-") as directory:
-        if os.name == "nt":
+        child_env = os.environ.copy()
+        if sys.platform == "linux":
+            # Some runner images ship a multi-call /bin/sleep whose copied
+            # image exits immediately under a different program name.
+            source = Path(sys.executable).resolve()
+            child_env["PYTHONHOME"] = sys.base_prefix
+            args = ["-S", "-c", "import time; time.sleep(1200)"]
+        elif os.name == "nt":
             source = Path(os.environ["SystemRoot"]) / "System32" / "ping.exe"
             args = ["-t", "127.0.0.1"]
         else:
@@ -23,7 +31,7 @@ def idle_process():
             args = ["1200"]
         image = Path(directory).resolve() / ("etd-g2-foreign" + source.suffix)
         shutil.copy2(source, image)
-        proc = subprocess.Popen([str(image), *args], stdin=subprocess.DEVNULL,
+        proc = subprocess.Popen([str(image), *args], stdin=subprocess.DEVNULL, env=child_env,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         try:

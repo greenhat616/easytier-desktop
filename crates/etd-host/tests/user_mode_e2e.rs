@@ -37,6 +37,7 @@ use etd_sysfx::{
 };
 use etd_sysfx_os::service::HostLock;
 use etd_testkit::fakes::{core::FakeCoreDriver, store::FakeCoreStore, system::FakeSystem};
+use etd_testkit::no_window::NoWindow;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -119,6 +120,7 @@ async fn apply_ready_stop_and_reclaim_over_real_transport() {
         let copy = dir.path().join(host_name);
         std::fs::copy(exe, &copy).unwrap();
         let output = std::process::Command::new(copy)
+            .no_window()
             .args([
                 "--exact",
                 "apply_ready_stop_and_reclaim_over_real_transport",

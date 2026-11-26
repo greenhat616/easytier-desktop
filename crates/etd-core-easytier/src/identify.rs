@@ -16,21 +16,110 @@ const PROGRAM: &str = "easytier-core";
 /// Output beyond this is not a version line.
 const MAX_OUTPUT: usize = 4096;
 
+#[cfg(windows)]
+fn spawn_directory(directory: &Path) -> std::path::PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Component, Prefix};
+    let units: Vec<_> = directory.as_os_str().encode_wide().collect();
+    // CreateProcess accepts ordinary short DOS paths most consistently.
+    // Preserve verbatim UNC, volume GUID and long paths rather than changing
+    // their namespace or truncating beyond MAX_PATH.
+    if matches!(directory.components().next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_)))
+        && units.len() >= 4
+        && units.len() - 4 < 260
+    {
+        std::path::PathBuf::from(std::ffi::OsString::from_wide(&units[4..]))
+    } else {
+        directory.to_owned()
+    }
+}
+
+#[cfg(windows)]
+async fn output_from_bundle(
+    command: &mut tokio::process::Command,
+    directory: &Path,
+    system_directory: &Path,
+) -> std::io::Result<std::process::Output> {
+    use std::path::{Component, Prefix};
+    // Both spawn attempts in this helper are windowless, including when
+    // the original working-directory creation fails.
+    command.creation_flags(0x0800_0000);
+    let result = command.spawn();
+    let verbatim = matches!(directory.components().next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(),
+            Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(_, _) | Prefix::Verbatim(_)));
+    // Windows CreateProcessW rejects some otherwise valid long/verbatim
+    // cwd paths (seen as ERROR_DIRECTORY on the hosted runner). Retry only
+    // if creation itself failed, from the trusted OS system directory.
+    // The verified absolute executable remains in the bundle, so its DLL
+    // directory is still searched; never fall back to the caller's cwd.
+    if verbatim
+        && result
+            .as_ref()
+            .is_err_and(|error| matches!(error.raw_os_error(), Some(267 | 206)))
+    {
+        command.current_dir(system_directory);
+        return command.spawn()?.wait_with_output().await;
+    }
+    result?.wait_with_output().await
+}
+
 pub async fn identify(binary: &Path) -> Result<CoreDescriptor, CoreError> {
-    let mut command = tokio::process::Command::new(binary);
+    // The executable and its companions live in the verified bundle.
+    // Do not inherit the installer/maintenance caller's working directory:
+    // Windows may search it for DLLs after the executable/system directories.
+    let binary = std::fs::canonicalize(binary)
+        .map_err(|error| CoreError::Identify(format!("cannot resolve kernel: {error}")))?;
+    let bundle = binary
+        .parent()
+        .ok_or_else(|| CoreError::Identify("kernel has no bundle directory".into()))?;
+    #[cfg(windows)]
+    let bundle = spawn_directory(bundle);
+    #[cfg(not(windows))]
+    let bundle = bundle.to_owned();
+    // no-window: output_from_bundle sets CREATE_NO_WINDOW
+    let mut command = tokio::process::Command::new(&binary);
     command
+        .current_dir(&bundle)
         .arg("--version")
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    // The C runtime and Winsock need SystemRoot even for `--version`.
+    // Match the fixed launch environment (etd-proc): never inherit PATH.
+    // Windows OS DLLs and trusted system tools are the platform exception
+    // to the bundle's pinned companion inventory.
+    #[cfg(unix)]
+    command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
     #[cfg(windows)]
-    if let Some(root) = std::env::var_os("SystemRoot") {
-        command.env("SystemRoot", root);
-    }
-    let output = tokio::time::timeout(VERSION_TIMEOUT, command.output())
+    let system_directory = {
+        let root = etd_proc::trusted_system_root().map_err(|error| {
+            CoreError::Identify(format!("cannot query Windows system root: {error}"))
+        })?;
+        let root_path = std::path::PathBuf::from(&root);
+        let path = std::env::join_paths([
+            root_path.join("System32"),
+            root_path.clone(),
+            root_path.join("System32").join("Wbem"),
+            root_path
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0"),
+        ])
+        .map_err(|error| CoreError::Identify(format!("invalid Windows system PATH: {error}")))?;
+        command
+            .env("SystemRoot", &root)
+            .env("windir", &root)
+            .env("PATH", path);
+        root_path.join("System32")
+    };
+    #[cfg(windows)]
+    let execution = output_from_bundle(&mut command, &bundle, &system_directory);
+    #[cfg(not(windows))]
+    let execution = command.output();
+    let output = tokio::time::timeout(VERSION_TIMEOUT, execution)
         .await
         .map_err(|_| CoreError::Identify(format!("{} --version timed out", binary.display())))?
         .map_err(|error| {
@@ -115,6 +204,48 @@ fn revision_of(describe: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn spawn_directory_preserves_unc_and_long_verbatim_paths() {
+        use std::path::PathBuf;
+        assert_eq!(
+            spawn_directory(Path::new(r"\\?\C:\short\bundle")),
+            PathBuf::from(r"C:\short\bundle")
+        );
+        let unc = Path::new(r"\\?\UNC\server\share\bundle");
+        assert_eq!(spawn_directory(unc), unc);
+
+        // Exercise actual CreateProcessW: prefer the long verbatim cwd,
+        // and if Windows rejects it, the same production helper retries
+        // from the OS system directory. No kernel is launched.
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let mut long = root;
+        for _ in 0..5 {
+            long.push("etd-cb-long-bundle-directory-segment-0123456789abcdef0123456789");
+        }
+        std::fs::create_dir_all(&long).unwrap();
+        let cwd = spawn_directory(&long);
+        assert_eq!(cwd, long);
+        let system = PathBuf::from(etd_proc::trusted_system_root().unwrap());
+        let system_directory = system.join("System32");
+        let mut command = tokio::process::Command::new(system_directory.join("whoami.exe"));
+        command
+            .current_dir(&cwd)
+            .creation_flags(0x0800_0000)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let output = output_from_bundle(&mut command, &cwd, &system_directory)
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert!(
+            matches!(command.as_std().get_current_dir(), Some(path) if path == cwd || path == system_directory)
+        );
+    }
 
     fn parse(text: &str) -> (String, String) {
         let core = parse_version_output(text).unwrap();

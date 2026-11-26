@@ -33,6 +33,7 @@ struct FluentChrome {
     preference: ThemePreference,
     preferences: Option<UiPreferencesStore>,
     preference_save_failed: bool,
+    preference_path_unavailable: bool,
 }
 
 impl Global for FluentChrome {}
@@ -79,6 +80,7 @@ pub fn init(cx: &mut App) {
         .unwrap_or_default();
     let chrome = cx.global_mut::<FluentChrome>();
     chrome.preference = preference;
+    chrome.preference_path_unavailable = store.is_none();
     chrome.preferences = store;
     set_native_preference(preference, cx);
     apply_theme(cx.window_appearance(), cx);
@@ -112,8 +114,8 @@ pub(crate) fn set_preference(preference: ThemePreference, window: &mut Window, c
     chrome.preference = preference;
     // Only production init connects a store, so the headless palette is
     // completely isolated from the user's real preference file.
-    chrome.preference_save_failed =
-        chrome
+    chrome.preference_save_failed = chrome.preference_path_unavailable
+        || chrome
             .preferences
             .as_ref()
             .is_some_and(|store| match store.save(preference) {

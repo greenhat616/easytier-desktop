@@ -303,20 +303,21 @@ fn theme_menu_switches_live_without_reopening_window(cx: &mut TestAppContext) {
     harness.push_store(connected_store(&[capability::INSTANCES]), cx);
 
     cx.update_window(harness.window, |_, window, cx| {
-        assert_eq!(window.find("theme-menu").label(), Some("Theme: System"));
+        assert_eq!(
+            window.find("theme-follow-system").label(),
+            Some("Follow system (selected)")
+        );
         let system_dark = ThemeMode::from(window.appearance()).is_dark();
-        for (item, choice, expected) in [
-            (2usize, "Dark", true),
-            (1usize, "Light", false),
-            (0usize, "System", system_dark),
+        for (id, choice, expected) in [
+            ("theme-dark", "Dark", true),
+            ("theme-light", "Light", false),
+            ("theme-follow-system", "Follow system", system_dark),
         ] {
-            window.click("theme-menu", cx);
-            assert!(window.find("popup-menu").visible());
-            window.within("popup-menu").click(item, cx);
+            window.click(id, cx);
             assert_eq!(Theme::global(cx).is_dark(), expected);
             window.render_frame(cx);
-            let label = format!("Theme: {choice}");
-            assert_eq!(window.find("theme-menu").label(), Some(label.as_str()));
+            let label = format!("{choice} (selected)");
+            assert_eq!(window.find(id).label(), Some(label.as_str()));
         }
     })
     .unwrap();

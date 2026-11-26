@@ -18,7 +18,7 @@ use crate::{
     controller::UiController,
     editor::{NetworkEditorState, render_editor},
     model::Section,
-    views::ui::{BtnStyle, action_button},
+    views::ui::{BtnStyle, action_button, theme_menu},
 };
 
 /// Main desktop window view.
@@ -152,6 +152,7 @@ fn render_sidebar(
         .child(new_btn)
         .child(instances_btn)
         .child(reclaim_btn)
+        .child(theme_menu(cx))
         .into_any_element()
 }
 

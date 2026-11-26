@@ -7,13 +7,12 @@
 //! entire enclosing render function, causing stack frames of 500–700 KiB.
 
 use gpui_kit::{
-    Anchor, AnyElement, App, ClickEvent, ElementId, Entity, IntoElement as _, ParentElement as _,
+    AnyElement, App, ClickEvent, ElementId, Entity, IntoElement as _, ParentElement as _,
     SharedString, Styled as _, Window,
     component::{
-        ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size,
+        ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, Size,
         button::{Button, ButtonVariant, ButtonVariants as _},
         input::{Input, InputContentType, InputState},
-        menu::{DropdownMenu, PopupMenuItem},
         switch::Switch,
     },
     div,
@@ -98,42 +97,63 @@ fn action_button_inner(
     btn.into_any_element()
 }
 
-/// Compact appearance picker in the app header. The checked item represents
-/// the saved choice, not merely the currently visible light/dark palette.
+/// The appearance section of the sidebar menu, with all choices visible.
+/// A checked button represents the saved choice, not the effective OS mode.
 #[inline(never)]
 pub fn theme_menu(cx: &App) -> AnyElement {
     use crate::{preferences::ThemePreference, theme};
     let current = theme::preference(cx);
-    let label = if theme::preference_save_failed(cx) {
-        "Theme (not saved)"
-    } else {
-        match current {
-            ThemePreference::FollowSystem => "Theme: System",
-            ThemePreference::Light => "Theme: Light",
-            ThemePreference::Dark => "Theme: Dark",
-        }
-    };
-    Button::new("theme-menu")
-        .with_size(Size::XSmall)
+    let mut menu = div()
+        .mt_auto()
+        .pt_3()
+        .border_t_1()
+        .border_color(cx.theme().border)
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child("Appearance"),
+        );
+    for (id, choice) in [
+        ("theme-follow-system", ThemePreference::FollowSystem),
+        ("theme-light", ThemePreference::Light),
+        ("theme-dark", ThemePreference::Dark),
+    ] {
+        menu = menu.child(theme_choice_button(id, choice, current == choice));
+    }
+    if theme::preference_save_failed(cx) {
+        menu = menu.child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().warning)
+                .child("Theme not saved"),
+        );
+    }
+    menu.into_any_element()
+}
+
+#[inline(never)]
+fn theme_choice_button(
+    id: &'static str,
+    choice: crate::preferences::ThemePreference,
+    selected: bool,
+) -> AnyElement {
+    let label = choice.label();
+    let mut button = Button::new(id)
+        .with_size(Size::Small)
         .with_variant(ButtonVariant::Ghost)
         .label(label)
-        .dropdown_menu_with_anchor(Anchor::TopRight, |menu, _, cx| {
-            let current = theme::preference(cx);
-            [
-                ThemePreference::FollowSystem,
-                ThemePreference::Light,
-                ThemePreference::Dark,
-            ]
-            .into_iter()
-            .fold(menu, |menu, choice| {
-                menu.item(
-                    PopupMenuItem::new(choice.label())
-                        .checked(choice == current)
-                        .on_click(move |_, window, cx| theme::set_preference(choice, window, cx)),
-                )
-            })
-        })
-        .into_any_element()
+        .selected(selected)
+        .on_click(move |_, window, cx| crate::theme::set_preference(choice, window, cx));
+    if selected {
+        button = button
+            .icon(Icon::default().path("fluent/checkmark.svg"))
+            .accessibility_label(format!("{label} (selected)"));
+    }
+    button.into_any_element()
 }
 
 /// Builds a labeled single-line [`Input`] in its own stack frame.

@@ -10,7 +10,7 @@ import time
 import uuid
 
 from service import Desktop, Service, command, eventually, require_runner
-from consistency import check_closed, check_generation, installed_image
+from consistency import UnpredictedChanges, check_closed, check_generation, installed_image
 from inventory import capture, file_identity
 import foreign
 
@@ -101,6 +101,16 @@ def recovery():
         def inventory():
             return service.inventory([foreign_image], [other_runtime])
         baseline = inventory()
+        differences = []
+        def verify_generation(snapshot, view):
+            try:
+                check_generation(baseline, snapshot, service.effects(), instance, view)
+            except UnpredictedChanges as err:
+                # Finish both crash observations and final cleanup even when a
+                # fully observed epoch changed an extra object. Fail below.
+                message = f"epoch {view['epoch']}: {err}"
+                print(message, flush=True)
+                differences.append(message)
         keys.update(key for key in baseline.rows if key[0] == "runtime")
         revision = str(service.ctl("status")["revision"])
         desktop = Desktop(instance, request, revision, stack.enter_context(tempfile.TemporaryDirectory()))
@@ -110,7 +120,7 @@ def recovery():
         first = service.ready(instance)
         print(f"installed kernel ready: {first['state']} epoch={first['epoch']}", flush=True)
         before = inventory()
-        check_generation(baseline, before, service.effects(), instance, first)
+        verify_generation(before, first)
         assert_foreign(baseline, before, keys)
         with desktop.connected("hold"):
             assert desktop.read("logs") > 0
@@ -137,7 +147,7 @@ def recovery():
                 assert len(prior) == len(current) == 1 and prior != current
                 del baseline.rows[prior[0]]
                 baseline.rows[current[0]] = after.rows[current[0]]
-            check_generation(baseline, after, service.effects(), instance, first)
+            verify_generation(after, first)
             # Replay the very first request across both restarts. Ticket,
             # revision and acceptance time must still be identical.
             assert desktop.read("receipt") == desktop.read("replay") == receipt
@@ -162,9 +172,13 @@ def recovery():
                     assert any("core_binary" in r["scope"] and r["state"] != "reclaimed"
                                and r["key"].get("name") == name for r in records)
                     remaining.remove(key)
-        assert not remaining, f"unreclaimed native objects or changed baseline: {sorted(remaining)}"
+        if remaining:
+            message = f"unreclaimed native objects or changed baseline: {sorted(remaining)}"
+            print(message, flush=True)
+            differences.append(message)
         if os.name == "nt":
             verify_shared_driver_purge(service, baseline, stopped)
+        assert not differences, "\n".join(differences)
 
 
 def verify_shared_driver_purge(service, baseline, stopped):

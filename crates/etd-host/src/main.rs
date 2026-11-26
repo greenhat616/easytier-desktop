@@ -116,12 +116,9 @@ fn execute(cli: Cli) -> Result<()> {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            let exit = runtime.block_on(host::run_until(HostMode::Service, Some(stop)));
-            // Dropping a runtime waits for every blocking task without
-            // limit; one stuck in a system call must not keep the service
-            // from reporting STOPPED. The lock goes only after this.
-            runtime.shutdown_timeout(host::RUNTIME_SHUTDOWN);
-            exit.finish()
+            // The lock goes only after the runtime is down.
+            run_bounded(runtime, host::run_until(HostMode::Service, Some(stop)))
+                .finish()
                 .map_err(|error| std::io::Error::other(format!("{error:#}")))
         })
         .context("Windows service dispatcher");
@@ -131,18 +128,14 @@ fn execute(cli: Cli) -> Result<()> {
         .build()?;
     match command {
         Action::Doctor => host::doctor(),
-        Action::Run { mode } => {
-            let exit = runtime.block_on(host::run(mode.into()));
-            runtime.shutdown_timeout(host::RUNTIME_SHUTDOWN);
-            exit.finish()
-        }
+        Action::Run { mode } => run_bounded(runtime, host::run(mode.into())).finish(),
         Action::Reclaim { mode, all, purge } => {
-            runtime.block_on(host::reclaim(mode.into(), all, purge))
+            run_bounded(runtime, host::reclaim(mode.into(), all, purge))
         }
         Action::RemoveCore { mode, version } => {
-            runtime.block_on(host::remove_core(mode.into(), &version))
+            run_bounded(runtime, host::remove_core(mode.into(), &version))
         }
-        Action::Install { allow_user } => runtime.block_on(host::install(&allow_user)),
+        Action::Install { allow_user } => run_bounded(runtime, host::install(&allow_user)),
         Action::Uninstall {
             status,
             wait_parent,
@@ -162,8 +155,52 @@ fn execute(cli: Cli) -> Result<()> {
                     bail!("uninstall worker is Windows-only");
                 }
             }
-            runtime.block_on(host::uninstall())
+            run_bounded(runtime, host::uninstall())
         }
-        Action::ResumeService => runtime.block_on(host::resume_service()),
+        Action::ResumeService => run_bounded(runtime, host::resume_service()),
+    }
+}
+
+/// Run `work` on `runtime`, then shut the runtime down within
+/// [`host::RUNTIME_SHUTDOWN`]. Dropping a runtime waits for its blocking
+/// tasks without limit: one stuck in a system call (an SCM or registry read,
+/// a management query) must never hold the process from exiting, whatever
+/// the command.
+fn run_bounded<T>(
+    runtime: tokio::runtime::Runtime,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    let output = runtime.block_on(work);
+    runtime.shutdown_timeout(host::RUNTIME_SHUTDOWN);
+    output
+}
+
+#[cfg(test)]
+mod run_bounded_tests {
+    use super::*;
+
+    #[test]
+    fn a_stuck_blocking_task_does_not_hold_the_exit() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (release, stuck) = std::sync::mpsc::channel::<()>();
+        let started = std::time::Instant::now();
+        let output = run_bounded(runtime, async {
+            // Never awaited to completion: stands in for a system call that
+            // does not return.
+            let _task = tokio::task::spawn_blocking(move || {
+                let _ = stuck.recv_timeout(std::time::Duration::from_secs(60));
+            });
+            7
+        });
+        let took = started.elapsed();
+        drop(release);
+        assert_eq!(output, 7);
+        assert!(
+            took < host::RUNTIME_SHUTDOWN + std::time::Duration::from_secs(1),
+            "took {took:?}"
+        );
     }
 }

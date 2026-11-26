@@ -295,12 +295,15 @@ Run both from the repository root:
 
 ```sh
 buf lint
-buf breaking --against '.git#tag=freeze-v1'
+buf breaking --against ".git#ref=$(git merge-base origin/main HEAD)"
 ```
 
-`buf` is an extra tool that the repository does not install, and the CI workflows in
-this tree do not run it. The descriptor baseline test is the check that runs in CI
-(through `cargo nextest run --workspace`).
+The `contract` job of `ci.yml` runs the same two checks on every push, with `buf`
+1.75.0. `buf breaking` compares with the start of the change: the merge base with
+`main`, or on `main` its previous commit. Against the `freeze-v1` tag it reports
+`NetworkFlags.multi_thread` and `bind_device`, which `3dcf200` gave explicit presence
+(wire compatible, a break only for the `FILE` category). The descriptor baseline test
+runs in CI too (through `cargo nextest run --workspace`).
 
 ## Changing the contract
 
@@ -315,4 +318,4 @@ an incidental edit. A compatible change:
    `every_contract_message_is_covered` test enforces this) and updates
    `tests/roles.rs` for new methods;
 4. regenerates the baseline with `ETD_UPDATE_BASELINE=1`, and passes `buf lint` and
-   `buf breaking --against '.git#tag=freeze-v1'`.
+   `buf breaking` (above).

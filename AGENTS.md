@@ -127,8 +127,9 @@ Tagged `freeze-v1`: `crates/etd-contract/**`, `buf.yaml`, every `Cargo.toml` and
 - Breaking changes need a review of every consumer, and for the contract a new major
   version.
 - Contract changes edit the `.proto` files, keep `(etd.v1.required_role)` on every
-  method, pass `buf breaking --against '.git#tag=freeze-v1'`, and regenerate the
-  descriptor baseline with `ETD_UPDATE_BASELINE=1 cargo nextest run -p etd-contract`.
+  method, pass `buf lint` and `buf breaking` against the start of the change (CI's
+  `contract` job), and regenerate the descriptor baseline with
+  `ETD_UPDATE_BASELINE=1 cargo nextest run -p etd-contract`.
 - A new dependency is a manifest change: it goes into `[workspace.dependencies]` and
   needs approval.
 

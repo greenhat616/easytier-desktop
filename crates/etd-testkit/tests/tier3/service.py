@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import sys
@@ -131,9 +132,24 @@ class Service:
                      if row["instance_id"] == instance), {})
 
     def ready(self, instance, after=0):
-        return eventually("new ready generation", lambda: self.view(instance),
-                          lambda s: s.get("state") in ("ready_basic", "ready_full")
-                          and s["epoch"] > after)
+        def ready_or_failed(status):
+            if status.get("state") in ("quarantined", "gave_up", "cut_unconfirmed"):
+                raise AssertionError(f"recovery stopped: {status}")
+            return status.get("state") in ("ready_basic", "ready_full") and status["epoch"] > after
+        try:
+            return eventually("new ready generation", lambda: self.view(instance), ready_or_failed)
+        except AssertionError:
+            for row in self.effects():
+                if row.get("last_error"):
+                    print(f"{row['kind']} {row['state']}: {row['last_error']}")
+            logs = command(self.client, "--json", "logs", instance, "--tail", "100", check=False)
+            for line in logs.stdout.splitlines():
+                entry = json.loads(line)
+                text = entry.get("text", "")
+                if (re.search(r"error|fail|denied|invalid|panic|not found|unsupported", text, re.I)
+                        and not re.search(r"secret|password|token|key[ =]|g2-log-probe", text, re.I)):
+                    print(f"{entry.get('source')}: {text[:500]}")
+            raise
 
     def inventory(self, extra=()):
         return capture(self.runtime, [self.host, self.cores, *extra])

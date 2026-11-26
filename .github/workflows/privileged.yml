@@ -57,6 +57,7 @@ jobs:
         shell: pwsh
         run: ./.github/scripts/setup-protoc.ps1
       - uses: actions/setup-python@v5
+        id: python
         with:
           python-version: '3.12'
       - run: python -m pip install psutil==7.0.0
@@ -69,6 +70,13 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.152
+      # Exercise all eight inventory classes even on a revision whose
+      # packaged Windows host cannot install the upstream binary yet (CB).
+      - name: Qualify independent Windows inventory
+        if: runner.os == 'Windows' && matrix.suite == 'recovery'
+        env:
+          ETD_G2_PYTHON: ${{ steps.python.outputs.python-path }}
+        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=independent_inventory_detects_native_foreign_objects)' --success-output immediate
       - name: Restore pinned upstream binary
         id: core-cache
         uses: actions/cache/restore@v4
@@ -104,9 +112,9 @@ jobs:
             # The upstream x64 distribution ships runtime libraries beside
             # its executable. Keep them local to the release bundle so the
             # installed host is tested with the actual service search path.
-            $sidecars = @(Get-ChildItem upstream/easytier/third_party/x86_64 -File |
-              Where-Object { $_.Extension -in '.dll','.sys' })
-            if (!$sidecars.Count) { throw 'Missing upstream Windows runtime libraries' }
+            $sidecars = @('Packet.dll','wintun.dll','WinDivert64.sys') | ForEach-Object {
+              Get-Item -LiteralPath "upstream/easytier/third_party/x86_64/$_"
+            }
             $sidecars | Copy-Item -Destination (Split-Path -Parent $core) -Force
           }
           $versionLine = & $core --version
@@ -117,7 +125,14 @@ jobs:
           $triple = ((rustc -vV | Select-String '^host: (\S+)$').Matches.Groups[1]).Value
           if (!$triple) { throw 'Missing Rust host triple' }
           $digest = (Get-FileHash -LiteralPath $core -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$triple $version $digest" | Set-Content -Encoding ascii "$stage/crates/etd-host/cores.lock"
+          $lock = @("$triple $version $digest")
+          if ($IsWindows) {
+            foreach ($file in $sidecars) {
+              $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              $lock += "$triple $version file:$($file.Name) $hash"
+            }
+          }
+          $lock | Set-Content -Encoding ascii "$stage/crates/etd-host/cores.lock"
           $target = Join-Path $env:GITHUB_WORKSPACE 'target'
           cargo build --manifest-path "$stage/Cargo.toml" --target-dir "$target" --locked -p etd-host -p etd-ctl
           $bundle = New-Item -ItemType Directory "$target/debug/cores/$version" -Force
@@ -131,7 +146,7 @@ jobs:
         run: cargo nextest list --locked --profile privileged --run-ignored only -p etd-testkit --test tier3
       - name: Installed service tests (administrator)
         if: runner.os == 'Windows' && matrix.suite == 'recovery'
-        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=installed_kernel_and_host_crash_recovery) | test(=independent_inventory_detects_native_foreign_objects)' --no-fail-fast --success-output immediate
+        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=installed_kernel_and_host_crash_recovery)' --success-output immediate
       - name: Pre-existing shared drivers (fresh administrator runner)
         if: matrix.suite == 'preflight'
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=preexisting_shared_drivers_are_conflicts)' --success-output immediate

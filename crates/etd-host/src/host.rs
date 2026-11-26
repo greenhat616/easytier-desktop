@@ -267,12 +267,41 @@ pub async fn run(mode: HostMode) -> HostExit {
 pub struct HostExit {
     lock: Option<LayoutLock>,
     result: Result<()>,
+    /// Every task, helper process and the ledger's writer confirmed ended.
+    quiescent: bool,
+    _logging: Option<tracing_appender::non_blocking::WorkerGuard>,
 }
 
 impl HostExit {
-    pub fn finish(self) -> Result<()> {
-        drop(self.lock);
+    /// `runtime_settled`: the runtime shut down before its timeout, so no
+    /// blocking task of this host still runs. Unless both that and the
+    /// host's own wind-down are confirmed, the lock is not released here:
+    /// only the process's exit releases it, so nothing of this host can
+    /// act once another process owns the ledger.
+    pub fn finish(self, runtime_settled: bool) -> Result<()> {
+        let quiescent = self.quiescent && runtime_settled;
+        if let Some(lock) = self.lock {
+            if !quiescent {
+                tracing::error!(
+                    stage = "shutdown.lock_kept",
+                    host_quiescent = self.quiescent,
+                    runtime_settled,
+                    "host shutdown: not confirmed quiescent; the singleton lock is released only when the process exits"
+                );
+            }
+            release(lock, quiescent);
+        }
         self.result
+    }
+}
+
+/// Release `lock` now if `quiescent`; otherwise keep it until the process
+/// exits (the OS releases it then).
+fn release<L>(lock: L, quiescent: bool) {
+    if quiescent {
+        drop(lock);
+    } else {
+        std::mem::forget(lock);
     }
 }
 
@@ -282,6 +311,8 @@ pub async fn run_until(mode: HostMode, managed_stop: Option<watch::Receiver<bool
         Err(error) => HostExit {
             lock: None,
             result: Err(error),
+            quiescent: true,
+            _logging: None,
         },
     }
 }
@@ -325,7 +356,7 @@ async fn serve_until(
             "service installation is incomplete or disabled for uninstall; retry maintenance"
         );
     }
-    let _logging = logging(&layout)?;
+    let logging = logging(&layout)?;
     let Dependencies {
         host,
         missing,
@@ -342,24 +373,35 @@ async fn serve_until(
             .map_err(anyhow::Error::from)
     })
     .await;
-    match closed {
-        Ok(Ok(())) => tracing::info!(
-            stage = "shutdown.ledger_closed",
-            "host shutdown: ledger closed"
-        ),
-        Ok(Err(error)) => tracing::error!(
-            stage = "shutdown.ledger_closed",
-            error = %error,
-            "host shutdown: ledger not closed; open records stay as they are"
-        ),
-        Err(_) => tracing::error!(
-            stage = "shutdown.ledger_closed",
-            "host shutdown: ledger close timed out; open records stay as they are"
-        ),
-    }
+    let ledger_closed = match closed {
+        Ok(Ok(())) => {
+            tracing::info!(
+                stage = "shutdown.ledger_closed",
+                "host shutdown: ledger closed"
+            );
+            true
+        }
+        Ok(Err(error)) => {
+            tracing::error!(
+                stage = "shutdown.ledger_closed",
+                error = %error,
+                "host shutdown: ledger not closed; open records stay as they are"
+            );
+            false
+        }
+        Err(_) => {
+            tracing::error!(
+                stage = "shutdown.ledger_closed",
+                "host shutdown: ledger close timed out; open records stay as they are"
+            );
+            false
+        }
+    };
     Ok(HostExit {
         lock: Some(stopped.lock),
         result: stopped.result,
+        quiescent: stopped.quiescent && ledger_closed,
+        _logging: Some(logging),
     })
 }
 
@@ -996,5 +1038,31 @@ mod maintenance_handoff_tests {
         assert!(result.is_err());
         assert!(entered_rx.recv_timeout(Duration::from_secs(5)).unwrap());
         waiter.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::release;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Lock<'a>(&'a AtomicBool);
+    impl Drop for Lock<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn the_lock_is_released_only_when_quiescent() {
+        let released = AtomicBool::new(false);
+        release(Lock(&released), true);
+        assert!(released.load(Ordering::SeqCst));
+        let released = AtomicBool::new(false);
+        release(Lock(&released), false);
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "kept until the process exits"
+        );
     }
 }

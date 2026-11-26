@@ -117,8 +117,9 @@ fn execute(cli: Cli) -> Result<()> {
                 .enable_all()
                 .build()?;
             // The lock goes only after the runtime is down.
-            run_bounded(runtime, host::run_until(HostMode::Service, Some(stop)))
-                .finish()
+            let (exit, settled) =
+                run_bounded(runtime, host::run_until(HostMode::Service, Some(stop)));
+            exit.finish(settled)
                 .map_err(|error| std::io::Error::other(format!("{error:#}")))
         })
         .context("Windows service dispatcher");
@@ -128,14 +129,17 @@ fn execute(cli: Cli) -> Result<()> {
         .build()?;
     match command {
         Action::Doctor => host::doctor(),
-        Action::Run { mode } => run_bounded(runtime, host::run(mode.into())).finish(),
+        Action::Run { mode } => {
+            let (exit, settled) = run_bounded(runtime, host::run(mode.into()));
+            exit.finish(settled)
+        }
         Action::Reclaim { mode, all, purge } => {
-            run_bounded(runtime, host::reclaim(mode.into(), all, purge))
+            run_bounded(runtime, host::reclaim(mode.into(), all, purge)).0
         }
         Action::RemoveCore { mode, version } => {
-            run_bounded(runtime, host::remove_core(mode.into(), &version))
+            run_bounded(runtime, host::remove_core(mode.into(), &version)).0
         }
-        Action::Install { allow_user } => run_bounded(runtime, host::install(&allow_user)),
+        Action::Install { allow_user } => run_bounded(runtime, host::install(&allow_user)).0,
         Action::Uninstall {
             status,
             wait_parent,
@@ -155,9 +159,9 @@ fn execute(cli: Cli) -> Result<()> {
                     bail!("uninstall worker is Windows-only");
                 }
             }
-            run_bounded(runtime, host::uninstall())
+            run_bounded(runtime, host::uninstall()).0
         }
-        Action::ResumeService => run_bounded(runtime, host::resume_service()),
+        Action::ResumeService => run_bounded(runtime, host::resume_service()).0,
     }
 }
 
@@ -165,14 +169,16 @@ fn execute(cli: Cli) -> Result<()> {
 /// [`host::RUNTIME_SHUTDOWN`]. Dropping a runtime waits for its blocking
 /// tasks without limit: one stuck in a system call (an SCM or registry read,
 /// a management query) must never hold the process from exiting, whatever
-/// the command.
+/// the command. Also returns whether the runtime settled: every thread
+/// ended before the timeout (`shutdown_timeout` returns early then).
 fn run_bounded<T>(
     runtime: tokio::runtime::Runtime,
     work: impl std::future::Future<Output = T>,
-) -> T {
+) -> (T, bool) {
     let output = runtime.block_on(work);
+    let started = std::time::Instant::now();
     runtime.shutdown_timeout(host::RUNTIME_SHUTDOWN);
-    output
+    (output, started.elapsed() < host::RUNTIME_SHUTDOWN)
 }
 
 #[cfg(test)]
@@ -187,7 +193,7 @@ mod run_bounded_tests {
             .unwrap();
         let (release, stuck) = std::sync::mpsc::channel::<()>();
         let started = std::time::Instant::now();
-        let output = run_bounded(runtime, async {
+        let (output, settled) = run_bounded(runtime, async {
             // Never awaited to completion: stands in for a system call that
             // does not return.
             let _task = tokio::task::spawn_blocking(move || {
@@ -198,9 +204,22 @@ mod run_bounded_tests {
         let took = started.elapsed();
         drop(release);
         assert_eq!(output, 7);
+        assert!(!settled, "the stuck task is reported");
         assert!(
             took < host::RUNTIME_SHUTDOWN + std::time::Duration::from_secs(1),
             "took {took:?}"
         );
+    }
+
+    #[test]
+    fn a_runtime_without_stuck_work_settles() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_, settled) = run_bounded(runtime, async {
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+        });
+        assert!(settled);
     }
 }

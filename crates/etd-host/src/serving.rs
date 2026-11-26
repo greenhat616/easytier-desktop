@@ -7,7 +7,7 @@ use etd_contract::{
 use etd_host_core::{
     api::{Command, HostDeps, HostView, orchestrator_channel},
     auth::allow_list::AllowListAuthorizer,
-    lifecycle::{LifecycleConfig, Orchestrator},
+    lifecycle::Orchestrator,
     service::{AllowListSink, ContractService},
     stub::host_service_server::HostServiceServer,
 };
@@ -36,6 +36,11 @@ const SHUTDOWN_BACKSTOP_MARGIN: Duration = Duration::from_secs(5);
 /// How long final replies may take to reach clients once the orchestrator
 /// has ended.
 const SERVER_DRAIN: Duration = Duration::from_secs(3);
+/// How long aborted supervisor tasks may take to end.
+const TASK_ABORT_WAIT: Duration = Duration::from_secs(2);
+/// How long system helper calls still in progress may take to finish
+/// before every helper process is terminated.
+const HELPER_DRAIN: Duration = Duration::from_secs(2);
 
 pub(crate) struct LayoutLock {
     _guard: HostLock,
@@ -204,6 +209,8 @@ pub(crate) async fn serve_with_deps(
     .with_start_blocker(start_blocker);
     let incoming = tonic_io::incoming(TrackedListener::new(listener, svc.clone(), mode));
     let orchestrator = Orchestrator::new(deps, port);
+    let budget = orchestrator.shutdown_budget();
+    let supervisors = orchestrator.supervisor_tasks();
     let mut orchestration = tokio::spawn(orchestrator.run());
     let (stop_server, stop_rx) = oneshot::channel::<()>();
     let mut server = tokio::spawn(
@@ -213,10 +220,20 @@ pub(crate) async fn serve_with_deps(
                 let _ = stop_rx.await;
             }),
     );
+    // Every way out below runs the same cleanup before the lock goes.
+    let mut result: Result<()> = Ok(());
     let outcome = tokio::select! {
-        result = &mut orchestration => { result?; None },
-        result = &mut server => { Some(result?.map_err(anyhow::Error::from)) },
-        result = shutdown_signal(&mut managed_stop) => { result?; Some(Ok(())) },
+        joined = &mut orchestration => {
+            if let Err(e) = joined {
+                result = Err(e.into());
+            }
+            None
+        },
+        served = &mut server => Some(match served {
+            Ok(served) => served.map_err(anyhow::Error::from),
+            Err(e) => Err(e.into()),
+        }),
+        signal = shutdown_signal(&mut managed_stop) => Some(signal.map_err(anyhow::Error::from)),
     };
     let started = Instant::now();
     if let Some(outcome) = outcome {
@@ -227,7 +244,7 @@ pub(crate) async fn serve_with_deps(
         // The orchestrator bounds its own wind-down (`shutdown_budget`);
         // this backstop also covers an actor stuck inside an await, so the
         // host always exits. Open records stay in the ledger either way.
-        let backstop = LifecycleConfig::default().shutdown_budget + SHUTDOWN_BACKSTOP_MARGIN;
+        let backstop = budget + SHUTDOWN_BACKSTOP_MARGIN;
         let (reply, acknowledged) = oneshot::channel();
         let drained = tokio::time::timeout(backstop, async {
             if handle.send(Command::Shutdown { reply }).await.is_ok() {
@@ -237,15 +254,13 @@ pub(crate) async fn serve_with_deps(
         })
         .await;
         match drained {
-            Ok(result) => {
-                let run = result?;
-                tracing::info!(
-                    stage = "shutdown.orchestrator_joined",
-                    outcome = ?run,
-                    elapsed_ms = millis(started.elapsed()),
-                    "host shutdown: orchestrator ended"
-                );
-            }
+            Ok(Ok(run)) => tracing::info!(
+                stage = "shutdown.orchestrator_joined",
+                outcome = ?run,
+                elapsed_ms = millis(started.elapsed()),
+                "host shutdown: orchestrator ended"
+            ),
+            Ok(Err(e)) => result = Err(e.into()),
             Err(_) => {
                 tracing::warn!(
                     stage = "shutdown.backstop",
@@ -256,7 +271,11 @@ pub(crate) async fn serve_with_deps(
                 let _ = orchestration.await;
             }
         }
-        outcome?;
+        if let Err(e) = outcome {
+            result = result.and(Err(e));
+        }
+    } else {
+        orchestration.abort();
     }
     let _ = stop_server.send(());
     if !server.is_finished() {
@@ -271,13 +290,48 @@ pub(crate) async fn serve_with_deps(
             let _ = server.await;
         }
     }
+    // Nothing of this host may still act on the ledger or the system once
+    // another process can take the lock: end the supervisors the
+    // orchestrator stopped waiting for, then every system helper process.
+    match supervisors.abort_and_wait(TASK_ABORT_WAIT).await {
+        Ok(0) => {}
+        Ok(aborted) => tracing::warn!(
+            stage = "shutdown.supervisors_aborted",
+            aborted,
+            "host shutdown: unfinished supervisors aborted; their open records stay in the ledger"
+        ),
+        Err(running) => tracing::error!(
+            stage = "shutdown.supervisors_aborted",
+            running,
+            "host shutdown: aborted supervisors did not end in time"
+        ),
+    }
+    let helpers =
+        tokio::task::spawn_blocking(|| etd_sysfx_os::shutdown_helpers(HELPER_DRAIN)).await;
+    match helpers {
+        Ok(Ok(())) => tracing::info!(
+            stage = "shutdown.helpers_ended",
+            elapsed_ms = millis(started.elapsed()),
+            "host shutdown: system helper processes ended"
+        ),
+        Ok(Err(e)) => tracing::error!(
+            stage = "shutdown.helpers_ended",
+            error = %e,
+            "host shutdown: system helper processes not confirmed gone; their records stay open"
+        ),
+        Err(e) => tracing::error!(
+            stage = "shutdown.helpers_ended",
+            error = %e,
+            "host shutdown: helper shutdown failed"
+        ),
+    }
     drop(guard);
     tracing::info!(
         stage = "shutdown.done",
         elapsed_ms = millis(started.elapsed()),
         "host shutdown: listener closed and lock released"
     );
-    Ok(())
+    result
 }
 
 fn millis(d: Duration) -> u64 {

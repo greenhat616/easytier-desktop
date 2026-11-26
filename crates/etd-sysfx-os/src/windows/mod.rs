@@ -244,6 +244,33 @@ fn program_credential_matches(key: &ObjectKey, observation: &Observation) -> boo
             .as_ref()
             .is_none_or(|g| v["group"].as_str() == Some(g.to_lowercase().as_str()))
 }
+/// A program rule under the key's name whose application condition, group
+/// or direction differ from what the name says: its identity stays the
+/// credential, and the observation's key is the one its actual condition
+/// names (`EasyTier <program> (<Direction>)` in its group), so a caller
+/// comparing it with the key it asked for sees a different object.
+fn foreign_program_rule(o: &Observation) -> Observation {
+    let found = match &o.credential {
+        Some(Credential::Opaque { value }) => serde_json::from_str::<Value>(value).ok(),
+        _ => None,
+    };
+    let key = found.and_then(|v| {
+        let direction = match v["direction"].as_str()? {
+            "inbound" => "Inbound",
+            "outbound" => "Outbound",
+            other => other,
+        }
+        .to_owned();
+        Some(ObjectKey::Rule {
+            name: format!("EasyTier {} ({direction})", v["program"].as_str()?),
+            group: v["group"]
+                .as_str()
+                .filter(|g| !g.is_empty())
+                .map(str::to_owned),
+        })
+    });
+    Observation { key, ..o.clone() }
+}
 async fn observe_kind(kind: EffectKind, key: &ObjectKey) -> Result<Option<Observation>, WinError> {
     if let Some(op) = rule_query(kind) {
         let name = rule_name(key)?;
@@ -455,7 +482,9 @@ impl SystemObserver for WindowsObserver {
                 .observe());
             }
             if kind == EffectKind::WinProgramFirewallRule && !program_credential_matches(key, o) {
-                return Err(WinError::invalid("same-name program rule has a different application condition, group or direction").observe());
+                // Definite foreign (the query succeeded): reported as found,
+                // never as an error (ruling topic#40 msg#1199).
+                return Ok(Some(foreign_program_rule(o)));
             }
             if matches!(&o.credential,Some(Credential::Opaque{value}) if value.starts_with("foreign-group:"))
             {
@@ -1213,6 +1242,37 @@ mod tests {
         );
         assert!(!program_credential_matches(&key, &other));
         assert_ne!(obs.credential, other.credential);
+    }
+    #[test]
+    fn a_foreign_program_rule_is_reported_under_the_key_its_condition_names() {
+        let name = r"EasyTier C:\store\core.exe (Inbound)";
+        let key = ObjectKey::Rule {
+            name: name.into(),
+            group: Some("EasyTier".into()),
+        };
+        let row = json!({"id":"other-guid","name":name,"group":"Other","program":r"C:\other\core.exe","direction":"Outbound"});
+        let found = observation(
+            Some(program_identity(&row).unwrap()),
+            key.clone(),
+            "d".into(),
+        );
+        assert!(!program_credential_matches(&key, &found));
+        let reported = foreign_program_rule(&found);
+        assert_eq!(reported.credential, found.credential, "its own identity");
+        assert_eq!(
+            reported.key,
+            Some(ObjectKey::Rule {
+                name: r"EasyTier c:\other\core.exe (Outbound)".into(),
+                group: Some("other".into()),
+            })
+        );
+        assert_ne!(reported.key, Some(key));
+        // Not even a readable identity: still a different object, never ours.
+        let unreadable = Observation {
+            credential: Some(opaque("garbage")),
+            ..found
+        };
+        assert_eq!(foreign_program_rule(&unreadable).key, None);
     }
     #[test]
     fn powershell_encoding() {

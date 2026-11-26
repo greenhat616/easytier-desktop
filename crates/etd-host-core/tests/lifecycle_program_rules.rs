@@ -519,3 +519,82 @@ async fn a_shutdown_while_waiting_for_the_gate_completes() {
     h.shutdown().await;
     assert_eq!(world.spawned().len(), 1, "b never spawned");
 }
+
+#[tokio::test]
+async fn a_kernel_dying_before_readiness_does_not_lock_the_binary_out() {
+    let world = with_rules();
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.apply("a", spec("net"), Desired::Running).await;
+    h.wait_state("a", S::ReadyFull).await;
+    until_records(&world, &mut h, |e| e.state == EffectState::Applied).await;
+    h.set_desired("a", Desired::Stopped).await.unwrap();
+    h.wait_state("a", S::Stopped).await;
+
+    // The next kernel recreates the rules, then dies before readiness: no
+    // record is written while it starts.
+    world.behave(KernelBehaviour {
+        address: false,
+        ..KernelBehaviour::default()
+    });
+    h.set_desired("a", Desired::Running).await.unwrap();
+    h.until("second kernel spawned", |_| world.spawned().len() == 2)
+        .await;
+    world.behave(KernelBehaviour::default());
+    world.engine.exit(
+        &world.last_kernel(),
+        etd_proc::Exit {
+            code: Some(101),
+            signal: None,
+            cause: etd_proc::ExitCause::Exited,
+        },
+    );
+
+    // Once it is verified dead, its rules are read back: the restart is
+    // not refused.
+    h.until("ready after the restart", |h| {
+        h.status("a")
+            .is_some_and(|s| s.epoch >= 3 && s.state() == S::ReadyFull)
+    })
+    .await;
+    assert!(notices(&mut h, "start.refused").is_empty());
+    assert_eq!(world.spawned().len(), 3);
+    until_records(&world, &mut h, |e| e.state == EffectState::Applied).await;
+    assert_records_current(&world).await;
+    assert!(!host_deleted_a_rule(&world));
+}
+
+#[tokio::test]
+async fn rules_given_up_at_the_deadline_are_read_back_once_the_kernel_is_gone() {
+    let world = with_rules();
+    observer_fails_after_spawn(&world, None);
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.apply("a", spec("net-a"), Desired::Running).await;
+    h.wait_state("a", S::ReadyFull).await;
+    h.idle(Duration::from_millis(500), Duration::from_secs(12))
+        .await;
+    assert_eq!(notices(&mut h, "program_rule.unsettled").len(), 1);
+
+    // Readable again, but the kernel still runs: nothing claimed yet.
+    world.sys.clear_faults();
+    h.idle(Duration::from_millis(500), Duration::from_secs(3))
+        .await;
+    assert!(
+        records(&world)
+            .await
+            .iter()
+            .all(|e| e.state == EffectState::Planned)
+    );
+
+    // Stopped and verified dead: read back, and the next start goes ahead.
+    h.set_desired("a", Desired::Stopped).await.unwrap();
+    h.wait_state("a", S::Stopped).await;
+    until_records(&world, &mut h, |e| e.state == EffectState::Applied).await;
+    assert_records_current(&world).await;
+    h.apply("b", spec("net-b"), Desired::Running).await;
+    h.wait_state("b", S::ReadyFull).await;
+    assert!(notices(&mut h, "start.refused").is_empty());
+    assert!(notices(&mut h, "program_rule.conflict").is_empty());
+    assert!(!host_deleted_a_rule(&world));
+}

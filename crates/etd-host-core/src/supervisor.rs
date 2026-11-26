@@ -53,6 +53,7 @@ use etd_sysfx::{
     ObjectKey, Observation, Persistence, ScopeFilter, StoredGeneration, SystemClass, Undo,
 };
 use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedMutexGuard, mpsc, oneshot, watch};
@@ -191,6 +192,9 @@ struct Live {
     /// Settling gives up here (basic readiness + `start_timeout`), keeping
     /// the records as they were.
     rules_deadline: Option<Instant>,
+    /// Rules given up at `rules_deadline`: read back once the kernel is
+    /// dead ([`Supervisor::post_mortem_rules`]).
+    rules_unsettled: Vec<Effect>,
     /// When several rules of a record's name were first seen in a row of
     /// snapshots; a second sighting `reclaim_retry` later makes it foreign.
     rules_several: HashMap<EffectId, Instant>,
@@ -198,6 +202,13 @@ struct Live {
     /// Partial output lines (a secret may span chunks).
     stdout: LineBuffer,
     stderr: LineBuffer,
+}
+
+/// Program rules to read back after a kernel's death.
+struct PostMortem {
+    epoch: Epoch,
+    binary: PathBuf,
+    rules: Vec<Effect>,
 }
 
 /// A fence re-verification running off the supervisor's task; aborted with
@@ -263,6 +274,11 @@ pub(crate) struct Supervisor {
     /// a spawn, and since when (two snapshots `reclaim_retry` apart refuse
     /// the start).
     rules_several: HashMap<EffectId, Instant>,
+    /// Program rule records a dead kernel may have replaced without them
+    /// being read back (gone before readiness, or given up at the
+    /// deadline): read back once its generation's process record is
+    /// closed (ruling topic#40 msg#1199 A).
+    post_mortem: Option<PostMortem>,
     reports: mpsc::UnboundedSender<Report>,
     presence: watch::Receiver<ClientPresence>,
     presence_closed: bool,
@@ -371,6 +387,55 @@ enum RuleRead {
     Unknown(String),
 }
 
+/// Two rule keys name the same rule (Windows compares names and groups
+/// without case).
+fn same_rule_key(a: &ObjectKey, b: &ObjectKey) -> bool {
+    let same = |x: &str, y: &str| x.eq_ignore_ascii_case(y);
+    match (a, b) {
+        (
+            ObjectKey::Rule {
+                name: n1,
+                group: g1,
+            },
+            ObjectKey::Rule {
+                name: n2,
+                group: g2,
+            },
+        ) => {
+            same(n1, n2)
+                && match (g1, g2) {
+                    (Some(g1), Some(g2)) => same(g1, g2),
+                    (None, None) => true,
+                    _ => false,
+                }
+        }
+        _ => a == b,
+    }
+}
+
+/// Whether a program rule's key names `binary` (upstream: `EasyTier
+/// <current_exe without \\?\> (<direction>)`), a kernel binary inside the
+/// protected core store `store`.
+fn names_store_binary(key: &ObjectKey, binary: &Path, store: &Path) -> bool {
+    let plain = |p: &str| p.replace(r"\\?\", "").to_lowercase();
+    let ObjectKey::Rule { name, .. } = key else {
+        return false;
+    };
+    let Some(path) = name.strip_prefix("EasyTier ").and_then(|rest| {
+        rest.strip_suffix(" (Inbound)")
+            .or_else(|| rest.strip_suffix(" (Outbound)"))
+    }) else {
+        return false;
+    };
+    let binary = plain(&binary.to_string_lossy());
+    let store = plain(&store.to_string_lossy());
+    let store = store.trim_end_matches(['/', '\\']);
+    plain(path) == binary
+        && binary
+            .strip_prefix(store)
+            .is_some_and(|rest| rest.starts_with(['/', '\\']))
+}
+
 /// A kernel record whose creation credential the host reads back after the
 /// spawn (lease and expiring records are record-only: never waited on).
 fn needs_read_back(e: &Effect) -> bool {
@@ -453,6 +518,7 @@ impl Supervisor {
             cmds_closed: false,
             deferred: VecDeque::new(),
             rules_several: HashMap::new(),
+            post_mortem: None,
             reports,
             presence,
             presence_closed: false,
@@ -1225,6 +1291,7 @@ impl Supervisor {
             rule_gate,
             rules_due: now,
             rules_deadline: None,
+            rules_unsettled: Vec::new(),
             rules_several: HashMap::new(),
             next_tick: now,
             stdout: LineBuffer::default(),
@@ -1479,8 +1546,18 @@ impl Supervisor {
                 RuleRead::Unknown("the rule vanished while it was looked at".into())
             }
             (Ok(Some(o)), Some(one)) => match &o.credential {
-                Some(found) if one.identity.as_ref() == Some(found) => RuleRead::One(o),
-                Some(_) => RuleRead::Unknown("the rule changed while it was looked at".into()),
+                Some(found) if one.identity.as_ref() != Some(found) => {
+                    RuleRead::Unknown("the rule changed while it was looked at".into())
+                }
+                // The observer reports a rule for another program, group
+                // or direction under the key its condition names.
+                Some(_) if !o.key.as_ref().is_some_and(|k| same_rule_key(k, &e.key)) => {
+                    RuleRead::Unconfirmed(format!(
+                        "a rule of that name for another program, group or direction ({})",
+                        o.key.as_ref().map_or("unreadable".into(), view::key_text)
+                    ))
+                }
+                Some(_) => RuleRead::One(o),
                 None => {
                     RuleRead::Unconfirmed("no identity of the kernel's rule could be read".into())
                 }
@@ -1698,11 +1775,12 @@ impl Supervisor {
                 NoticeLevel::Warning,
                 "program_rule.unsettled",
                 format!(
-                    "program firewall rules not read back in time, records left as they were: {}",
+                    "program firewall rules not read back in time, records left as they were \
+                     until the kernel is gone: {}",
                     names.join(", ")
                 ),
             );
-            left.clear();
+            live.rules_unsettled.append(&mut left);
         }
         live.rules = left;
         if live.rules.is_empty() {
@@ -1710,6 +1788,70 @@ impl Supervisor {
             live.rules_several.clear();
         }
         live.rules_due = now + self.ctx.config.reclaim_retry;
+    }
+
+    /// Ruling topic#40 msg#1199 A: once the kernel of the remembered
+    /// generation is verified dead (its process record closed), read its
+    /// program rules again under the gate, from one consistent snapshot,
+    /// and refresh a record only from exactly one rule of that name that
+    /// the observer confirms as the kernel binary's, the key naming that
+    /// binary inside the protected core store. Anything else leaves the
+    /// record as it is (the next start refuses, as before). Runs once.
+    async fn post_mortem_rules(&mut self) {
+        let Some(pm) = self.post_mortem.take() else {
+            return;
+        };
+        let deps = self.ctx.deps.clone();
+        let dead = match deps.ledger.generation(&self.id, pm.epoch).await {
+            Ok(Some(stored)) => stored
+                .effects
+                .iter()
+                .filter(|e| e.kind == EffectKind::Process)
+                .all(|e| e.state.is_closed()),
+            _ => false,
+        };
+        if !dead {
+            // Not yet verified dead: try again after the next reclaim pass.
+            self.post_mortem = Some(pm);
+            return;
+        }
+        let _gate = match self.rule_gate().await {
+            Ok(gate) => gate,
+            // Served after this pass; the read-back is dropped (the next
+            // start decides as before).
+            Err(LaunchFail::Cut(reply)) => {
+                self.deferred.push_front(SupCmd::Cut { reply });
+                return;
+            }
+            Err(_) => return,
+        };
+        let current = match deps.ledger.generation(&self.id, pm.epoch).await {
+            Ok(Some(stored)) => stored.effects,
+            _ => return,
+        };
+        let store = deps.dirs.core_store_dir.clone();
+        for e in pm.rules {
+            let Some(mut e) = current.iter().find(|c| c.id == e.id).cloned() else {
+                continue;
+            };
+            if !matches!(e.state, EffectState::Planned | EffectState::Applied)
+                || !names_store_binary(&e.key, &pm.binary, &store)
+            {
+                continue;
+            }
+            match self.read_program_rule(&e).await {
+                RuleRead::One(o) if recorded_credential(&e) != o.credential.as_ref() => {
+                    if self.refresh_rule(&mut e, o).await {
+                        tracing::info!(
+                            instance = %self.id,
+                            rule = %view::key_text(&e.key),
+                            "program rule read back after the kernel's death"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Record `o` as the rule's credential (planned or stale before).
@@ -2237,6 +2379,15 @@ impl Supervisor {
     fn exited(&mut self, mut live: Box<Live>, exit: Exit, then: Option<Then>) {
         // Output still queued behind the exit.
         self.flush_output(&mut live);
+        let mut rules = std::mem::take(&mut live.rules);
+        rules.append(&mut live.rules_unsettled);
+        self.post_mortem = (!rules.is_empty()).then(|| PostMortem {
+            epoch: live.epoch,
+            binary: live.inputs.core.binary.clone(),
+            rules,
+        });
+        // The gate goes with the kernel.
+        live.rule_gate = None;
         let then = match then {
             Some(t) => t,
             None if exit.abnormal() => self.abnormal_then(&exit),
@@ -2459,6 +2610,9 @@ impl Supervisor {
         };
         self.report(Report::Reclaimed(report.clone()));
         self.status.open_residues = u32::try_from(report.residues.len()).unwrap_or(u32::MAX);
+        if self.post_mortem.as_ref().is_some_and(|p| p.epoch == epoch) {
+            self.post_mortem_rules().await;
+        }
         match report.outcome {
             GenerationOutcome::Closed => self.closed(epoch, then),
             GenerationOutcome::Quarantined(reason) => {

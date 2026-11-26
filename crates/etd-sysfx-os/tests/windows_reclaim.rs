@@ -938,3 +938,84 @@ async fn a_disabled_driver_service_without_a_file_is_observed() {
     }
     assert!(gone.is_some(), "the deleted service is absent");
 }
+
+/// PowerShell, never with a console window (memory channel/windows-processes).
+fn ps_hidden(script: &str) -> String {
+    use std::os::windows::process::CommandExt;
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(0x0800_0000)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().into()
+}
+
+// A program rule named after our kernel binary but for another program (or
+// group, or direction) is a definite third-party object: observed as found,
+// with its own identity, under the key its condition names (topic#40
+// msg#1199), never an error.
+#[tokio::test]
+#[ignore = "creates a real local program firewall rule on disposable CI"]
+async fn a_foreign_program_rule_is_observed_not_an_error() {
+    assert_eq!(std::env::var("CI").as_deref(), Ok("true"));
+    let dir = tempfile::tempdir().unwrap();
+    let os = adapters(&OsConfig {
+        state_dir: dir.path().into(),
+        run_dir: dir.path().join("run"),
+        core_store_dir: dir.path().join("core"),
+    })
+    .unwrap();
+    let ours = dir.path().join(format!(
+        "core-{}.exe",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ));
+    let other = dir.path().join("someone-else.exe");
+    let name = format!("EasyTier {} (Inbound)", ours.display());
+    let key = ObjectKey::Rule {
+        name: name.clone(),
+        group: Some("EasyTier".into()),
+    };
+    assert_eq!(
+        os.observer
+            .observe(EffectKind::WinProgramFirewallRule, &key)
+            .await
+            .unwrap(),
+        None
+    );
+    let id = uuid::Uuid::new_v4().to_string();
+    ps_hidden(&format!(
+        "$ErrorActionPreference='Stop'; New-NetFirewallRule -Name '{id}' -DisplayName '{name}' -Group 'EasyTier' -Direction Inbound -Action Allow -Program '{}' | Out-Null",
+        other.display()
+    ));
+    let _rule = Rule(id.clone());
+
+    let found = os
+        .observer
+        .observe(EffectKind::WinProgramFirewallRule, &key)
+        .await
+        .expect("a definite foreign rule is not an error")
+        .expect("it is there");
+    println!("observed: {found:?}");
+    let Some(Credential::Opaque { value }) = &found.credential else {
+        panic!("its identity: {found:?}");
+    };
+    assert!(value.contains(&id), "{value}");
+    let Some(ObjectKey::Rule {
+        name: found_name, ..
+    }) = &found.key
+    else {
+        panic!("the key its condition names: {found:?}");
+    };
+    assert!(
+        found_name
+            .to_lowercase()
+            .contains(&other.display().to_string().to_lowercase()),
+        "{found_name}"
+    );
+    assert_ne!(found.key, Some(key));
+}

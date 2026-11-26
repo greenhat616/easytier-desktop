@@ -32,6 +32,7 @@ use etd_sysfx::{
 };
 use etd_sysfx_os::service::HostLock;
 use etd_testkit::fakes::{core::FakeCoreDriver, store::FakeCoreStore, system::FakeSystem};
+use etd_testkit::no_window::NoWindow;
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -351,6 +352,7 @@ fn isolated_unix(test: &str) -> bool {
     // symlinks on macOS. Linux authenticates against the process runtime dir.
     let runtime = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
     private(runtime.path());
+    // no-window: Unix only
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", test, "--nocapture"])
         .env("ETD_G1_RUNTIME", runtime.path())
@@ -404,6 +406,7 @@ impl Fixture {
     }
     fn spawn(root: &Path, service: bool) -> Child {
         let mut cmd = Command::new(binary(root, "etd-host"));
+        cmd.no_window();
         if service {
             cmd.env(SERVICE, "1");
         } else {
@@ -737,6 +740,7 @@ async fn killed_ui_leaves_user_host_running_until_lease_grace() {
     }
     let mut f = Fixture::new();
     let mut ui = Command::new(std::env::current_exe().unwrap())
+        .no_window()
         .args(["--exact", "host_process::fixture_ui", "--nocapture"])
         .env("ETD_G1_UI", f.root.path())
         .kill_on_drop(true)
@@ -811,6 +815,7 @@ async fn finish_user(f: &mut Fixture, client: &mut Client) {
 async fn killed_ui_does_not_stop_service_host_after_lease_grace() {
     let mut f = Fixture::new_mode(true);
     let mut ui = Command::new(std::env::current_exe().unwrap())
+        .no_window()
         .args(["--exact", "host_process::fixture_ui", "--nocapture"])
         .env("ETD_G1_UI", f.root.path())
         .env(SERVICE, "1")
@@ -1035,6 +1040,7 @@ async fn ui_death_after_intent_does_not_prevent_launch() {
     let mut f = Fixture::new();
     std::fs::write(f.root.path().join("block-spawn"), "block").unwrap();
     let mut ui = Command::new(std::env::current_exe().unwrap())
+        .no_window()
         .args(["--exact", "host_process::fixture_ui", "--nocapture"])
         .env("ETD_G1_UI", f.root.path())
         .kill_on_drop(true)

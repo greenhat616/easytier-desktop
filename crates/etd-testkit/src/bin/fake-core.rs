@@ -1,5 +1,6 @@
 //! Scriptable stand-in for easytier-core in process tests; never packaged.
 //! Owned by P1.
+use etd_testkit::no_window::NoWindow;
 use std::{
     ffi::OsString,
     io::Write,
@@ -147,6 +148,7 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
     // Keep the child alive until the host's actual containment kills it.
     let mut child = if let Some(path) = child_ready {
         let mut cmd = std::process::Command::new(std::env::current_exe()?);
+        cmd.no_window();
         cmd.args([
             OsString::from("--mode"),
             "ignore".into(),

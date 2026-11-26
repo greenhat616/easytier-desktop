@@ -4,6 +4,7 @@
 use etd_contract::InstanceId;
 use etd_sysfx::*;
 use etd_sysfx_os::{OsConfig, adapters};
+use etd_testkit::no_window::NoWindow;
 use std::{
     process::Command,
     time::{Duration, Instant},
@@ -11,6 +12,7 @@ use std::{
 
 fn ps(script: &str) -> String {
     let output = Command::new("powershell.exe")
+        .no_window()
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
         .unwrap();

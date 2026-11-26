@@ -13,7 +13,7 @@ Get-NetIPAddress -PolicyStore ActiveStore | Group-Object InterfaceIndex | ForEac
 foreach ($nic in Get-NetAdapter -IncludeHidden) {
     if ($inventory.interface.ContainsKey($nic.Name)) { throw "Duplicate NetAdapter name: $($nic.Name)" }
     $inventory.interface[$nic.Name] = @{
-        index=$nic.ifIndex; guid=$nic.InterfaceGuid; device=$nic.PnPDeviceID
+        index=$nic.ifIndex; guid=$nic.InterfaceGuid; device=$nic.PnPDeviceID; mac=$nic.MacAddress
         addresses=$addresses[[int]$nic.ifIndex]
     }
 }
@@ -84,7 +84,6 @@ foreach ($rule in Get-NetFirewallRule -PolicyStore ActiveStore) {
     )
 }
 $ruleStore.Dispose()
-$sha.Dispose()
 $system = 'HKLM:\SYSTEM\CurrentControlSet\Services'
 $network = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles'
 $product = 'HKLM:\SOFTWARE\EasyTier'
@@ -111,11 +110,16 @@ foreach ($tree in @("$system\Tcpip\Parameters\Interfaces","$system\Tcpip6\Parame
     if (!(Test-Path -LiteralPath $tree)) { continue }
     foreach ($key in Get-ChildItem -LiteralPath $tree) {
         foreach ($name in $key.GetValueNames()) {
+            $id = $key.Name.Replace('HKEY_LOCAL_MACHINE','HKLM') + '\' + $name
             if ($name -in @('RegistrationEnabled','DisableDynamicUpdate',
                 'MaxNumberOfAddressesToRegister','NetbiosOptions','SearchList','ProfileName','Category',
-                'NameServer','Domain','EnableDHCP')) {
-                $id = $key.Name.Replace('HKEY_LOCAL_MACHINE','HKLM') + '\' + $name
+                'NameServer','Domain','EnableDHCP','Dhcpv6Iaid','Dhcpv6State')) {
                 $inventory.registry[$id] = @([string]$key.GetValueKind($name),$key.GetValue($name))
+            } elseif ($tree -eq "$system\Tcpip\Parameters\Interfaces" -or
+                      $tree -eq "$system\Tcpip6\Parameters\Interfaces") {
+                # Include every other per-interface value in the strict diff.
+                # Only a digest leaves this process for these opaque settings.
+                $inventory.registry[$id] = @([string]$key.GetValueKind($name), (StableHash $key.GetValue($name)))
             }
         }
     }
@@ -138,4 +142,5 @@ try {
         } finally { $entry.Dispose() }
     }
 } finally { $serviceStore.Dispose() }
+$sha.Dispose()
 ConvertTo-Json -InputObject $inventory -Depth 12 -Compress

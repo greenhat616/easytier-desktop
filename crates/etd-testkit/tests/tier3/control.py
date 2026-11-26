@@ -19,64 +19,26 @@ def compare(stage, base, current):
         k = (kind, key)
         old, new = base.rows.get(k), current.rows.get(k)
         detail = "added" if old is None else "removed" if new is None else "modified"
-        if key.startswith("wfp-group/"):
-            old, new = set(old or []), set(new or [])
-            detail = f"filters {len(old)} to {len(new)}, added {len(new-old)}, removed {len(old-new)}"
-            prior, latest = base.wfp.get(key, {}), current.wfp.get(key, {})
-            left, right = base.fields.get(key,{}), current.fields.get(key,{})
-            labels = set().union(*(r.keys() for r in [*left.values(), *right.values()]))
-            def tuples(source, fields):
-                names = sorted(fields)
-                return Counter(tuple(rule.get(f) for f in names) for rule in source.values())
-            changing = set()
-            for field in sorted(labels):
-                left_field, right_field = tuples(left,{field}), tuples(right,{field})
-                removed, added = (left_field-right_field).total(),(right_field-left_field).total()
-                if removed or added:
-                    changing.add(field)
-                    print(f"{group} {stage} {key} leaf {field}: -{removed}/+{added}",flush=True)
-            def residual(drop):
-                a,b=tuples(left,labels-set(drop)),tuples(right,labels-set(drop))
-                return (a-b).total(),(b-a).total()
-            print(f"{group} {stage} {key} omit all changed leaves {sorted(changing)} -> {residual(changing)}",flush=True)
-            volatile = {f for f in labels if f.split("/")[0] in ("rawContext","providerContextKey","reserved","providerData","effectiveWeight","weight","displayData")}
-            best = None
-            for n in range(min(4,len(volatile))+1):
-                for drop in combinations(sorted(volatile),n):
-                    lost,gained=residual(drop)
-                    score=(min(lost,gained),len(drop),lost+gained)
-                    if best is None or score<best[0]:
-                        best=(score,drop,(lost,gained))
-                    if min(lost,gained)==0:
-                        break
-                if best[0][0]==0:
-                    break
-            drop=best[1]
-            print(f"{group} {stage} {key} best metadata omission {drop} unmatched {best[2]}",flush=True)
-            if min(best[2])==0 and best[2]!=(0,0):
-                a,b=tuples(left,labels-set(drop)),tuples(right,labels-set(drop))
-                names=sorted(labels-set(drop))
-                for source,full,unmatched,verb in [(left,prior,a-b,"removed"),(right,latest,b-a,"added")]:
-                    templates=Counter()
-                    for fid,rule in source.items():
-                        fp=tuple(rule.get(f) for f in names)
-                        if unmatched[fp]:
-                            templates[str(full[fid][1])] += 1
-                            unmatched[fp]-=1
-                    print(f"{group} {stage} {key} {verb} policy templates {sorted(templates.items())}",flush=True)
-        elif kind == "registry" and key.rsplit(chr(92), 1)[-1] in ("NameServer","Domain","EnableDHCP"):
-            def safe(value):
-                if value is None:
-                    return "absent"
-                typ, val = value
-                return (typ, val if isinstance(val,int) or val == "" else "<nonempty>")
-            detail += f" {safe(old)} to {safe(new)}"
+        if kind == "registry" and key.rsplit(chr(92),1)[-1] in ("Dhcpv6Iaid","Dhcpv6State"):
+            typ,val = new or old
+            guid = key.split(chr(92))[-2].lower()
+            nic = next((value for (cls,_),value in current.rows.items()
+                        if cls=="interface" and str(value.get("guid","")).lower()==guid),None)
+            if isinstance(val,int): value=str(val)
+            elif isinstance(val,list):
+                value=f"bytes={len(val)} nonzero={sum(x!=0 for x in val)}"
+            else: value=f"length={len(str(val))}"
+            detail += f" type={typ} value={value}"
+            if nic:
+                mac=(nic.get("mac") or "").replace("-","").replace(":","")
+                detail += f" adapter index={nic['index']} GUID matches"
+                if isinstance(val,int) and len(mac)==12:
+                    detail += f" iaid hex={val&0xffffffff:08x} low24=MAC-low24:{(val&0xffffff)==int(mac[-6:],16)} index-high8:{(val>>24)==nic['index']}"
         elif kind == "process":
-            native = new or old
-            ancestors = [pid for pid,ids in current.descendants.items() if (int(key),native[1]) in ids]
-            detail += f" image={Path(native[0]).name} creation={native[1]} tracked_ancestors={ancestors}"
-        elif kind == "interface" and isinstance(new,dict):
-            detail += f" guid={new.get('guid')}"
+            n=new or old
+            detail+=f" image={Path(n[0]).name} created={n[1]}"
+        elif kind == "firewall" and key.startswith("wfp-group/"):
+            continue
         elif kind == "service" and isinstance(old, dict) and isinstance(new, dict):
             detail += " fields " + str([field for field in old.keys() | new.keys() if old.get(field) != new.get(field)])
         print(f"{group} {stage} {kind} {key} {detail}", flush=True)
@@ -91,7 +53,7 @@ try:
             instance = str(uuid.uuid4())
             service.apply(spec(), instance, str(uuid.uuid4()), str(service.ctl("status")["revision"]))
             service.ready(instance)
-        for seconds in (90, 180):
+        for seconds in (90, 160):
             time.sleep(max(0, start+seconds-time.monotonic()))
             compare(f"t{seconds}", base, service.inventory())
         if group == "start":
@@ -102,6 +64,9 @@ try:
             from service import command
             result=command(service.installer,"reclaim","--all","--purge",check=False,timeout=240)
             print(f"standalone purge exit {result.returncode}",flush=True)
+            for line in (result.stdout+"\n"+result.stderr).splitlines():
+                if line.strip().startswith(("Reclaim:", "left in place:","etd-host:")):
+                    print(f"standalone purge result {line.strip()[:450]}",flush=True)
             compare("purged",base,service.inventory())
 finally:
     compare("uninstall", pre, service.inventory())

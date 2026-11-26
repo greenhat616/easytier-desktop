@@ -409,6 +409,44 @@ pub(super) fn boot_id(machine: bool) -> Result<BootId, WinError> {
     let _ = cache.set(id.clone());
     Ok(id)
 }
+/// Uninstall (topic#40 msg#1290): remove the service host's volatile boot
+/// marker `HKLM\SOFTWARE\EasyTierDesk\Volatile`, then that parent only if it
+/// is left with no subkey and no value. Nothing else is touched; a missing
+/// key is fine. Non-recursive: an unexpected subkey under the marker makes
+/// this fail rather than delete it.
+pub(super) fn remove_machine_boot_marker() -> Result<(), WinError> {
+    let _lock = marker_lock(true)?;
+    let Some(parent) = Key::open(HKEY_LOCAL_MACHINE, r"SOFTWARE\EasyTierDesk", KEY_READ)? else {
+        return Ok(());
+    };
+    delete_key(parent.0, "Volatile", false)?;
+    let mut subkeys = 0u32;
+    let mut values = 0u32;
+    check(
+        unsafe {
+            RegQueryInfoKeyW(
+                parent.0,
+                None,
+                None,
+                None,
+                Some(&raw mut subkeys),
+                None,
+                None,
+                Some(&raw mut values),
+                None,
+                None,
+                None,
+                None,
+            )
+        },
+        "query registry key",
+    )?;
+    drop(parent);
+    if subkeys == 0 && values == 0 {
+        delete_key(HKEY_LOCAL_MACHINE, r"SOFTWARE\EasyTierDesk", false)?;
+    }
+    Ok(())
+}
 fn read_or_create_boot_id(machine: bool) -> Result<BootId, WinError> {
     let _lock = marker_lock(machine)?;
     // HostMode::User rejects elevated entry tokens; it always uses HKCU.

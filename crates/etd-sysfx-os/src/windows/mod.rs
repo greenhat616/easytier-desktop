@@ -1,6 +1,16 @@
 //! Windows system effects, using a persistent native WFP fence and independent
 //! Windows management provider queries. No request data is executed as code.
+pub mod appearance;
 pub mod driver_refs;
+
+/// Uninstall: remove the service host's volatile boot marker (see
+/// `registry::remove_machine_boot_marker`).
+pub fn remove_service_boot_marker() -> Result<(), crate::OsError> {
+    registry::remove_machine_boot_marker().map_err(|e| crate::OsError::Os {
+        code: e.code,
+        message: e.message,
+    })
+}
 mod execution;
 mod interfaces;
 mod magic;
@@ -244,6 +254,45 @@ fn program_credential_matches(key: &ObjectKey, observation: &Observation) -> boo
             .as_ref()
             .is_none_or(|g| v["group"].as_str() == Some(g.to_lowercase().as_str()))
 }
+/// Our WFP filters as a successful enumeration shows them: not all four
+/// present is positively missing (`FenceError::Missing`); an enumeration
+/// that failed stays an OS error.
+fn fence_presence(complete: bool) -> Result<(), FenceError> {
+    if complete {
+        Ok(())
+    } else {
+        Err(FenceError::Missing(
+            "persistent fence is incomplete: our WFP filters are not all present".into(),
+        ))
+    }
+}
+/// A program rule under the key's name whose application condition, group
+/// or direction differ from what the name says: its identity stays the
+/// credential, and the observation's key is the one its actual condition
+/// names (`EasyTier <program> (<Direction>)` in its group), so a caller
+/// comparing it with the key it asked for sees a different object.
+fn foreign_program_rule(o: &Observation) -> Observation {
+    let found = match &o.credential {
+        Some(Credential::Opaque { value }) => serde_json::from_str::<Value>(value).ok(),
+        _ => None,
+    };
+    let key = found.and_then(|v| {
+        let direction = match v["direction"].as_str()? {
+            "inbound" => "Inbound",
+            "outbound" => "Outbound",
+            other => other,
+        }
+        .to_owned();
+        Some(ObjectKey::Rule {
+            name: format!("EasyTier {} ({direction})", v["program"].as_str()?),
+            group: v["group"]
+                .as_str()
+                .filter(|g| !g.is_empty())
+                .map(str::to_owned),
+        })
+    });
+    Observation { key, ..o.clone() }
+}
 async fn observe_kind(kind: EffectKind, key: &ObjectKey) -> Result<Option<Observation>, WinError> {
     if let Some(op) = rule_query(kind) {
         let name = rule_name(key)?;
@@ -339,16 +388,12 @@ async fn observe_kind(kind: EffectKind, key: &ObjectKey) -> Result<Option<Observ
             let ObjectKey::Service { name } = key else {
                 return Err(WinError::invalid("expected driver service key"));
             };
-            let rows = query(json!({"op":"drivers"})).await?;
+            // From SCM, cross-checked with the Services registry key: WMI
+            // omits disabled drivers without a file (topic#40 msg#1179).
             // Shared drivers have no creation credential in the upstream API.
-            Ok(rows
-                .iter()
-                .find(|r| {
-                    r["name"]
-                        .as_str()
-                        .is_some_and(|s| s.eq_ignore_ascii_case(name))
-                })
-                .map(|r| observation(None, key.clone(), r["description"].to_string())))
+            let name = name.clone();
+            let found = blocking(move || driver_refs::driver_service(&name)).await?;
+            Ok(found.map(|d| observation(None, key.clone(), d.detail())))
         }
         _ => Err(WinError::invalid(format!(
             "unsupported Windows effect {kind}"
@@ -459,7 +504,9 @@ impl SystemObserver for WindowsObserver {
                 .observe());
             }
             if kind == EffectKind::WinProgramFirewallRule && !program_credential_matches(key, o) {
-                return Err(WinError::invalid("same-name program rule has a different application condition, group or direction").observe());
+                // Definite foreign (the query succeeded): reported as found,
+                // never as an error (ruling topic#40 msg#1199).
+                return Ok(Some(foreign_program_rule(o)));
             }
             if matches!(&o.credential,Some(Credential::Opaque{value}) if value.starts_with("foreign-group:"))
             {
@@ -990,12 +1037,11 @@ impl PortFence for WindowsFence {
         listener_pid: u32,
     ) -> Result<FenceVerification, FenceError> {
         let key = wfp::key(spec);
-        if !blocking(move || wfp::complete(&key))
-            .await
-            .map_err(WinError::fence)?
-        {
-            return Err(FenceError::Probe("persistent fence is incomplete".into()));
-        }
+        fence_presence(
+            blocking(move || wfp::complete(&key))
+                .await
+                .map_err(WinError::fence)?,
+        )?;
         let check = listener_check(spec.address, listener_pid).await;
         if check != ListenerCheck::Expected {
             return Ok(FenceVerification {
@@ -1217,6 +1263,47 @@ mod tests {
         );
         assert!(!program_credential_matches(&key, &other));
         assert_ne!(obs.credential, other.credential);
+    }
+    #[test]
+    fn incomplete_filters_in_a_successful_enumeration_are_missing() {
+        assert_eq!(fence_presence(true), Ok(()));
+        assert!(matches!(fence_presence(false), Err(FenceError::Missing(_))));
+        // A failed enumeration is not a verdict.
+        assert!(matches!(
+            WinError::new(5, "access denied").fence(),
+            FenceError::Os { .. }
+        ));
+    }
+    #[test]
+    fn a_foreign_program_rule_is_reported_under_the_key_its_condition_names() {
+        let name = r"EasyTier C:\store\core.exe (Inbound)";
+        let key = ObjectKey::Rule {
+            name: name.into(),
+            group: Some("EasyTier".into()),
+        };
+        let row = json!({"id":"other-guid","name":name,"group":"Other","program":r"C:\other\core.exe","direction":"Outbound"});
+        let found = observation(
+            Some(program_identity(&row).unwrap()),
+            key.clone(),
+            "d".into(),
+        );
+        assert!(!program_credential_matches(&key, &found));
+        let reported = foreign_program_rule(&found);
+        assert_eq!(reported.credential, found.credential, "its own identity");
+        assert_eq!(
+            reported.key,
+            Some(ObjectKey::Rule {
+                name: r"EasyTier c:\other\core.exe (Outbound)".into(),
+                group: Some("other".into()),
+            })
+        );
+        assert_ne!(reported.key, Some(key));
+        // Not even a readable identity: still a different object, never ours.
+        let unreadable = Observation {
+            credential: Some(opaque("garbage")),
+            ..found
+        };
+        assert_eq!(foreign_program_rule(&unreadable).key, None);
     }
     #[test]
     fn powershell_encoding() {

@@ -13,7 +13,7 @@ use etd_app::{
 };
 use etd_contract::{HostMode, HostPhase, InstanceId};
 use gpui_kit::{
-    AnyElement, Context, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Role,
+    AnyElement, App, Context, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Role,
     SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _,
     component::{ActiveTheme as _, Size, StyledExt as _, button::ButtonVariant},
     div,
@@ -23,7 +23,7 @@ use crate::{
     model::InstallStatus,
     views::{
         MainView,
-        ui::{BtnStyle, action_button},
+        ui::{BtnStyle, FluentInfoBar, InfoSeverity, action_button},
     },
 };
 
@@ -34,7 +34,7 @@ pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
     let sec_fg = cx.theme().secondary_foreground;
     let warn = cx.theme().warning;
     let border = cx.theme().border;
-    let title_bar = cx.theme().title_bar;
+    let title_bar = crate::theme::chrome_fill(cx, cx.theme().title_bar);
 
     let (link_label, tray_available) = {
         let model = view.controller.model.read(cx);
@@ -102,7 +102,13 @@ pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
                 .px_2()
                 .py_1()
                 .rounded_sm()
-                .bg(warn.opacity(0.2))
+                // Keep the warning pill readable even over native Mica.
+                .bg(Hsla::from(
+                    cx.theme()
+                        .popover
+                        .to_rgb()
+                        .blend(warn.opacity(0.2).to_rgb()),
+                ))
                 .text_xs()
                 .text_color(warn)
                 .child(note),
@@ -112,7 +118,9 @@ pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
     let svc_btn = action_button(
         "btn-connect-service",
         "Service",
-        BtnStyle::new(ButtonVariant::Default, Size::XSmall).outline(),
+        BtnStyle::new(ButtonVariant::Default, Size::XSmall)
+            .outline()
+            .icon("fluent/server.svg"),
         cx.listener(|this, _, _, _| {
             this.controller
                 .send_command(UserCommand::Connect(HostMode::Service));
@@ -121,7 +129,9 @@ pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
     let user_btn = action_button(
         "btn-connect-user",
         "User Host",
-        BtnStyle::new(ButtonVariant::Default, Size::XSmall).outline(),
+        BtnStyle::new(ButtonVariant::Default, Size::XSmall)
+            .outline()
+            .icon("fluent/person.svg"),
         cx.listener(|this, _, _, _| {
             this.controller
                 .send_command(UserCommand::Connect(HostMode::User));
@@ -130,7 +140,7 @@ pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
     let refresh_btn = action_button(
         "btn-refresh",
         "Refresh",
-        BtnStyle::new(ButtonVariant::Ghost, Size::XSmall),
+        BtnStyle::new(ButtonVariant::Ghost, Size::XSmall).icon("fluent/arrow-clockwise.svg"),
         cx.listener(|this, _, _, _| {
             this.controller.send_command(UserCommand::Refresh);
         }),
@@ -138,7 +148,7 @@ pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
     let exit_btn = action_button(
         "btn-app-exit",
         "Exit",
-        BtnStyle::new(ButtonVariant::Danger, Size::XSmall),
+        BtnStyle::new(ButtonVariant::Danger, Size::XSmall).icon("fluent/sign-out.svg"),
         cx.listener(|this, _, _, cx| {
             this.controller.request_exit(ExitReason::AppMenu, cx);
         }),
@@ -261,8 +271,8 @@ pub fn render_banners(view: &MainView, cx: &mut Context<MainView>) -> AnyElement
         items.push(render_simple_alert(
             "banner-install-failed",
             format!("Service installation failed: {err}"),
-            cx.theme().danger,
-            cx.theme().danger,
+            InfoSeverity::Error,
+            cx,
         ));
     }
     if let Some((host_major, host_minor)) = upgrade_required {
@@ -271,16 +281,16 @@ pub fn render_banners(view: &MainView, cx: &mut Context<MainView>) -> AnyElement
             format!(
                 "Service upgrade required: host speaks contract v{host_major}.{host_minor}, incompatible with this client."
             ),
-            cx.theme().danger,
-            cx.theme().danger,
+            InfoSeverity::Error,
+            cx,
         ));
     }
     if let Some(reason) = unverified_host {
         items.push(render_simple_alert(
             "banner-unverified-host",
             format!("Unverified host endpoint blocked (nothing sent): {reason}"),
-            cx.theme().danger,
-            cx.theme().danger,
+            InfoSeverity::Error,
+            cx,
         ));
     }
     if keep_window_notice {
@@ -290,8 +300,8 @@ pub fn render_banners(view: &MainView, cx: &mut Context<MainView>) -> AnyElement
         items.push(render_simple_alert(
             "banner-profile-error",
             format!("Profile library error: {err}"),
-            cx.theme().warning,
-            cx.theme().foreground,
+            InfoSeverity::Warning,
+            cx,
         ));
     }
     if !actionable_ops.is_empty() {
@@ -302,14 +312,13 @@ pub fn render_banners(view: &MainView, cx: &mut Context<MainView>) -> AnyElement
         .id("banners-stack")
         .flex()
         .flex_col()
+        .bg(cx.theme().popover)
         .children(items)
         .into_any_element()
 }
 
 #[inline(never)]
 fn render_reconnecting_banner(attempt: u32, cx: &mut Context<MainView>) -> AnyElement {
-    let warning = cx.theme().warning;
-    let fg = cx.theme().foreground;
     let msg = format!(
         "Host reconnecting (attempt {attempt}) — displaying last known state until connection resumes"
     );
@@ -321,25 +330,9 @@ fn render_reconnecting_banner(attempt: u32, cx: &mut Context<MainView>) -> AnyEl
             this.controller.send_command(UserCommand::Refresh);
         }),
     );
-    div()
-        .id("banner-reconnecting")
-        .role(Role::Alert)
-        .test_support()
-        .aria_label(SharedString::from(msg.clone()))
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .px_4()
-        .py_2()
-        .border_b_1()
-        .border_color(warning)
-        .bg(warning.opacity(0.14))
-        .text_sm()
-        .text_color(fg)
-        .child(msg)
-        .child(btn)
-        .into_any_element()
+    FluentInfoBar::new("banner-reconnecting", InfoSeverity::Warning, msg)
+        .actions([btn])
+        .render(cx)
 }
 
 #[inline(never)]
@@ -347,8 +340,6 @@ fn render_cut_unconfirmed_banner(
     cut_instances: Vec<(InstanceId, String)>,
     cx: &mut Context<MainView>,
 ) -> AnyElement {
-    let danger = cx.theme().danger;
-    let fg = cx.theme().foreground;
     let names = cut_instances
         .iter()
         .map(|(_, name)| name.as_str())
@@ -371,32 +362,13 @@ fn render_cut_unconfirmed_banner(
             }),
         ));
     }
-    div()
-        .id("banner-cut-unconfirmed")
-        .role(Role::Alert)
-        .test_support()
-        .aria_label(SharedString::from(summary.clone()))
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .gap_3()
-        .px_4()
-        .py_2()
-        .border_b_1()
-        .border_color(danger)
-        .bg(danger.opacity(0.14))
-        .text_sm()
-        .text_color(fg)
-        .child(summary)
-        .child(div().flex().flex_row().gap_2().children(action_btns))
-        .into_any_element()
+    FluentInfoBar::new("banner-cut-unconfirmed", InfoSeverity::Error, summary)
+        .actions(action_btns)
+        .render(cx)
 }
 
 #[inline(never)]
 fn render_elevated_refused_banner(cx: &mut Context<MainView>) -> AnyElement {
-    let warning = cx.theme().warning;
-    let fg = cx.theme().foreground;
     let msg = "Elevated user host refused: an elevated process cannot operate a user host. Use or install the system service instead.";
     let connect_btn = action_button(
         "btn-offer-service-connect",
@@ -415,33 +387,9 @@ fn render_elevated_refused_banner(cx: &mut Context<MainView>) -> AnyElement {
             this.controller.request_service_install(cx);
         }),
     );
-    div()
-        .id("banner-elevated-user-refused")
-        .role(Role::Alert)
-        .test_support()
-        .aria_label(SharedString::from(msg))
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .gap_3()
-        .px_4()
-        .py_2()
-        .border_b_1()
-        .border_color(warning)
-        .bg(warning.opacity(0.16))
-        .text_sm()
-        .text_color(fg)
-        .child(msg)
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .gap_2()
-                .child(connect_btn)
-                .child(install_btn),
-        )
-        .into_any_element()
+    FluentInfoBar::new("banner-elevated-user-refused", InfoSeverity::Warning, msg)
+        .actions([connect_btn, install_btn])
+        .render(cx)
 }
 
 #[inline(never)]
@@ -451,8 +399,6 @@ fn render_not_installed_banner(
     is_elevated: bool,
     cx: &mut Context<MainView>,
 ) -> AnyElement {
-    let info = cx.theme().info;
-    let fg = cx.theme().foreground;
     let msg = format!(
         "System service is not installed. Install the service for full TUN support ({preview})."
     );
@@ -479,32 +425,13 @@ fn render_not_installed_banner(
             }),
         ));
     }
-    div()
-        .id("banner-not-installed")
-        .role(Role::Alert)
-        .test_support()
-        .aria_label(SharedString::from(msg.clone()))
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .gap_3()
-        .px_4()
-        .py_2()
-        .border_b_1()
-        .border_color(info)
-        .bg(info.opacity(0.14))
-        .text_sm()
-        .text_color(fg)
-        .child(msg)
-        .child(div().flex().flex_row().gap_2().children(btns))
-        .into_any_element()
+    FluentInfoBar::new("banner-not-installed", InfoSeverity::Informational, msg)
+        .actions(btns)
+        .render(cx)
 }
 
 #[inline(never)]
 fn render_launch_failed_banner(failure: &LaunchFailure, cx: &mut Context<MainView>) -> AnyElement {
-    let danger = cx.theme().danger;
-    let fg = cx.theme().foreground;
     let msg = format!(
         "Host launch failed ({:?}): {}",
         failure.kind, failure.message
@@ -517,33 +444,13 @@ fn render_launch_failed_banner(failure: &LaunchFailure, cx: &mut Context<MainVie
             this.controller.send_command(UserCommand::AutoConnect);
         }),
     );
-    div()
-        .id("banner-launch-failed")
-        .role(Role::Alert)
-        .test_support()
-        .aria_label(SharedString::from(msg.clone()))
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .gap_3()
-        .px_4()
-        .py_2()
-        .border_b_1()
-        .border_color(danger)
-        .bg(danger.opacity(0.12))
-        .text_sm()
-        .text_color(fg)
-        .child(msg)
-        .child(btn)
-        .into_any_element()
+    FluentInfoBar::new("banner-launch-failed", InfoSeverity::Error, msg)
+        .actions([btn])
+        .render(cx)
 }
 
 #[inline(never)]
 fn render_no_host_banner(is_elevated: bool, cx: &mut Context<MainView>) -> AnyElement {
-    let border = cx.theme().border;
-    let sec = cx.theme().secondary;
-    let fg = cx.theme().foreground;
     let msg = if is_elevated {
         "No host is running. Running elevated: install or connect to the system service."
     } else {
@@ -579,89 +486,41 @@ fn render_no_host_banner(is_elevated: bool, cx: &mut Context<MainView>) -> AnyEl
             }),
         ));
     }
-    div()
-        .id("banner-no-host")
-        .role(Role::Status)
-        .test_support()
-        .aria_label(SharedString::from(msg))
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .gap_3()
-        .px_4()
-        .py_2()
-        .border_b_1()
-        .border_color(border)
-        .bg(sec.opacity(0.45))
-        .text_sm()
-        .text_color(fg)
-        .child(msg)
-        .child(div().flex().flex_row().gap_2().children(btns))
-        .into_any_element()
+    FluentInfoBar::new("banner-no-host", InfoSeverity::Informational, msg)
+        .status()
+        .actions(btns)
+        .render(cx)
 }
 
 #[inline(never)]
 fn render_keep_window_banner(cx: &mut Context<MainView>) -> AnyElement {
-    let info = cx.theme().info;
-    let fg = cx.theme().foreground;
     let msg = "System tray is unavailable on this desktop; window kept open. Use the Exit button to quit.";
     let btn = action_button(
         "btn-dismiss-keep-window",
         "Dismiss",
-        BtnStyle::new(ButtonVariant::Ghost, Size::XSmall),
+        BtnStyle::new(ButtonVariant::Ghost, Size::XSmall).icon("fluent/dismiss.svg"),
         cx.listener(|this, _, _, cx| {
             this.controller.dismiss_keep_window_notice(cx);
         }),
     );
-    div()
-        .id("banner-keep-window")
-        .role(Role::Status)
-        .test_support()
-        .aria_label(SharedString::from(msg))
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .px_4()
-        .py_2()
-        .border_b_1()
-        .border_color(info)
-        .bg(info.opacity(0.12))
-        .text_xs()
-        .text_color(fg)
-        .child(msg)
-        .child(btn)
-        .into_any_element()
+    FluentInfoBar::new("banner-keep-window", InfoSeverity::Informational, msg)
+        .status()
+        .close(btn)
+        .render(cx)
 }
 
 #[inline(never)]
 fn render_simple_alert(
     id: &'static str,
     msg: String,
-    accent: Hsla,
-    text_color: Hsla,
+    severity: InfoSeverity,
+    cx: &App,
 ) -> AnyElement {
-    div()
-        .id(id)
-        .role(Role::Alert)
-        .test_support()
-        .aria_label(SharedString::from(msg.clone()))
-        .px_4()
-        .py_2()
-        .border_b_1()
-        .border_color(accent)
-        .bg(accent.opacity(0.14))
-        .text_xs()
-        .text_color(text_color)
-        .child(msg)
-        .into_any_element()
+    FluentInfoBar::new(id, severity, msg).render(cx)
 }
 
 #[inline(never)]
 fn render_operations_bar(ops: &[Operation], cx: &mut Context<MainView>) -> AnyElement {
-    let border = cx.theme().border;
-    let sec = cx.theme().secondary;
     let rows: Vec<AnyElement> = ops
         .iter()
         .filter_map(|op| render_operation_row(op, cx))
@@ -671,11 +530,6 @@ fn render_operations_bar(ops: &[Operation], cx: &mut Context<MainView>) -> AnyEl
         .flex()
         .flex_col()
         .gap_1()
-        .px_4()
-        .py_2()
-        .border_b_1()
-        .border_color(border)
-        .bg(sec.opacity(0.35))
         .children(rows)
         .into_any_element()
 }
@@ -706,22 +560,25 @@ fn render_operation_row(op: &Operation, cx: &mut Context<MainView>) -> Option<An
     btns.push(action_button(
         SharedString::from(format!("btn-op-dismiss-{}", req_id_dismiss.0)),
         "Dismiss",
-        BtnStyle::new(ButtonVariant::Ghost, Size::XSmall),
+        BtnStyle::new(ButtonVariant::Ghost, Size::XSmall).icon("fluent/dismiss.svg"),
         cx.listener(move |this, _, _, _| {
             this.controller
                 .send_command(UserCommand::DismissOperation(req_id_dismiss.clone()));
         }),
     ));
+    let close = btns.pop().expect("dismiss action is always present");
     Some(
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .gap_2()
-            .text_xs()
-            .child(label)
-            .child(div().flex().flex_row().gap_1().children(btns))
-            .into_any_element(),
+        FluentInfoBar::new(
+            SharedString::from(format!("operation-{}", op.request_id.0)),
+            if can_retry {
+                InfoSeverity::Warning
+            } else {
+                InfoSeverity::Error
+            },
+            label,
+        )
+        .actions(btns)
+        .close(close)
+        .render(cx),
     )
 }

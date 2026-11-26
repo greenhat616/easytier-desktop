@@ -252,6 +252,8 @@ class Service:
                     assert_driver_notice(result.stdout, self.retained_drivers)
                 if self.preexisting_drivers:
                     assert_driver_notice(result.stdout, self.preexisting_drivers, recorded=self.recorded_driver_images)
+                if (self.state / "ledger.sqlite3").exists():
+                    assert all(r["state"] == "reclaimed" for r in self.effects()), "open ledger effects after uninstall"
             after = self.inventory()
             delta = before.delta(after) - managed_service_changes(before, after)
             delta -= runner_noise(before, after) | tun_created(before, after)

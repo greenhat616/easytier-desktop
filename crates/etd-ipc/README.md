@@ -189,8 +189,8 @@ These tests are privileged and `#[ignore]`d:
 `stale_endpoint::foreign_owned_stale_socket_is_preserved` and the three `privileged_*`
 tests in `unix_service.rs`. They need root, and some also need a second local account.
 Run them only as root in a disposable VM, with
-`--profile privileged --run-ignored only`. No CI workflow in this tree runs them at
-present.
+`--profile privileged --run-ignored only`. CI runs them as root in the
+`privileged-install` job of `ci.yml`, on Linux and macOS.
 
 `pipe_acl::second_account_denied_allowed_and_revoked_on_real_pipe` creates a temporary
 local Windows account. It runs only with `ETD_IPC_CI_ACCOUNTS=1` and an elevated token,

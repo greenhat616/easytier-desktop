@@ -142,6 +142,21 @@ jobs:
         run: |
           cargo nextest list --locked --profile privileged -p etd-host --run-ignored only --test install_roundtrip
           sudo -E env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "CI=true" "ETD_HOST_CI_INSTALL=1" "$(command -v cargo)" nextest run --locked --profile privileged -p etd-host --run-ignored only --test install_roundtrip --success-output immediate
+      # Root-owned service sockets (etd-ipc) and tier 2's service-form host,
+      # after the roundtrip has removed the installed service. Windows has no
+      # step: tier 2's service case needs LocalSystem, not the runner's
+      # administrator, and etd-ipc's Windows account case runs in `check`.
+      - name: Service IPC and service-form host on Unix (root on disposable runner)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cargo nextest list --locked --profile privileged -p etd-ipc --run-ignored only --test unix_service --test stale_endpoint
+          cargo nextest list --locked --profile privileged -p etd-testkit --run-ignored only --test tier2
+          if [ "$RUNNER_OS" = macOS ]; then runtime=/private/var/run/etd-g1; else runtime=/run/etd-g1; fi
+          sudo install -d -m 0700 -o root "$runtime"
+          as_root() { sudo -E env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "CI=true" "ETD_G1_SERVICE_RUNTIME=$runtime" "$(command -v cargo)" "$@"; }
+          as_root nextest run --locked --profile privileged -p etd-ipc --run-ignored only --test unix_service --test stale_endpoint --success-output immediate
+          as_root nextest run --locked --profile privileged -p etd-testkit --run-ignored only --test tier2 --success-output immediate
       # The cache is saved as the runner user, which cannot manage root's files.
       - name: Return build files to the runner user
         if: always() && runner.os != 'Windows'

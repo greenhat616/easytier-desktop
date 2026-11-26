@@ -5,6 +5,10 @@ import json
 import stat
 
 
+class UnpredictedChanges(AssertionError):
+    """All expected objects were verified, but there were additional changes."""
+
+
 def scope(instance, epoch):
     return {"instance": {"instance": instance, "epoch": epoch}}
 
@@ -139,7 +143,8 @@ def compare_generation(base, live, records, instance, view):
                 exempt.add(category)
     assert expected <= changed, f"predicted effects already present at baseline: {sorted(expected - changed)}"
     unexpected = changed - expected - exempt
-    assert not unexpected, f"unpredicted native changes: {sorted(unexpected)}"
+    if unexpected:
+        raise UnpredictedChanges(f"unpredicted native changes: {sorted(unexpected)}")
     for kind in sorted({k[0] for k in live.rows}):
         print(f"{kind}: baseline={base.counts()[kind]} live={live.counts()[kind]} "
               f"changed={sum(k[0] == kind for k in changed)}")

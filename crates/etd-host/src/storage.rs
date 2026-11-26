@@ -391,13 +391,22 @@ pub fn discard_manifest_backup(backup: &Path) -> Result<()> {
     }
 }
 
-/// The SQLite header fields of the ledger that tell whether a host
-/// migrated it: `user_version` is the schema version, and a non-empty WAL
-/// means the main file's header may not be current yet.
+/// What tells whether a host wrote, and so possibly migrated, the ledger:
+/// `user_version` is the schema version; a non-empty write-ahead log (its
+/// size and modification time) means the main file's header may not be
+/// current yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LedgerHeader {
     pub user_version: u32,
-    pub wal_pending: bool,
+    pub wal: Option<(u64, std::time::SystemTime)>,
+}
+
+impl LedgerHeader {
+    /// Whether a host may have migrated the ledger between `self` and
+    /// `after`: the schema version changed, or the write-ahead log did.
+    pub fn maybe_migrated(&self, after: &LedgerHeader) -> bool {
+        after.user_version != self.user_version || (after.wal.is_some() && after.wal != self.wal)
+    }
 }
 
 /// Read without opening the database, so no migration can run. `None` if
@@ -411,11 +420,11 @@ pub fn ledger_header(state: &Path) -> Option<LedgerHeader> {
         return None;
     }
     let user_version = u32::from_be_bytes([header[60], header[61], header[62], header[63]]);
-    let wal_pending = fs::metadata(state.join("ledger.sqlite3-wal")).is_ok_and(|m| m.len() > 0);
-    Some(LedgerHeader {
-        user_version,
-        wal_pending,
-    })
+    let wal = fs::metadata(state.join("ledger.sqlite3-wal"))
+        .ok()
+        .filter(|m| m.len() > 0)
+        .and_then(|m| Some((m.len(), m.modified().ok()?)));
+    Some(LedgerHeader { user_version, wal })
 }
 
 /// What an upgrade that dropped `dropped` kernels must tell the user about
@@ -1006,11 +1015,22 @@ mod tests {
         std::fs::write(state.path().join("ledger.sqlite3"), &page).unwrap();
         let header = super::ledger_header(state.path()).unwrap();
         assert_eq!(header.user_version, 7);
-        assert!(!header.wal_pending);
+        assert_eq!(header.wal, None);
         std::fs::write(state.path().join("ledger.sqlite3-wal"), b"").unwrap();
-        assert!(!super::ledger_header(state.path()).unwrap().wal_pending);
+        assert_eq!(super::ledger_header(state.path()).unwrap().wal, None);
+        // A log left by the previous host that nobody touched is no sign.
         std::fs::write(state.path().join("ledger.sqlite3-wal"), b"frames").unwrap();
-        assert!(super::ledger_header(state.path()).unwrap().wal_pending);
+        let left = super::ledger_header(state.path()).unwrap();
+        assert!(left.wal.is_some());
+        assert!(!left.maybe_migrated(&super::ledger_header(state.path()).unwrap()));
+        assert!(!header.maybe_migrated(&header));
+        // A log that grew, or a new schema version, is.
+        std::fs::write(state.path().join("ledger.sqlite3-wal"), b"more frames").unwrap();
+        assert!(left.maybe_migrated(&super::ledger_header(state.path()).unwrap()));
+        assert!(header.maybe_migrated(&super::LedgerHeader {
+            user_version: 8,
+            wal: None
+        }));
         std::fs::write(state.path().join("ledger.sqlite3"), b"not a database").unwrap();
         assert_eq!(super::ledger_header(state.path()), None);
     }

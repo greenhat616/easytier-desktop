@@ -284,9 +284,7 @@ pub async fn upgrade() -> Result<()> {
             ),
         }
         let migrated = match (ledger_before, storage::ledger_header(&layout.state)) {
-            (Some(before), Some(after)) => {
-                after.user_version != before.user_version || after.wal_pending
-            }
+            (Some(before), Some(after)) => before.maybe_migrated(&after),
             _ => false,
         };
         let mut error = error.context("the new host did not become ready; upgrade rolled back");

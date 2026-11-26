@@ -182,10 +182,11 @@ Ticks run every `readiness_tick` (250 ms) while starting, then at the poll deadl
 
 The policy comes from `HostDeps::restart_policy` (`etd_proc::backoff::BackoffPolicy`
 in the product): delays 1 s, 2 s, 4 s, 8 s for abnormal exits within a rolling five
-minutes; the fifth gives up. `GAVE_UP` keeps desired state running. Only
-`RetryStart` (resets the policy, the attempt counter and the fence-failure flag) or a
-committed stop (clears the fence-failure flag, so the next start installs and
-verifies a fresh fence) leaves it. Abnormal exits include start timeouts, spawn failures and
+minutes; the fifth gives up. An exit leaves the window once it is a full five minutes
+old, for the policy and the published `restart_attempt` alike. `GAVE_UP` keeps desired
+state running. Only `RetryStart` (resets the policy, the attempt counter and the
+fence-failure flag) or a committed stop (clears the fence-failure flag, so the next
+start installs and verifies a fresh fence) leaves it. Abnormal exits include start timeouts, spawn failures and
 exits before identity capture.
 
 ### Quarantine

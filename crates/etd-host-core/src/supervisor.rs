@@ -650,7 +650,7 @@ impl Supervisor {
         while self
             .abnormal
             .front()
-            .is_some_and(|t| now.saturating_duration_since(*t) > etd_proc::GIVE_UP_WINDOW)
+            .is_some_and(|t| now.saturating_duration_since(*t) >= etd_proc::GIVE_UP_WINDOW)
         {
             self.abnormal.pop_front();
         }

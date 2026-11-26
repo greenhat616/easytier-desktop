@@ -110,7 +110,7 @@ impl Target {
 }
 
 /// SHA-256 of every extracted file, executable first.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Extracted {
     exe: String,
     files: BTreeMap<String, String>,
@@ -258,6 +258,8 @@ fn download(url: &str, dest: &Path, limit: u64) -> Result<()> {
     let mut command = Command::new("curl");
     command
         .args([
+            // First, so that no user or system curlrc applies.
+            "-q",
             "--fail",
             "--location",
             "--silent",
@@ -291,8 +293,7 @@ fn download(url: &str, dest: &Path, limit: u64) -> Result<()> {
     Ok(())
 }
 
-/// Extract the bundle members of one verified archive into `dest`, which
-/// must not exist yet.
+/// Extract the bundle members of one verified archive into the empty `dest`.
 fn extract(archive: &Path, target: &Target, dest: &Path) -> Result<Extracted> {
     let exe = target.executable();
     let wanted: BTreeSet<&str> = std::iter::once(exe)
@@ -465,43 +466,81 @@ pub fn run(root: &Path, args: Args) -> Result<()> {
             Some(bundle) => bundle.join(&release.version),
             None => out.join(&target.triple).join(&release.version),
         };
-        if fs::symlink_metadata(&dest).is_ok() {
-            fs::remove_dir_all(&dest)
-                .with_context(|| format!("cannot replace {}", dest.display()))?;
-        }
-        let extracted = extract(&archive, target, &dest)?;
+        // Extract beside the destination; the staging directory is removed
+        // on any failure and becomes the bundle only after verification.
+        let parent = dest.parent().context("bundle directory has no parent")?;
+        fs::create_dir_all(parent)?;
+        let staging = tempfile::Builder::new()
+            .prefix(".etd-fetch-")
+            .tempdir_in(parent)?;
+        let extracted = extract(&archive, target, staging.path())?;
         fs::remove_file(&archive)?;
-        let core = std::path::absolute(dest.join(target.executable()))?;
-        println!("{} {}: {}", target.triple, release.version, core.display());
-        bundles.push((target, extracted, core));
+        bundles.push(Staged {
+            target,
+            extracted,
+            staging,
+            dest,
+        });
     }
 
     let lock_path = root.join(LOCK);
     if args.update_lock {
-        let bundles: Vec<_> = bundles
-            .into_iter()
-            .map(|(target, extracted, _)| (target, extracted))
+        let rows: Vec<_> = bundles
+            .iter()
+            .map(|staged| (staged.target, staged.extracted.clone()))
             .collect();
-        let text = render_lock(&pin, &bundles);
+        let text = render_lock(&pin, &rows);
         core_lock::parse(&text).map_err(anyhow::Error::msg)?;
         fs::write(&lock_path, text)?;
         println!("wrote {LOCK}");
     } else {
         let lock = fs::read_to_string(&lock_path).context(LOCK)?;
-        for (target, bundle, _) in &bundles {
-            check_lock(&lock, &target.triple, &release.version, bundle)?;
+        for staged in &bundles {
+            check_lock(
+                &lock,
+                &staged.target.triple,
+                &release.version,
+                &staged.extracted,
+            )?;
         }
         println!("extracted files match {LOCK}");
-        if let (Some(name), [(_, _, core)]) = (&args.github_env, bundles.as_slice()) {
-            let file = std::env::var_os("GITHUB_ENV").context("GITHUB_ENV is not set")?;
-            let core = core.to_str().context("kernel path is not UTF-8")?;
-            ensure!(!core.contains('\n'), "kernel path contains a newline");
-            let mut env = fs::OpenOptions::new().append(true).open(file)?;
-            std::io::Write::write_all(&mut env, format!("{name}={core}\n").as_bytes())?;
-            println!("exported {name}");
+    }
+
+    let mut cores = Vec::new();
+    for staged in bundles {
+        if fs::symlink_metadata(&staged.dest).is_ok() {
+            fs::remove_dir_all(&staged.dest)
+                .with_context(|| format!("cannot replace {}", staged.dest.display()))?;
         }
+        fs::rename(staged.staging.path(), &staged.dest)
+            .with_context(|| format!("cannot publish {}", staged.dest.display()))?;
+        let _ = staged.staging.keep();
+        let core = std::path::absolute(staged.dest.join(staged.target.executable()))?;
+        println!(
+            "{} {}: {}",
+            staged.target.triple,
+            release.version,
+            core.display()
+        );
+        cores.push(core);
+    }
+    if let (Some(name), [core]) = (&args.github_env, cores.as_slice()) {
+        let file = std::env::var_os("GITHUB_ENV").context("GITHUB_ENV is not set")?;
+        let core = core.to_str().context("kernel path is not UTF-8")?;
+        ensure!(!core.contains('\n'), "kernel path contains a newline");
+        let mut env = fs::OpenOptions::new().append(true).open(file)?;
+        std::io::Write::write_all(&mut env, format!("{name}={core}\n").as_bytes())?;
+        println!("exported {name}");
     }
     Ok(())
+}
+
+/// One verified archive's files, extracted but not yet published.
+struct Staged<'a> {
+    target: &'a Target,
+    extracted: Extracted,
+    staging: tempfile::TempDir,
+    dest: PathBuf,
 }
 
 #[cfg(test)]

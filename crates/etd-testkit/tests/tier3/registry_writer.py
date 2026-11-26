@@ -1,4 +1,4 @@
-"""Disposable CI audit of writes to IKEEXT Start."""
+"""Disposable CI audit of writes to BITS Start."""
 from contextlib import contextmanager, ExitStack
 import csv
 import datetime
@@ -15,7 +15,7 @@ import win32evtlog as events
 import win32security as security
 from service import command
 
-KEY = r"MACHINE\SYSTEM\CurrentControlSet\Services\IKEEXT"
+KEY = r"MACHINE\SYSTEM\CurrentControlSet\Services\BITS"
 INFO = security.SACL_SECURITY_INFORMATION
 REG = security.SE_REGISTRY_KEY
 UTC = datetime.timezone.utc
@@ -39,7 +39,7 @@ def registry_writes(start, seen):
         for event in batch:
             xml = ElementTree.fromstring(events.EvtRender(event, events.EvtRenderEventXml))
             data = {n.attrib["Name"]: n.text for n in xml.findall("./{*}EventData/{*}Data")}
-            if not re.fullmatch(r"\\REGISTRY\\MACHINE\\SYSTEM\\(?:ControlSet\d+|CurrentControlSet)\\Services\\IKEEXT",
+            if not re.fullmatch(r"\\REGISTRY\\MACHINE\\SYSTEM\\(?:ControlSet\d+|CurrentControlSet)\\Services\\BITS",
                                 data.get("ObjectName", ""), re.I):
                 continue
             identifier = xml.findtext("./{*}System/{*}EventRecordID")
@@ -70,7 +70,7 @@ def registry_audit():
     seen = set()
     with ExitStack() as cleanup:
         cleanup.callback(security.AdjustTokenPrivileges, token, False, prior)
-        key = win32api.RegOpenKeyEx(win32con.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\IKEEXT",
+        key = win32api.RegOpenKeyEx(win32con.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\BITS",
                                     0, win32con.ACCESS_SYSTEM_SECURITY | win32con.READ_CONTROL)
         cleanup.callback(key.Close)
         def read_sd():
@@ -104,7 +104,7 @@ def registry_audit():
             print(f"SACL restore control old/new: {original.GetSecurityDescriptorControl()}/"
                   f"{restored.GetSecurityDescriptorControl()}", flush=True)
             assert acl_text(restored) == old_sddl, (old_sddl, acl_text(restored))
-            print("restored original IKEEXT SACL", flush=True)
+            print("restored original BITS SACL", flush=True)
         cleanup.callback(restore_acl)
         modified.SetSecurityDescriptorSacl(True, acl, False)
         win32api.RegSetKeySecurity(key, INFO, modified)

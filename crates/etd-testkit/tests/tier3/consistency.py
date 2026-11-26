@@ -14,6 +14,18 @@ def installed_image(value):
 
 
 def check_generation(base, live, records, instance, view):
+    try:
+        return compare_generation(base, live, records, instance, view)
+    except (AssertionError, KeyError, OSError):
+        for kind, key in sorted(base.delta(live)):
+            print(f"native delta: {kind} {key}", flush=True)
+        for row in records:
+            if row["state"] != "reclaimed":
+                print(f"open intent: {row['kind']} {row['state']}", flush=True)
+        raise
+
+
+def compare_generation(base, live, records, instance, view):
     changed = base.delta(live)
     expected = set()
     active = [r for r in records if r["state"] != "reclaimed"
@@ -46,11 +58,14 @@ def check_generation(base, live, records, instance, view):
         elif key["type"] == "routes_via":
             matches = {("route", name)}
         elif key["type"] == "path" and kind == "run_dir":
-            matches = {("runtime", key["path"])}
+            path = Path(key["path"])
+            matches = {k for k in live.rows if k[0] == "runtime" and path.samefile(k[1])}
+            assert len(matches) == 1, f"expected one native runtime directory for {path}"
         elif kind == "process":
             matches = {("process", str((obs.get("credential") or {})["pid"]))}
             for match in matches:
-                assert installed_image(live.rows[match]).resolve() == Path(key["exe"]).resolve()
+                observed = installed_image(live.rows[match])
+                assert observed.samefile(key["exe"]), f"PID {match[1]} uses {observed}; plan {key['exe']}"
         elif key["type"] == "resolved_link":
             matches = {("resolver", key["interface"])}
         elif key["type"] == "fence":

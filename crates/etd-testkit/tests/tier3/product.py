@@ -196,6 +196,10 @@ def driver_conflict():
                     "binPath=", missing)
             stack.callback(command, "sc.exe", "delete", name)
         foreign_state = service.inventory()
+        for name in sorted(names):
+            native = foreign_state.rows.get(("service", name))
+            print(f"pre-existing driver {name}: {native}", flush=True)
+            assert native and native[1].lower() == "disabled", f"driver fixture missing: {name}"
         instance = str(uuid.uuid4())
         service.apply(spec(), instance, str(uuid.uuid4()), str(service.ctl("status")["revision"]))
         def conflicts():

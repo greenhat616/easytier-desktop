@@ -176,6 +176,7 @@ async fn owned_control_socket_and_verify_only_reclaim() {
         assert!(matches!(reclaimer.probe(&e).await, Probe::Present(_)));
         effects.push((reclaimer, e));
     }
+    let original_identity = iface.credential.clone();
     drop(socket);
     for (r, e) in effects {
         let deadline = std::time::Instant::now() + Duration::from_secs(8);
@@ -185,6 +186,20 @@ async fn owned_control_socket_and_verify_only_reclaim() {
         }
         assert_eq!(r.reclaim(&e).await.unwrap(), Reclaimed::AlreadyAbsent);
     }
+    let (_replacement, next_name) = utun();
+    let next = adapters
+        .observer
+        .interfaces_owned_by(std::process::id())
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name == next_name)
+        .unwrap();
+    println!(
+        "Reopened control socket {name} -> {next_name}, old {original_identity:?}, new {:?}, reused ifindex={}",
+        next.credential,
+        next.credential == original_identity
+    );
     println!(
         "Observed {name} via PID, verified identity conflicts; kernel reclaimed interface and route after close"
     );

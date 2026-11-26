@@ -1,6 +1,6 @@
 //! The kernel anchor is the source of truth across writer and host restarts.
 //! Mutate only its filter rules and read them back before returning.
-use super::{boot, command, observe::listener, output};
+use super::{COMMAND_TIMEOUT, boot, capture, command, holders::CoreIdentity, output, status};
 use crate::service::{HostFilesystem, NativeHostFilesystem};
 use etd_sysfx::{FenceSpec, ObjectKey};
 use nix::unistd::Uid;
@@ -83,7 +83,24 @@ fn valid_label(label: &str) -> bool {
     })
 }
 
-pub(super) fn rules() -> io::Result<BTreeSet<Rule>> {
+fn parsed(line: &str) -> Option<(Rule, bool)> {
+    let (prefix, label) = line.rsplit_once(" label \"")?;
+    let (label, family) = label.strip_suffix('"')?.rsplit_once('-')?;
+    let port = prefix
+        .split_once(" port = ")?
+        .1
+        .split_whitespace()
+        .next()?
+        .parse::<u16>()
+        .ok()?;
+    let rule = Rule {
+        label: label.into(),
+        port,
+    };
+    let v6 = family == "v6";
+    (port != 0 && valid_label(label) && rule.line(v6) == line).then_some((rule, v6))
+}
+fn inventory(sweep: bool) -> io::Result<BTreeSet<Rule>> {
     let parents = output(command(PF).args(["-a", "com.apple", "-s", "Anchors"]))?;
     if !parents
         .lines()
@@ -91,56 +108,64 @@ pub(super) fn rules() -> io::Result<BTreeSet<Rule>> {
     {
         return Ok(BTreeSet::new());
     }
+    let mut anomaly = false;
     for args in [&["-sn"][..], &["-s", "Tables"], &["-s", "Anchors"]] {
-        if !output(command(PF).args(["-a", ANCHOR]).args(args))?
-            .trim()
-            .is_empty()
+        for _ in output(command(PF).args(["-a", ANCHOR]).args(args))?
+            .lines()
+            .filter(|l| !l.trim().is_empty())
         {
-            return Err(io::Error::other(
-                "unexpected objects in the product PF anchor",
-            ));
+            anomaly = true;
+            tracing::warn!(anchor=ANCHOR,query=?args,"unexpected PF object left untouched");
         }
     }
-    let filter = output(command(PF).args(["-a", ANCHOR, "-sr"]))?;
-    let mut v4 = BTreeSet::new();
-    let mut v6 = BTreeSet::new();
-    for line in filter.lines() {
-        let invalid = || io::Error::other("unexpected rule in the product PF anchor");
-        let (prefix, label) = line.rsplit_once(" label \"").ok_or_else(invalid)?;
-        let (label, family) = label
-            .strip_suffix('"')
-            .and_then(|s| s.rsplit_once('-'))
-            .ok_or_else(invalid)?;
-        let port = prefix
-            .split_once(" port = ")
-            .and_then(|(_, s)| s.split_whitespace().next())
-            .and_then(|s| s.parse::<u16>().ok())
-            .filter(|p| *p != 0)
-            .ok_or_else(invalid)?;
-        let rule = Rule {
-            label: label.into(),
-            port,
-        };
-        let ipv6 = family == "v6";
-        if !valid_label(label)
-            || rule.line(ipv6) != line
-            || !(if ipv6 { &mut v6 } else { &mut v4 }).insert(rule)
-        {
-            return Err(invalid());
+    let mut pairs = std::collections::BTreeMap::<Rule, (usize, usize)>::new();
+    let mut unknown = Vec::new();
+    let filters = output(command(PF).args(["-a", ANCHOR, "-sr"]))?;
+    for (index, line) in filters.lines().enumerate() {
+        if let Some((rule, v6)) = parsed(line) {
+            let counts = pairs.entry(rule).or_default();
+            if v6 {
+                counts.1 += 1;
+            } else {
+                counts.0 += 1;
+            }
+        } else {
+            anomaly = true;
+            unknown.push(line);
+            tracing::warn!(
+                anchor = ANCHOR,
+                index,
+                "unrecognized PF filter left untouched"
+            );
         }
     }
-    if v4 != v6 {
-        return Err(io::Error::other("incomplete PF rule pair"));
+    let mut found = BTreeSet::new();
+    for (rule, count) in pairs {
+        if count == (1, 1) && !unknown.iter().any(|line| line.contains(&rule.label)) {
+            found.insert(rule);
+        } else {
+            anomaly = true;
+            tracing::warn!(anchor=ANCHOR,label=%rule.label,"ambiguous or incomplete PF generation left untouched");
+        }
     }
-    Ok(v4)
+    if anomaly && !sweep {
+        return Err(io::Error::other("unexpected objects in product PF anchor"));
+    }
+    Ok(found)
+}
+pub(super) fn rules() -> io::Result<BTreeSet<Rule>> {
+    inventory(false)
+}
+pub(super) fn sweep_rules() -> io::Result<BTreeSet<Rule>> {
+    inventory(true)
 }
 
 // HR keeps the maintenance directory across uninstall. All privileged
 // sessions use its stable inode, independent of the generation's state dir.
 // Each mutating pfctl inherits the lock if its spawning host dies mid-command.
-struct Writer(File, std::path::PathBuf);
+pub(super) struct Writer(File, std::path::PathBuf);
 impl Writer {
-    fn lock() -> io::Result<Self> {
+    pub(super) fn lock() -> io::Result<Self> {
         if !Uid::effective().is_root() {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
@@ -166,7 +191,19 @@ impl Writer {
         if !m.is_dir() || m.uid() != 0 || m.mode() & 0o777 != 0o700 {
             return Err(io::Error::other("untrusted PF maintenance directory"));
         }
-        dir.lock()?;
+        let deadline = std::time::Instant::now() + COMMAND_TIMEOUT;
+        loop {
+            match dir.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(25))
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "PF writer is busy"));
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(e),
+            }
+        }
         Ok(Self(dir, path.join(OWNER)))
     }
     fn pf(&self) -> io::Result<Command> {
@@ -203,14 +240,17 @@ impl Writer {
         }
         Ok(())
     }
-    fn install(&self) -> io::Result<()> {
-        let top = output(command(PF).arg("-sr"))?;
-        if !top
-            .lines()
-            .any(|l| l.trim() == "anchor \"com.apple/*\" all")
-        {
-            return Err(io::Error::other("PF wildcard filter hook unavailable"));
+    pub(super) fn confirm(&self, rule: &Rule) -> io::Result<()> {
+        hook()?;
+        active()?;
+        let own = token(&self.1)?.ok_or_else(|| io::Error::other("missing PF receipt"))?;
+        if !reference_live(&own)? || !rules()?.contains(rule) {
+            return Err(io::Error::other("generation fence is not active"));
         }
+        Ok(())
+    }
+    fn install(&self) -> io::Result<()> {
+        hook()?;
         let current = rules()?;
         if let Some(token) = token(&self.1)?
             && reference_live(&token)?
@@ -233,12 +273,13 @@ impl Writer {
             .open(&self.1)?;
         writeln!(receipt, "boot {}", boot()?.0)?;
         receipt.sync_all()?;
-        let status = self
-            .pf()?
-            .arg("-E")
-            .stdout(receipt.try_clone()?)
-            .stderr(receipt)
-            .status()?;
+        let status = status(
+            self.pf()?
+                .arg("-E")
+                .stdout(receipt.try_clone()?)
+                .stderr(receipt),
+            COMMAND_TIMEOUT,
+        )?;
         if !status.success() || token(&self.1)?.is_none() {
             return Err(io::Error::other("PF enable failed"));
         }
@@ -247,6 +288,16 @@ impl Writer {
     }
 }
 
+fn hook() -> io::Result<()> {
+    let top = output(command(PF).arg("-sr"))?;
+    if !top
+        .lines()
+        .any(|l| l.trim() == "anchor \"com.apple/*\" all")
+    {
+        return Err(io::Error::other("PF wildcard filter hook unavailable"));
+    }
+    Ok(())
+}
 fn active() -> io::Result<()> {
     if !output(command(PF).args(["-s", "info"]))?
         .lines()
@@ -297,9 +348,33 @@ fn token(path: &std::path::Path) -> io::Result<Option<String>> {
     Ok(Some(token.into()))
 }
 fn reference_live(token: &str) -> io::Result<bool> {
-    Ok(output(command(PF).args(["-s", "References"]))?
-        .split(|c: char| !c.is_ascii_digit())
-        .any(|word| word == token))
+    references(&output(command(PF).args(["-s", "References"]))?, token)
+}
+fn references(list: &str, token: &str) -> io::Result<bool> {
+    let mut lines = list.lines().filter(|l| !l.trim().is_empty());
+    let Some(header) = lines.next() else {
+        return Ok(false);
+    };
+    let invalid = || io::Error::other("unexpected PF reference table format");
+    if header.split_whitespace().collect::<Vec<_>>()
+        != ["PID", "Process", "Name", "TOKEN", "TIMESTAMP"]
+    {
+        return Err(invalid());
+    }
+    let start = header.find("TOKEN").ok_or_else(invalid)?;
+    let end = header.find("TIMESTAMP").ok_or_else(invalid)?;
+    let mut found = false;
+    for line in lines {
+        let value = line.get(start..end).map(str::trim).ok_or_else(invalid)?;
+        if value.is_empty()
+            || !value.bytes().all(|c| c.is_ascii_digit())
+            || value.parse::<u64>().is_err()
+        {
+            return Err(invalid());
+        }
+        found |= value == token;
+    }
+    Ok(found)
 }
 
 const SERVICE_RECEIPT: &str = "installed-pf-reference";
@@ -329,7 +404,7 @@ pub(crate) fn uninstall_anchor(state: &std::path::Path, rollback: bool) -> io::R
         && reference_live(&t)?
     {
         // Do not surface an enable token in diagnostics.
-        if !writer.pf()?.args(["-X", &t]).output()?.status.success() || reference_live(&t)? {
+        if !capture(writer.pf()?.args(["-X", &t]))?.status.success() || reference_live(&t)? {
             return Err(io::Error::other("PF reference release failed"));
         }
     }
@@ -339,7 +414,7 @@ pub(crate) fn uninstall_anchor(state: &std::path::Path, rollback: bool) -> io::R
     }
 }
 
-pub(super) fn change(rule: Rule, install: bool) -> io::Result<bool> {
+pub(super) fn change(rule: Rule, install: bool, cores: &CoreIdentity) -> io::Result<bool> {
     let writer = Writer::lock()?;
     if install {
         writer.install()?;
@@ -354,25 +429,17 @@ pub(super) fn change(rule: Rule, install: bool) -> io::Result<bool> {
             "PF generation label or management port already in use",
         ));
     }
-    // A ledger-loss sweep has no process record. A remaining listener in
-    // either family is positive evidence that removing the fence is unsafe.
-    if !install && all.contains(&rule) {
+    let remaining = if !install && all.contains(&rule) {
         let own =
             token(&writer.1)?.ok_or_else(|| io::Error::other("missing product PF reference"))?;
         if !reference_live(&own)? {
             return Err(io::Error::other("unconfirmed product PF reference"));
         }
-        for ip in [
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-        ] {
-            if listener(std::net::SocketAddr::new(ip, rule.port))?.is_some() {
-                return Err(io::Error::other(
-                    "management listener still present; keeping its PF rules",
-                ));
-            }
-        }
-    }
+        cores.before_removal(rule.port)?
+    } else {
+        vec![]
+    };
+    let port = rule.port;
     let changed = if install {
         all.insert(rule)
     } else {
@@ -381,5 +448,32 @@ pub(super) fn change(rule: Rule, install: bool) -> io::Result<bool> {
     if changed {
         writer.load(&all)?;
     }
+    for h in remaining {
+        tracing::warn!(anchor=ANCHOR,port,pid=h.pid,euid=h.uid,image=%h.image.display(),"reclaimed fence; unrelated listener left running");
+    }
     Ok(changed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::references;
+    #[test]
+    fn reference_identity_uses_only_the_token_column() {
+        let table = format!(
+            "{:<9}{:<29}{:<25}{}\n{:<9}{:<29}{:<25}{}\n",
+            "PID",
+            "Process Name",
+            "TOKEN",
+            "TIMESTAMP",
+            "42",
+            "agent 123",
+            "567",
+            "2026-11-26 12:34:56"
+        );
+        assert!(references(&table, "567").unwrap());
+        for other in ["42", "123", "2026", "34"] {
+            assert!(!references(&table, other).unwrap());
+        }
+        assert!(references(&table.replace("567", "bad"), "42").is_err());
+    }
 }

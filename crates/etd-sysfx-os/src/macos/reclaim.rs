@@ -7,6 +7,7 @@ use std::sync::Arc;
 pub(super) struct MacReclaimer {
     pub(super) kind: EffectKind,
     pub(super) observer: Arc<MacObserver>,
+    pub(super) cores: Arc<super::holders::CoreIdentity>,
 }
 
 fn concrete(effect: &Effect) -> &ObjectKey {
@@ -70,7 +71,8 @@ impl Reclaimer for MacReclaimer {
             {
                 return Err(ReclaimError::CredentialMismatch);
             }
-            let changed = tokio::task::spawn_blocking(move || pf::change(rule, false))
+            let cores = self.cores.clone();
+            let changed = tokio::task::spawn_blocking(move || pf::change(rule, false, &cores))
                 .await
                 .map_err(|e| ReclaimError::Indeterminate(e.to_string()))?
                 .map_err(|e| ReclaimError::Indeterminate(e.to_string()))?;
@@ -103,7 +105,7 @@ impl Sweeper for MacSweep {
             if !nix::unistd::Uid::effective().is_root() {
                 return Ok(vec![]);
             }
-            let rules = tokio::task::spawn_blocking(pf::rules)
+            let rules = tokio::task::spawn_blocking(pf::sweep_rules)
                 .await
                 .map_err(|e| ReclaimError::Indeterminate(e.to_string()))?
                 .map_err(|e| ReclaimError::Indeterminate(e.to_string()))?;

@@ -105,8 +105,8 @@ fn interfaces() -> io::Result<BTreeMap<String, InterfaceInfo>> {
     Ok(found)
 }
 
-fn fields(args: &[&str], empty_ok: bool) -> io::Result<Vec<String>> {
-    let result = command("/usr/sbin/lsof").args(args).output()?;
+pub(super) fn fields(args: &[&str], empty_ok: bool) -> io::Result<Vec<String>> {
+    let result = super::capture(command("/usr/sbin/lsof").args(["-b", "-w"]).args(args))?;
     if !result.stderr.is_empty() || !result.status.success() {
         if empty_ok
             && result.status.code() == Some(1)

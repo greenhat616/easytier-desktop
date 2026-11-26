@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-pub(super) struct MacFence;
+pub(super) struct MacFence(pub(super) std::sync::Arc<super::holders::CoreIdentity>);
 
 fn validate(spec: &FenceSpec) -> Result<(), FenceError> {
     if !matches!(spec.address.ip(), IpAddr::V4(ip) if ip == Ipv4Addr::LOCALHOST)
@@ -59,6 +59,9 @@ fn verify(spec: FenceSpec, pid: u32) -> Result<FenceVerification, FenceError> {
             None => ListenerCheck::NotListening,
         })
     };
+    let writer = pf::Writer::lock().map_err(os)?;
+    let rule = Rule::for_spec(&spec);
+    writer.confirm(&rule).map_err(os)?;
     let initial = listener()?;
     let mut result = FenceVerification {
         listener: initial,
@@ -72,31 +75,25 @@ fn verify(spec: FenceSpec, pid: u32) -> Result<FenceVerification, FenceError> {
     if result.host != DirectionResult::Connected {
         return Ok(result);
     }
-    let rule = Rule::for_spec(&spec);
+
     let before = packets(&rule, address.is_ipv6()).map_err(os)?;
-    let nobody = nix::unistd::User::from_name("nobody")
-        .map_err(|e| FenceError::Probe(e.to_string()))?
-        .filter(|u| !u.uid.is_root())
-        .ok_or_else(|| FenceError::Probe("unprivileged account unavailable".into()))?;
-    let probe = command("/usr/bin/sudo")
-        .args([
-            "-n",
-            "-u",
-            &format!("#{}", nobody.uid),
-            "--",
-            "/usr/bin/nc",
-            "-n",
-            "-v",
-            "-z",
-            "-G",
-            "2",
-            "-w",
-            "2",
-            &address.ip().to_string(),
-            &address.port().to_string(),
-        ])
-        .output()
-        .map_err(os)?;
+    let probe = super::capture(command("/usr/bin/sudo").args([
+        "-n",
+        "-u",
+        "nobody",
+        "--",
+        "/usr/bin/nc",
+        "-n",
+        "-v",
+        "-z",
+        "-G",
+        "2",
+        "-w",
+        "2",
+        &address.ip().to_string(),
+        &address.port().to_string(),
+    ]))
+    .map_err(os)?;
     // A timeout alone proves nothing. Require a packet matching this actual PF
     // block, plus the same live listener and a second successful host connect.
     let message = String::from_utf8_lossy(&probe.stderr);
@@ -114,6 +111,7 @@ fn verify(spec: FenceSpec, pid: u32) -> Result<FenceVerification, FenceError> {
     };
     result.host = host(address);
     result.listener = listener()?;
+    writer.confirm(&rule).map_err(os)?;
     Ok(result)
 }
 #[async_trait]
@@ -134,7 +132,8 @@ impl PortFence for MacFence {
         validate(spec)?;
         let rule = Rule::for_spec(spec);
         let key = rule.key();
-        tokio::task::spawn_blocking(move || pf::change(rule, true))
+        let cores = self.0.clone();
+        tokio::task::spawn_blocking(move || pf::change(rule, true, &cores))
             .await
             .map_err(|e| FenceError::Probe(e.to_string()))?
             .map_err(os)?;
@@ -159,7 +158,8 @@ impl PortFence for MacFence {
     async fn remove(&self, spec: &FenceSpec) -> Result<Reclaimed, FenceError> {
         validate(spec)?;
         let rule = Rule::for_spec(spec);
-        let changed = tokio::task::spawn_blocking(move || pf::change(rule, false))
+        let cores = self.0.clone();
+        let changed = tokio::task::spawn_blocking(move || pf::change(rule, false, &cores))
             .await
             .map_err(|e| FenceError::Probe(e.to_string()))?
             .map_err(os)?;

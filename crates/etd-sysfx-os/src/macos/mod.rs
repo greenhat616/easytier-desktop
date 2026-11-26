@@ -1,12 +1,19 @@
 //! Darwin observations, verify-only utun/route reclaim and the PF fence.
 mod fence;
+mod holders;
 mod observe;
 mod pf;
 mod reclaim;
 
 use crate::{OsAdapters, OsConfig, OsError};
 use etd_sysfx::*;
-use std::{io, process::Command, sync::Arc};
+use std::{
+    io::{self, Read, Seek},
+    os::unix::process::CommandExt,
+    process::{Command, ExitStatus, Output},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 pub(crate) use pf::{install_anchor, uninstall_anchor};
 
@@ -18,8 +25,54 @@ fn command(path: &str) -> Command {
     cmd
 }
 
+fn status(cmd: &mut Command, timeout: Duration) -> io::Result<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    let mut child = cmd.process_group(0).spawn()?;
+    let err = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => return Ok(s),
+            Err(e) => break e,
+            Ok(None) if Instant::now() >= deadline => {
+                break io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("{} timed out", cmd.get_program().to_string_lossy()),
+                );
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    // The unreaped child pins its PID and group. Terminate helpers as well;
+    // wait for the actual pfctl before letting the caller drop its writer lock.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    child.wait()?;
+    Err(err)
+}
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
+fn capture(cmd: &mut Command) -> io::Result<Output> {
+    // File-backed output cannot fill a pipe while we poll the deadline or
+    // keep us blocked on a descendant's copy of the write end.
+    let mut stdout = tempfile::tempfile()?;
+    let mut stderr = tempfile::tempfile()?;
+    let status = status(
+        cmd.stdout(stdout.try_clone()?).stderr(stderr.try_clone()?),
+        COMMAND_TIMEOUT,
+    )?;
+    stdout.rewind()?;
+    stderr.rewind()?;
+    let mut out = Output {
+        status,
+        stdout: vec![],
+        stderr: vec![],
+    };
+    stdout.read_to_end(&mut out.stdout)?;
+    stderr.read_to_end(&mut out.stderr)?;
+    Ok(out)
+}
 fn output(cmd: &mut Command) -> io::Result<String> {
-    let result = cmd.output()?;
+    let result = capture(cmd)?;
     if !result.status.success() {
         return Err(io::Error::other(format!(
             "{}: {}: {}",
@@ -41,8 +94,26 @@ fn observation(key: &ObjectKey, credential: Credential) -> Observation {
 }
 
 fn boot() -> io::Result<BootId> {
-    let value = output(command("/usr/sbin/sysctl").args(["-n", "kern.bootsessionuuid"]))?;
-    let id = uuid::Uuid::parse_str(value.trim()).map_err(io::Error::other)?;
+    let mut buf = [0u8; 64];
+    let mut size = buf.len();
+    // SAFETY: bounded output and size, no new value supplied.
+    if unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let value = std::ffi::CStr::from_bytes_until_nul(&buf[..size])
+        .map_err(io::Error::other)?
+        .to_str()
+        .map_err(io::Error::other)?;
+    let id = uuid::Uuid::parse_str(value).map_err(io::Error::other)?;
     Ok(BootId(id.to_string()))
 }
 
@@ -64,6 +135,10 @@ pub(crate) fn adapters(config: &OsConfig) -> Result<OsAdapters, OsError> {
     let observer = Arc::new(observe::MacObserver {
         run_dir: config.run_dir.clone(),
     });
+    let cores = Arc::new(holders::CoreIdentity {
+        store: config.core_store_dir.clone(),
+        uid: 0,
+    });
     let reclaimers = [
         EffectKind::MacUtun,
         EffectKind::Route,
@@ -74,6 +149,7 @@ pub(crate) fn adapters(config: &OsConfig) -> Result<OsAdapters, OsError> {
         Arc::new(reclaim::MacReclaimer {
             kind,
             observer: observer.clone(),
+            cores: cores.clone(),
         }) as Arc<dyn Reclaimer>
     })
     .collect();
@@ -84,6 +160,17 @@ pub(crate) fn adapters(config: &OsConfig) -> Result<OsAdapters, OsError> {
         boot_id: Arc::new(MacBoot),
         fence: nix::unistd::Uid::effective()
             .is_root()
-            .then(|| Arc::new(fence::MacFence) as Arc<dyn PortFence>),
+            .then(|| Arc::new(fence::MacFence(cores)) as Arc<dyn PortFence>),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn timed_out_child_is_reaped_before_return() {
+        let mut cmd = command("/bin/sleep");
+        let err = status(cmd.arg("30"), Duration::from_millis(50)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
 }

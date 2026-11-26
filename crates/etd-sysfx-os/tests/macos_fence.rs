@@ -183,10 +183,6 @@ async fn fence_survives_host_death_and_reclaims_only_one_generation() {
         .iter()
         .find(|r| r.kind() == EffectKind::MacFenceRule)
         .unwrap();
-    assert!(
-        reclaim.reclaim(&effect).await.is_err(),
-        "orphan still holds listener"
-    );
     drop((v4, v6));
     let original = effect.observation.as_ref().unwrap().credential.clone();
     effect.observation.as_mut().unwrap().credential = Some(Credential::ExclusiveContainer {
@@ -232,4 +228,79 @@ async fn fence_survives_host_death_and_reclaims_only_one_generation() {
     println!(
         "Independent PF enumeration: zero product rules, translations or tables after reclaim"
     );
+}
+
+#[tokio::test]
+#[ignore = "disposable macOS runner with a second account"]
+async fn removal_checks_store_image_and_effective_uid() {
+    use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+    assert_eq!(std::env::var("ETD_O3_CI").as_deref(), Ok("1"));
+    if let Ok(port) = std::env::var("ETD_O3_HOLDER_PORT") {
+        let listener = TcpListener::bind(("0.0.0.0", port.parse::<u16>().unwrap())).unwrap();
+        for stream in listener.incoming() {
+            drop(stream.unwrap());
+        }
+        return;
+    }
+    let dir = tempfile::Builder::new()
+        .prefix("etd-o3-store")
+        .tempdir_in("/private/tmp")
+        .unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let store = dir.path().join("cores");
+    fs::create_dir(&store).unwrap();
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o755)).unwrap();
+    let image = store.join("listener");
+    fs::copy(std::env::current_exe().unwrap(), &image).unwrap();
+    fs::set_permissions(&image, fs::Permissions::from_mode(0o755)).unwrap();
+    let account = nix::unistd::User::from_name("etd_o3_probe")
+        .unwrap()
+        .unwrap();
+    assert!(!account.uid.is_root());
+    let fence = system(dir.path()).fence.unwrap();
+    for (epoch, uid, gid) in [(1, 0, 0), (2, account.uid.as_raw(), account.gid.as_raw())] {
+        let port = TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let s = spec(port, "holders", epoch);
+        fence.install(&s).await.unwrap();
+        let mut child = Fixture(
+            Command::new(&image)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "removal_checks_store_image_and_effective_uid",
+                ])
+                .env("ETD_O3_HOLDER_PORT", port.to_string())
+                .uid(uid)
+                .gid(gid)
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while std::net::TcpStream::connect(s.address).is_err() {
+            assert!(child.0.try_wait().unwrap().is_none() && Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        let outcome = fence.remove(&s).await;
+        if uid == 0 {
+            assert!(
+                outcome
+                    .unwrap_err()
+                    .to_string()
+                    .contains("protected kernel still listens")
+            );
+            drop(child);
+            assert_eq!(fence.remove(&s).await.unwrap(), Reclaimed::Removed);
+        } else {
+            assert_eq!(outcome.unwrap(), Reclaimed::Removed);
+            assert!(std::net::TcpStream::connect(s.address).is_ok());
+        }
+        println!(
+            "store image wildcard listener euid={uid}: protected={}",
+            uid == 0
+        );
+    }
 }

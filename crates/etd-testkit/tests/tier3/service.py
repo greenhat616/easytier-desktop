@@ -35,6 +35,33 @@ def eventually(description, read, accept, timeout=75):
         time.sleep(0.4)
 
 
+def empty_pf_namespace(before, after):
+    anchor = "com.apple/easytier-desk"
+    key = ("firewall", "pf/anchor/" + anchor)
+    if key not in before.rows and key in after.rows:
+        children = output("/sbin/pfctl", "-a", anchor, "-s", "Anchors").split()
+        policy = after.rows[key]
+        references = []
+        for (kind, path), ruleset in after.rows.items():
+            if kind != "firewall" or not path.startswith("pf/anchor/"):
+                continue
+            parent = path.removeprefix("pf/anchor/")
+            for line in ruleset["rules"] + ruleset["nat"]:
+                for target in re.findall(r'\banchor\s+"([^"]+)"', line):
+                    if anchor in (target.strip("/"), (parent + "/" + target).strip("/")):
+                        references.append(parent)
+        same_state = all(before.rows["firewall", k] == after.rows["firewall", k]
+                         for k in ("pf/status", "pf/references"))
+        print(f"post-uninstall PF {anchor}: rules={len(policy['rules'])}, "
+              f"nat={len(policy['nat'])}, tables={len(policy['tables'])}, "
+              f"children={len(children)}, explicit references={len(references)}, "
+              f"original status and enable references restored={same_state}", flush=True)
+        if (policy == {"rules": [], "nat": [], "tables": {}} and not children
+                and not references and same_state):
+            return {key}  # PF can retain an empty namespace (ruling msg#892).
+    return set()
+
+
 class Service:
     def __init__(self):
         require_runner()
@@ -171,12 +198,17 @@ class Service:
             print(f"installed service handshake: serving, admin; kernel probe: {version}", flush=True)
             yield self
         finally:
-            # Shared driver candidates can legitimately prevent uninstall;
-            # retain the native report, never delete drivers to pass cleanup.
+            # Inventory the result even when a failed uninstall retains files.
             result = self.uninstall()
+            if not result.returncode:
+                eventually("uninstall journal closed",
+                           lambda: self.call(self.installer, "uninstall", "--status"),
+                           lambda status: status.startswith("No maintenance journal:"))
             after = self.inventory()
             delta = before.delta(after) - managed_service_changes(before, after)
             delta -= runner_noise(before, after) | tun_created(before, after)
+            if sys.platform == "darwin":
+                delta -= empty_pf_namespace(before, after)
             for name in self.retained_drivers:
                 key = ("service", name)
                 if key not in before.rows and after.rows.get(key) == self.retained_drivers[name]:
@@ -185,13 +217,7 @@ class Service:
             assert not (delta or files), (
                 f"pre-install to post-uninstall differences: native={sorted(delta)}, installed={files}"
             )
-            if result.returncode and sys.exc_info()[0] is None:
-                if "reclaim incomplete" not in result.stderr or not self.retained_drivers:
-                    raise RuntimeError("test service uninstall incomplete")
-                pending = [r for r in self.effects() if r["state"] != "reclaimed"]
-                assert all(r["kind"] == "driver" and r["scope"] == "product"
-                           and r["state"] in ("candidate", "conflict") for r in pending)
-                assert {r["key"]["name"].lower() for r in pending} == set(self.retained_drivers)
+            assert result.returncode == 0, f"service uninstall exited {result.returncode}"
 
     @staticmethod
     def call(*args):

@@ -87,7 +87,7 @@ def processes(inv, paths):
     for parent, row in table.items():
         if not row["exe"]:
             continue
-        path = Path(row["exe"])
+        path = Path(row["exe"]).resolve()
         if not any(path == root or root in path.parents for root in roots):
             continue
         seen = set()
@@ -160,9 +160,11 @@ def linux(inv):
         config = output("systemctl", "cat", unit) if unit.startswith("easytier-desk") else None
         inv.put("service", unit, (state, hashlib.sha256(config.encode()).hexdigest() if config else None))
     tun = Path("/dev/net/tun")
-    if tun.exists():
-        st = tun.stat()
-        inv.put("interface", str(tun), (st.st_mode, st.st_rdev, st.st_ino))
+    try:
+        st = tun.lstat()
+    except FileNotFoundError:
+        return
+    inv.put("interface", str(tun), (st.st_mode, st.st_rdev, st.st_ino))
 
 
 def darwin(inv):
@@ -200,9 +202,23 @@ def darwin(inv):
     status = re.search(r"^Status:\s+(Enabled|Disabled)\b", output(pf, "-si"), re.M)
     assert status, "missing PF status"
     inv.put("firewall", "pf/status", status[1])
-    refs = output(pf, "-s", "References").strip()
-    # Compare native enable references without emitting their tokens.
-    inv.put("firewall", "pf/references", hashlib.sha256(refs.encode()).hexdigest())
+    refs = [line for line in output(pf, "-s", "References").splitlines() if line.strip()]
+    owners = {}
+    if [line.strip() for line in refs] != ["No pf starter references held"]:
+        if refs and refs[0].strip() == "TOKENS:":
+            refs.pop(0)
+        assert refs and refs[0].split() == ["PID", "Process", "Name", "TOKEN", "TIMESTAMP"]
+        header = refs.pop(0)
+        start, end = header.index("TOKEN"), header.index("TIMESTAMP")
+        for line in refs:
+            token = line[start:end].strip()
+            assert token.isdecimal(), "invalid PF reference record"
+            fingerprint = hashlib.sha256(token.encode()).hexdigest()
+            assert fingerprint not in owners, "duplicate PF reference"
+            owners[fingerprint] = tuple(line[:start].split())
+    # Compare the enable references and their owners. The TIMESTAMP column
+    # is presentation data and the native tokens must never appear in logs.
+    inv.put("firewall", "pf/references", owners)
     anchors = output(pf, "-v", "-s", "Anchors").split()
     for anchor in ["", *anchors]:
         args = [pf, "-a", anchor] if anchor else [pf]

@@ -115,7 +115,7 @@ impl AppearanceWatch {
                 [
                     UIColorType::AccentLight2,
                     UIColorType::AccentLight3,
-                    UIColorType::AccentLight1,
+                    UIColorType::AccentLight2,
                 ],
             ),
         }

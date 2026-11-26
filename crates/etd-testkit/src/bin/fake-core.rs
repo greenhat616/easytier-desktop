@@ -2,6 +2,7 @@
 //! Owned by P1.
 use std::{
     ffi::OsString,
+    io::Write,
     path::PathBuf,
     process::ExitCode,
     sync::atomic::{AtomicUsize, Ordering},
@@ -161,11 +162,16 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // A host that dies abruptly closes the read ends of our stdio pipes. The
+    // Rust runtime ignores SIGPIPE, so println! would panic on EPIPE and the
+    // fake core would exit by itself, unlike a core that outlives its host
+    // (macOS has no parent-death primitive). Output is best-effort; readiness
+    // is published only after it, so a ready file proves startup output ran.
+    let _ = writeln!(std::io::stdout(), "READY {}", std::process::id());
+    let _ = writeln!(std::io::stderr(), "fake-core ready");
     if let Some(path) = ready {
         publish_ready(path, std::process::id().to_string())?;
     }
-    println!("READY {}", std::process::id());
-    eprintln!("fake-core ready");
     let start = Instant::now();
     let mut logged = 0;
     loop {

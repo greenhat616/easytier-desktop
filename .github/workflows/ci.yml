@@ -57,7 +57,7 @@ jobs:
       # branch would evict them from the repository's quota.
       - uses: Swatinem/rust-cache@v2.9.3
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.152
@@ -94,7 +94,7 @@ jobs:
         run: ./.github/scripts/setup-protoc.ps1
       - uses: Swatinem/rust-cache@v2.9.3
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.152

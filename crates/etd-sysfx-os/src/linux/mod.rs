@@ -19,6 +19,21 @@ struct Linux {
 }
 struct LinuxReclaimer(EffectKind, Arc<Linux>);
 
+impl LinuxReclaimer {
+    async fn current(&self, e: &Effect) -> Result<Option<Observation>, ObserveError> {
+        if let (
+            EffectKind::LinuxResolvedLink,
+            ObjectKey::ResolvedLink { interface },
+            Undo::RestoreIfOurs { .. },
+        ) = (e.kind, &e.key, &e.undo)
+        {
+            // An empty list can be the value a RestoreIfOurs record wrote.
+            return self.1.resolved_observation(&e.key, interface, true).await;
+        }
+        self.1.observe(e.kind, &e.key).await
+    }
+}
+
 pub(crate) fn adapters(config: &crate::OsConfig) -> Result<crate::OsAdapters, crate::OsError> {
     let linux = Arc::new(Linux {
         run_dir: config.run_dir.clone(),
@@ -134,7 +149,7 @@ impl Reclaimer for LinuxReclaimer {
         if self.0 != e.kind {
             return Probe::Indeterminate("wrong reclaimer".into());
         }
-        match self.1.observe(e.kind, &e.key).await {
+        match self.current(e).await {
             Ok(Some(o)) => Probe::Present(o),
             Ok(None) => Probe::Absent,
             Err(err) => Probe::Indeterminate(err.to_string()),
@@ -144,7 +159,7 @@ impl Reclaimer for LinuxReclaimer {
         if self.0 != e.kind {
             return Err(ReclaimError::Unsupported(e.kind));
         }
-        let Some(current) = self.1.observe(e.kind, &e.key).await.map_err(uncertain)? else {
+        let Some(current) = self.current(e).await.map_err(uncertain)? else {
             return Ok(Reclaimed::AlreadyAbsent);
         };
         let expected = e.observation.as_ref().and_then(|o| o.credential.as_ref());
@@ -196,6 +211,29 @@ impl Sweeper for Linux {
                         instance: id.clone(),
                     });
                 let object = network::key(&link.name);
+                for (kind, key) in [
+                    (
+                        EffectKind::Route,
+                        ObjectKey::RoutesVia {
+                            interface: Some(link.name.clone()),
+                        },
+                    ),
+                    (
+                        EffectKind::LinuxResolvedLink,
+                        ObjectKey::ResolvedLink {
+                            interface: link.name.clone(),
+                        },
+                    ),
+                ] {
+                    if let Some(observation) = self.observe(kind, &key).await.map_err(uncertain)? {
+                        found.push(FoundObject {
+                            kind,
+                            key,
+                            observation,
+                            origin: origin.clone(),
+                        });
+                    }
+                }
                 found.push(FoundObject {
                     kind: EffectKind::LinuxTun,
                     observation: observed(&object, link.credential, None),

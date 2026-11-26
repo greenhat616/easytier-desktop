@@ -44,17 +44,7 @@ impl SystemObserver for Linux {
                     .then(|| observed(key, l.credential, None)))
             }
             (EffectKind::LinuxResolvedLink, ObjectKey::ResolvedLink { interface }) => {
-                let Some(l) = self.interface(&network::key(interface)).await? else {
-                    return Ok(None);
-                };
-                let Credential::UnixInterface { index, .. } = &l.credential else {
-                    return Err(os(other("missing link index")));
-                };
-                Ok(resolved::read(*index)
-                    .await
-                    .map_err(os)?
-                    .filter(|s| !s.empty())
-                    .map(|s| observed(key, l.credential, serde_json::to_string(&s).ok())))
+                self.resolved_observation(key, interface, false).await
             }
             (EffectKind::RuntimeDir, ObjectKey::Path { path }) => {
                 match fs::symlink_metadata(path) {
@@ -245,6 +235,24 @@ fn processes() -> io::Result<Vec<SystemEntry>> {
     Ok(entries)
 }
 impl Linux {
+    pub(super) async fn resolved_observation(
+        &self,
+        key: &ObjectKey,
+        interface: &str,
+        include_empty: bool,
+    ) -> Result<Option<Observation>, ObserveError> {
+        let Some(link) = self.interface(&network::key(interface)).await? else {
+            return Ok(None);
+        };
+        let Credential::UnixInterface { index, .. } = link.credential else {
+            return Err(os(other("missing link index")));
+        };
+        Ok(resolved::read(index)
+            .await
+            .map_err(os)?
+            .filter(|s| include_empty || !s.empty())
+            .map(|s| observed(key, link.credential, serde_json::to_string(&s).ok())))
+    }
     async fn entries(&self, class: SystemClass) -> io::Result<Vec<SystemEntry>> {
         let mut entries = Vec::new();
         match class {

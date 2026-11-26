@@ -51,6 +51,8 @@ async fn reclaim_real_link_route_and_dns() {
     .unwrap();
     let name = naming::interface_name(&InstallKey([3; 32]), &InstanceId::from("integration"));
     let foreign = "etd-0badf00d";
+    let epoch_dir = temp.path().join("integration/7");
+    std::fs::create_dir_all(&epoch_dir).unwrap();
     for name in [name.as_str(), foreign] {
         command("ip", &["tuntap", "add", "dev", name, "mode", "tun"]);
         command("ip", &["link", "set", name, "up"]);
@@ -119,6 +121,41 @@ async fn reclaim_real_link_route_and_dns() {
         )
         .await
         .unwrap();
+    assert!(marked.iter().any(|o| o.key
+        == ObjectKey::Path {
+            path: epoch_dir.clone()
+        }
+        && o.origin == FoundBy::ExclusiveContainer));
+    for class in [
+        SystemClass::Interfaces,
+        SystemClass::Routes,
+        SystemClass::DnsPolicy,
+        SystemClass::FirewallRules,
+        SystemClass::RegistryValues,
+        SystemClass::Services,
+        SystemClass::RuntimeDirs,
+        SystemClass::Processes,
+    ] {
+        let entries = os
+            .observer
+            .enumerate(class)
+            .await
+            .unwrap_or_else(|e| panic!("{class:?}: {e}"));
+        assert!(entries.iter().all(|entry| entry.class == class));
+        if class == SystemClass::Interfaces {
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e.key == key && e.identity == obs.credential)
+            );
+        }
+        if class == SystemClass::RuntimeDirs {
+            assert!(entries.iter().any(|e| e.key
+                == ObjectKey::Path {
+                    path: epoch_dir.clone()
+                }));
+        }
+    }
     assert!(
         marked
             .iter()
@@ -184,6 +221,19 @@ async fn reclaim_real_link_route_and_dns() {
             Reclaimed::Removed
         );
         assert_eq!(reclaim(dns_kind).probe(&dns).await, Probe::Absent);
+        dns.undo = Undo::RestoreIfOurs {
+            ours: SettingValue::Absent,
+            original: value("192.0.2.55"),
+        };
+        assert!(matches!(
+            reclaim(dns_kind).probe(&dns).await,
+            Probe::Present(_)
+        ));
+        assert_eq!(
+            reclaim(dns_kind).reclaim(&dns).await.unwrap(),
+            Reclaimed::Restored
+        );
+        assert!(command("resolvectl", &["dns", &name]).contains("192.0.2.55"));
         // Leave new per-link settings live across RTM_DELLINK and check
         // resolve1 independently, using its global server and domain lists.
         command("resolvectl", &["dns", &name, "192.0.2.56"]);

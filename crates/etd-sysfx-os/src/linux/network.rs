@@ -85,7 +85,7 @@ fn endpoint(raw: &str) -> io::Result<SocketAddr> {
         .split_once(':')
         .ok_or_else(|| other("invalid TCP endpoint"))?;
     let mut octets = Vec::new();
-    for word in addr.as_bytes().chunks_exact(8) {
+    for word in addr.as_bytes().as_chunks::<8>().0 {
         octets.extend(
             u32::from_str_radix(std::str::from_utf8(word).map_err(other)?, 16)
                 .map_err(other)?

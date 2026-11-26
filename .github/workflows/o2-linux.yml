@@ -117,6 +117,6 @@ jobs:
             grep -Ei 'error|failed|denied|panic|caused by|invalid|not found|requires|missing|permitted' core.log | grep -Eiv 'secret|password|key|token' | tail -12 || true
           fi
           if [[ -e /proc/$core/status ]]; then grep -E '^(Uid|CapEff):' "/proc/$core/status"; fi
-          case "$2" in root) test "$ready" = true ;; none) test "$ready" = false ;; esac
+          case "$2" in root|net_admin) test "$ready" = true ;; none) test "$ready" = false ;; esac
           EOF
           done

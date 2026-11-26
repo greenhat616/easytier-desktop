@@ -94,7 +94,9 @@ jobs:
           docker exec "$container" nft --version
           docker exec "$container" nft -j list ruleset > "$RUNNER_TEMP/distro.json"
           jq -c '.nftables[] | select(any(.[]; ((.table // .name // "") | startswith("etd_f_"))))' "$RUNNER_TEMP/distro.json"
-          ETD_O2_RULESET="$RUNNER_TEMP/distro.json" "$parser" --ignored --exact linux::fence::tests::parse_distribution_ruleset --nocapture
+          table=$(jq -er '.nftables[].table.name | strings | select(startswith("etd_f_"))' "$RUNNER_TEMP/distro.json")
+          docker exec "$container" nft -a -n list table inet "$table" | tee "$RUNNER_TEMP/distro-table.nft"
+          ETD_O2_RULESET="$RUNNER_TEMP/distro.json" ETD_O2_TABLE_LIST="$RUNNER_TEMP/distro-table.nft" "$parser" --ignored --exact linux::fence::tests::parse_distribution_ruleset --nocapture
 
   core-capability:
     runs-on: ubuntu-latest

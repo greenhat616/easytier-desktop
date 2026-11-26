@@ -75,23 +75,54 @@ impl Table {
         )
     }
 }
-// Read the marker, chain and both generation-specific rule handles in one
-// dump. Mere presence of a table with a product-looking name grants nothing.
-fn inspect(all: &[Value], name: &str) -> io::Result<Option<Table>> {
-    let port = parse_table(name).ok_or_else(|| other("invalid generation table"))?;
-    let Some(table) = all
-        .iter()
-        .map(|e| &e["table"])
+fn header<'a>(all: &'a [Value], name: &str) -> Option<&'a Value> {
+    all.iter()
+        .map(|row| &row["table"])
         .find(|t| t["family"] == "inet" && t["name"] == name)
-    else {
+}
+
+// Debian 12 nft 1.0.6 omits table userdata from JSON. Its native listing
+// exposes the table comment. Bind that read to the same kernel handle and
+// accept only the marker in the table declaration (never a rule comment).
+fn native_marker(text: &str, name: &str, handle: u64) -> bool {
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let heading = format!("table inet {name} {{ # handle {handle}");
+    let marker = format!("comment \"{MARK}\"");
+    lines.next() == Some(heading.as_str())
+        && lines
+            .next()
+            .is_some_and(|l| l.trim_end_matches(';') == marker)
+        && lines
+            .next()
+            .is_some_and(|l| l.starts_with("chain output { # handle "))
+}
+
+async fn lookup(all: &[Value], name: &str) -> io::Result<Option<Table>> {
+    let native = if header(all, name).is_some_and(|h| h["comment"].is_null()) {
+        Some(run(NFT, &["-a", "-n", "list", "table", "inet", name]).await?)
+    } else {
+        None
+    };
+    inspect(all, name, native.as_deref())
+}
+fn inspect(all: &[Value], name: &str, native: Option<&str>) -> io::Result<Option<Table>> {
+    let port = parse_table(name).ok_or_else(|| other("invalid generation table"))?;
+    let Some(table) = header(all, name) else {
         return Ok(None);
     };
-    if table["comment"] != MARK || table["flags"].as_array().is_some_and(|f| !f.is_empty()) {
-        return Err(other("nft table ownership marker differs"));
-    }
     let handle = table["handle"]
         .as_u64()
         .ok_or_else(|| other("missing table handle"))?;
+    let marked = match table["comment"].as_str() {
+        Some(comment) => comment == MARK,
+        None if table["comment"].is_null() => {
+            native.is_some_and(|s| native_marker(s, name, handle))
+        }
+        _ => false,
+    };
+    if !marked || table["flags"].as_array().is_some_and(|f| !f.is_empty()) {
+        return Err(other("nft table ownership marker differs"));
+    }
     let mut rules = [0; 2];
     let mut packets = [0; 2];
     let mut chain = false;
@@ -165,7 +196,9 @@ fn inspect(all: &[Value], name: &str) -> io::Result<Option<Table>> {
 }
 pub(super) async fn observe(key: &ObjectKey) -> io::Result<Option<Observation>> {
     let (name, _) = parts(key)?;
-    Ok(inspect(&ruleset().await?, name)?.map(|t| t.observation(key, name)))
+    Ok(lookup(&ruleset().await?, name)
+        .await?
+        .map(|t| t.observation(key, name)))
 }
 pub(super) async fn sweep() -> io::Result<Vec<FoundObject>> {
     let all = ruleset().await?;
@@ -181,10 +214,10 @@ pub(super) async fn sweep() -> io::Result<Vec<FoundObject>> {
         let Some(port) = parse_table(name) else {
             continue;
         };
-        if t["comment"] != MARK {
+        if t["comment"].as_str().is_some_and(|c| c != MARK) {
             continue;
         }
-        let table = match inspect(&all, name) {
+        let table = match lookup(&all, name).await {
             Ok(t) => t,
             Err(error) => {
                 tracing::warn!(table=name,port,%error,"skipped unverified fence table during sweep");
@@ -214,7 +247,9 @@ impl Linux {
         generation: Option<(&InstanceId, Epoch)>,
     ) -> Result<Reclaimed, ReclaimError> {
         let (table, port) = parts(key).map_err(uncertain)?;
-        let Some(t) = inspect(&ruleset().await.map_err(uncertain)?, table).map_err(uncertain)?
+        let Some(t) = lookup(&ruleset().await.map_err(uncertain)?, table)
+            .await
+            .map_err(uncertain)?
         else {
             return Ok(Reclaimed::AlreadyAbsent);
         };
@@ -339,7 +374,8 @@ add rule inet {name} output ip6 daddr ::1 tcp dport {port} meta skuid != 0 count
         let addr = spec.address;
         let key = object(spec);
         let (name, _) = parts(&key).map_err(error)?;
-        let before = inspect(&ruleset().await.map_err(error)?, name)
+        let before = lookup(&ruleset().await.map_err(error)?, name)
+            .await
             .map_err(error)?
             .ok_or_else(|| error("missing fence"))?;
         let check = |found: io::Result<Option<ListenerInfo>>| match found {
@@ -363,7 +399,8 @@ add rule inet {name} output ip6 daddr ::1 tcp dport {port} meta skuid != 0 count
         result.unprivileged = dropped(addr).await?;
         result.listener = check(blocking(move || network::listener(addr)).await);
         result.host = host(addr).await;
-        let after = inspect(&ruleset().await.map_err(error)?, name)
+        let after = lookup(&ruleset().await.map_err(error)?, name)
+            .await
             .map_err(error)?
             .ok_or_else(|| error("fence disappeared"))?;
         let slot = usize::from(addr.is_ipv6());
@@ -417,7 +454,13 @@ mod tests {
             .filter(|n| parse_table(n).is_some())
             .collect();
         assert_eq!(tables.len(), 1);
-        let table = inspect(all, tables[0]).unwrap().unwrap();
+        let native =
+            std::fs::read_to_string(std::env::var_os("ETD_O2_TABLE_LIST").unwrap()).unwrap();
+        if header(all, tables[0]).unwrap()["comment"].is_null() {
+            assert!(inspect(all, tables[0], None).is_err());
+            assert!(inspect(all, tables[0], Some(&native.replace(MARK, "foreign"))).is_err());
+        }
+        let table = inspect(all, tables[0], Some(&native)).unwrap().unwrap();
         println!(
             "parsed {} with table handle {} and two rule handles {:?}",
             tables[0], table.handle, table.rules

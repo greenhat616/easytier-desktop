@@ -6,7 +6,7 @@ import json
 import os
 import stat
 from uuid import UUID
-from inventory import WINDOWS_POLICY_GROUPS, WFP_WF
+from inventory import WINDOWS_POLICY_GROUPS, WFP_QUARANTINE, WFP_WF
 
 
 class UnpredictedChanges(AssertionError):
@@ -23,6 +23,26 @@ def scope(instance, epoch):
 
 def installed_image(value):
     return Path(value[0] if isinstance(value, list) else value)
+
+
+def management_processes(base, live, host_image):
+    verified = set()
+    for pid, started in live.management_workers:
+        parent = live.parents.get(pid)
+        host_key = ("process", str(parent))
+        host = live.rows.get(host_key)
+        if not host or installed_image(host) != host_image or host != base.rows.get(host_key):
+            continue
+        assert started >= host[1]
+        verified.add((pid, started))
+        console = Path(os.environ["SystemRoot"]) / "System32/conhost.exe"
+        children = {(child, born) for child, born in live.descendants[parent]
+                    if live.parents[child] == pid and born >= started
+                    and installed_image(live.rows["process", str(child)]) == console}
+        assert len(children) <= 1, "extra console hosts for management worker"
+        verified.update(children)
+        print(f"verified management script: host={parent} worker={pid} console={sorted(children)}", flush=True)
+    return verified
 
 
 def managed_service_changes(base, live):
@@ -86,7 +106,7 @@ def runner_noise(base, live):
     return set()
 
 
-def system_policy_changes(base, live, phase, retained_app=None):
+def system_policy_changes(base, live, phase, retained_app=None, *, fixture_tunnel=False):
     # Product allow-list, not hosted-runner noise. MpsSvc recompiles these
     # five groups on adapter changes (45857049239, rulings 1353 and 1355).
     allowed = set()
@@ -99,7 +119,22 @@ def system_policy_changes(base, live, phase, retained_app=None):
         missing, extra = prior - current, current - prior
         print(f"{phase} {group}: {prior.total()} -> {current.total()}, "
               f"missing={missing.total()} extra={extra.total()}", flush=True)
-        if phase == "active" or (not missing and not extra):
+        if group == WFP_QUARANTINE and fixture_tunnel and (missing or extra):
+            # The independent, tunnel-free job judges this group across stop,
+            # purge and uninstall. Record replacements while the foreign
+            # IPv6 tunnel is present (ruling msg#1502, control 45863459869).
+            added = [live.quarantine_fields[x] for x in extra.elements()]
+            for key_hash in missing.elements():
+                prior_fields = base.quarantine_fields[key_hash]
+                if not added:
+                    break
+                def changes(fields):
+                    return {k for k in prior_fields.keys() | fields.keys() if prior_fields.get(k) != fields.get(k)}
+                index = min(range(len(added)), key=lambda i: len(changes(added[i])))
+                print(f"{phase} fixture Quarantine nearest replacement fields: {sorted(changes(added.pop(index)))}",
+                      flush=True)
+            allowed.add(key)
+        elif phase == "active" or (not missing and not extra):
             allowed.add(key)
         elif group == WFP_WF and phase == "stopped" and retained_app is not None and not missing:
             expected = {(layer + version, retained_app)

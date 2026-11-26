@@ -13,7 +13,7 @@ import uuid
 from service import Desktop, Service, assert_driver_notice, command, eventually, require_runner
 from consistency import (
     FirewallReadbackPending, UnpredictedChanges, adapter_defaults, check_closed, check_generation, installed_image,
-    managed_service_changes, runner_noise, scope, system_policy_changes, tun_created,
+    managed_service_changes, management_processes, runner_noise, scope, system_policy_changes, tun_created,
 )
 from inventory import assert_exited, capture, file_identity, native_application_id, native_interface_guid
 import foreign
@@ -145,25 +145,9 @@ def recovery(with_fixtures=True):
                 pid, born = cores[0]
                 generation_processes.add((pid, born))
                 generation_processes.update(snapshot.descendants[pid])
-                worker_keys = set()
-                for worker, started in snapshot.management_workers:
-                    parent = snapshot.parents.get(worker)
-                    host_key = ("process", str(parent))
-                    host = snapshot.rows.get(host_key)
-                    if not host or installed_image(host) != service.host or host != baseline.rows.get(host_key):
-                        continue
-                    assert started >= host[1]
-                    worker_keys.add(("process", str(worker)))
-                    workers_seen.add((worker, started))
-                    console = Path(os.environ["SystemRoot"]) / "System32/conhost.exe"
-                    children = [(child, value[1]) for (kind, child), value in snapshot.rows.items()
-                                if kind == "process" and snapshot.parents[int(child)] == worker
-                                and value[1] >= started and installed_image(value) == console]
-                    assert len(children) <= 1, "extra console hosts for management worker"
-                    for child, born_at in children:
-                        worker_keys.add(("process", child))
-                        workers_seen.add((int(child), born_at))
-                    print(f"verified management script: host={parent} worker={worker} console={children}", flush=True)
+                workers = management_processes(baseline, snapshot, service.host)
+                workers_seen.update(workers)
+                worker_keys = {("process", str(pid)) for pid, _ in workers}
                 try:
                     check_generation(baseline, snapshot, service.effects(), instance, view, service.adapter_indices,
                                      worker_keys)
@@ -259,7 +243,8 @@ def recovery(with_fixtures=True):
                 directions.add(direction)
             assert directions == {"Inbound", "Outbound"}
             remaining -= program_rules
-            remaining -= system_policy_changes(baseline, stopped, "stopped", native_application_id(service.core))
+            remaining -= system_policy_changes(baseline, stopped, "stopped", native_application_id(service.core),
+                                               fixture_tunnel=with_fixtures)
             for key in remaining.copy():
                 if key[0] == "service" and key[1] in ("wintun", "windivert"):
                     assert any(r["scope"] == "product" and r["state"] != "reclaimed"
@@ -309,7 +294,6 @@ def verify_shared_driver_purge(service, baseline, stopped, inventory, foreign_ke
         assert {r["key"]["name"].lower() for r in open_rows} == names
     else:
         assert not open_rows, "completed purge left open ledger effects"
-        service.purged_drivers = result.returncode == 0
     after = inventory()
     assert_foreign(stopped, after, {("service", name) for name in names})
     assert_foreign(baseline, after, foreign_keys)
@@ -317,7 +301,7 @@ def verify_shared_driver_purge(service, baseline, stopped, inventory, foreign_ke
     delta = baseline.delta(after) - managed_service_changes(baseline, after)
     delta -= runner_noise(baseline, after) | {("service", name) for name in names}
     delta -= adapter_defaults(baseline, after, service.adapter_indices)
-    delta -= system_policy_changes(baseline, after, "purged")
+    delta -= system_policy_changes(baseline, after, "purged", fixture_tunnel=bool(interfaces))
     # The installed baseline included a running host. Purge is an offline
     # command, so that exact host identity must now have exited.
     hosts = [k for k, v in baseline.rows.items() if k[0] == "process" and installed_image(v) == service.host]

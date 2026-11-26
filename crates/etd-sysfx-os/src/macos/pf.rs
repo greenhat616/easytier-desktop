@@ -303,8 +303,10 @@ impl Writer {
     }
 }
 
-/// A successful pfctl read shows the fence absent or PF disabled (mapped to
-/// `FenceError::Missing`); a pfctl call that failed is a plain error.
+/// A successful pfctl read shows the fence absent or ineffective: rule
+/// missing, PF disabled, the wildcard filter hook missing, loopback
+/// filtering skipped (mapped to `FenceError::Missing`); a pfctl call that
+/// failed is a plain error.
 #[derive(Debug)]
 pub(super) struct Missing(pub(super) &'static str);
 impl Missing {
@@ -325,7 +327,7 @@ fn hook() -> io::Result<()> {
         .lines()
         .any(|l| l.trim() == "anchor \"com.apple/*\" all")
     {
-        return Err(io::Error::other("PF wildcard filter hook unavailable"));
+        return Err(Missing::error("PF wildcard filter hook unavailable"));
     }
     Ok(())
 }
@@ -341,7 +343,7 @@ fn active() -> io::Result<()> {
         .lines()
         .any(|line| line.split_whitespace().next() == Some("lo0") && !line.contains("skip"))
     {
-        return Err(io::Error::other(
+        return Err(Missing::error(
             "PF loopback filtering is skipped or unavailable",
         ));
     }

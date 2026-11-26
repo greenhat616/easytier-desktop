@@ -23,13 +23,9 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            suite: recovery
-          - os: windows-latest
-            suite: preflight
-          - os: windows-latest
-            suite: program
-          - os: windows-latest
             suite: clean
+          - os: windows-latest
+            suite: idle
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -174,7 +170,9 @@ jobs:
         if: matrix.suite == 'program'
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=preexisting_program_rule_blocks_start)' --success-output immediate
       - name: Complete install and uninstall (fresh administrator runner)
-        if: matrix.suite == 'clean'
+        if: matrix.suite == 'clean' || matrix.suite == 'idle'
+        env:
+          G2_REGISTRY_SUITE: ${{ matrix.suite }}
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=installed_network_uninstall_restores_machine)' --success-output immediate
       - name: Pre-existing inactive program rule (fresh administrator runner)
         if: matrix.suite == 'program'

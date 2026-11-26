@@ -125,6 +125,71 @@ def recovery_fixtures(service, instance, stack):
     return inventory, keys
 
 
+def probe_profile(service, before, live, view):
+    import struct, winreg
+    from datetime import datetime
+    name = view["interface_name"]
+    nic = live.rows["interface", name]
+    rows = [p for p,v in live.registry_values.items() if p.endswith("\\ProfileName") and v == ["String",name]]
+    assert len(rows) == 1
+    path = rows[0].rsplit("\\",1)[0]
+    pguid = path.rsplit("\\",1)[1]
+    evidence = {"new_profile": all(not p.startswith(path+"\\") for k,p in before.rows if k=="registry")}
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,path.removeprefix("HKLM\\")) as key:
+        for field in ("ProfileName","DateCreated","DateLastConnected","Description","Managed","NameType"):
+            val,kind = winreg.QueryValueEx(key,field)
+            if field in ("Description","ProfileName"):
+                semantic = f"matches_alias={val==name} empty={val==''} length={len(val)}"
+            elif field.startswith("Date"):
+                year,month,dow,day,hour,minute,second,ms=struct.unpack("<8H",val)
+                stamp=datetime(year,month,day,hour,minute,second,ms*1000)
+                semantic=f"SYSTEMTIME={stamp.isoformat()} valid_weekday={dow==stamp.isoweekday()%7}"
+            else:
+                semantic=val if isinstance(val,int) else "unexpected type"
+            evidence[field]=(kind,semantic)
+    print(f"native profile {pguid} interface {name} guid={nic['guid']} ifIndex={nic['index']} evidence={evidence}",flush=True)
+    ps = r"""$ErrorActionPreference='Stop'
+    $c = Get-NetConnectionProfile -InterfaceIndex ([int]$env:G2_IFINDEX) -ErrorAction SilentlyContinue
+    foreach ($x in $c) { "CIM alias_match=$($x.InterfaceAlias -eq $env:G2_ALIAS) name_match=$($x.Name -eq $env:G2_ALIAS) id_match=$($x.InstanceID -eq $env:G2_PROFILE)" }
+    $m=[Activator]::CreateInstance([type]::GetTypeFromCLSID([guid]'DCB00C01-570F-4A9B-8D69-199FDBA5723B'))
+    foreach ($x in $m.GetNetworkConnections()) {
+        if ([guid]($x.GetAdapterId()) -eq [guid]$env:G2_GUID) { "NLM adapter_guid_match=True profile_guid_match=$([guid]($x.GetNetwork().GetNetworkId()) -eq [guid]$env:G2_PROFILE)" }
+    }"""
+    result=command("powershell.exe","-NoProfile","-NonInteractive","-Command",ps,check=False,
+                   env=dict(os.environ,G2_GUID=str(nic["guid"]),G2_IFINDEX=str(nic["index"]),G2_ALIAS=name,G2_PROFILE=pguid))
+    for line in result.stdout.splitlines():
+        if line.startswith(("CIM ","NLM ")): print(line,flush=True)
+    print(f"native connection lookup rc={result.returncode}",flush=True)
+    for r in service.effects():
+        if r["kind"]=="win.network_profile" and r["state"]!="reclaimed":
+            cred=(r.get("observation") or {}).get("credential") or {}
+            print(f"ledger profile GUID matches native={cred.get('value','').casefold()==pguid.casefold()}", flush=True)
+    netbt(service,live,"active",{uuid.UUID(nic["guid"])})
+
+
+def netbt(service,live,phase,guids):
+    import winreg
+    for guid in guids:
+        path=rf"SYSTEM\CurrentControlSet\Services\NetBT\Parameters\Interfaces\Tcpip_{{{guid}}}"
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,path) as key:
+                v,t=winreg.QueryValueEx(key,"NameServerList")
+                print(f"{phase} NetBT adapter={guid} NameServerList type={t} empty_list={v==[]} count={len(v)}",flush=True)
+        except FileNotFoundError:
+            print(f"{phase} NetBT adapter={guid} absent",flush=True)
+
+
+def idle_control():
+    service=Service()
+    with service.installed():
+        before=service.inventory()
+        for delay in (30,60):
+            time.sleep(delay)
+            now=service.inventory()
+            diff=[k for k in before.delta(now) if k[0]=="registry"]
+            print(f"idle registry changed keys={sorted(diff)}",flush=True)
+            assert not diff
+
 def recovery(with_fixtures=True):
     service = Service()
     instance = str(uuid.uuid4())
@@ -137,6 +202,7 @@ def recovery(with_fixtures=True):
         differences = []
         generation_processes = set()
         def verify_generation(snapshot, view):
+            probe_profile(service, baseline, snapshot, view)
             end = time.monotonic() + 240
             while True:
                 cores = [(int(k[1]), value[1]) for k, value in snapshot.rows.items()
@@ -299,6 +365,7 @@ def verify_shared_driver_purge(service, baseline, stopped, inventory, foreign_ke
             if after.rows.get(("service", name)) == stopped.rows["service", name]}
     assert len(kept) == len(names), "purge changed a retained shared driver registration"
     assert_foreign(baseline, after, foreign_keys)
+    netbt(service,after,"purged",service.adapter_indices)
     assert not program_rules & after.rows.keys(), "CoreBinary firewall rules survived purge"
     delta = baseline.delta(after) - managed_service_changes(baseline, after)
     delta -= runner_noise(baseline, after) | kept
@@ -470,7 +537,7 @@ def magic_dns():
 
 if __name__ == "__main__":
     require_runner()
-    {"recovery": recovery, "clean_install": lambda: recovery(with_fixtures=False),
+    {"recovery": recovery, "clean_install": lambda: idle_control() if os.getenv("G2_REGISTRY_SUITE")=="idle" else recovery(with_fixtures=False),
      "magic_dns": magic_dns, "inventory": inventory_case,
      "driver_conflict": driver_conflict, "driver_uninstall": lambda: driver_conflict(through_uninstall=True),
      "program_rule_conflict": program_rule_conflict}[sys.argv[1]]()

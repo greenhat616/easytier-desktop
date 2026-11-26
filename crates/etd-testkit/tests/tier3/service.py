@@ -62,6 +62,24 @@ def empty_pf_namespace(before, after):
     return set()
 
 
+def assert_driver_notice(stdout, retained):
+    notices = re.findall(r"^[ \t]*left in place: shared driver service (\S+) image (.+?); "
+                         r"remove it yourself if no other software uses it\s*$", stdout, re.M | re.I)
+    assert len(notices) == len(retained) and {name.lower() for name, _ in notices} == retained.keys()
+    root = Path(os.environ["SystemRoot"])
+    for name, image in notices:
+        config = retained[name.lower()]
+        match = re.search(r"^\s*BINARY_PATH_NAME\s*:\s*(.+)$", config, re.M)
+        assert match and image != "unknown", f"missing shared driver image for {name}"
+        native = os.path.expandvars(match[1].strip().strip('"')).removeprefix("\\??\\")
+        if native.lower().startswith("\\systemroot\\"):
+            native = root / native[len("\\systemroot\\"):]
+        elif not Path(native).is_absolute():
+            native = root / native
+        assert Path(image).samefile(native), f"shared driver report differs from SCM for {name}"
+    print(f"native shared driver notices verified: {sorted(retained)}", flush=True)
+
+
 class Service:
     def __init__(self):
         require_runner()
@@ -220,6 +238,8 @@ class Service:
                 f"pre-install to post-uninstall differences: native={sorted(delta)}, installed={files}"
             )
             assert result.returncode == 0, f"service uninstall exited {result.returncode}"
+            if self.retained_drivers:
+                assert_driver_notice(result.stdout, self.retained_drivers)
 
     @staticmethod
     def call(*args):

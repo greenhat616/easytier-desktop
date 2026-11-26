@@ -7,8 +7,8 @@
 //!    reclaims them;
 //! 2. a normal shutdown with a running instance ends before the budget with
 //!    the generation closed;
-//! 3. a shutdown received during the startup self-check also stops the
-//!    instances the self-check goes on to start.
+//! 3. a shutdown received during the startup self-check launches nothing;
+//!    the generation left open by a crash is still reclaimed.
 mod lifecycle_common;
 
 use etd_contract::{Desired, InstanceState as S};
@@ -94,10 +94,11 @@ async fn shutdown_stops_and_reclaims_within_the_budget() {
 }
 
 #[tokio::test]
-async fn shutdown_during_the_self_check_stops_what_it_starts() {
+async fn shutdown_during_the_self_check_launches_nothing() {
     let world = World::new();
     let h = ready(&world).await;
     h.crash();
+    let spawned = world.spawned().len();
     // Shutdown queued before the new host's self-check has run: it is
     // received while the self-check is still in progress.
     let h = world.start();
@@ -105,6 +106,13 @@ async fn shutdown_during_the_self_check_stops_what_it_starts() {
     assert_eq!(h.shutdown().await, RunOutcome::Shutdown);
     let took = world.clock.now().saturating_duration_since(started);
     assert!(took < world.config.shutdown_budget, "took {took:?}");
+    assert_eq!(
+        world.spawned().len(),
+        spawned,
+        "no kernel is launched once a shutdown is pending"
+    );
+    // The crashed generation was still reclaimed.
+    assert!(world.open_records("a").await.is_empty());
     for kernel in world.spawned() {
         assert_ne!(
             world.engine.liveness(&kernel).await,

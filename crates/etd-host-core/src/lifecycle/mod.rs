@@ -73,7 +73,7 @@ impl Default for LifecycleConfig {
             reclaim_retry: Duration::from_secs(2),
             log_lines: 1000,
             lease_grace: Duration::from_secs(30),
-            shutdown_budget: Duration::from_secs(35),
+            shutdown_budget: Duration::from_secs(30),
         }
     }
 }
@@ -90,6 +90,9 @@ pub(crate) struct Ctx {
     /// until a sweep of their own run directories proves no kernel of
     /// theirs is alive (RetryReclaim).
     pub excluded: std::sync::Mutex<std::collections::BTreeSet<InstanceId>>,
+    /// Every supervisor task started, so a host that stops waiting for them
+    /// can still end them before it gives up its lock.
+    pub tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl Ctx {
@@ -160,6 +163,48 @@ pub enum RunOutcome {
     Closed,
 }
 
+/// The supervisor tasks of an orchestrator ([`Orchestrator::supervisor_tasks`]).
+#[derive(Clone)]
+pub struct SupervisorTasks(Arc<Ctx>);
+
+impl SupervisorTasks {
+    /// Abort every supervisor task still running and wait up to `wait`
+    /// (real time) for them to end. A task aborted mid-reclaim leaves its
+    /// records as the ledger has them: open ones stay open for the next
+    /// start. Returns how many had to be aborted; `Err` with how many did
+    /// not end in time.
+    pub async fn abort_and_wait(&self, wait: Duration) -> Result<usize, usize> {
+        let tasks: Vec<_> = std::mem::take(
+            &mut *self
+                .0
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_iter()
+        .filter(|t| !t.is_finished())
+        .collect();
+        let aborted = tasks.len();
+        for task in &tasks {
+            task.abort();
+        }
+        let mut left = tasks;
+        let until = tokio::time::Instant::now() + wait;
+        while !left.is_empty() {
+            left.retain(|t| !t.is_finished());
+            if left.is_empty() || tokio::time::Instant::now() >= until {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if left.is_empty() {
+            Ok(aborted)
+        } else {
+            Err(left.len())
+        }
+    }
+}
+
 /// The lifecycle orchestrator (H1's side of the frozen handle).
 pub struct Orchestrator {
     ctx: Arc<Ctx>,
@@ -182,9 +227,21 @@ impl Orchestrator {
                 config,
                 hold: std::sync::Mutex::new(None),
                 excluded: std::sync::Mutex::new(Default::default()),
+                tasks: std::sync::Mutex::new(Vec::new()),
             }),
             port,
         }
+    }
+
+    /// How long the wind-down waits for the supervisors.
+    pub fn shutdown_budget(&self) -> Duration {
+        self.ctx.config.shutdown_budget
+    }
+
+    /// The supervisor tasks of this orchestrator, to end them once it has
+    /// returned or been abandoned.
+    pub fn supervisor_tasks(&self) -> SupervisorTasks {
+        SupervisorTasks(self.ctx.clone())
     }
 
     /// Self-check, then serve until shut down.
@@ -431,10 +488,27 @@ impl Actor {
             self.resweep_due = Some(self.ctx.deps.clock.now() + self.ctx.config.reclaim_retry);
         }
         let mut initial = outcome.initial;
+        // Asked to stop during the self-check: launch nothing. Only an open
+        // generation gets a supervisor, told to stop before it does anything
+        // else, so it reclaims within what is left of the budget.
+        let ending = self.ending.is_some();
         for desired in outcome.desired {
             let id = InstanceId(desired.instance_id.clone());
             let init = initial.remove(&id).unwrap_or(Initial::Idle);
-            self.spawn_supervisor(id, Box::new(desired), init, None);
+            if !ending {
+                self.spawn_supervisor(id, Box::new(desired), init, None);
+            } else if !matches!(init, Initial::Idle) {
+                let (reply, _) = oneshot::channel();
+                let first = SupCmd::Shutdown { reply };
+                self.spawn_supervisor(id, Box::new(desired), init, Some(first));
+            }
+        }
+        if ending {
+            let at = self.now_ms();
+            for notice in outcome.notices {
+                self.publisher.notice(at, notice);
+            }
+            return;
         }
 
         self.set_phase(HostPhase::Serving);
@@ -565,7 +639,15 @@ impl Actor {
             self.presence.subscribe(),
             logs,
         );
-        tokio::spawn(sup.run());
+        let task = tokio::spawn(sup.run());
+        let mut tasks = self
+            .ctx
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tasks.retain(|t| !t.is_finished());
+        tasks.push(task);
+        drop(tasks);
         self.supervisors.insert(id, SupHandle { tx });
     }
 
@@ -900,7 +982,19 @@ impl Actor {
         self.host_log(format!(
             "shutdown budget exhausted; left for the next start: {pending}"
         ));
+        // Their tasks are aborted here; whoever holds the host's lock waits
+        // for them to end (`SupervisorTasks::abort_and_wait`) before
+        // releasing it.
         self.supervisors.clear();
+        for task in self
+            .ctx
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+        {
+            task.abort();
+        }
         self.ending_deadline = None;
     }
 

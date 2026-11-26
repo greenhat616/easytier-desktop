@@ -476,7 +476,7 @@ impl World {
             reclaim_retry: Duration::from_millis(500),
             log_lines: 100,
             lease_grace: Duration::from_secs(30),
-            shutdown_budget: Duration::from_secs(35),
+            shutdown_budget: Duration::from_secs(30),
         };
         Self {
             scratch,

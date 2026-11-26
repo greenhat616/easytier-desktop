@@ -45,6 +45,7 @@ class Inventory:
     # command lines, firewall policy dumps, or environment variables in CI.
     rows: dict = field(default_factory=dict)
     descendants: dict = field(default_factory=dict)
+    parents: dict = field(default_factory=dict)
 
     def put(self, kind, key, value):
         entry = (kind, str(key))
@@ -102,6 +103,7 @@ def processes(inv, paths):
             assert born is not None, f"no creation time for product process {pid}"
             if ("process", str(pid)) not in inv.rows:
                 inv.put("process", pid, [child["exe"] or "", born])
+                inv.parents[pid] = child["ppid"]
             pending.extend(p for p in children[pid] if table[p]["create_time"] is None
                            or table[p]["create_time"] >= born)
         inv.descendants[parent] = {(pid, table[pid]["create_time"]) for pid in seen - {parent}}

@@ -13,7 +13,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src" / "sysdiff"))
 from inventory import capture, command, digest, output
-from consistency import managed_service_changes, runner_noise, tun_created
+from consistency import adapter_defaults, managed_service_changes, runner_noise, tun_created
 
 
 def require_runner():
@@ -83,6 +83,7 @@ class Service:
         self.core = self.cores / os.environ["ETD_G2_SHA"] / ("easytier-core" + ext)
         self.runtime = self.state / "run"
         self.retained_drivers = {}
+        self.adapter_guids = set()
 
     def verify_bundle(self):
         expected = {self.core.name: os.environ["ETD_G2_SHA"]}
@@ -207,6 +208,7 @@ class Service:
             after = self.inventory()
             delta = before.delta(after) - managed_service_changes(before, after)
             delta -= runner_noise(before, after) | tun_created(before, after)
+            delta -= adapter_defaults(before, after, self.adapter_guids)
             if sys.platform == "darwin":
                 delta -= empty_pf_namespace(before, after)
             for name in self.retained_drivers:

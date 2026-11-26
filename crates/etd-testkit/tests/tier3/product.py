@@ -11,7 +11,7 @@ import uuid
 
 from service import Desktop, Service, command, eventually, require_runner
 from consistency import (
-    FirewallReadbackPending, UnpredictedChanges, check_closed, check_generation, installed_image,
+    FirewallReadbackPending, UnpredictedChanges, adapter_defaults, check_closed, check_generation, installed_image,
     managed_service_changes, runner_noise, scope, tun_created,
 )
 from inventory import assert_exited, capture, file_identity
@@ -120,7 +120,11 @@ def recovery():
         foreign_image, process_key = stack.enter_context(foreign.idle_process())
         keys.add(process_key)
         def inventory():
-            return service.inventory([foreign_image], [other_runtime])
+            snapshot = service.inventory([foreign_image], [other_runtime])
+            marker = other_runtime / instance / "1" / "marker"
+            if marker.is_file():
+                snapshot.put("runtime", marker, file_identity(marker))
+            return snapshot
         baseline = inventory()
         differences = []
         generation_processes = set()
@@ -134,7 +138,7 @@ def recovery():
                 generation_processes.add((pid, born))
                 generation_processes.update(snapshot.descendants[pid])
                 try:
-                    check_generation(baseline, snapshot, service.effects(), instance, view)
+                    check_generation(baseline, snapshot, service.effects(), instance, view, service.adapter_guids)
                 except FirewallReadbackPending:
                     # A shared Applied record can still carry the preceding
                     # epoch's rule ID while the fresh native policy is visible.
@@ -206,6 +210,7 @@ def recovery():
         assert_foreign(baseline, stopped, keys)
         remaining = baseline.delta(stopped) - managed_service_changes(baseline, stopped)
         remaining -= runner_noise(baseline, stopped) | tun_created(baseline, stopped)
+        remaining -= adapter_defaults(baseline, stopped, service.adapter_guids)
         if os.name == "nt":
             records = service.effects()
             for key in remaining.copy():
@@ -254,6 +259,7 @@ def verify_shared_driver_purge(service, baseline, stopped, inventory, foreign_ke
     assert not program_rules & after.rows.keys(), "CoreBinary firewall rules survived purge"
     delta = baseline.delta(after) - managed_service_changes(baseline, after)
     delta -= runner_noise(baseline, after) | {("service", name) for name in names}
+    delta -= adapter_defaults(baseline, after, service.adapter_guids)
     # The installed baseline included a running host. Purge is an offline
     # command, so that exact host identity must now have exited.
     hosts = [k for k, v in baseline.rows.items() if k[0] == "process" and installed_image(v) == service.host]

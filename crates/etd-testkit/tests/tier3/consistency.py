@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import os
 import stat
+from uuid import UUID
 
 
 class UnpredictedChanges(AssertionError):
@@ -40,6 +41,22 @@ def tun_created(base, live):
                      and os.major(native[1]) == 10 and os.minor(native[1]) == 200) else set()
 
 
+def adapter_defaults(base, live, guids):
+    # Windows retains these exact defaults under a newly created adapter's
+    # GUID after it goes away (paired run 45854603162, ruling msg#1321).
+    expected = {}
+    for guid in guids:
+        for stack in ("Tcpip", "Tcpip6"):
+            prefix = rf"HKLM\SYSTEM\CurrentControlSet\Services\{stack}\Parameters\Interfaces\{{{guid}}}"
+            fields = {"EnableDHCP": ["DWord", 0]}
+            if stack == "Tcpip":
+                fields.update(NameServer=["String", ""], Domain=["String", ""])
+            expected.update({(prefix + "\\" + name).casefold(): value for name, value in fields.items()})
+    return {key for key, value in live.rows.items()
+            if key[0] == "registry" and key not in base.rows
+            and key[1].casefold() in expected and value == expected[key[1].casefold()]}
+
+
 def runner_noise(base, live):
     # Hosted-image noise, independent of product launch: the idle control in
     # run 45841944759 recorded services.exe changing BITS Start (4657 #582930).
@@ -52,9 +69,9 @@ def runner_noise(base, live):
     return set()
 
 
-def check_generation(base, live, records, instance, view):
+def check_generation(base, live, records, instance, view, adapter_guids):
     try:
-        return compare_generation(base, live, records, instance, view)
+        return compare_generation(base, live, records, instance, view, adapter_guids)
     except FirewallReadbackPending:
         raise
     except (AssertionError, KeyError, OSError):
@@ -75,7 +92,7 @@ def check_generation(base, live, records, instance, view):
         raise
 
 
-def compare_generation(base, live, records, instance, view):
+def compare_generation(base, live, records, instance, view, adapter_guids):
     changed = base.delta(live)
     expected = set()
     active = [r for r in records if r["state"] != "reclaimed"
@@ -105,6 +122,15 @@ def compare_generation(base, live, records, instance, view):
         if key["type"] == "interface":
             matches = {("interface", name)}
             assert not key.get("name") or key["name"] == name
+            if kind == "win.tun":
+                assert record["scope"] == scope(instance, view["epoch"])
+                assert ("interface", name) not in base.rows
+                guid = UUID(live.rows["interface", name]["guid"])
+                assert all(UUID(v["guid"]) != guid for (cls, _), v in base.rows.items()
+                           if cls == "interface" and v.get("guid"))
+                if key.get("guid"):
+                    assert UUID(key["guid"]) == guid
+                adapter_guids.add(guid)
         elif key["type"] == "routes_via":
             matches = {("route", name)}
         elif key["type"] == "path" and kind == "run_dir":
@@ -112,10 +138,21 @@ def compare_generation(base, live, records, instance, view):
             matches = {k for k in live.rows if k[0] == "runtime" and path.samefile(k[1])}
             assert len(matches) == 1, f"expected one native runtime directory for {path}"
         elif kind == "process":
-            matches = {("process", str((obs.get("credential") or {})["pid"]))}
+            pid = int((obs.get("credential") or {})["pid"])
+            matches = {("process", str(pid))}
             for match in matches:
                 observed = installed_image(live.rows[match])
                 assert observed.samefile(key["exe"]), f"PID {match[1]} uses {observed}; plan {key['exe']}"
+            if os.name == "nt":
+                # The Windows hidden console can have one native conhost child.
+                # Generation end checks use its PID *and* creation time.
+                console = Path(os.environ["SystemRoot"]) / "System32/conhost.exe"
+                born = live.rows["process", str(pid)][1]
+                children = {("process", str(child)) for child, started in live.descendants[pid]
+                            if live.parents[child] == pid and started >= born
+                            and installed_image(live.rows["process", str(child)]) == console}
+                assert len(children) <= 1, "unexpected additional console host"
+                matches.update(children)
         elif key["type"] == "resolved_link":
             matches = {("resolver", key["interface"])}
         elif key["type"] == "fence":
@@ -190,7 +227,7 @@ def compare_generation(base, live, records, instance, view):
         expected.update(matches)
     # These changes intentionally have no separate ownership record.
     # Match the precise object and transition, never a registry subtree.
-    exempt = managed_service_changes(base, live) | tun_created(base, live)
+    exempt = managed_service_changes(base, live) | tun_created(base, live) | adapter_defaults(base, live, adapter_guids)
     for kind, path in expected:
         if kind == "registry" and path.endswith("\\ProfileName"):
             category = ("registry", path.removesuffix("ProfileName") + "Category")

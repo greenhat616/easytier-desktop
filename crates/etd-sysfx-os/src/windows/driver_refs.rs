@@ -21,7 +21,7 @@ use ::windows::{
                 HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_READ, REG_DWORD, REG_EXPAND_SZ, REG_SZ,
             },
             Services::*,
-            SystemInformation::GetWindowsDirectoryW,
+            SystemInformation::GetSystemWindowsDirectoryW,
             Threading::{GetCurrentThread, OpenThreadToken},
         },
     },
@@ -344,7 +344,7 @@ fn loaded_images() -> Result<Vec<String>, WinError> {
 fn windows_dir() -> Result<PathBuf, WinError> {
     let mut buffer = vec![0u16; 32768];
     // SAFETY: buffer is writable.
-    let n = unsafe { GetWindowsDirectoryW(Some(&mut buffer)) } as usize;
+    let n = unsafe { GetSystemWindowsDirectoryW(Some(&mut buffer)) } as usize;
     if n == 0 || n >= buffer.len() {
         return Err(error("cannot determine Windows directory"));
     }
@@ -386,6 +386,40 @@ fn device_path(value: &str) -> Result<PathBuf, WinError> {
     Ok(PathBuf::from(format!(r"\\?\GLOBALROOT{value}")))
 }
 
+fn machine_var(name: &str) -> Result<String, WinError> {
+    let environment = Key::open(
+        HKEY_LOCAL_MACHINE,
+        r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        KEY_QUERY_VALUE,
+    )?
+    .ok_or_else(|| error("machine environment registry unavailable"))?;
+    let value = environment
+        .read(name)?
+        .ok_or_else(|| error(format!("unknown machine environment variable {name}")))?;
+    if !matches!(value.ty, REG_SZ | REG_EXPAND_SZ) || !value.bytes.len().is_multiple_of(2) {
+        return Err(error(format!(
+            "invalid machine environment variable {name}"
+        )));
+    }
+    let units: Vec<_> = value
+        .bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|unit| u16::from_le_bytes(*unit))
+        .collect();
+    let end = units
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(units.len());
+    if units[end..].iter().any(|unit| *unit != 0) {
+        return Err(error(format!(
+            "ambiguous machine environment variable {name}"
+        )));
+    }
+    decode(&units[..end])
+}
+
 fn expand_vars(value: &str, system_root: &Path) -> Result<String, WinError> {
     let mut value = value.to_owned();
     // Expand Windows environment syntax (case-insensitive on Windows).
@@ -410,11 +444,7 @@ fn expand_vars(value: &str, system_root: &Path) -> Result<String, WinError> {
                     .trim_end_matches('\\')
                     .to_owned()
             } else {
-                std::env::var(name).map_err(|_| {
-                    error(format!(
-                        "cannot expand environment variable {name} in driver path"
-                    ))
-                })?
+                machine_var(name)?
             };
         value.replace_range(start..=end, &replacement);
     }
@@ -430,7 +460,7 @@ fn image_path(raw: &str, system_root: &Path) -> Result<PathBuf, WinError> {
     } else {
         raw
     };
-    let value = expand_vars(raw, system_root)?.replace('/', "\\");
+    let value = raw.replace('/', "\\");
     let value = strip_prefix_ci(&value, r"\??\").unwrap_or(&value);
     let path = if let Some(tail) = strip_prefix_ci(value, r"\SystemRoot\") {
         system_root.join(tail)
@@ -530,7 +560,10 @@ fn unavailable_volume(path: &Path) -> bool {
 
 // If the image is missing, canonicalize its closest existing ancestor to
 // account for directory junctions; any error other than NotFound is ambiguous.
-fn canonical_even_missing(path: &Path) -> Result<Option<PathBuf>, WinError> {
+fn canonical_even_missing(
+    path: &Path,
+    allow_missing_volume: bool,
+) -> Result<Option<PathBuf>, WinError> {
     match fs::canonicalize(path) {
         Ok(path) => Ok(Some(path)),
         Err(e)
@@ -538,14 +571,22 @@ fn canonical_even_missing(path: &Path) -> Result<Option<PathBuf>, WinError> {
                 || matches!(e.raw_os_error(), Some(15 | 21)))
                 && unavailable_volume(path) =>
         {
-            Ok(None)
+            if allow_missing_volume {
+                Ok(None)
+            } else {
+                Err(error(format!(
+                    "loaded driver volume is no longer available: {}",
+                    path.display()
+                )))
+            }
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             let parent = path.parent().ok_or_else(|| io_error(e))?;
             let name = path
                 .file_name()
                 .ok_or_else(|| error("missing driver path name"))?;
-            Ok(canonical_even_missing(parent)?.map(|parent| parent.join(name)))
+            Ok(canonical_even_missing(parent, allow_missing_volume)?
+                .map(|parent| parent.join(name)))
         }
         Err(e) => Err(io_error(e)),
     }
@@ -587,12 +628,12 @@ fn referenced(dir: &Path) -> Result<Option<String>, WinError> {
     let normalized_dir = normalized(&dir)?;
     let system_root = windows_dir()?;
     // Check SCM first: a stopped driver registration is also a reference.
-    let check = |raw: &str| -> Result<bool, WinError> {
+    let check_path = |raw: &str, allow_missing_volume: bool| -> Result<bool, WinError> {
         let path = image_path(raw, &system_root)?;
         if inside(&normalized(&path)?, &normalized_dir) {
             return Ok(true);
         }
-        let Some(canonical) = canonical_even_missing(&path)? else {
+        let Some(canonical) = canonical_even_missing(&path, allow_missing_volume)? else {
             return Ok(false);
         };
         if inside(&normalized(&canonical)?, &normalized_dir) {
@@ -602,6 +643,24 @@ fn referenced(dir: &Path) -> Result<Option<String>, WinError> {
             Ok(_) => Ok(identities.contains(&identity(&canonical)?)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(io_error(e)),
+        }
+    };
+    let check = |raw: &str| -> Result<bool, WinError> {
+        // The kernel understands NT paths and \SystemRoot, not arbitrary
+        // percent variables. The literal registered path is authoritative.
+        // Also consider any machine-environment expansion conservatively.
+        let literal = check_path(raw, true);
+        if matches!(literal, Ok(true)) {
+            return Ok(true);
+        }
+        if !raw.contains('%') {
+            return literal;
+        }
+        let expanded = expand_vars(raw, &system_root).and_then(|path| check_path(&path, true));
+        match (literal, expanded) {
+            (Ok(true), _) | (_, Ok(true)) => Ok(true),
+            (Ok(false), _) | (_, Ok(false)) => Ok(false),
+            (Err(error), Err(_)) => Err(error),
         }
     };
     let mut unresolved = None;
@@ -654,7 +713,7 @@ fn referenced(dir: &Path) -> Result<Option<String>, WinError> {
         }
     }
     for raw in loaded_images()? {
-        match check(&raw) {
+        match check_path(&raw, false) {
             Ok(true) => return Ok(Some(format!("loaded driver image {raw}"))),
             Ok(false) => (),
             Err(e) => {
@@ -688,11 +747,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn registered_missing_volume_is_absent_but_loaded_volume_is_unknown() {
+        let missing = (b'A'..=b'Z')
+            .map(|letter| PathBuf::from(format!(r"{}:\unused-driver.sys", char::from(letter))))
+            .find(|path| unavailable_volume(path));
+        if let Some(path) = missing {
+            assert_eq!(canonical_even_missing(&path, true).unwrap(), None);
+            assert!(canonical_even_missing(&path, false).is_err());
+        }
+    }
+
+    #[test]
     fn resolves_supported_driver_path_forms_and_rejects_ambiguity() {
         let root = Path::new(r"C:\Windows");
         for raw in [
             r"\SystemRoot\System32\Drivers\Example.sys",
-            r"%SystemRoot%\System32\Drivers\Example.sys",
             r"system32\drivers\example.sys",
             r"\??\C:\Windows\System32\Drivers\Example.sys",
             r#""C:\Windows\System32\Drivers\Example.sys""#,
@@ -705,7 +774,6 @@ mod tests {
         }
         for raw in [
             r"..\..\example.sys",
-            r"%ETD_CB_UNKNOWN_TEST_ENV_VAR%\example.sys",
             r"C:example.sys",
             r#" "C:\example.sys" arguments "#,
         ] {
@@ -715,6 +783,18 @@ mod tests {
             normalized(&image_path(r"drivers\example.sys", root).unwrap()).unwrap(),
             r"C:\WINDOWS\DRIVERS\EXAMPLE.SYS"
         );
+        let variable = r"%SystemRoot%\System32\Drivers\Example.sys";
+        assert_eq!(
+            normalized(&image_path(variable, root).unwrap()).unwrap(),
+            r"C:\WINDOWS\%SYSTEMROOT%\SYSTEM32\DRIVERS\EXAMPLE.SYS"
+        );
+        let expanded = expand_vars(variable, root).unwrap();
+        assert_eq!(
+            normalized(&image_path(&expanded, root).unwrap()).unwrap(),
+            r"C:\WINDOWS\SYSTEM32\DRIVERS\EXAMPLE.SYS"
+        );
+        assert!(expand_vars(r"%ETD_CB_UNKNOWN_TEST_ENV_VAR%\example.sys", root).is_err());
+
         assert!(inside(r"C:\STORE\HASH\DRIVER.SYS", r"C:\STORE\HASH"));
         assert!(!inside(r"C:\STORE\HASH2\DRIVER.SYS", r"C:\STORE\HASH"));
     }

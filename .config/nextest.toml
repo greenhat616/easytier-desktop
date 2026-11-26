@@ -1,4 +1,13 @@
-# Privileged tests are marked ignored and selected explicitly with
-# `--run-ignored only`; never execute them on a developer machine.
+# CI's unprivileged run: report every failure, and stop a hung test instead of
+# waiting for the job timeout.
+[profile.ci]
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# Privileged tests are marked `#[ignore]` and selected explicitly with
+# `--run-ignored only`; never execute them on a developer machine. Nextest has
+# no profile key for that selection, so every command using this profile must
+# pass the flag (the xtask tests check the workflows).
 [profile.privileged]
 test-threads = 1
+slow-timeout = { period = "120s", terminate-after = 5 }

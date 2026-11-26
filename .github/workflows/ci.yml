@@ -7,15 +7,36 @@ on:
 permissions:
   contents: read
 
+# A newer push replaces a branch's running checks. Every commit on main is
+# checked.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  # Debug information costs link time and cache space, above all on Windows.
+  # Panic messages keep their file and line without it.
+  CARGO_PROFILE_DEV_DEBUG: '0'
+
 jobs:
+  # Platform-independent, and quick enough to fail first: `cargo metadata`
+  # covers every target from one host.
+  boundaries:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - run: cargo fmt --all -- --check
+      - run: cargo xtask check-boundaries
   check:
     strategy:
       fail-fast: false
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
-    env:
-      CARGO_TERM_COLOR: always
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Install Linux development libraries
@@ -32,35 +53,31 @@ jobs:
           cargo fmt --version
           cargo clippy --version
           protoc --version
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --locked --workspace -- -D warnings
-      - run: cargo build --locked --workspace
-      - name: Install nextest (fallback to cargo test if unavailable)
-        uses: taiki-e/install-action@v2
-        continue-on-error: true
+      # Only main writes caches: branches restore them, and one cache per
+      # branch would evict them from the repository's quota.
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.152
-      - name: Tests (nextest if available)
-        shell: pwsh
+      # Without dev-dependencies, so this also catches a feature that only
+      # tests enable. There is no separate `cargo build` step: the test step
+      # compiles and links the workspace.
+      - run: cargo clippy --locked --workspace -- -D warnings
+      - name: Tests
         env:
           ETD_IPC_CI_ACCOUNTS: ${{ runner.os == 'Windows' && '1' || '' }}
-        run: |
-          cargo nextest --version
-          if ($LASTEXITCODE -eq 0) {
-            cargo nextest run --locked --workspace
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            cargo test --locked --workspace --doc
-          } else {
-            cargo test --locked --workspace
-          }
-          exit $LASTEXITCODE
-      - run: cargo xtask check-boundaries
+        run: cargo nextest run --locked --workspace --profile ci
+      - name: Doc tests
+        run: cargo test --locked --workspace --doc
   privileged-install:
     strategy:
       fail-fast: false
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     env:
       CI: 'true'
       ETD_HOST_CI_INSTALL: '1'
@@ -75,6 +92,9 @@ jobs:
       - name: Install pinned protoc
         shell: pwsh
         run: ./.github/scripts/setup-protoc.ps1
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.152
@@ -85,10 +105,19 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          cargo nextest list --locked --profile privileged -p etd-host --test install_roundtrip
+          cargo nextest list --locked --profile privileged -p etd-host --run-ignored only --test install_roundtrip
           sudo -E env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "CI=true" "ETD_HOST_CI_INSTALL=1" "$(command -v cargo)" nextest run --locked --profile privileged -p etd-host --run-ignored only --test install_roundtrip --success-output immediate
+      # The cache is saved as the runner user, which cannot manage root's files.
+      - name: Return build files to the runner user
+        if: always() && runner.os != 'Windows'
+        shell: bash
+        run: |
+          for directory in target "${CARGO_HOME:-$HOME/.cargo}"; do
+            if [ -e "$directory" ]; then sudo chown -R "$(id -u):$(id -g)" "$directory"; fi
+          done
   dependencies:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: taiki-e/install-action@v2

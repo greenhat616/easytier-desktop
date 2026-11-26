@@ -645,7 +645,10 @@ pub(super) fn defer_install_removal(
         .map_err(other)?;
     }
     let _keep = dir.keep();
-    let child = std::process::Command::new(&helper)
+    let mut command = std::process::Command::new(&helper);
+    // CREATE_NO_WINDOW
+    std::os::windows::process::CommandExt::creation_flags(&mut command, 0x0800_0000);
+    let child = command
         .args([
             "uninstall",
             "--wait-parent",

@@ -30,6 +30,8 @@ pub async fn identify(binary: &Path) -> Result<CoreDescriptor, CoreError> {
     if let Some(root) = std::env::var_os("SystemRoot") {
         command.env("SystemRoot", root);
     }
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     let output = tokio::time::timeout(VERSION_TIMEOUT, command.output())
         .await
         .map_err(|_| CoreError::Identify(format!("{} --version timed out", binary.display())))?

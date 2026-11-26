@@ -260,7 +260,7 @@ impl Writer {
         active()?;
         let own = token(&self.1)?.ok_or_else(|| io::Error::other("missing PF receipt"))?;
         if !reference_live(&own)? || !rules()?.contains(rule) {
-            return Err(io::Error::other("generation fence is not active"));
+            return Err(Missing::error("generation fence is not active"));
         }
         Ok(())
     }
@@ -303,6 +303,22 @@ impl Writer {
     }
 }
 
+/// A successful pfctl read shows the fence absent or PF disabled (mapped to
+/// `FenceError::Missing`); a pfctl call that failed is a plain error.
+#[derive(Debug)]
+pub(super) struct Missing(pub(super) &'static str);
+impl Missing {
+    pub(super) fn error(why: &'static str) -> io::Error {
+        io::Error::other(Missing(why))
+    }
+}
+impl std::fmt::Display for Missing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for Missing {}
+
 fn hook() -> io::Result<()> {
     let top = output(command(PF).arg("-sr"))?;
     if !top
@@ -318,7 +334,7 @@ fn active() -> io::Result<()> {
         .lines()
         .any(|l| l.starts_with("Status: Enabled"))
     {
-        return Err(io::Error::other("PF is disabled"));
+        return Err(Missing::error("PF is disabled"));
     }
     let interfaces = output(command(PF).args(["-v", "-s", "Interfaces"]))?;
     if !interfaces

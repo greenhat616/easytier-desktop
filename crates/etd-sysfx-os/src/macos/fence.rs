@@ -23,6 +23,17 @@ fn validate(spec: &FenceSpec) -> Result<(), FenceError> {
     }
     Ok(())
 }
+/// Like [`os`], except that a successful read showing the fence absent or
+/// PF disabled is [`FenceError::Missing`].
+fn confirmed(e: io::Error) -> FenceError {
+    match e
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<pf::Missing>())
+    {
+        Some(missing) => FenceError::Missing(missing.0.into()),
+        None => os(e),
+    }
+}
 fn os(e: io::Error) -> FenceError {
     FenceError::Os {
         code: i64::from(e.raw_os_error().unwrap_or(-1)),
@@ -61,7 +72,7 @@ fn verify(spec: FenceSpec, pid: u32) -> Result<FenceVerification, FenceError> {
     };
     let rule = Rule::for_spec(&spec);
     let confirm = || pf::Writer::lock()?.confirm(&rule);
-    confirm().map_err(os)?;
+    confirm().map_err(confirmed)?;
     let initial = listener()?;
     let mut result = FenceVerification {
         listener: initial,
@@ -111,8 +122,31 @@ fn verify(spec: FenceSpec, pid: u32) -> Result<FenceVerification, FenceError> {
     };
     result.host = host(address);
     result.listener = listener()?;
-    confirm().map_err(os)?;
+    confirm().map_err(confirmed)?;
     Ok(result)
+}
+
+#[cfg(test)]
+mod missing_tests {
+    use super::*;
+
+    #[test]
+    fn an_absent_fence_or_disabled_pf_is_missing_not_a_failed_query() {
+        for why in ["generation fence is not active", "PF is disabled"] {
+            assert_eq!(
+                confirmed(pf::Missing::error(why)),
+                FenceError::Missing(why.into())
+            );
+        }
+        assert!(matches!(
+            confirmed(io::Error::other("pfctl timed out")),
+            FenceError::Os { .. }
+        ));
+        assert!(matches!(
+            confirmed(io::Error::other("PF writer is busy")),
+            FenceError::Os { .. }
+        ));
+    }
 }
 #[async_trait]
 impl PortFence for MacFence {

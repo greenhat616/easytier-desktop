@@ -1,6 +1,15 @@
 //! Windows system effects, using a persistent native WFP fence and independent
 //! Windows management provider queries. No request data is executed as code.
 pub mod driver_refs;
+
+/// Uninstall: remove the service host's volatile boot marker (see
+/// `registry::remove_machine_boot_marker`).
+pub fn remove_service_boot_marker() -> Result<(), crate::OsError> {
+    registry::remove_machine_boot_marker().map_err(|e| crate::OsError::Os {
+        code: e.code,
+        message: e.message,
+    })
+}
 mod execution;
 mod interfaces;
 mod magic;

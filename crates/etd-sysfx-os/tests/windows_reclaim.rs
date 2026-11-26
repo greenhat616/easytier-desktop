@@ -1024,3 +1024,43 @@ async fn a_foreign_program_rule_is_observed_not_an_error() {
     );
     assert_ne!(found.key, Some(key));
 }
+
+// Uninstall removes the service host's volatile boot marker (topic#40
+// msg#1290): the Volatile key, then the parent only once nothing else is in
+// it; never anything else; missing is fine.
+#[test]
+#[ignore = "creates and removes the native machine boot marker on disposable CI"]
+fn uninstall_removes_only_the_service_boot_marker() {
+    assert_eq!(std::env::var("CI").as_deref(), Ok("true"));
+    let dir = tempfile::tempdir().unwrap();
+    let config = OsConfig {
+        state_dir: dir.path().into(),
+        run_dir: dir.path().join("run"),
+        core_store_dir: dir.path().join("core"),
+    };
+    adapters(&config).unwrap().boot_id.current().unwrap();
+    let parent = r"HKLM:\SOFTWARE\EasyTierDesk";
+    let exists = |path: &str| ps_hidden(&format!("Test-Path -LiteralPath '{path}'")) == "True";
+    assert!(exists(&format!(r"{parent}\Volatile")));
+
+    // Something else under the parent stays, and so does the parent.
+    let other = format!(
+        r"{parent}\etd-h1f-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
+    ps_hidden(&format!(
+        "$ErrorActionPreference='Stop'; New-Item -Path '{other}' -Force | Out-Null"
+    ));
+    etd_sysfx_os::remove_service_boot_marker().unwrap();
+    assert!(!exists(&format!(r"{parent}\Volatile")));
+    assert!(exists(&other), "a foreign subkey is never deleted");
+    assert!(exists(parent));
+
+    // Once it is empty, the parent goes too; again is fine.
+    ps_hidden(&format!(
+        "$ErrorActionPreference='Stop'; Remove-Item -LiteralPath '{other}'"
+    ));
+    etd_sysfx_os::remove_service_boot_marker().unwrap();
+    assert!(!exists(parent));
+    etd_sysfx_os::remove_service_boot_marker().unwrap();
+}

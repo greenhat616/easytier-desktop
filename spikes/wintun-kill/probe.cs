@@ -8,7 +8,8 @@ using System.Net;
 using System.Runtime.InteropServices;
 using System.Threading;
 
-// OperStatus is IF_OPER_STATUS: 1 up, 2 down, 6 not present.
+// OperStatus is IF_OPER_STATUS: 1 up, 2 down, 6 not present. GetIfTable2 keeps
+// a "down" row for a removed adapter, so a row alone does not mean it exists.
 public class Iface { public ulong Luid; public uint Index; public Guid Guid; public string Alias; public string Description; public int OperStatus; }
 public class Node { public string Id; public bool Live; public bool Phantom; public uint Status; public uint Problem; }
 public class Sample

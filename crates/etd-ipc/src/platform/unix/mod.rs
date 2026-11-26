@@ -316,7 +316,12 @@ pub(super) async fn connect(
     } else {
         HostForm::User
     };
-    let id = socket_identity(path, form).map_err(denied)?;
+    // Nothing is connected or sent yet, so a host which is simply not there
+    // is reported as such. Every other failure is a refusal.
+    let id = socket_identity(path, form).map_err(|error| match error.kind() {
+        io::ErrorKind::NotFound => error,
+        _ => denied(error),
+    })?;
     let stream = UnixStream::connect(path).await?;
     let peer = os::peer(&stream).map_err(denied)?;
     verify_user(expect, &peer.user, current_user()?, OsUserId::UnixUid(0))?;
@@ -345,4 +350,63 @@ pub(super) async fn connect(
         Err(e) => return Err(denied(e)),
     };
     Ok((Box::new(stream), ServerIdentity { peer, exe }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener as StdListener;
+
+    // The service form needs a root-owned directory chain, which these
+    // system directories offer to an unprivileged test.
+    #[cfg(target_os = "linux")]
+    const ROOT_DIR: &str = "/usr";
+    #[cfg(target_os = "macos")]
+    const ROOT_DIR: &str = "/Library";
+
+    async fn failure(socket: PathBuf, privileged: bool) -> io::ErrorKind {
+        let expect = ServerExpectation {
+            exe_dir: ROOT_DIR.into(),
+            user: None,
+            privileged,
+        };
+        match connect(&Endpoint::UnixSocket(socket), &expect).await {
+            Ok(_) => panic!("connected"),
+            Err(error) => error.kind(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_socket_is_not_found() {
+        let socket = Path::new(ROOT_DIR).join("etd-no-such-host.sock");
+        assert_eq!(failure(socket, true).await, io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn a_missing_directory_is_not_found() {
+        let socket = Path::new(ROOT_DIR).join("etd-no-such-directory/host.sock");
+        assert_eq!(failure(socket, true).await, io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn a_socket_with_a_wrong_owner_or_mode_stays_denied() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().canonicalize().unwrap();
+        let socket = dir.join("host.sock");
+        let _listener = StdListener::bind(&socket).unwrap();
+        // Not owned by root, as the service form requires. (Root would own
+        // it, so there is nothing to refuse then.)
+        if !Uid::effective().is_root() {
+            assert_eq!(
+                failure(socket.clone(), true).await,
+                io::ErrorKind::PermissionDenied
+            );
+        }
+        // A user socket needs a private directory.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            failure(socket, false).await,
+            io::ErrorKind::PermissionDenied
+        );
+    }
 }

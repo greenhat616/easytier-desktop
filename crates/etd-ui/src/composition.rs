@@ -246,8 +246,14 @@ fn current_user_allow_arg() -> io::Result<String> {
     }
 }
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 fn run_direct(binary: &Path, args: &[String]) -> Result<(), String> {
-    let output = Command::new(binary)
+    let mut command = Command::new(binary);
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut command, CREATE_NO_WINDOW);
+    let output = command
         .args(args)
         .output()
         .map_err(|error| format!("failed to launch {}: {error}", binary.display()))?;
@@ -274,9 +280,11 @@ fn run_elevated(binary: &Path, args: &[String]) -> Result<(), String> {
         .collect::<Vec<_>>()
         .join(", ");
     let script = format!(
-        "$p = Start-Process -FilePath {file_path} -ArgumentList @({arg_list}) -Verb RunAs -PassThru -Wait; exit $p.ExitCode"
+        "$p = Start-Process -FilePath {file_path} -ArgumentList @({arg_list}) -Verb RunAs -WindowStyle Hidden -PassThru -Wait; exit $p.ExitCode"
     );
-    let output = Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    std::os::windows::process::CommandExt::creation_flags(&mut command, CREATE_NO_WINDOW);
+    let output = command
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
         .map_err(|error| format!("failed to invoke UAC elevation prompt: {error}"))?;
@@ -297,6 +305,7 @@ fn run_elevated(binary: &Path, args: &[String]) -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 fn run_elevated(binary: &Path, args: &[String]) -> Result<(), String> {
+    // no-window: Linux only
     let mut cmd = Command::new("pkexec");
     cmd.arg(binary).args(args);
     let output = cmd.output().map_err(|error| {
@@ -328,6 +337,7 @@ fn run_elevated(binary: &Path, args: &[String]) -> Result<(), String> {
     let shell_cmd = parts.join(" ");
     let escaped_for_as = shell_cmd.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!("do shell script \"{escaped_for_as}\" with administrator privileges");
+    // no-window: macOS only
     let output = Command::new("osascript")
         .args(["-e", &script])
         .output()

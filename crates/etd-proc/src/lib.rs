@@ -11,6 +11,8 @@ pub use restart::*;
 
 pub mod backoff;
 pub mod console_ctrl;
+#[cfg(windows)]
+mod console_host;
 pub mod identity;
 pub mod parent_death;
 pub mod processkit_engine;

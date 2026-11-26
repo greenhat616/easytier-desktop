@@ -45,7 +45,9 @@ async fn kernel_identity_matches_process() {
     }
     #[cfg(windows)]
     {
+        use etd_testkit::no_window::NoWindow;
         let out = std::process::Command::new("whoami")
+            .no_window()
             .args(["/user", "/fo", "csv", "/nh"])
             .output()
             .unwrap();

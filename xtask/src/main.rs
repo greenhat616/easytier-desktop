@@ -3,6 +3,8 @@
 mod boundaries;
 #[cfg(test)]
 mod ci_config;
+#[cfg(test)]
+mod spawn_flags;
 
 use anyhow::{Context, Result, bail};
 use cargo_metadata::MetadataCommand;

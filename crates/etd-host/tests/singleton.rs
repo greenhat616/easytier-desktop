@@ -1,4 +1,5 @@
 use etd_sysfx_os::service::HostLock;
+use etd_testkit::no_window::NoWindow;
 use std::{io, path::PathBuf, process::Command};
 
 #[test]
@@ -10,6 +11,7 @@ fn second_process_cannot_acquire_and_later_can() {
         io::ErrorKind::WouldBlock
     );
     let output = Command::new(std::env::current_exe().unwrap())
+        .no_window()
         .args(["--exact", "lock_contender", "--nocapture"])
         .env("ETD_LOCK_TEST_DIRECTORY", dir.path())
         .output()

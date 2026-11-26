@@ -78,6 +78,7 @@ pub async fn identify(binary: &Path) -> Result<CoreDescriptor, CoreError> {
     let bundle = spawn_directory(bundle);
     #[cfg(not(windows))]
     let bundle = bundle.to_owned();
+    // no-window: output_from_bundle sets CREATE_NO_WINDOW
     let mut command = tokio::process::Command::new(&binary);
     command
         .current_dir(&bundle)

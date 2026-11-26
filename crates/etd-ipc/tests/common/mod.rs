@@ -3,6 +3,7 @@ use etd_ipc::{
     Endpoint, ListenerPolicy, ServerExpectation,
     platform::{LocalConnector, LocalListener},
 };
+use etd_testkit::no_window::NoWindow;
 use std::{
     path::{Path, PathBuf},
     process::Command,
@@ -71,6 +72,7 @@ pub fn run_as_host(test: &str) -> bool {
     let host = install.path().join(host_name());
     std::fs::copy(exe, &host).unwrap();
     let mut cmd = Command::new(host);
+    cmd.no_window();
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::PermissionsExt;

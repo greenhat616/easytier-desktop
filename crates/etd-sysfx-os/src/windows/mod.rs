@@ -104,6 +104,13 @@ fn encoded_command(script: &str) -> String {
     }
     out
 }
+/// See [`crate::shutdown_helpers`].
+pub(crate) fn shutdown_helpers(drain: Duration) -> Result<(), crate::OsError> {
+    execution::shutdown(drain).map_err(|e| crate::OsError::Os {
+        code: e.code,
+        message: e.message,
+    })
+}
 async fn query(request: Value) -> Result<Vec<Value>, WinError> {
     blocking(move || execution::run(request)).await
 }

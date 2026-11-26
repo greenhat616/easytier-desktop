@@ -79,3 +79,20 @@ pub fn driver_bundle_referenced(_: &std::path::Path) -> Result<bool, OsError> {
 pub fn driver_bundle_reference(_: &std::path::Path) -> Result<Option<String>, OsError> {
     Ok(None)
 }
+
+/// Host shutdown: end every system-management helper process (Windows: the
+/// warm PowerShell workers) and confirm they are gone, so none outlives the
+/// host's singleton lock. Calls still in progress get `drain` to finish.
+/// `Err`: some could not be confirmed gone; whatever they were reclaiming
+/// stays open in the ledger. Elsewhere there is nothing to end.
+pub fn shutdown_helpers(drain: std::time::Duration) -> Result<(), OsError> {
+    #[cfg(windows)]
+    {
+        windows::shutdown_helpers(drain)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = drain;
+        Ok(())
+    }
+}

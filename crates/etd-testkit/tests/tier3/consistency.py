@@ -1,10 +1,12 @@
 """Compare persisted launch intents with native observations, in both directions."""
 
 from pathlib import Path
+from collections import Counter
 import json
 import os
 import stat
 from uuid import UUID
+from inventory import WINDOWS_POLICY_GROUPS, WFP_WF
 
 
 class UnpredictedChanges(AssertionError):
@@ -67,6 +69,31 @@ def runner_noise(base, live):
         if transition == {2, 3} and after == {**before, "Start": after["Start"]}:
             return {key}
     return set()
+
+
+def system_policy_changes(base, live, phase, retained_app=None):
+    # Product allow-list, not hosted-runner noise. MpsSvc recompiles these
+    # five groups on adapter changes (45857049239, rulings 1353 and 1355).
+    allowed = set()
+    for group in sorted(WINDOWS_POLICY_GROUPS):
+        key = ("firewall", group)
+        if key not in base.rows and key not in live.rows:
+            continue
+        prior = base.policy_filters.get(group, Counter())
+        current = live.policy_filters.get(group, Counter())
+        missing, extra = prior - current, current - prior
+        print(f"{phase} {group}: {prior.total()} -> {current.total()}, "
+              f"missing={missing.total()} extra={extra.total()}", flush=True)
+        if phase == "active" or (not missing and not extra):
+            allowed.add(key)
+        elif group == WFP_WF and phase == "stopped" and retained_app is not None and not missing:
+            expected = {(layer + version, retained_app)
+                        for layer in ("AUTH_LISTEN", "AUTH_RECV_ACCEPT", "RESOURCE_ASSIGNMENT")
+                        for version in ("_V4", "_V6")}
+            actual = {live.application_filters.get(digest) for digest in extra}
+            if extra.total() == 6 and actual == expected:
+                allowed.add(key)
+    return allowed
 
 
 def check_generation(base, live, records, instance, view, adapter_guids):
@@ -227,7 +254,8 @@ def compare_generation(base, live, records, instance, view, adapter_guids):
         expected.update(matches)
     # These changes intentionally have no separate ownership record.
     # Match the precise object and transition, never a registry subtree.
-    exempt = managed_service_changes(base, live) | tun_created(base, live) | adapter_defaults(base, live, adapter_guids)
+    exempt = managed_service_changes(base, live) | tun_created(base, live)
+    exempt |= adapter_defaults(base, live, adapter_guids) | system_policy_changes(base, live, "active")
     for kind, path in expected:
         if kind == "registry" and path.endswith("\\ProfileName"):
             category = ("registry", path.removesuffix("ProfileName") + "Category")

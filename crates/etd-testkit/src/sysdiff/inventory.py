@@ -1,6 +1,6 @@
 """Native, read-only inventory. No product observer, sweeper, or ledger calls."""
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -14,6 +14,12 @@ from xml.etree import ElementTree
 
 
 CLASSES = ("interface", "route", "resolver", "firewall", "registry", "service", "runtime", "process")
+WFP_WF = "wfp-group/fwpm_provider_mpssvc_wf/fwpm_sublayer_mpssvc_wf"
+WINDOWS_POLICY_GROUPS = {WFP_WF,
+    "wfp-group/fwpm_provider_mpssvc_wf/fwpm_sublayer_mpssvc_quarantine",
+    "wfp-group/fwpm_provider_mpssvc_wf/fwpm_sublayer_teredo",
+    "wfp-group/fwpm_provider_mpssvc_wsh/fwpm_sublayer_mpssvc_wsh",
+    "wfp-group/fwpm_provider_mpssvc_app_isolation/fwpm_sublayer_mpssvc_app_isolation"}
 
 
 def command(*args, check=True, timeout=60, **kwargs):
@@ -46,6 +52,8 @@ class Inventory:
     rows: dict = field(default_factory=dict)
     descendants: dict = field(default_factory=dict)
     parents: dict = field(default_factory=dict)
+    policy_filters: dict = field(default_factory=dict)
+    application_filters: dict = field(default_factory=dict)
 
     def put(self, kind, key, value):
         entry = (kind, str(key))
@@ -234,6 +242,62 @@ def darwin(inv):
         inv.put("service", file.name, file_identity(file))
 
 
+def wfp_policy_record(item):
+    # Retain the entire record and its structure, except the exact MpsSvc
+    # regeneration fields from run 45857049239, ruling msg#1353.
+    def content(node):
+        children = tuple(content(c) for c in node
+                         if not (node is item and c.tag in {"filterKey", "filterId", "providerContextKey"})
+                         and not (node.tag == "providerData" and c.tag in {"data", "asString"}))
+        value = node.text or ""
+        return node.tag, value if value.strip() else "", tuple(sorted(node.attrib.items())), children
+    return hashlib.sha256(repr(content(item)).encode()).digest()
+
+
+def wf_application_rule(item):
+    if item.findtext("action/type") != "FWP_ACTION_PERMIT":
+        return None
+    layer = item.findtext("layerKey", "").removeprefix("FWPM_LAYER_ALE_")
+    expected = {"FWPM_CONDITION_ALE_APP_ID"}
+    if layer in ("RESOURCE_ASSIGNMENT_V4", "RESOURCE_ASSIGNMENT_V6"):
+        expected.add("FWPM_CONDITION_IP_PROTOCOL")
+    elif layer not in ("AUTH_LISTEN_V4", "AUTH_LISTEN_V6", "AUTH_RECV_ACCEPT_V4", "AUTH_RECV_ACCEPT_V6"):
+        return None
+    conditions = item.findall("filterCondition/item")
+    if len(conditions) != len(expected) or {c.findtext("fieldKey") for c in conditions} != expected:
+        return None
+    app = next(c for c in conditions if c.findtext("fieldKey") == "FWPM_CONDITION_ALE_APP_ID")
+    if app.findtext("matchType") != "FWP_MATCH_EQUAL":
+        return None
+    if app.findtext("conditionValue/type") != "FWP_BYTE_BLOB_TYPE":
+        return None
+    data = app.findtext("conditionValue/byteBlob/data")
+    if not data:
+        return None
+    return layer, hashlib.sha256(bytes.fromhex(data)).digest()
+
+
+def native_application_id(path):
+    import ctypes
+    class Blob(ctypes.Structure):
+        _fields_ = [("size", ctypes.c_uint32), ("data", ctypes.POINTER(ctypes.c_ubyte))]
+    native = ctypes.WinDLL("fwpuclnt")
+    ptr = ctypes.POINTER(Blob)()
+    get = native.FwpmGetAppIdFromFileName0
+    get.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.POINTER(Blob))]
+    get.restype = ctypes.c_uint32
+    rc = get(str(path), ctypes.byref(ptr))
+    if rc:
+        raise ctypes.WinError(rc)
+    try:
+        return hashlib.sha256(ctypes.string_at(ptr.contents.data, ptr.contents.size)).digest()
+    finally:
+        free = native.FwpmFreeMemory0
+        free.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+        free.restype = None
+        free(ctypes.cast(ctypes.byref(ptr), free.argtypes[0]))
+
+
 def windows(inv):
     data = json.loads(command("powershell.exe", "-NoProfile", "-NonInteractive", "-File",
                               Path(__file__).with_name("windows.ps1"), timeout=180).stdout)
@@ -253,7 +317,7 @@ def windows(inv):
     with tempfile.TemporaryDirectory() as directory:
         filters = Path(directory) / "filters.xml"
         command("netsh.exe", "wfp", "show", "filters", "verbose=on", f"file={filters}")
-        groups = defaultdict(set)
+        groups = defaultdict(dict)
         for _, item in ElementTree.iterparse(filters):
             if item.tag != "item" or item.find("filterKey") is None:
                 continue
@@ -261,7 +325,15 @@ def windows(inv):
             group = tuple(item.findtext(field, "").strip().strip("{}").lower()
                           for field in ("providerKey", "subLayerKey"))
             assert key and key not in groups[group], "missing or duplicate WFP filter key"
-            groups[group].add(key)
+            group_name = "wfp-group/" + "/".join(group)
+            item.tail = None  # whitespace between XML records is not filter configuration
+            raw = ElementTree.tostring(item, encoding="utf-8")
+            groups[group][key] = hashlib.sha256(raw).digest()
+            if group_name in WINDOWS_POLICY_GROUPS:
+                fingerprint = wfp_policy_record(item)
+                inv.policy_filters.setdefault(group_name, Counter())[fingerprint] += 1
+                if group_name == WFP_WF:
+                    inv.application_filters[fingerprint] = wf_application_rule(item)
             label = item.findtext("displayData/name", "").strip()
             if ("51e7d001-7bc3-43b9-a795-7b80c196382f" in group
                     or "51e7d002-7bc3-43b9-a795-7b80c196382f" in group):
@@ -269,8 +341,8 @@ def windows(inv):
                         [label, ElementTree.tostring(item, encoding="unicode")])
             item.clear()
         assert groups, "WFP export contains no native filters"
-        for group, keys in groups.items():
-            inv.put("firewall", "wfp-group/" + "/".join(group), sorted(keys))
+        for group, records in groups.items():
+            inv.put("firewall", "wfp-group/" + "/".join(group), records)
 
 
 def capture(run_dir, images, other_run_dirs=()):

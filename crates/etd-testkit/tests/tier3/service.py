@@ -13,7 +13,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src" / "sysdiff"))
 from inventory import capture, command, digest, output
-from consistency import adapter_defaults, managed_service_changes, runner_noise, tun_created
+from consistency import adapter_defaults, managed_service_changes, runner_noise, system_policy_changes, tun_created
 
 
 def require_runner():
@@ -223,10 +223,13 @@ class Service:
                 eventually("uninstall journal closed",
                            lambda: self.call(self.installer, "uninstall", "--status"),
                            lambda status: status.startswith("No maintenance journal:"))
+                if self.retained_drivers:
+                    assert_driver_notice(result.stdout, self.retained_drivers)
             after = self.inventory()
             delta = before.delta(after) - managed_service_changes(before, after)
             delta -= runner_noise(before, after) | tun_created(before, after)
             delta -= adapter_defaults(before, after, self.adapter_guids)
+            delta -= system_policy_changes(before, after, "uninstalled")
             if sys.platform == "darwin":
                 delta -= empty_pf_namespace(before, after)
             for name in self.retained_drivers:
@@ -238,8 +241,6 @@ class Service:
                 f"pre-install to post-uninstall differences: native={sorted(delta)}, installed={files}"
             )
             assert result.returncode == 0, f"service uninstall exited {result.returncode}"
-            if self.retained_drivers:
-                assert_driver_notice(result.stdout, self.retained_drivers)
 
     @staticmethod
     def call(*args):

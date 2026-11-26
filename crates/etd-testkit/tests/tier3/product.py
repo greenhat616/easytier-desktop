@@ -12,9 +12,9 @@ import uuid
 from service import Desktop, Service, assert_driver_notice, command, eventually, require_runner
 from consistency import (
     FirewallReadbackPending, UnpredictedChanges, adapter_defaults, check_closed, check_generation, installed_image,
-    managed_service_changes, runner_noise, scope, tun_created,
+    managed_service_changes, runner_noise, scope, system_policy_changes, tun_created,
 )
-from inventory import assert_exited, capture, file_identity
+from inventory import assert_exited, capture, file_identity, native_application_id
 import foreign
 
 
@@ -213,33 +213,40 @@ def recovery():
         remaining -= adapter_defaults(baseline, stopped, service.adapter_guids)
         if os.name == "nt":
             records = service.effects()
+            program_rules = {("firewall", "policy/" + json.loads(r["observation"]["credential"]["value"])["id"])
+                             for r in records if "core_binary" in r["scope"]
+                             and r["kind"] == "win.program_firewall_rule" and r["state"] == "applied"}
+            assert len(program_rules) == 2 and program_rules <= remaining
+            # The last active snapshot verified the two native IDs, programs,
+            # directions and rule groups against this installed core's ledger.
+            assert_foreign(after, stopped, program_rules)
+            directions = set()
+            for key in program_rules:
+                _, group, direction, action, enabled, image, _ = stopped.rows[key]
+                assert group == "EasyTier" and enabled == "True" and action == "Allow"
+                assert Path(image).samefile(service.core)
+                directions.add(direction)
+            assert directions == {"Inbound", "Outbound"}
+            remaining -= program_rules
+            remaining -= system_policy_changes(baseline, stopped, "stopped", native_application_id(service.core))
             for key in remaining.copy():
                 if key[0] == "service" and key[1] in ("wintun", "windivert"):
                     assert any(r["scope"] == "product" and r["state"] != "reclaimed"
                                and r["key"].get("name", "").lower() == key[1] for r in records)
-                    remaining.remove(key)
-                elif key[0] == "firewall" and key[1].startswith("policy/"):
-                    name = stopped.rows[key][0]
-                    assert any("core_binary" in r["scope"] and r["state"] != "reclaimed"
-                               and r["key"].get("name") == name for r in records)
                     remaining.remove(key)
         if remaining:
             message = f"unreclaimed native objects or changed baseline: {sorted(remaining)}"
             print(message, flush=True)
             differences.append(message)
         if os.name == "nt":
-            verify_shared_driver_purge(service, baseline, stopped, inventory, keys)
+            verify_shared_driver_purge(service, baseline, stopped, inventory, keys, program_rules)
         assert not differences, "\n".join(differences)
 
 
-def verify_shared_driver_purge(service, baseline, stopped, inventory, foreign_keys):
+def verify_shared_driver_purge(service, baseline, stopped, inventory, foreign_keys, program_rules):
     names = {name for name in ("wintun", "windivert")
              if ("service", name) not in baseline.rows and ("service", name) in stopped.rows}
     assert "wintun" in names, "the real kernel did not load its TUN driver"
-    program_rules = {("firewall", "policy/" + json.loads(r["observation"]["credential"]["value"])["id"])
-                     for r in service.effects() if "core_binary" in r["scope"]
-                     and r["kind"] == "win.program_firewall_rule" and r["state"] == "applied"}
-    assert len(program_rules) == 2 and program_rules <= stopped.rows.keys()
     service.stop()
     result = command(service.installer, "reclaim", "--all", "--purge", check=False, timeout=240)
     records = service.effects()
@@ -257,6 +264,7 @@ def verify_shared_driver_purge(service, baseline, stopped, inventory, foreign_ke
     delta = baseline.delta(after) - managed_service_changes(baseline, after)
     delta -= runner_noise(baseline, after) | {("service", name) for name in names}
     delta -= adapter_defaults(baseline, after, service.adapter_guids)
+    delta -= system_policy_changes(baseline, after, "purged")
     # The installed baseline included a running host. Purge is an offline
     # command, so that exact host identity must now have exited.
     hosts = [k for k, v in baseline.rows.items() if k[0] == "process" and installed_image(v) == service.host]

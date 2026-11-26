@@ -990,12 +990,12 @@ const STOPPED_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10
 /// message.
 async fn lock_after_stop<T>(
     wait: std::time::Duration,
-    mut lock: impl FnMut() -> io::Result<T>,
+    mut lock: impl FnMut() -> std::io::Result<T>,
 ) -> Result<T> {
     let until = tokio::time::Instant::now() + wait;
     loop {
         match lock() {
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if tokio::time::Instant::now() >= until {
                     bail!(
                         "the service reported STOPPED but its process is still exiting and holds the host lock; retry etd-host uninstall in a moment"

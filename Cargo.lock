@@ -2334,7 +2334,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "async-trait",
  "clap",
+ "etd-client",
  "etd-contract",
  "etd-core-api",
  "etd-core-easytier",
@@ -2344,12 +2346,18 @@ dependencies = [
  "etd-sysfx",
  "etd-sysfx-os",
  "etd-testkit",
+ "futures-util",
  "predicates",
+ "rand 0.10.4",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
+ "tonic",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

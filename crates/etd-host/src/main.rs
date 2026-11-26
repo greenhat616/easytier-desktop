@@ -8,17 +8,123 @@
 //! Removing a kernel: `ReclaimEngine::reclaim_core`, then
 //! `CoreStore::remove` only if no core-binary record is pending.
 
-// The host composition root will construct real implementations of the trait layers.
-use anyhow as _;
-use etd_contract as _;
-use etd_core_api as _;
-use etd_core_easytier as _;
-use etd_host_core as _;
-use etd_ipc as _;
-use etd_proc as _;
-use etd_sysfx as _;
-use etd_sysfx_os as _;
+mod host;
+mod storage;
+mod unavailable;
 
-fn main() {
-    eprintln!("EasyTier Desktop: scaffold only");
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand, ValueEnum};
+use etd_contract::HostMode;
+use std::process::ExitCode;
+
+#[derive(Parser)]
+#[command(
+    name = "etd-host",
+    version,
+    about = "EasyTier Desktop host",
+    args_conflicts_with_subcommands = true
+)]
+struct Cli {
+    #[arg(long, hide = true)]
+    console_ctrl: Option<u32>,
+    #[command(subcommand)]
+    command: Option<Action>,
+}
+
+#[derive(Debug, Copy, Clone, ValueEnum)]
+enum Mode {
+    User,
+    Service,
+}
+impl From<Mode> for HostMode {
+    fn from(value: Mode) -> Self {
+        match value {
+            Mode::User => Self::User,
+            Mode::Service => Self::Service,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum Action {
+    /// Run a local authenticated host.
+    Run {
+        #[arg(long, value_enum, default_value = "user")]
+        mode: Mode,
+    },
+    /// Install the system service (requires administrator privileges).
+    Install {
+        #[arg(long, value_name = "SID_OR_UID")]
+        allow_user: Vec<String>,
+    },
+    /// Stop, reclaim and remove the installed service.
+    Uninstall,
+    /// Check and reclaim ownership records while the host is stopped.
+    Reclaim {
+        #[arg(long, value_enum, default_value = "service")]
+        mode: Mode,
+        #[arg(long)]
+        all: bool,
+        #[arg(long, requires = "all")]
+        purge: bool,
+    },
+    /// Read-only diagnostic information (no special privileges required).
+    Doctor,
+    /// Remove a stored kernel after reclaiming its binary-scoped records.
+    RemoveCore {
+        version: String,
+        #[arg(long, value_enum, default_value = "service")]
+        mode: Mode,
+    },
+}
+
+fn main() -> ExitCode {
+    match execute(Cli::parse()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("etd-host: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn execute(cli: Cli) -> Result<()> {
+    if let Some(pid) = cli.console_ctrl {
+        return etd_proc::console_ctrl::send_ctrl_c(pid).context("console helper failed");
+    }
+    let Some(command) = cli.command else {
+        bail!("a command is required; see --help")
+    };
+    #[cfg(windows)]
+    if matches!(
+        &command,
+        Action::Run {
+            mode: Mode::Service
+        }
+    ) {
+        return etd_sysfx_os::service::dispatch_service(|stop| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            runtime
+                .block_on(host::run_until(HostMode::Service, Some(stop)))
+                .map_err(|error| std::io::Error::other(format!("{error:#}")))
+        })
+        .context("Windows service dispatcher");
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    match command {
+        Action::Doctor => host::doctor(),
+        Action::Run { mode } => runtime.block_on(host::run(mode.into())),
+        Action::Reclaim { mode, all, purge } => {
+            runtime.block_on(host::reclaim(mode.into(), all, purge))
+        }
+        Action::RemoveCore { mode, version } => {
+            runtime.block_on(host::remove_core(mode.into(), &version))
+        }
+        Action::Install { allow_user } => runtime.block_on(host::install(&allow_user)),
+        Action::Uninstall => runtime.block_on(host::uninstall()),
+    }
 }

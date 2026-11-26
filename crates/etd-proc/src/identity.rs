@@ -410,6 +410,25 @@ impl Pin {
         unsafe { windows::Win32::System::Threading::TerminateProcess(self.0, 1) }
             .map_err(io::Error::from)
     }
+    /// Image path of the pinned process, from the native API.
+    pub(crate) fn image(&self) -> io::Result<PathBuf> {
+        use std::os::windows::ffi::OsStringExt;
+        use windows::Win32::System::Threading::{PROCESS_NAME_WIN32, QueryFullProcessImageNameW};
+        let mut buffer = vec![0u16; 32768];
+        let mut length = 32768;
+        // SAFETY: the buffer holds `length` UTF-16 units; the handle is owned
+        // and grants limited query access.
+        unsafe {
+            QueryFullProcessImageNameW(
+                self.0,
+                PROCESS_NAME_WIN32,
+                windows::core::PWSTR(buffer.as_mut_ptr()),
+                &mut length,
+            )
+        }
+        .map_err(io::Error::from)?;
+        Ok(std::ffi::OsString::from_wide(&buffer[..length as usize]).into())
+    }
     pub(crate) fn gone(&self) -> bool {
         // SAFETY: we hold a process handle with SYNCHRONIZE access.
         (unsafe { windows::Win32::System::Threading::WaitForSingleObject(self.0, 0) })

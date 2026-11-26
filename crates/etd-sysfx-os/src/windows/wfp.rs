@@ -9,13 +9,15 @@ use ::windows::{
         },
         NetworkManagement::WindowsFilteringPlatform::*,
         Security::{
+            ACCESS_ALLOWED_ACE, ACL,
             Authorization::{
                 ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
             },
-            PSECURITY_DESCRIPTOR,
+            DACL_SECURITY_INFORMATION, GetAce, GetSecurityDescriptorDacl, IsWellKnownSid,
+            PSECURITY_DESCRIPTOR, PSID, WinBuiltinAdministratorsSid, WinLocalSystemSid,
         },
     },
-    core::{GUID, HSTRING, PCWSTR, PWSTR},
+    core::{BOOL, GUID, HSTRING, PCWSTR, PWSTR},
 };
 use etd_sysfx::{Credential, FenceSpec, ObjectKey, Observation, Reclaimed};
 use std::ptr::null_mut;
@@ -151,6 +153,160 @@ unsafe fn display_name(ptr: PWSTR) -> String {
     }
 }
 
+// BFE owns and validates the security descriptors returned by its APIs.
+// Never treat a container as exclusive if its ACL admits an ordinary user.
+unsafe fn trusted_acl(dacl: *const ACL, system_only: bool) -> Result<bool, WinError> {
+    if dacl.is_null() {
+        return Ok(false);
+    }
+    let mut system = false;
+    let mut admin = false;
+    for index in 0..unsafe { (*dacl).AceCount } as u32 {
+        let mut ptr = null_mut();
+        unsafe {
+            GetAce(dacl, index, &mut ptr).map_err(WinError::windows)?;
+        }
+        if ptr.is_null() {
+            return Ok(false);
+        }
+        let ace = unsafe { &*ptr.cast::<ACCESS_ALLOWED_ACE>() };
+        if ace.Header.AceType != 0 {
+            return Ok(false);
+        }
+        let sid = PSID(std::ptr::addr_of!(ace.SidStart).cast_mut().cast());
+        if unsafe { IsWellKnownSid(sid, WinLocalSystemSid).as_bool() } {
+            if system_only && ace.Mask != 1 {
+                return Ok(false);
+            }
+            system = true;
+        } else if !system_only
+            && unsafe { IsWellKnownSid(sid, WinBuiltinAdministratorsSid).as_bool() }
+        {
+            admin = true;
+        } else {
+            return Ok(false);
+        }
+    }
+    Ok(system && (system_only || admin))
+}
+
+fn check_acl(e: &Engine, key: GUID, kind: &str) -> Result<(), WinError> {
+    let mut dacl = null_mut();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        let getter = match kind {
+            "provider" => FwpmProviderGetSecurityInfoByKey0,
+            "sublayer" => FwpmSubLayerGetSecurityInfoByKey0,
+            _ => FwpmFilterGetSecurityInfoByKey0,
+        };
+        check(
+            getter(
+                e.0,
+                Some(&key),
+                DACL_SECURITY_INFORMATION.0,
+                null_mut(),
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut sd,
+            ),
+            "read WFP security descriptor",
+        )?;
+        let trusted = trusted_acl(dacl, false);
+        FwpmFreeMemory0(&mut sd.0);
+        if !trusted? {
+            return Err(WinError::invalid(format!("untrusted {kind} WFP ACL")));
+        }
+    }
+    Ok(())
+}
+
+unsafe fn exact_conditions(filter: &FWPM_FILTER0, i: u8, port: u16) -> Result<bool, WinError> {
+    let v6 = i >= 2;
+    let permit = i % 2 == 1;
+    if filter.layerKey
+        != if v6 {
+            FWPM_LAYER_ALE_AUTH_CONNECT_V6
+        } else {
+            FWPM_LAYER_ALE_AUTH_CONNECT_V4
+        }
+        || filter.action.r#type
+            != if permit {
+                FWP_ACTION_PERMIT
+            } else {
+                FWP_ACTION_BLOCK
+            }
+        || filter.flags.contains(FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT) == permit
+        || filter.numFilterConditions != if permit { 4 } else { 3 }
+        || filter.filterCondition.is_null()
+    {
+        return Ok(false);
+    }
+    let mut address = false;
+    let mut protocol = false;
+    let mut remote_port = false;
+    let mut identity = false;
+    for c in unsafe {
+        std::slice::from_raw_parts(filter.filterCondition, filter.numFilterConditions as usize)
+    } {
+        if c.matchType != FWP_MATCH_EQUAL {
+            return Ok(false);
+        }
+        let value = &c.conditionValue;
+        unsafe {
+            if c.fieldKey == FWPM_CONDITION_IP_REMOTE_ADDRESS && !address {
+                if v6 {
+                    let expected = std::net::Ipv6Addr::LOCALHOST.octets();
+                    if value.r#type != FWP_BYTE_ARRAY16_TYPE
+                        || value.Anonymous.byteArray16.is_null()
+                        || (*value.Anonymous.byteArray16).byteArray16 != expected
+                    {
+                        return Ok(false);
+                    }
+                } else if value.r#type != FWP_UINT32 || value.Anonymous.uint32 != 0x7f000001 {
+                    return Ok(false);
+                }
+                address = true;
+            } else if c.fieldKey == FWPM_CONDITION_IP_REMOTE_PORT && !remote_port {
+                if value.r#type != FWP_UINT16 || value.Anonymous.uint16 != port {
+                    return Ok(false);
+                }
+                remote_port = true;
+            } else if c.fieldKey == FWPM_CONDITION_IP_PROTOCOL && !protocol {
+                if value.r#type != FWP_UINT8 || value.Anonymous.uint8 != 6 {
+                    return Ok(false);
+                }
+                protocol = true;
+            } else if permit && c.fieldKey == FWPM_CONDITION_ALE_USER_ID && !identity {
+                if value.r#type != FWP_SECURITY_DESCRIPTOR_TYPE || value.Anonymous.sd.is_null() {
+                    return Ok(false);
+                }
+                let blob = &*value.Anonymous.sd;
+                if blob.data.is_null() || blob.size < 20 {
+                    return Ok(false);
+                }
+                let mut present = BOOL(0);
+                let mut defaulted = BOOL(0);
+                let mut dacl = null_mut();
+                GetSecurityDescriptorDacl(
+                    PSECURITY_DESCRIPTOR(blob.data.cast()),
+                    &mut present,
+                    &mut dacl,
+                    &mut defaulted,
+                )
+                .map_err(WinError::windows)?;
+                if !present.as_bool() || !trusted_acl(dacl, true)? {
+                    return Ok(false);
+                }
+                identity = true;
+            } else {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(address && remote_port && protocol && identity == permit)
+}
+
 #[derive(Debug)]
 struct Filter {
     key: GUID,
@@ -226,12 +382,22 @@ fn matching(e: &Engine, id: Uuid, port: u16) -> Result<Vec<Filter>, WinError> {
                     && !value.providerKey.is_null()
                     && *value.providerKey == PROVIDER,
             };
+            let valid_conditions = exact_conditions(value, i, port);
             FwpmFreeMemory0((&mut f as *mut *mut FWPM_FILTER0).cast());
-            if !found.owned || !found.persistent || found.label != label(id, port) {
+            if !found.owned
+                || !found.persistent
+                || found.label != label(id, port)
+                || !valid_conditions?
+            {
                 return Err(WinError::invalid("WFP filter identity mismatch"));
             }
+            check_acl(e, found.key, "filter")?;
             out.push(found);
         }
+    }
+    if !out.is_empty() {
+        check_acl(e, PROVIDER, "provider")?;
+        check_acl(e, SUBLAYER, "sublayer")?;
     }
     Ok(out)
 }
@@ -260,6 +426,7 @@ fn ensure_container(e: &Engine, sd: &Sd) -> Result<(), WinError> {
             if !valid {
                 return Err(WinError::invalid("WFP provider identity mismatch"));
             }
+            check_acl(e, PROVIDER, "provider")?;
         }
         let mut s = null_mut();
         let rc = FwpmSubLayerGetByKey0(e.0, &SUBLAYER, &mut s);
@@ -288,6 +455,7 @@ fn ensure_container(e: &Engine, sd: &Sd) -> Result<(), WinError> {
             if !valid {
                 return Err(WinError::invalid("WFP sublayer identity mismatch"));
             }
+            check_acl(e, SUBLAYER, "sublayer")?;
         }
     }
     Ok(())

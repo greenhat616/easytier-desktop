@@ -59,24 +59,31 @@ jobs:
           $tag = [guid]::NewGuid().ToString('N').Substring(0,8)
           $name = "etdo1_$tag"
           $account = "$env:COMPUTERNAME\$name"
-          $task = "ETD-O1-Second-$tag"
           $folder = Join-Path $env:ProgramData "etd-o1-$tag"
           $password = [guid]::NewGuid().ToString('N') + 'Aa!5'
+          $job = $null
           try {
             New-LocalUser -Name $name -Password (ConvertTo-SecureString $password -AsPlainText -Force) | Out-Null
             Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $account -ErrorAction SilentlyContinue
+            Start-Service seclogon
             New-Item -ItemType Directory -Path $folder | Out-Null
-            & icacls $folder /inheritance:r /grant '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)' "${account}:(OI)(CI)(M)" | Out-Null
+            New-Item -ItemType Directory -Path "$folder\results" | Out-Null
+            & icacls $folder /inheritance:r /grant '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)' "${account}:(OI)(CI)(RX)" | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'Test ACL failed' }
+            & icacls "$folder\results" /grant "${account}:(OI)(CI)(M)" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Probe result ACL failed' }
             @'
+          param($endpoint)
           $ErrorActionPreference = 'Stop'
           $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
           $expected = Get-Content "$PSScriptRoot\sid.txt" -Raw
           if ($sid -ne $expected.Trim()) { throw 'Wrong probe identity' }
-          $endpoint = [Net.IPEndPoint]::Parse((Get-Content "$PSScriptRoot\endpoint.txt" -Raw).Trim())
-          $client = [Net.Sockets.TcpClient]::new($endpoint.AddressFamily)
+          $split = $endpoint.LastIndexOf(':')
+          $address = [ipaddress]::Parse($endpoint.Substring(0,$split).Trim('[',']'))
+          $port = [int]$endpoint.Substring($split+1)
+          $client = [Net.Sockets.TcpClient]::new($address.AddressFamily)
           try {
-            $client.Connect($endpoint.Address,$endpoint.Port)
+            $client.Connect($address,$port)
             $verdict = 'connected'
           } catch {
             $errorObject = $_.Exception
@@ -84,18 +91,35 @@ jobs:
             if ($errorObject -is [Net.Sockets.SocketException] -and $errorObject.SocketErrorCode -in @('AccessDenied','ConnectionRefused')) { $verdict = 'refused' }
             else { $verdict = "unexpected error: $errorObject" }
           } finally { $client.Dispose() }
-          [IO.File]::WriteAllText("$PSScriptRoot\verdict.txt",$verdict)
+          [IO.File]::WriteAllText("$PSScriptRoot\results\verdict.txt",$verdict)
           '@ | Set-Content "$folder\probe.ps1"
             (Get-LocalUser -Name $name).SID.Value | Set-Content "$folder\sid.txt"
-            # Windows PowerShell 5 lacks IPEndPoint.Parse; use pwsh 7 installed on the runner.
-            $action = New-ScheduledTaskAction -Execute (Get-Command pwsh).Source -Argument "-NoProfile -NonInteractive -File `"$folder\probe.ps1`""
-            Register-ScheduledTask -TaskName $task -Action $action -User $account -Password $password -RunLevel Limited | Out-Null
+            # S1 demonstrated CreateProcessWithLogonW on the hosted runner;
+            # scheduled non-admin tasks can fail for missing batch-logon rights.
+            # Keep the disposable user's credential in memory in this job.
+            $credential = [pscredential]::new($account,(ConvertTo-SecureString $password -AsPlainText -Force))
+            $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $job = Start-ThreadJob -ArgumentList $folder,$credential,$powershell -ScriptBlock {
+              param($folder,$credential,$powershell)
+              $ErrorActionPreference='Stop'
+              while ($true) {
+                try {
+                  if (Test-Path "$folder\endpoint.txt") {
+                    $endpoint=(Get-Content "$folder\endpoint.txt" -Raw).Trim()
+                    Remove-Item -LiteralPath "$folder\endpoint.txt"
+                    $arguments='-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}\probe.ps1" {1}' -f $folder,$endpoint
+                    $p=Start-Process -FilePath $powershell -ArgumentList $arguments -Credential $credential -WorkingDirectory $folder -WindowStyle Hidden -PassThru
+                    if (!$p.WaitForExit(20000)) { $p.Kill(); throw 'Second user process timed out' }
+                    if ($p.ExitCode -ne 0) { throw "Second user process exited $($p.ExitCode)" }
+                  }
+                } catch { [IO.File]::WriteAllText("$folder\results\verdict.txt","probe error: $($_.Exception.Message)") }
+                Start-Sleep -Milliseconds 100
+              }
+            }
             $env:ETD_O1_SECOND_DIR = $folder
-            $env:ETD_O1_SECOND_TASK = $task
             cargo nextest run --locked --profile privileged -p etd-sysfx-os --run-ignored only --test windows_fence --success-output immediate
             if ($LASTEXITCODE -ne 0) { throw 'WFP fence acceptance failed' }
           } finally {
-            Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
-            Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
+            if ($job) { Stop-Job $job -ErrorAction SilentlyContinue; Receive-Job $job -ErrorAction SilentlyContinue; Remove-Job $job -Force -ErrorAction SilentlyContinue }
             Remove-LocalUser -Name $name -ErrorAction SilentlyContinue
           }

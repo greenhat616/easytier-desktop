@@ -34,11 +34,193 @@ impl RepairIndexStore for Index {
 struct Rule(String);
 impl Drop for Rule {
     fn drop(&mut self) {
-        let _ = ps(&format!(
-            "Get-NetFirewallRule -PolicyStore PersistentStore | Where-Object Name -eq '{}' | Remove-NetFirewallRule",
-            self.0
-        ));
+        let _ = Command::new("powershell.exe").args(["-NoProfile","-NonInteractive","-Command",&format!("Get-NetFirewallRule -PolicyStore PersistentStore | Where-Object Name -eq '{}' | Remove-NetFirewallRule",self.0)]).output();
     }
+}
+
+struct RegistryFixture(Vec<String>);
+impl Drop for RegistryFixture {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _=Command::new("powershell.exe").args(["-NoProfile","-NonInteractive","-Command",&format!("Remove-Item -LiteralPath '{path}' -Recurse -Force -ErrorAction SilentlyContinue")]).output();
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "creates isolated registry, NRPT, and Magic DNS recovery fixtures on CI"]
+async fn registry_and_magic_dns() {
+    assert_eq!(std::env::var("CI").as_deref(), Ok("true"));
+    let dir = tempfile::tempdir().unwrap();
+    let os = adapters(&OsConfig {
+        state_dir: dir.path().into(),
+        run_dir: dir.path().join("run"),
+        core_store_dir: dir.path().join("core"),
+    })
+    .unwrap();
+    let guid = format!("{{{}}}", uuid::Uuid::new_v4().to_string().to_uppercase());
+    let id = format!("{{{}}}", uuid::Uuid::new_v4().to_string().to_uppercase());
+    let tcpip =
+        format!(r"HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{guid}");
+    let nrpt = format!(
+        r"HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig\{id}"
+    );
+    let magic = r"HKLM:\SOFTWARE\EasyTier\MagicDNS";
+    assert_eq!(
+        ps(&format!("Test-Path -LiteralPath '{magic}'")),
+        "False",
+        "don't touch a preexisting shared recovery record"
+    );
+    let _fixture = RegistryFixture(vec![tcpip.clone(), nrpt.clone(), magic.into()]);
+    ps(&format!(
+        "$ErrorActionPreference='Stop'; New-Item -Path '{tcpip}' -Force | Out-Null; New-ItemProperty -Path '{tcpip}' -Name RegistrationEnabled -Value 0 -PropertyType DWord | Out-Null; New-ItemProperty -Path '{tcpip}' -Name DisableDynamicUpdate -Value 5 -PropertyType DWord | Out-Null; New-ItemProperty -Path '{tcpip}' -Name SearchList -Value 'current.invalid' -PropertyType String | Out-Null"
+    ));
+    let boot = os.boot_id.current().unwrap();
+    let make = |kind, key, undo, observation| Effect {
+        id: EffectId(uuid::Uuid::new_v4().to_string()),
+        scope: EffectScope::Instance {
+            instance: InstanceId::from("registry-test"),
+            epoch: Epoch(1),
+        },
+        kind,
+        key,
+        undo,
+        persistence: Persistence::Persistent,
+        state: EffectState::Applied,
+        boot: boot.clone(),
+        observation: Some(observation),
+        failures: 0,
+        last_error: None,
+        recorded_at: jiff::Timestamp::now(),
+    };
+    let reclaimer = |kind| os.reclaimers.iter().find(|r| r.kind() == kind).unwrap();
+    let key = ObjectKey::Registry {
+        key: tcpip.replace("HKLM:", "HKLM"),
+        value: Some("RegistrationEnabled".into()),
+    };
+    let obs = os
+        .observer
+        .observe(EffectKind::WinRegistryValue, &key)
+        .await
+        .unwrap()
+        .unwrap();
+    let effect = make(
+        EffectKind::WinRegistryValue,
+        key.clone(),
+        Undo::RestoreIfOurs {
+            ours: SettingValue::U32(0),
+            original: SettingValue::Absent,
+        },
+        obs,
+    );
+    assert_eq!(
+        reclaimer(effect.kind).reclaim(&effect).await.unwrap(),
+        Reclaimed::Restored
+    );
+    assert!(
+        os.observer
+            .observe(effect.kind, &key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let key = ObjectKey::Registry {
+        key: tcpip.replace("HKLM:", "HKLM"),
+        value: Some("DisableDynamicUpdate".into()),
+    };
+    let obs = os
+        .observer
+        .observe(EffectKind::WinRegistryValue, &key)
+        .await
+        .unwrap()
+        .unwrap();
+    let effect = make(
+        EffectKind::WinRegistryValue,
+        key.clone(),
+        Undo::RestoreIfOurs {
+            ours: SettingValue::U32(1),
+            original: SettingValue::Absent,
+        },
+        obs,
+    );
+    assert_eq!(
+        reclaimer(effect.kind).reclaim(&effect).await.unwrap(),
+        Reclaimed::LeftModified
+    );
+    assert_eq!(
+        ps(&format!(
+            "(Get-ItemProperty -LiteralPath '{tcpip}').DisableDynamicUpdate"
+        )),
+        "5"
+    );
+
+    // The same schema used by upstream c97f36b. Only the exact random NRPT
+    // id and saved SearchList are authorised by this recovery key.
+    ps(&format!(
+        "$ErrorActionPreference='Stop'; New-Item -Path '{nrpt}' -Force | Out-Null; New-ItemProperty -Path '{nrpt}' -Name Comment -Value 'EasyTier Magic DNS' -PropertyType String | Out-Null; New-Item -Path '{magic}' -Force | Out-Null; New-ItemProperty -Path '{magic}' -Name NRPTRuleIDs -Value @('{id}') -PropertyType MultiString | Out-Null; $saved='{magic}\\SearchLists\\{guid}\\IPv4'; New-Item -Path $saved -Force | Out-Null; New-ItemProperty -Path $saved -Name Ready -Value 1 -PropertyType DWord | Out-Null; New-ItemProperty -Path $saved -Name OriginalSearchList -Value 'original.invalid' -PropertyType String | Out-Null"
+    ));
+    let nrpt_key = ObjectKey::Rule {
+        name: id,
+        group: Some("EasyTier Magic DNS".into()),
+    };
+    assert!(
+        os.observer
+            .observe(EffectKind::WinNrptRule, &nrpt_key)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let magic_key = ObjectKey::Registry {
+        key: magic.replace("HKLM:", "HKLM"),
+        value: None,
+    };
+    let obs = os
+        .observer
+        .observe(EffectKind::WinMagicDnsRecovery, &magic_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let effect = make(
+        EffectKind::WinMagicDnsRecovery,
+        magic_key.clone(),
+        Undo::ReplayUpstreamRecovery,
+        obs,
+    );
+    assert_eq!(
+        reclaimer(effect.kind).reclaim(&effect).await.unwrap(),
+        Reclaimed::Removed
+    );
+    assert!(
+        os.observer
+            .observe(effect.kind, &magic_key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        os.observer
+            .observe(EffectKind::WinNrptRule, &nrpt_key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        ps(&format!(
+            "(Get-ItemProperty -LiteralPath '{tcpip}').SearchList"
+        )),
+        "original.invalid"
+    );
+    assert!(
+        os.observer
+            .enumerate(SystemClass::DnsPolicy)
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.key != magic_key && r.key != nrpt_key)
+    );
+    println!(
+        "REAL registry: RestoreIfOurs restored own value, preserved modified value; Magic DNS NRPT id removed then SearchList restored then recovery key removed"
+    );
 }
 
 #[tokio::test]

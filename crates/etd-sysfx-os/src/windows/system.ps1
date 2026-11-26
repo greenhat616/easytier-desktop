@@ -68,7 +68,8 @@ function ProfileRows {
 function NoEasyTier {
     # Upstream's shared recovery record cannot be attributed to one instance.
     # Fail closed when WMI cannot enumerate processes.
-    $running = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^easytier(?:-core|-cli)?(?:\.exe)?$' -or $_.ExecutablePath -match '(?i)\\easytier(?:-core)?\.exe$' })
+    $root = if ($q.core_store) { ([string]$q.core_store).Replace('\\?\','').TrimEnd('\') + '\' } else { $null }
+    $running = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^easytier(?:-core|-cli)?(?:\.exe)?$' -or $_.ExecutablePath -match '(?i)\\easytier(?:-core)?\.exe$' -or ($root -and $_.ExecutablePath -and $_.ExecutablePath.Replace('\\?\','').StartsWith($root,[StringComparison]::OrdinalIgnoreCase)) })
     if ($running.Count) { throw 'BUSY: another EasyTier process is running' }
 }
 function ReplayMagic {

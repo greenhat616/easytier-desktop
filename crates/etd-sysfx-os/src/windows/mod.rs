@@ -392,7 +392,7 @@ fn matching_credential(e: &Effect, found: &Observation) -> Result<(), ReclaimErr
         Err(ReclaimError::CredentialMismatch)
     }
 }
-struct WindowsReclaimer(EffectKind);
+struct WindowsReclaimer(EffectKind, PathBuf);
 #[async_trait]
 impl Reclaimer for WindowsReclaimer {
     fn kind(&self) -> EffectKind {
@@ -429,7 +429,7 @@ impl Reclaimer for WindowsReclaimer {
             }
             EffectKind::WinMagicDnsRecovery => {
                 if e.undo != Undo::ReplayUpstreamRecovery { return Err(ReclaimError::CredentialMismatch); }
-                single(json!({"op":"replay_magic"})).await
+                single(json!({"op":"replay_magic","core_store":self.1})).await
             }
             EffectKind::WinFirewallRule | EffectKind::WinProgramFirewallRule | EffectKind::WinNrptRule | EffectKind::WinNetworkProfile => {
                 if e.undo != Undo::EnsureAbsent { return Err(ReclaimError::CredentialMismatch); }
@@ -695,7 +695,9 @@ impl BootIdSource for WindowsBoot {
         probe::boot_id().map_err(WinError::reclaim)
     }
 }
-struct WindowsSweeper;
+struct WindowsSweeper {
+    core_store_dir: PathBuf,
+}
 impl Sweeper for WindowsSweeper {
     fn find_marked<'a>(
         &'a self,
@@ -739,6 +741,30 @@ impl Sweeper for WindowsSweeper {
                 .map_err(WinError::reclaim)?
             {
                 let name = string(&row, "name").map_err(WinError::reclaim)?;
+                if let Some((program, _)) = program_name(name) {
+                    let root = format!(
+                        "{}\\",
+                        normalize_program(&self.core_store_dir.to_string_lossy())
+                            .trim_end_matches('\\')
+                    );
+                    if normalize_program(program).starts_with(&root) {
+                        let object = ObjectKey::Rule {
+                            name: name.into(),
+                            group: row["group"].as_str().map(str::to_owned),
+                        };
+                        found.push(FoundObject {
+                            kind: EffectKind::WinProgramFirewallRule,
+                            key: object.clone(),
+                            observation: observation(
+                                Some(program_identity(&row).map_err(WinError::reclaim)?),
+                                object,
+                                "program rule under protected core store".into(),
+                            ),
+                            origin: FoundBy::PrefixOnly,
+                        });
+                    }
+                    continue;
+                }
                 let Some(iface) = name
                     .strip_prefix("EasyTier ")
                     .and_then(|s| s.split_once(" - "))
@@ -762,6 +788,106 @@ impl Sweeper for WindowsSweeper {
                         "marked firewall rule".into(),
                     ),
                     origin: origin(iface),
+                });
+            }
+            for row in query(json!({"op":"profiles"}))
+                .await
+                .map_err(WinError::reclaim)?
+            {
+                let name = string(&row, "name").map_err(WinError::reclaim)?;
+                if !owned_name(name) {
+                    continue;
+                }
+                let object = ObjectKey::NetworkProfile {
+                    profile_name: name.into(),
+                };
+                found.push(FoundObject {
+                    kind: EffectKind::WinNetworkProfile,
+                    key: object.clone(),
+                    observation: observation(
+                        Some(opaque(string(&row, "id").map_err(WinError::reclaim)?)),
+                        object,
+                        "marked profile; ownership not proved".into(),
+                    ),
+                    origin: origin(name),
+                });
+            }
+            if let Some(install_key) = key {
+                let names: Vec<_> = known
+                    .iter()
+                    .map(|instance| {
+                        (
+                            instance,
+                            naming::wintun_guid(&naming::interface_name(install_key, instance))
+                                .to_string(),
+                        )
+                    })
+                    .collect();
+                for row in query(json!({"op":"registry_rows"}))
+                    .await
+                    .map_err(WinError::reclaim)?
+                {
+                    let path = string(&row, "key").map_err(WinError::reclaim)?;
+                    let Some((instance, _)) = names.iter().find(|(_, guid)| {
+                        path.to_ascii_lowercase().ends_with(&format!("{{{guid}}}"))
+                    }) else {
+                        continue;
+                    };
+                    let object = ObjectKey::Registry {
+                        key: path.into(),
+                        value: Some(string(&row, "value").map_err(WinError::reclaim)?.into()),
+                    };
+                    if registry_value_key(&object).is_err() {
+                        continue;
+                    }
+                    found.push(FoundObject {
+                        kind: EffectKind::WinRegistryValue,
+                        key: object.clone(),
+                        observation: observation(
+                            None,
+                            object,
+                            "derived registry value; original not known".into(),
+                        ),
+                        origin: FoundBy::DerivedName {
+                            instance: (*instance).clone(),
+                        },
+                    });
+                }
+            }
+            // Shared upstream objects may have been made by another EasyTier
+            // installation. Surface them as candidates, never exclusive.
+            let magic = ObjectKey::Registry {
+                key: r"HKLM\SOFTWARE\EasyTier\MagicDNS".into(),
+                value: None,
+            };
+            if let Some(obs) = observe_kind(EffectKind::WinMagicDnsRecovery, &magic)
+                .await
+                .map_err(WinError::reclaim)?
+            {
+                found.push(FoundObject {
+                    kind: EffectKind::WinMagicDnsRecovery,
+                    key: magic,
+                    observation: obs,
+                    origin: FoundBy::PrefixOnly,
+                });
+            }
+            for row in query(json!({"op":"drivers"}))
+                .await
+                .map_err(WinError::reclaim)?
+            {
+                let name = string(&row, "name").map_err(WinError::reclaim)?;
+                if !["wintun", "WinDivert"]
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(name))
+                {
+                    continue;
+                }
+                let object = ObjectKey::Service { name: name.into() };
+                found.push(FoundObject {
+                    kind: EffectKind::Driver,
+                    key: object.clone(),
+                    observation: observation(None, object, "shared EasyTier driver".into()),
+                    origin: FoundBy::PrefixOnly,
                 });
             }
             Ok(found)
@@ -864,11 +990,15 @@ pub(crate) fn adapters(config: &OsConfig) -> Result<OsAdapters, OsError> {
         EffectKind::Driver,
     ]
     .into_iter()
-    .map(|kind| Arc::new(WindowsReclaimer(kind)) as Arc<dyn Reclaimer>)
+    .map(|kind| {
+        Arc::new(WindowsReclaimer(kind, config.core_store_dir.clone())) as Arc<dyn Reclaimer>
+    })
     .collect();
     Ok(OsAdapters {
         reclaimers,
-        sweeper: Arc::new(WindowsSweeper),
+        sweeper: Arc::new(WindowsSweeper {
+            core_store_dir: config.core_store_dir.clone(),
+        }),
         boot_id: Arc::new(WindowsBoot),
         observer: Arc::new(WindowsObserver {
             run_dir: config.run_dir.clone(),

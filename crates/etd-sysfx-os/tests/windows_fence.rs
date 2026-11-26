@@ -76,8 +76,7 @@ async fn privileged_fence() {
         let result = dir.path().join("exit.txt");
         let script = dir.path().join("run.ps1");
         let second_dir = std::env::var("ETD_O1_SECOND_DIR").unwrap();
-        let second_task = std::env::var("ETD_O1_SECOND_TASK").unwrap();
-        std::fs::write(&script,format!("$env:CI='true'\n$env:ETD_O1_SECOND_DIR={}\n$env:ETD_O1_SECOND_TASK={}\n& {} --exact privileged_fence --ignored --nocapture *> {}\n$LASTEXITCODE | Set-Content {}",quote(&second_dir),quote(&second_task),quote(&exe.to_string_lossy()),quote(&log.to_string_lossy()),quote(&result.to_string_lossy()))).unwrap();
+        std::fs::write(&script,format!("$env:CI='true'\n$env:ETD_O1_SECOND_DIR={}\n& {} --exact privileged_fence --ignored --nocapture *> {}\n$LASTEXITCODE | Set-Content {}",quote(&second_dir),quote(&exe.to_string_lossy()),quote(&log.to_string_lossy()),quote(&result.to_string_lossy()))).unwrap();
         let task = format!("ETD-O1-System-{}", uuid::Uuid::new_v4());
         ps(&format!(
             "$ErrorActionPreference='Stop'; $a=New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{}\"'; $p=New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest; Register-ScheduledTask -TaskName '{task}' -Action $a -Principal $p | Out-Null; Start-ScheduledTask -TaskName '{task}'",
@@ -127,11 +126,10 @@ async fn privileged_fence() {
         let intent = fence.plan(&spec);
         let second = || {
             let folder = std::path::PathBuf::from(std::env::var("ETD_O1_SECOND_DIR").unwrap());
-            let file = folder.join("verdict.txt");
+            let file = folder.join("results/verdict.txt");
             let _ = std::fs::remove_file(&file);
-            std::fs::write(folder.join("endpoint.txt"), addr.to_string()).unwrap();
-            let task = std::env::var("ETD_O1_SECOND_TASK").unwrap();
-            ps(&format!("Start-ScheduledTask -TaskName {}", quote(&task)));
+            std::fs::write(folder.join("endpoint.tmp"), addr.to_string()).unwrap();
+            std::fs::rename(folder.join("endpoint.tmp"), folder.join("endpoint.txt")).unwrap();
             let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 if let Ok(s) = std::fs::read_to_string(&file)

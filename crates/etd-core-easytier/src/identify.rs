@@ -16,6 +16,25 @@ const PROGRAM: &str = "easytier-core";
 /// Output beyond this is not a version line.
 const MAX_OUTPUT: usize = 4096;
 
+#[cfg(windows)]
+fn spawn_directory(directory: &Path) -> std::path::PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Component, Prefix};
+    let units: Vec<_> = directory.as_os_str().encode_wide().collect();
+    // CreateProcess accepts ordinary short DOS paths most consistently.
+    // Preserve verbatim UNC, volume GUID and long paths rather than changing
+    // their namespace or truncating beyond MAX_PATH.
+    if matches!(directory.components().next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_)))
+        && units.len() >= 4
+        && units.len() - 4 < 260
+    {
+        std::path::PathBuf::from(std::ffi::OsString::from_wide(&units[4..]))
+    } else {
+        directory.to_owned()
+    }
+}
+
 pub async fn identify(binary: &Path) -> Result<CoreDescriptor, CoreError> {
     // The executable and its companions live in the verified bundle.
     // Do not inherit the installer/maintenance caller's working directory:
@@ -25,6 +44,8 @@ pub async fn identify(binary: &Path) -> Result<CoreDescriptor, CoreError> {
     let bundle = binary
         .parent()
         .ok_or_else(|| CoreError::Identify("kernel has no bundle directory".into()))?;
+    #[cfg(windows)]
+    let bundle = spawn_directory(bundle);
     let mut command = tokio::process::Command::new(&binary);
     command
         .current_dir(bundle)
@@ -41,10 +62,9 @@ pub async fn identify(binary: &Path) -> Result<CoreDescriptor, CoreError> {
     command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
     #[cfg(windows)]
     {
-        let root = std::env::var_os("SystemRoot")
-            .filter(|value| !value.is_empty())
-            .or_else(|| std::env::var_os("windir").filter(|value| !value.is_empty()))
-            .ok_or_else(|| CoreError::Identify("missing Windows system root".into()))?;
+        let root = etd_proc::trusted_system_root().map_err(|error| {
+            CoreError::Identify(format!("cannot query Windows system root: {error}"))
+        })?;
         let root_path = std::path::PathBuf::from(&root);
         let path = std::env::join_paths([
             root_path.join("System32"),
@@ -146,6 +166,38 @@ fn revision_of(describe: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn spawn_directory_preserves_unc_and_long_verbatim_paths() {
+        use std::os::windows::process::CommandExt;
+        use std::path::PathBuf;
+        assert_eq!(
+            spawn_directory(Path::new(r"\\?\C:\short\bundle")),
+            PathBuf::from(r"C:\short\bundle")
+        );
+        let unc = Path::new(r"\\?\UNC\server\share\bundle");
+        assert_eq!(spawn_directory(unc), unc);
+
+        // Verify CreateProcessW accepts the long verbatim cwd as well.
+        // This is an inert, windowless system command, never a kernel launch.
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let mut long = root;
+        for _ in 0..5 {
+            long.push("etd-cb-long-bundle-directory-segment-0123456789abcdef0123456789");
+        }
+        std::fs::create_dir_all(&long).unwrap();
+        let cwd = spawn_directory(&long);
+        assert_eq!(cwd, long);
+        let system = PathBuf::from(etd_proc::trusted_system_root().unwrap());
+        let output = std::process::Command::new(system.join("System32").join("whoami.exe"))
+            .current_dir(cwd)
+            .creation_flags(0x0800_0000)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    }
 
     fn parse(text: &str) -> (String, String) {
         let core = parse_version_output(text).unwrap();

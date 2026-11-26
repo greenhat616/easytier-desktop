@@ -321,6 +321,81 @@ fn group_entry(class: SystemClass, group: &str, name: &str, description: String)
     )
 }
 
+// Read process identities from libproc. Starting a short-lived ps would
+// introduce an extra process in every before/after system diff.
+fn processes() -> io::Result<Vec<SystemEntry>> {
+    let mut capacity = 512usize;
+    let pids = loop {
+        let mut pids = vec![0i32; capacity];
+        let bytes =
+            i32::try_from(std::mem::size_of_val(pids.as_slice())).map_err(io::Error::other)?;
+        // SAFETY: libproc writes at most bytes to the initialized pid buffer.
+        let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+        if count <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if (count as usize) < capacity {
+            pids.truncate(count as usize);
+            break pids;
+        }
+        capacity = capacity
+            .checked_mul(2)
+            .ok_or_else(|| io::Error::other("PID list too large"))?;
+    };
+    let mut entries = Vec::new();
+    for pid in pids.into_iter().filter(|&pid| pid > 0) {
+        // SAFETY: proc_bsdinfo consists of integer and fixed-size array fields.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of_val(&info) as i32;
+        let count = unsafe {
+            libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size)
+        };
+        if count != size {
+            let e = io::Error::last_os_error();
+            if count <= 0 && e.raw_os_error() == Some(libc::ESRCH) {
+                continue;
+            }
+            return Err(io::Error::other(format!(
+                "cannot read process identity for {pid}: {e}"
+            )));
+        }
+        let name = if info.pbi_name[0] == 0 {
+            &info.pbi_comm[..]
+        } else {
+            &info.pbi_name[..]
+        };
+        let bytes: Vec<_> = name
+            .iter()
+            .copied()
+            .take_while(|&c| c != 0)
+            .map(|c| c as u8)
+            .collect();
+        let name = String::from_utf8_lossy(&bytes).into_owned();
+        let mut path = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        let got = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
+        let exe = if got > 0 {
+            use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+            PathBuf::from(OsStr::from_bytes(&path[..got as usize]))
+        } else {
+            PathBuf::from(&name)
+        };
+        let start = info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec;
+        entries.push(entry(
+            SystemClass::Processes,
+            ObjectKey::Process {
+                exe,
+                cmdline_marker: PathBuf::new(),
+            },
+            Some(Credential::Process {
+                pid: pid as u32,
+                start_token: start.to_string(),
+            }),
+            name,
+        ));
+    }
+    Ok(entries)
+}
+
 fn enumerate(class: SystemClass, run_dir: &Path) -> io::Result<Vec<SystemEntry>> {
     let mut result = vec![];
     match class {
@@ -335,26 +410,51 @@ fn enumerate(class: SystemClass, run_dir: &Path) -> io::Result<Vec<SystemEntry>>
             }
         }
         SystemClass::Routes => {
+            let links = interfaces()?;
             for (iface, desc) in routes()? {
+                let identity = links.get(&iface).map(|i| i.credential.clone());
                 result.push(entry(
                     class,
                     ObjectKey::RoutesVia {
                         interface: Some(iface),
                     },
-                    None,
+                    identity,
                     desc,
                 ));
             }
         }
         SystemClass::FirewallRules => {
-            // Enumerate global and recursive rules as well as product identities.
-            for anchor in ["", "*"] {
+            // Include each anchor's actual table membership in consistency diffs.
+            let anchors = output(command("/sbin/pfctl").args(["-v", "-s", "Anchors"]))?;
+            for anchor in
+                std::iter::once("").chain(anchors.lines().map(str::trim).filter(|s| !s.is_empty()))
+            {
                 for kind in ["rules", "nat", "Tables"] {
                     let mut cmd = command("/sbin/pfctl");
                     if !anchor.is_empty() {
                         cmd.args(["-a", anchor]);
                     }
                     for (i, line) in output(cmd.args(["-s", kind]))?.lines().enumerate() {
+                        if kind == "Tables" {
+                            let table = line.trim();
+                            let mut query = command("/sbin/pfctl");
+                            if !anchor.is_empty() {
+                                query.args(["-a", anchor]);
+                            }
+                            let mut addresses: Vec<_> =
+                                output(query.args(["-t", table, "-T", "show"]))?
+                                    .lines()
+                                    .map(|s| s.trim().to_owned())
+                                    .collect();
+                            addresses.sort();
+                            result.push(group_entry(
+                                class,
+                                anchor,
+                                &format!("table-{table}"),
+                                addresses.join("\n"),
+                            ));
+                            continue;
+                        }
                         result.push(group_entry(
                             class,
                             anchor,
@@ -420,28 +520,7 @@ fn enumerate(class: SystemClass, run_dir: &Path) -> io::Result<Vec<SystemEntry>>
                 }
             }
         }
-        SystemClass::Processes => {
-            // comm contains the executable, not the potentially secret argv.
-            for line in output(command("/bin/ps").args(["-axo", "pid=,lstart=,comm="]))?.lines() {
-                let fields: Vec<_> = line.split_whitespace().collect();
-                if fields.len() < 7 {
-                    return Err(io::Error::other("malformed process row"));
-                }
-                let pid = fields[0].parse::<u32>().map_err(io::Error::other)?;
-                result.push(entry(
-                    class,
-                    ObjectKey::Process {
-                        exe: PathBuf::from(fields[6..].join(" ")),
-                        cmdline_marker: PathBuf::new(),
-                    },
-                    Some(Credential::Process {
-                        pid,
-                        start_token: fields[1..6].join(" "),
-                    }),
-                    fields[6..].join(" "),
-                ));
-            }
-        }
+        SystemClass::Processes => return processes(),
         SystemClass::Services => {
             for line in output(command("/bin/launchctl").arg("list"))?
                 .lines()

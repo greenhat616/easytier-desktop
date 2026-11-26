@@ -277,7 +277,14 @@ fn token(path: &std::path::Path) -> io::Result<Option<String>> {
     }
     let contents = fs::read_to_string(path)?;
     let mut lines = contents.lines();
-    if lines.next() != Some(&format!("boot {}", boot()?.0)) || lines.all(|l| l.trim().is_empty()) {
+    let Some(header) = lines.next() else {
+        return Ok(None);
+    };
+    let recorded = header
+        .strip_prefix("boot ")
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .ok_or_else(|| io::Error::other("invalid PF receipt boot identity"))?;
+    if recorded.to_string() != boot()?.0 || lines.all(|l| l.trim().is_empty()) {
         return Ok(None);
     }
     let token = contents

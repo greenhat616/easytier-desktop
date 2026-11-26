@@ -77,6 +77,21 @@ async fn owned_control_socket_and_verify_only_reclaim() {
     })
     .unwrap();
     let (socket, name) = utun();
+    for class in [
+        SystemClass::Processes,
+        SystemClass::Services,
+        SystemClass::Routes,
+        SystemClass::Interfaces,
+        SystemClass::FirewallRules,
+        SystemClass::RuntimeDirs,
+        SystemClass::RegistryValues,
+    ] {
+        let entries = adapters.observer.enumerate(class).await.unwrap();
+        assert!(entries.iter().all(|e| e.class == class));
+        if class == SystemClass::Processes {
+            assert!(entries.iter().any(|e|matches!(e.identity,Some(Credential::Process{pid,..}) if pid==std::process::id())));
+        }
+    }
     assert!(
         Command::new("/sbin/ifconfig")
             .args([&name, "inet", "192.0.2.41", "192.0.2.42", "up"])

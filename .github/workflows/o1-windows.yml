@@ -1,12 +1,18 @@
 name: O1 Windows privileged adapters
 on:
   push:
-    branches: [wbs/O1-windows]
+    branches: [main]
     paths:
-      - 'crates/etd-sysfx-os/src/windows/**'
-      - 'crates/etd-sysfx-os/tests/windows_*.rs'
-      - '.github/workflows/o1-windows.yml'
+      - 'crates/**'
+      - 'xtask/**'
+      - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'packaging/cores.toml'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - '.config/**'
+      - '.github/scripts/**'
+      - '.github/workflows/**'
   workflow_dispatch:
 
 permissions:

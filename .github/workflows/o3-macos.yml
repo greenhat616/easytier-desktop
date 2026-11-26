@@ -1,12 +1,18 @@
 name: O3 macOS system adapter
 on:
   push:
-    branches: [wbs/O3-macos]
+    branches: [main]
     paths:
-      - 'crates/etd-sysfx-os/src/macos/**'
-      - 'crates/etd-sysfx-os/src/service/unix.rs'
-      - 'crates/etd-sysfx-os/tests/macos_*.rs'
-      - '.github/workflows/o3-macos.yml'
+      - 'crates/**'
+      - 'xtask/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'packaging/cores.toml'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - '.config/**'
+      - '.github/scripts/**'
+      - '.github/workflows/**'
   workflow_dispatch:
 
 permissions:

@@ -1,0 +1,365 @@
+use super::*;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+pub(super) const NFT: &str = "/usr/sbin/nft";
+const PREFIX: &str = "etd_f_";
+const MARK: &str = "easytier-desk rpc fence v1";
+const CHAIN: &str = "output";
+fn object(spec: &FenceSpec) -> ObjectKey {
+    let generation = format!("{}:{}", spec.instance.as_str(), spec.epoch.0);
+    let id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, generation.as_bytes()).simple();
+    let port = spec.address.port();
+    ObjectKey::Fence {
+        container: format!("{PREFIX}{id}_{port}"),
+        rule: CHAIN.into(),
+        port,
+    }
+}
+fn parse_table(name: &str) -> Option<u16> {
+    let (id, suffix) = name.strip_prefix(PREFIX)?.split_once('_')?;
+    if id.len() != 32
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return None;
+    }
+    let port = suffix.parse::<u16>().ok()?;
+    (port > 0 && port.to_string() == suffix).then_some(port)
+}
+fn parts(key: &ObjectKey) -> io::Result<(&str, u16)> {
+    match key {
+        ObjectKey::Fence {
+            container,
+            rule,
+            port,
+        } if rule == CHAIN && parse_table(container) == Some(*port) => Ok((container, *port)),
+        _ => Err(other("invalid Linux fence key")),
+    }
+}
+fn validate(spec: &FenceSpec) -> Result<(), FenceError> {
+    if spec.address.port() == 0
+        || ![
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Ipv6Addr::LOCALHOST.into(),
+        ]
+        .contains(&spec.address.ip())
+    {
+        return Err(FenceError::Unsupported(
+            "expected a canonical loopback endpoint with a fixed port".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) async fn ruleset() -> io::Result<Vec<Value>> {
+    let value = json(NFT, &["-j", "-a", "-n", "list", "ruleset"]).await?;
+    Ok(rows(&value["nftables"])?.clone())
+}
+struct Table {
+    handle: u64,
+    rules: [u64; 2],
+    packets: [u64; 2],
+}
+impl Table {
+    fn observation(&self, key: &ObjectKey, name: &str) -> Observation {
+        observed(
+            key,
+            Credential::ExclusiveContainer {
+                container: name.into(),
+            },
+            Some(format!(
+                "inet table handle {}, IPv4/IPv6 rule handles {:?}",
+                self.handle, self.rules
+            )),
+        )
+    }
+}
+// Read the marker, chain and both generation-specific rule handles in one
+// dump. Mere presence of a table with a product-looking name grants nothing.
+fn inspect(all: &[Value], name: &str) -> io::Result<Option<Table>> {
+    let Some(table) = all
+        .iter()
+        .map(|e| &e["table"])
+        .find(|t| t["family"] == "inet" && t["name"] == name)
+    else {
+        return Ok(None);
+    };
+    if table["comment"] != MARK {
+        return Err(other("nft table ownership marker differs"));
+    }
+    let handle = table["handle"]
+        .as_u64()
+        .ok_or_else(|| other("missing table handle"))?;
+    let mut rules = [0; 2];
+    let mut packets = [0; 2];
+    let mut chain = false;
+    for row in all {
+        let (kind, item) = row
+            .as_object()
+            .and_then(|o| o.iter().next())
+            .ok_or_else(|| other("invalid nft object"))?;
+        if item["family"] != "inet" || item["table"] != name {
+            continue;
+        }
+        match kind.as_str() {
+            "chain"
+                if item["name"] == CHAIN
+                    && item["type"] == "filter"
+                    && item["hook"] == "output"
+                    && item["prio"] == -150
+                    && item["policy"] == "accept" =>
+            {
+                chain = true
+            }
+            "rule" if item["chain"] == CHAIN => {
+                let slot = match item["comment"].as_str() {
+                    Some("etd-rpc-v4") => 0,
+                    Some("etd-rpc-v6") => 1,
+                    _ => return Err(other("unexpected nft rule")),
+                };
+                if rules[slot] != 0 {
+                    return Err(other("duplicate nft rule"));
+                }
+                rules[slot] = item["handle"]
+                    .as_u64()
+                    .ok_or_else(|| other("missing nft rule handle"))?;
+                packets[slot] = rows(&item["expr"])?
+                    .iter()
+                    .find_map(|e| e["counter"]["packets"].as_u64())
+                    .ok_or_else(|| other("missing nft counter"))?;
+            }
+            _ => return Err(other("foreign object in fence table")),
+        }
+    }
+    if !chain || rules.contains(&0) {
+        return Err(other("incomplete fence table"));
+    }
+    Ok(Some(Table {
+        handle,
+        rules,
+        packets,
+    }))
+}
+pub(super) async fn observe(key: &ObjectKey) -> io::Result<Option<Observation>> {
+    let (name, _) = parts(key)?;
+    Ok(inspect(&ruleset().await?, name)?.map(|t| t.observation(key, name)))
+}
+pub(super) async fn sweep() -> io::Result<Vec<FoundObject>> {
+    let all = ruleset().await?;
+    let mut found = Vec::new();
+    for row in &all {
+        let t = &row["table"];
+        if t["family"] != "inet" {
+            continue;
+        }
+        let Some(name) = t["name"].as_str() else {
+            continue;
+        };
+        let Some(port) = parse_table(name) else {
+            continue;
+        };
+        if t["comment"] != MARK {
+            continue;
+        }
+        if let Some(table) = inspect(&all, name)? {
+            let key = ObjectKey::Fence {
+                container: name.into(),
+                rule: CHAIN.into(),
+                port,
+            };
+            found.push(FoundObject {
+                kind: EffectKind::LinuxFenceRule,
+                observation: table.observation(&key, name),
+                key,
+                origin: FoundBy::ExclusiveContainer,
+            });
+        }
+    }
+    Ok(found)
+}
+pub(super) async fn remove(key: &ObjectKey) -> Result<Reclaimed, ReclaimError> {
+    let (table, port) = parts(key).map_err(uncertain)?;
+    let Some(t) = inspect(&ruleset().await.map_err(uncertain)?, table).map_err(uncertain)? else {
+        return Ok(Reclaimed::AlreadyAbsent);
+    };
+    for addr in [
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+    ] {
+        if !network::sockets(addr).map_err(uncertain)?.is_empty() {
+            return Err(ReclaimError::Busy(
+                "protected port still has a listener".into(),
+            ));
+        }
+    }
+    run(
+        NFT,
+        &["delete", "table", "inet", "handle", &t.handle.to_string()],
+    )
+    .await
+    .map_err(uncertain)?;
+    Ok(Reclaimed::Removed)
+}
+fn error(e: impl std::fmt::Display) -> FenceError {
+    FenceError::Os {
+        code: -1,
+        message: e.to_string(),
+    }
+}
+async fn host(addr: SocketAddr) -> DirectionResult {
+    match tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(addr)).await {
+        Ok(Ok(_)) => DirectionResult::Connected,
+        Ok(Err(e)) => DirectionResult::Error(e.to_string()),
+        Err(_) => DirectionResult::Error("timeout".into()),
+    }
+}
+// Exit codes alone cannot distinguish failure to exec from a TCP refusal.
+// Only ECONNREFUSED on a socket created after dropping privileges counts.
+async fn dropped(addr: SocketAddr) -> Result<DirectionResult, FenceError> {
+    const PROBE: &str = r#"import errno, os, socket, sys
+assert os.geteuid() == 65534 and os.getegid() == 65534 and not os.getgroups()
+with socket.socket(socket.AF_INET6 if ':' in sys.argv[1] else socket.AF_INET) as s:
+    s.settimeout(2)
+    rc = s.connect_ex((sys.argv[1], int(sys.argv[2])))
+    print('refused' if rc == errno.ECONNREFUSED else 'connected' if rc == 0 else str(rc))"#;
+    let out = run(
+        "/usr/bin/setpriv",
+        &[
+            "--reuid=65534",
+            "--regid=65534",
+            "--clear-groups",
+            "--no-new-privs",
+            "--inh-caps=-all",
+            "--ambient-caps=-all",
+            "--bounding-set=-all",
+            "/usr/bin/python3",
+            "-I",
+            "-S",
+            "-c",
+            PROBE,
+            &addr.ip().to_string(),
+            &addr.port().to_string(),
+        ],
+    )
+    .await
+    .map_err(|e| FenceError::Probe(e.to_string()))?;
+    Ok(match out.trim() {
+        "refused" => DirectionResult::Refused,
+        "connected" => DirectionResult::Connected,
+        v => DirectionResult::Error(v.into()),
+    })
+}
+
+#[async_trait]
+impl PortFence for Linux {
+    fn plan(&self, spec: &FenceSpec) -> EffectIntent {
+        EffectIntent {
+            scope: EffectScope::Instance {
+                instance: spec.instance.clone(),
+                epoch: spec.epoch,
+            },
+            kind: EffectKind::LinuxFenceRule,
+            key: object(spec),
+            undo: Undo::EnsureAbsent,
+            persistence: Persistence::Persistent,
+        }
+    }
+    async fn install(&self, spec: &FenceSpec) -> Result<Observation, FenceError> {
+        validate(spec)?;
+        if !nix::unistd::Uid::effective().is_root() {
+            return Err(FenceError::PermissionDenied(
+                "RPC fence requires the root host identity".into(),
+            ));
+        }
+        let key = object(spec);
+        let (name, port) = parts(&key).map_err(error)?;
+        // create (exclusive), chain and rules are one netlink transaction.
+        // A retry after a successful install adopts only a marked container.
+        let transaction = format!(
+            r#"create table inet {name} {{ comment "{MARK}"; }}
+add chain inet {name} output {{ type filter hook output priority -150; policy accept; }}
+add rule inet {name} output ip daddr 127.0.0.1 tcp dport {port} meta skuid != 0 counter reject with tcp reset comment "etd-rpc-v4"
+add rule inet {name} output ip6 daddr ::1 tcp dport {port} meta skuid != 0 counter reject with tcp reset comment "etd-rpc-v6""#
+        );
+        let result = run(NFT, &[&transaction]).await;
+        observe(&key).await.map_err(error)?.ok_or_else(|| {
+            error(result.err().map_or_else(
+                || "fence missing after install".to_string(),
+                |e| e.to_string(),
+            ))
+        })
+    }
+    async fn verify(&self, spec: &FenceSpec, pid: u32) -> Result<FenceVerification, FenceError> {
+        validate(spec)?;
+        let addr = spec.address;
+        let key = object(spec);
+        let (name, _) = parts(&key).map_err(error)?;
+        let before = inspect(&ruleset().await.map_err(error)?, name)
+            .map_err(error)?
+            .ok_or_else(|| error("missing fence"))?;
+        let check = |found: io::Result<Option<ListenerInfo>>| match found {
+            Ok(Some(l)) if l.pid == pid => ListenerCheck::Expected,
+            Ok(Some(l)) => ListenerCheck::Other { pid: l.pid },
+            Ok(None) => ListenerCheck::NotListening,
+            Err(e) => ListenerCheck::Indeterminate(e.to_string()),
+        };
+        let mut result = FenceVerification {
+            listener: check(network::listener(addr)),
+            host: DirectionResult::NoListener,
+            unprivileged: DirectionResult::NoListener,
+        };
+        if result.listener != ListenerCheck::Expected {
+            return Ok(result);
+        }
+        result.host = host(addr).await;
+        if result.host != DirectionResult::Connected {
+            return Ok(result);
+        }
+        result.unprivileged = dropped(addr).await?;
+        result.listener = check(network::listener(addr));
+        result.host = host(addr).await;
+        let after = inspect(&ruleset().await.map_err(error)?, name)
+            .map_err(error)?
+            .ok_or_else(|| error("fence disappeared"))?;
+        let slot = usize::from(addr.is_ipv6());
+        if before.handle != after.handle
+            || before.rules != after.rules
+            || (result.unprivileged == DirectionResult::Refused
+                && after.packets[slot] <= before.packets[slot])
+        {
+            return Err(FenceError::Probe(
+                "refusal not confirmed by this fence".into(),
+            ));
+        }
+        Ok(result)
+    }
+    async fn remove(&self, spec: &FenceSpec) -> Result<Reclaimed, FenceError> {
+        validate(spec)?;
+        remove(&object(spec)).await.map_err(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn fence_names_are_generation_bound_and_grammar_checked() {
+        let mut s = FenceSpec {
+            instance: InstanceId::from("a"),
+            epoch: Epoch(1),
+            address: "[::1]:12345".parse().unwrap(),
+        };
+        let first = object(&s);
+        assert!(parts(&first).is_ok());
+        s.epoch = Epoch(2);
+        assert_ne!(first, object(&s));
+        for name in [
+            "etd_f_123_123",
+            "etd_f_00000000000000000000000000000000_01",
+            "inet filter",
+        ] {
+            assert!(parse_table(name).is_none());
+        }
+    }
+}

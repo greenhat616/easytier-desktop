@@ -1,0 +1,116 @@
+name: O2 Linux
+on:
+  push:
+    branches: [wbs/O2-linux]
+    paths:
+      - crates/etd-sysfx-os/src/linux/**
+      - crates/etd-sysfx-os/tests/linux_*.rs
+      - .github/workflows/o2-linux.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+concurrency:
+  group: o2-linux-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_BUILD_JOBS: '4'
+
+jobs:
+  privileged:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - run: sudo apt-get update && sudo apt-get install -y nftables iproute2 libdbus-1-dev
+      - name: Install pinned protoc
+        shell: pwsh
+        run: ./.github/scripts/setup-protoc.ps1
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          save-if: 'false'
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.152
+      - run: cargo nextest list --locked --profile privileged -p etd-sysfx-os --run-ignored only --test linux_reclaim --test linux_fence
+      - name: Real links, resolved, and nftables
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo useradd --no-create-home --shell /usr/sbin/nologin etd_o2_probe
+          sudo systemctl start systemd-resolved
+          mkdir -p evidence
+          sudo -E env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" ETD_O2_PRIVILEGED=1 "$(command -v cargo)" nextest run --locked --profile privileged -p etd-sysfx-os --run-ignored only --test linux_reclaim --test linux_fence --success-output immediate |& tee evidence/privileged.txt
+      - name: Resolver without resolve1
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -E env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" ETD_O2_PRIVILEGED=1 ETD_O2_NO_RESOLVED=1 dbus-run-session -- bash -ec 'export DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS"; cargo nextest run --locked --profile privileged -p etd-sysfx-os --run-ignored only --test linux_reclaim --success-output immediate' |& tee evidence/other-resolver.txt
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: o2-linux-evidence
+          path: evidence
+
+  core-capability:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: EasyTier/EasyTier
+          ref: c97f36b8d40f3bde7a95cc9ec99fe95fe35a6ff0
+          path: upstream
+      - name: Install pinned protoc
+        shell: pwsh
+        run: ./.github/scripts/setup-protoc.ps1
+      - name: Build the pinned TUN-enabled core
+        run: cargo build --manifest-path upstream/Cargo.toml --locked -p easytier --bin easytier-core --no-default-features --features tun,management
+      - name: Start the core under each identity in a private network namespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d)
+          sudo useradd -M etd_o2_core
+          cp upstream/target/debug/easytier-core "$work/core"
+          cat > "$work/config.toml" <<'EOF'
+          instance_name = "etd-o2-cap"
+          ipv4 = "192.0.2.5/30"
+          dhcp = false
+          listeners = []
+          [network_identity]
+          network_name = "o2-ci"
+          [flags]
+          dev_name = "etd-o2-test"
+          enable_ipv6 = false
+          EOF
+          chmod 755 "$work"
+          for mode in root net_admin none; do
+            mkdir "$work/$mode"
+            sudo chown etd_o2_core "$work/$mode"
+            sudo unshare --net -- bash -se -- "$work" "$mode" <<'EOF'
+          set -euo pipefail
+          cd "$1/$2"
+          ip link set lo up
+          case "$2" in
+            root) as=() ;;
+            net_admin) as=(setpriv --reuid=etd_o2_core --regid=etd_o2_core --clear-groups --inh-caps=-all,+net_admin --ambient-caps=-all,+net_admin --bounding-set=-all,+net_admin) ;;
+            none) as=(setpriv --reuid=etd_o2_core --regid=etd_o2_core --clear-groups --inh-caps=-all --ambient-caps=-all --bounding-set=-all) ;;
+          esac
+          "${as[@]}" ../core -c ../config.toml --rpc-portal 127.0.0.1:15998 --rpc-portal-whitelist 255.255.255.255/32 --file-log-dir . >core.log 2>&1 &
+          core=$!
+          trap 'kill "$core" 2>/dev/null || true; wait "$core" || true' EXIT
+          ready=false
+          for i in {1..100}; do
+            if ip -o -4 addr show | grep -q 'etd-o2-test.*192.0.2.5/30'; then ready=true; break; fi
+            kill -0 "$core" 2>/dev/null || break
+            sleep .1
+          done
+          echo "mode=$2 TUN_with_configured_address=$ready"
+          if [[ -e /proc/$core/status ]]; then grep -E '^(Uid|CapEff):' "/proc/$core/status"; fi
+          case "$2" in root) test "$ready" = true ;; none) test "$ready" = false ;; esac
+          EOF
+          done

@@ -5,6 +5,7 @@ from collections import Counter
 import json
 import os
 import stat
+import time
 from uuid import UUID
 from inventory import WINDOWS_POLICY_GROUPS, WFP_QUARANTINE, WFP_WF
 
@@ -71,6 +72,8 @@ def adapter_defaults(base, live, adapter_indices):
     expected = {}
     iaids = {}
     for guid, index in adapter_indices.items():
+        netbt = rf"HKLM\SYSTEM\CurrentControlSet\Services\NetBT\Parameters\Interfaces\Tcpip_{{{guid}}}\NameServerList"
+        expected[netbt.casefold()] = ["MultiString", []]
         for stack in ("Tcpip", "Tcpip6"):
             prefix = rf"HKLM\SYSTEM\CurrentControlSet\Services\{stack}\Parameters\Interfaces\{{{guid}}}"
             fields = {"EnableDHCP": ["DWord", 0]}
@@ -105,6 +108,36 @@ def runner_noise(base, live):
         if transition == {2, 3} and after == {**before, "Start": after["Start"]}:
             return {key}
     return set()
+
+
+def profile_metadata(base, live, profile_name_key, name, credential):
+    profile = profile_name_key.rsplit("\\", 1)[0]
+    profile_guid = UUID(profile.rsplit("\\", 1)[1])
+    assert profile_guid == UUID(credential), "native profile GUID differs from the ledger"
+    assert profile_name_key.startswith(r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles" + "\\")
+    assert not any(kind == "registry" and path.startswith(profile + "\\") for kind, path in base.rows)
+    nic = live.rows["interface", name]
+    connections = [c for c in live.profile_connections if c["index"] == nic["index"]]
+    assert connections == [{"alias": name, "index": nic["index"], "matches": True}], "native NLA profile/adapter mismatch"
+    print(f"active NLA profile {profile_guid}: adapter={name} GUID={nic['guid']} ifIndex={nic['index']}", flush=True)
+    # Windows NLA creates these only while this specific adapter's profile
+    # exists. At stop and afterwards all five native values must disappear.
+    included = set()
+    description = ("registry", profile + "\\Description")
+    if live.rows.get(description) == live.rows["registry", profile_name_key]:
+        included.add(description)
+    for field, value in (("NameType", 53), ("Managed", 0)):
+        path = profile + "\\" + field
+        if live.registry_values.get(path) == ["DWord", value]:
+            included.add(("registry", path))
+    start = base.captured_at
+    for field in ("DateCreated", "DateLastConnected"):
+        path = profile + "\\" + field
+        stamp = live.registry_values.get(path)
+        if stamp and stamp[0] == "SYSTEMTIME" and start <= stamp[1] <= time.time():
+            included.add(("registry", path))
+            start = stamp[1]
+    return included
 
 
 def system_policy_changes(base, live, phase, retained_app=None, *, fixture_tunnel=False):
@@ -306,6 +339,9 @@ def compare_generation(base, live, records, instance, view, adapter_indices, wor
             matches = {("registry", path) for path, value in live.registry_values.items()
                        if path.endswith("\\ProfileName") and value == ["String", key["profile_name"]]}
             assert len(matches) == 1, f"NetworkList profile for {name}"
+            assert key["profile_name"] == name and ("interface", name) not in base.rows
+            profile_name_key = next(iter(matches))[1]
+            matches.update(profile_metadata(base, live, profile_name_key, name, obs["credential"]["value"]))
         else:
             raise AssertionError(f"unmapped local launch effect {kind}")
         assert matches <= live.rows.keys(), f"predicted but absent: {matches - live.rows.keys()}"

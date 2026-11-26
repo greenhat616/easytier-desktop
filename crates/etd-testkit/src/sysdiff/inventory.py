@@ -2,6 +2,7 @@
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime
 import base64
 import hashlib
 import json
@@ -9,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -57,6 +59,8 @@ class Inventory:
     parents: dict = field(default_factory=dict)
     management_workers: set = field(default_factory=set)
     registry_values: dict = field(default_factory=dict)
+    profile_connections: list = field(default_factory=list)
+    captured_at: float = field(default_factory=time.time)
     policy_filters: dict = field(default_factory=dict)
     quarantine_fields: dict = field(default_factory=dict)
     application_filters: dict = field(default_factory=dict)
@@ -424,6 +428,16 @@ def windows_registry(inv):
                     inv.registry_values[key_name] = ["String", ""]
                 elif name == "ProfileName":
                     inv.registry_values[key_name] = ["String", raw.decode("utf-16-le").removesuffix("\0")]
+            elif name == "NameServerList" and kind.value == winreg.REG_MULTI_SZ and raw in (b"", b"\0\0", b"\0\0\0\0"):
+                inv.registry_values[key_name] = ["MultiString", []]
+            elif name in ("DateCreated", "DateLastConnected") and kind.value == winreg.REG_BINARY and len(raw) == 16:
+                year, month, weekday, day, hour, minute, second, ms = struct.unpack("<8H", raw)
+                try:
+                    stamp = datetime(year, month, day, hour, minute, second, ms * 1000)
+                    if weekday == stamp.isoweekday() % 7:
+                        inv.registry_values[key_name] = ["SYSTEMTIME", stamp.timestamp()]
+                except (ValueError, OSError, OverflowError):
+                    pass  # An invalid native time remains in the strict byte-level diff.
         for index in range(children):
             name = winreg.EnumKey(key, index)
             with winreg.OpenKey(key, name) as child:
@@ -442,6 +456,7 @@ def windows(inv):
     windows_registry(inv)
     data = json.loads(command("powershell.exe", "-NoProfile", "-NonInteractive", "-File",
                               Path(__file__).with_name("windows.ps1"), timeout=180).stdout)
+    inv.profile_connections = data.pop("networkProfiles")
     # Win32_SystemDriver can omit a disabled SCM registration with no
     # loadable image. SCM is authoritative for these two product-wide names.
     for name in ("wintun", "windivert"):

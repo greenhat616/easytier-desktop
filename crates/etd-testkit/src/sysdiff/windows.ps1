@@ -29,6 +29,11 @@ foreach ($nic in Get-NetIPInterface) {
         }
     }
 }
+# Native NLA connection evidence, joined in Python to the adapter GUID and
+# registry profile. Only the name comparison is needed outside PowerShell.
+$inventory.networkProfiles = @(Get-NetConnectionProfile | ForEach-Object {
+    @{ index=$_.InterfaceIndex; alias=$_.InterfaceAlias; matches=($_.Name -ceq $_.InterfaceAlias) }
+})
 Get-NetRoute -PolicyStore ActiveStore | Group-Object InterfaceAlias | ForEach-Object {
     $inventory.route[$_.Name] = @($_.Group | ForEach-Object {
         "$($_.DestinationPrefix) $($_.NextHop) $($_.RouteMetric) $($_.Protocol)"

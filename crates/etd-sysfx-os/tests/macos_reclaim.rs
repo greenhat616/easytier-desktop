@@ -1,13 +1,20 @@
 #![cfg(target_os = "macos")]
 
-use etd_sysfx::*;
-use etd_sysfx_os::{OsConfig, adapters};
+use async_trait::async_trait;
+use etd_contract::{Desired, InstanceId};
+use etd_sysfx::{engine::ReclaimEngineImpl, *};
+use etd_sysfx_os::{OsAdapters, OsConfig, adapters};
+use etd_testkit::{
+    conformance::ledger::{changes, plan, put},
+    fakes::ledger::MemoryLedger,
+};
 use std::{
     ffi::CStr,
     io,
     mem::{size_of, size_of_val},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     process::Command,
+    sync::Arc,
     time::Duration,
 };
 
@@ -266,5 +273,260 @@ async fn owned_control_socket_and_verify_only_reclaim() {
     }
     println!(
         "Observed {name} via PID, verified identity conflicts; kernel reclaimed interface and route after close"
+    );
+}
+
+struct NoIndex;
+impl RepairIndexStore for NoIndex {
+    fn load(&self) -> Result<Option<RepairIndex>, LedgerError> {
+        Ok(None)
+    }
+    fn store(&self, _: &RepairIndex) -> Result<(), LedgerError> {
+        Ok(())
+    }
+}
+
+/// Stands in for the host's process reclaimer: reports the generation's
+/// kernel as the fixture says and never kills anything.
+struct KernelProcess(Probe);
+#[async_trait]
+impl Reclaimer for KernelProcess {
+    fn kind(&self) -> EffectKind {
+        EffectKind::Process
+    }
+    fn rank(&self) -> u8 {
+        EffectKind::Process.default_rank()
+    }
+    async fn probe(&self, _: &Effect) -> Probe {
+        self.0.clone()
+    }
+    async fn reclaim(&self, _: &Effect) -> Result<Reclaimed, ReclaimError> {
+        Err(ReclaimError::Busy("kernel still running".into()))
+    }
+}
+
+const INSTANCE: &str = "mf-unnamed";
+
+fn unnamed_utun_intents() -> Vec<EffectIntent> {
+    let scope = EffectScope::Instance {
+        instance: InstanceId::from(INSTANCE),
+        epoch: Epoch(1),
+    };
+    [
+        (
+            EffectKind::MacUtun,
+            ObjectKey::Interface {
+                name: None,
+                guid: None,
+            },
+        ),
+        (EffectKind::Route, ObjectKey::RoutesVia { interface: None }),
+    ]
+    .into_iter()
+    .map(|(kind, key)| EffectIntent {
+        scope: scope.clone(),
+        kind,
+        key,
+        undo: Undo::EnsureAbsent,
+        persistence: Persistence::WithProcess,
+    })
+    .collect()
+}
+
+/// A generation planned with its kernel, utun and route, all still
+/// `Planned`: the kernel exited before its utun name was read back.
+async fn planned_generation(os: &OsAdapters) -> Arc<MemoryLedger> {
+    let ledger = Arc::new(MemoryLedger::new(os.boot_id.current().unwrap()));
+    let mut generation = plan(INSTANCE, 1, &[]);
+    generation.effects.extend(unnamed_utun_intents());
+    ledger
+        .commit(
+            0,
+            changes(
+                INSTANCE,
+                1,
+                vec![put(INSTANCE, Desired::Running, &[])],
+                vec![generation],
+            ),
+        )
+        .await
+        .unwrap();
+    ledger
+}
+
+fn engine(os: OsAdapters, ledger: Arc<MemoryLedger>, kernel: Probe) -> ReclaimEngineImpl {
+    let mut reclaimers = os.reclaimers;
+    reclaimers.push(Arc::new(KernelProcess(kernel)));
+    ReclaimEngineImpl::new(ReclaimDeps {
+        ledger,
+        reclaimers,
+        sweeper: os.sweeper,
+        boot_id: os.boot_id,
+        repair_index: Arc::new(NoIndex),
+    })
+}
+
+fn os_adapters(dir: &tempfile::TempDir) -> OsAdapters {
+    adapters(&OsConfig {
+        state_dir: dir.path().into(),
+        run_dir: dir.path().join("run"),
+        core_store_dir: std::env::current_exe().unwrap().parent().unwrap().into(),
+    })
+    .unwrap()
+}
+
+/// G2 (topic#42 msg#1081): the kernel died before readiness, leaving a
+/// MacUtun and a route record with no name and no credential. Once its
+/// process record closes, both close as already absent; an unrelated utun
+/// held by another process is left alone.
+#[tokio::test]
+#[ignore = "disposable macOS runner with allocated utun"]
+async fn unnamed_utun_records_close_after_the_kernel_died_before_readiness() {
+    assert_eq!(std::env::var("ETD_O3_CI").as_deref(), Ok("1"));
+    let dir = tempfile::tempdir().unwrap();
+    let os = os_adapters(&dir);
+    let ledger = planned_generation(&os).await;
+    let (_unrelated, name) = utun(0);
+    let observer = os.observer.clone();
+    let engine = engine(os, ledger.clone(), Probe::Absent);
+    let report = engine
+        .reclaim_generation(&InstanceId::from(INSTANCE), Epoch(1))
+        .await
+        .unwrap();
+    let open = ledger.open_effects(&ScopeFilter::all()).await.unwrap();
+    assert!(open.is_empty(), "{report:?} {open:?}");
+    assert!(
+        observer
+            .interface(&ObjectKey::Interface {
+                name: Some(name.clone()),
+                guid: None,
+            })
+            .await
+            .unwrap()
+            .is_some(),
+        "unrelated {name} must survive"
+    );
+    println!("Unnamed utun and route records closed after the kernel died; {name} untouched");
+}
+
+/// While the generation's kernel process record is still open (kernel may
+/// be alive), the unnamed utun and route records are not touched.
+#[tokio::test]
+#[ignore = "disposable macOS runner with allocated utun"]
+async fn unnamed_utun_records_wait_while_the_kernel_may_be_alive() {
+    assert_eq!(std::env::var("ETD_O3_CI").as_deref(), Ok("1"));
+    let dir = tempfile::tempdir().unwrap();
+    let os = os_adapters(&dir);
+    let ledger = planned_generation(&os).await;
+    let engine = engine(
+        os,
+        ledger.clone(),
+        Probe::Indeterminate("liveness unknown".into()),
+    );
+    engine
+        .reclaim_generation(&InstanceId::from(INSTANCE), Epoch(1))
+        .await
+        .unwrap();
+    let open = ledger.open_effects(&ScopeFilter::all()).await.unwrap();
+    for kind in [EffectKind::MacUtun, EffectKind::Route] {
+        let e = open.iter().find(|e| e.kind == kind).unwrap();
+        assert_eq!((e.state, e.failures), (EffectState::Planned, 0), "{e:?}");
+    }
+    println!("Unnamed utun and route records untouched while the kernel record is open");
+}
+
+/// Independent of the engine's order: a live process of the generation
+/// (its `-c` configuration lies in the generation's runtime directory) that
+/// holds a utun control socket keeps the unnamed records indeterminate;
+/// once it is gone they probe absent.
+#[tokio::test]
+#[ignore = "disposable macOS runner with allocated utun"]
+async fn unnamed_utun_held_by_a_live_generation_process_is_indeterminate() {
+    assert_eq!(std::env::var("ETD_O3_CI").as_deref(), Ok("1"));
+    if let Some(marker) = std::env::var_os("ETD_MF_UTUN_HOLDER") {
+        let (_socket, name) = utun(0);
+        std::fs::write(marker, name).unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let os = os_adapters(&dir);
+    let epoch_dir = dir.path().join("run").join(INSTANCE).join("1");
+    std::fs::create_dir_all(&epoch_dir).unwrap();
+    let marker = dir.path().join("holder-ready");
+    struct Fixture(std::process::Child);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    // Arguments after `--` are extra test-name filters to libtest; the
+    // kernel-style `-c <config>` pair is what identifies the generation.
+    let mut holder = Fixture(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "unnamed_utun_held_by_a_live_generation_process_is_indeterminate",
+                "--",
+                "-c",
+            ])
+            .arg(epoch_dir.join("config.toml"))
+            .env("ETD_MF_UTUN_HOLDER", &marker)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(holder.0.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let name = std::fs::read_to_string(&marker).unwrap();
+    let pid = holder.0.id().to_string();
+    let effects: Vec<Effect> = unnamed_utun_intents()
+        .into_iter()
+        .map(|i| Effect {
+            id: EffectId(i.kind.to_string()),
+            kind: i.kind,
+            key: i.key,
+            scope: i.scope,
+            undo: i.undo,
+            persistence: i.persistence,
+            state: EffectState::Reclaiming,
+            boot: os.boot_id.current().unwrap(),
+            observation: None,
+            failures: 0,
+            last_error: None,
+            recorded_at: jiff::Timestamp::now(),
+        })
+        .collect();
+    for e in &effects {
+        let r = os.reclaimers.iter().find(|r| r.kind() == e.kind).unwrap();
+        let probe = r.probe(e).await;
+        assert!(
+            matches!(&probe, Probe::Indeterminate(m) if m.contains(&pid)),
+            "{} while PID {pid} holds {name}: {probe:?}",
+            e.kind
+        );
+        assert!(matches!(
+            r.reclaim(e).await,
+            Err(ReclaimError::Indeterminate(_))
+        ));
+    }
+    holder.0.kill().unwrap();
+    holder.0.wait().unwrap();
+    for e in &effects {
+        let r = os.reclaimers.iter().find(|r| r.kind() == e.kind).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while !matches!(r.probe(e).await, Probe::Absent) {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(r.reclaim(e).await.unwrap(), Reclaimed::AlreadyAbsent);
+    }
+    println!(
+        "Live generation holder of {name} kept unnamed records indeterminate; absent after it exited"
     );
 }

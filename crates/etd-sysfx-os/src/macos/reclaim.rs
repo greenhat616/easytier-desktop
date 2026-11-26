@@ -30,6 +30,9 @@ impl Reclaimer for MacReclaimer {
         if e.kind != self.kind {
             return Probe::Indeterminate("wrong effect kind".into());
         }
+        if let Some(probe) = self.never_read_back(e).await {
+            return probe;
+        }
         match self.observer.observe(self.kind, concrete(e)).await {
             Ok(Some(observed)) => self.check_utun_owner(e, observed).await,
             Ok(None) => Probe::Absent,
@@ -93,7 +96,87 @@ impl Reclaimer for MacReclaimer {
     }
 }
 
+/// A MacUtun or route record whose utun name was never read back: the
+/// kernel died before readiness, so the record holds neither a name nor a
+/// credential.
+fn unnamed_utun(kind: EffectKind, e: &Effect) -> bool {
+    let unnamed = matches!(
+        (kind, concrete(e)),
+        (
+            EffectKind::MacUtun,
+            ObjectKey::Interface {
+                name: None,
+                guid: None,
+            },
+        ) | (EffectKind::Route, ObjectKey::RoutesVia { interface: None })
+    );
+    unnamed
+        && e.observation
+            .as_ref()
+            .is_none_or(|o| o.credential.is_none())
+}
+
+/// Whether any live utun control socket belongs to the generation whose
+/// runtime directory is `epoch`: some holder's `-c` configuration lies
+/// inside it. A holder whose arguments cannot be read counts as ours.
+fn generation_holds_utun(epoch: &std::path::Path) -> std::io::Result<Option<i32>> {
+    for pid in super::observe::utun_control_pids()? {
+        let config = super::holders::generation_config(pid).map_err(|err| {
+            std::io::Error::other(format!("cannot read arguments of utun holder {pid}: {err}"))
+        })?;
+        if config.is_some_and(|c| c.starts_with(epoch)) {
+            return Ok(Some(pid));
+        }
+    }
+    Ok(None)
+}
+
 impl MacReclaimer {
+    /// Darwin destroys a utun, and every route through it, when its last
+    /// control socket closes. A record that never learned its utun's name
+    /// is reached only once every kernel process record of its generation is
+    /// closed (kernel and process group verified dead): the reclaim engine
+    /// handles process records before any other record of a generation
+    /// (ruling msg#567; `run_group` and `delete_gate` in etd-sysfx). As an
+    /// independent check, a live utun control socket held by a process of
+    /// this generation keeps the record indeterminate. Nothing is deleted
+    /// here and no name is guessed.
+    async fn never_read_back(&self, e: &Effect) -> Option<Probe> {
+        if !unnamed_utun(self.kind, e) {
+            return None;
+        }
+        let Some((instance, epoch)) = e.scope.generation() else {
+            return Some(Probe::Indeterminate(
+                "unnamed utun record has no generation".into(),
+            ));
+        };
+        let marker = self
+            .observer
+            .run_dir
+            .join(instance.as_str())
+            .join(epoch.0.to_string());
+        let check = marker.clone();
+        let held = tokio::task::spawn_blocking(move || generation_holds_utun(&check)).await;
+        Some(match held {
+            Ok(Ok(None)) => {
+                tracing::warn!(
+                    effect = %e.id.0,
+                    kind = %self.kind,
+                    instance = instance.as_str(),
+                    epoch = epoch.0,
+                    runtime_dir = %marker.display(),
+                    "utun name was never read back and no process of the generation holds a utun control socket; the utun and its routes are gone"
+                );
+                Probe::Absent
+            }
+            Ok(Ok(Some(pid))) => Probe::Indeterminate(format!(
+                "utun name was never read back and PID {pid} of this generation still holds a utun control socket"
+            )),
+            Ok(Err(err)) => Probe::Indeterminate(err.to_string()),
+            Err(err) => Probe::Indeterminate(err.to_string()),
+        })
+    }
+
     async fn check_utun_owner(&self, e: &Effect, observed: Observation) -> Probe {
         let name = match (self.kind, concrete(e)) {
             (

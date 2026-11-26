@@ -322,6 +322,25 @@ def verify_shared_driver_purge(service, baseline, stopped, inventory, foreign_ke
     assert not delta, f"post-purge native differences: {sorted(delta)}"
 
 
+def driver_registration(name):
+    import winreg
+    def subtree(key):
+        subkeys, values, _ = winreg.QueryInfoKey(key)
+        entries = {}
+        for i in range(values):
+            field, value, kind = winreg.EnumValue(key, i)
+            entries[field] = (kind, value)
+        children = {}
+        for i in range(subkeys):
+            child_name = winreg.EnumKey(key, i)
+            with winreg.OpenKey(key, child_name) as child:
+                children[child_name] = subtree(child)
+        return entries, children
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, rf"SYSTEM\CurrentControlSet\Services\{name}") as key:
+        registry = subtree(key)
+    return registry, command("sc.exe", "sdshow", name).stdout, command("sc.exe", "query", name).stdout
+
+
 @contextmanager
 def disabled_drivers(service, with_images):
     names = {"wintun", "windivert"}
@@ -340,6 +359,7 @@ def disabled_drivers(service, with_images):
                     "binPath=", image)
             stack.callback(command, "sc.exe", "delete", name)
         foreign_state = service.inventory()
+        registrations = {name: driver_registration(name) for name in names}
         for name in sorted(names):
             native = foreign_state.rows.get(("service", name))
             print(f"pre-existing driver {name}: {native}", flush=True)
@@ -348,6 +368,7 @@ def disabled_drivers(service, with_images):
             yield foreign_state
         finally:
             assert_foreign(foreign_state, service.inventory(), {("service", n) for n in names})
+            assert {n: driver_registration(n) for n in names} == registrations, "foreign driver registration changed"
             assert all(file_identity(file) == identity for file, identity in files.items())
             print(f"foreign registrations and {len(files)} driver images preserved", flush=True)
 

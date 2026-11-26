@@ -293,7 +293,6 @@ impl Linux {
                 for l in network::links().await? {
                     if let Credential::UnixInterface { index, .. } = l.credential
                         && let Some(s) = resolved::read(index).await?
-                        && !s.empty()
                     {
                         entries.push(entry(
                             class,

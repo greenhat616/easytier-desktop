@@ -3,7 +3,7 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use zbus::{Connection, Proxy, zvariant::OwnedObjectPath};
+use zbus::{Connection, OwnedObjectPath, Proxy};
 
 const SERVICE: &str = "org.freedesktop.resolve1";
 const MANAGER: &str = "org.freedesktop.resolve1.Manager";
@@ -13,6 +13,9 @@ type Server = (i32, Vec<u8>, u16, String);
 pub(super) struct Settings {
     dns: Vec<Server>,
     domains: Vec<(String, bool)>,
+    default_route: bool,
+    dns_over_tls: String,
+    dnssec: String,
 }
 impl Settings {
     pub(super) fn empty(&self) -> bool {
@@ -23,15 +26,15 @@ impl Settings {
 async fn manager() -> io::Result<Option<Proxy<'static>>> {
     let conn = Connection::system().await.map_err(other)?;
     let bus = zbus::fdo::DBusProxy::new(&conn).await.map_err(other)?;
-    if !bus
-        .name_has_owner(SERVICE.try_into().map_err(other)?)
-        .await
-        .map_err(other)?
-    {
-        return Ok(None);
-    }
+    // Pin the daemon for the entire read/compare/write operation. If it
+    // restarts, a stale snapshot cannot authorize a call to the new owner.
+    let owner = match bus.get_name_owner(SERVICE.try_into().map_err(other)?).await {
+        Ok(owner) => owner,
+        Err(zbus::fdo::Error::NameHasNoOwner(_)) => return Ok(None),
+        Err(err) => return Err(other(err)),
+    };
     Ok(Some(
-        Proxy::new(&conn, SERVICE, "/org/freedesktop/resolve1", MANAGER)
+        Proxy::new(&conn, owner, "/org/freedesktop/resolve1", MANAGER)
             .await
             .map_err(other)?,
     ))
@@ -47,7 +50,7 @@ async fn snapshot(manager: &Proxy<'_>, index: i32) -> io::Result<Option<Settings
     };
     let link = Proxy::new(
         manager.connection(),
-        SERVICE,
+        manager.destination().clone(),
         path,
         "org.freedesktop.resolve1.Link",
     )
@@ -56,6 +59,9 @@ async fn snapshot(manager: &Proxy<'_>, index: i32) -> io::Result<Option<Settings
     Ok(Some(Settings {
         dns: link.get_property("DNSEx").await.map_err(other)?,
         domains: link.get_property("Domains").await.map_err(other)?,
+        default_route: link.get_property("DefaultRoute").await.map_err(other)?,
+        dns_over_tls: link.get_property("DNSOverTLS").await.map_err(other)?,
+        dnssec: link.get_property("DNSSEC").await.map_err(other)?,
     }))
 }
 

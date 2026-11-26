@@ -758,7 +758,35 @@ impl<S: SweepSource> Sweeper for WindowsSweeper<S> {
     ) -> BoxFuture<'a, Result<Vec<FoundObject>, ReclaimError>> {
         Box::pin(async move {
             let mut found = Vec::new();
-            for (key, observation) in class_result("wfp", self.source.wfp().await)? {
+            let magic = ObjectKey::Registry {
+                key: r"HKLM\SOFTWARE\EasyTier\MagicDNS".into(),
+                value: None,
+            };
+            // Each class is one independent, read-only system query (most of
+            // them a PowerShell process): run them together, not one after
+            // another, then interpret them in the fixed order below. The
+            // first failing class, in that order, still fails the sweep.
+            let started = std::time::Instant::now();
+            let (wfp, interfaces, firewall, profiles, registry, magic_found, drivers) = tokio::join!(
+                self.source.wfp(),
+                self.source.interfaces(),
+                sweep_rows(&self.source, "firewall"),
+                sweep_rows(&self.source, "profiles"),
+                async {
+                    match key {
+                        Some(_) => sweep_rows(&self.source, "registry_rows").await.map(Some),
+                        None => Ok(None),
+                    }
+                },
+                self.source.magic(&magic),
+                sweep_rows(&self.source, "drivers"),
+            );
+            tracing::info!(
+                stage = "reclaim.sweep_queries",
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "Windows sweep queries finished"
+            );
+            for (key, observation) in class_result("wfp", wfp)? {
                 found.push(FoundObject {
                     kind: EffectKind::WinFenceFilter,
                     key,
@@ -773,7 +801,7 @@ impl<S: SweepSource> Sweeper for WindowsSweeper<S> {
                     })
                     .unwrap_or(FoundBy::PrefixOnly)
             };
-            for (object, info) in class_result("interfaces", self.source.interfaces().await)? {
+            for (object, info) in class_result("interfaces", interfaces)? {
                 if !owned_name(&info.name) {
                     continue;
                 }
@@ -788,7 +816,7 @@ impl<S: SweepSource> Sweeper for WindowsSweeper<S> {
                     origin: origin(&info.name),
                 });
             }
-            for row in sweep_rows(&self.source, "firewall").await? {
+            for row in firewall? {
                 let Some(name) = sweep_field("firewall", &row, "name") else {
                     continue;
                 };
@@ -851,7 +879,7 @@ impl<S: SweepSource> Sweeper for WindowsSweeper<S> {
                     origin: origin(iface),
                 });
             }
-            for row in sweep_rows(&self.source, "profiles").await? {
+            for row in profiles? {
                 let Some(name) = sweep_field("profiles", &row, "name") else {
                     continue;
                 };
@@ -886,7 +914,7 @@ impl<S: SweepSource> Sweeper for WindowsSweeper<S> {
                         )
                     })
                     .collect();
-                for row in sweep_rows(&self.source, "registry_rows").await? {
+                for row in registry?.unwrap_or_default() {
                     let Some(path) = sweep_field("registry_rows", &row, "key") else {
                         continue;
                     };
@@ -921,11 +949,7 @@ impl<S: SweepSource> Sweeper for WindowsSweeper<S> {
             }
             // Shared upstream objects may have been made by another EasyTier
             // installation. Surface them as candidates, never exclusive.
-            let magic = ObjectKey::Registry {
-                key: r"HKLM\SOFTWARE\EasyTier\MagicDNS".into(),
-                value: None,
-            };
-            if let Some(obs) = class_result("magic", self.source.magic(&magic).await)? {
+            if let Some(obs) = class_result("magic", magic_found)? {
                 found.push(FoundObject {
                     kind: EffectKind::WinMagicDnsRecovery,
                     key: magic,
@@ -933,7 +957,7 @@ impl<S: SweepSource> Sweeper for WindowsSweeper<S> {
                     origin: FoundBy::PrefixOnly,
                 });
             }
-            for row in sweep_rows(&self.source, "drivers").await? {
+            for row in drivers? {
                 let Some(name) = sweep_field("drivers", &row, "name") else {
                     continue;
                 };

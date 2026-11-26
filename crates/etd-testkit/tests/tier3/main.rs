@@ -1,5 +1,6 @@
 //! Each case uses the installed product service on a fresh hosted runner.
 use std::{path::Path, process::Command};
+mod desktop;
 
 fn run_case(case: &str) {
     for (key, expected) in [
@@ -10,6 +11,7 @@ fn run_case(case: &str) {
         assert_eq!(std::env::var(key).as_deref(), Ok(expected), "{key}");
     }
     let mut command = Command::new(std::env::var_os("ETD_G2_PYTHON").expect("CI Python"));
+    command.env("ETD_G2_TEST_IMAGE", std::env::current_exe().unwrap());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

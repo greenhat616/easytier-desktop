@@ -92,6 +92,15 @@ jobs:
           tar -xf $archive -C $stage
           $ext = if ($IsWindows) { '.exe' } else { '' }
           $core = (Resolve-Path "upstream/target/debug/easytier-core$ext").Path
+          if ($IsWindows) {
+            # The upstream x64 distribution ships runtime libraries beside
+            # its executable. Keep them local to the release bundle so the
+            # installed host is tested with the actual service search path.
+            $sidecars = @(Get-ChildItem upstream/easytier/third_party/x86_64 -File |
+              Where-Object { $_.Extension -in '.dll','.sys' })
+            if (!$sidecars.Count) { throw 'Missing upstream Windows runtime libraries' }
+            $sidecars | Copy-Item -Destination (Split-Path -Parent $core) -Force
+          }
           $versionLine = & $core --version
           if ($versionLine -notmatch '^easytier-core (2\.7\.1)-.*c97f36b8(?:-|$)') {
             throw "Unexpected pinned core version: $versionLine"
@@ -105,6 +114,7 @@ jobs:
           cargo build --manifest-path "$stage/Cargo.toml" --target-dir "$target" --locked -p etd-host -p etd-ctl
           $bundle = New-Item -ItemType Directory "$target/debug/cores/$version" -Force
           Copy-Item -LiteralPath $core -Destination $bundle.FullName
+          if ($IsWindows) { $sidecars | Copy-Item -Destination $bundle.FullName }
           if (!$IsWindows) { chmod +x "$bundle/easytier-core" }
           "ETD_G2_BIN=$target/debug" >> $env:GITHUB_ENV
           "ETD_G2_SHA=$digest" >> $env:GITHUB_ENV

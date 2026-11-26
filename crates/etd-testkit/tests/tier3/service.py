@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -103,6 +104,15 @@ class Service:
         finally:
             db.close()
 
+    def receipt(self, tag):
+        uri = (self.state / "ledger.sqlite3").as_uri() + "?mode=ro"
+        db = sqlite3.connect(uri, uri=True)
+        try:
+            row = db.execute("SELECT payload FROM requests WHERE id = ?", (tag,)).fetchone()
+            return json.loads(row[0])["receipt"] if row else None
+        finally:
+            db.close()
+
     def view(self, instance):
         result = command(self.client, "--json", "--timeout", "2", "status", instance, check=False)
         if result.returncode == 3:
@@ -138,3 +148,37 @@ class Service:
                        lambda text: "STOPPED" in text)
             self.call("sc.exe", "start", "easytier-desk-host")
         return target.pid
+
+
+class Desktop:
+    def __init__(self, instance, request, revision, directory):
+        self.env = dict(os.environ, ETD_G2_INSTANCE=instance, ETD_G2_REQUEST=request,
+                        ETD_G2_REVISION=revision)
+        self.directory = Path(directory)
+
+    def args(self, action):
+        path = self.directory / action
+        path.unlink(missing_ok=True)
+        return ([os.environ["ETD_G2_TEST_IMAGE"], "--exact", "desktop::peer", "--nocapture"],
+                dict(self.env, ETD_G2_DESKTOP=action, ETD_G2_REPLY=str(path)), path)
+
+    @contextmanager
+    def connected(self, action):
+        args, env, path = self.args(action)
+        proc = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        try:
+            if action == "hold":
+                eventually("desktop handshake", path.exists, bool)
+            yield
+            assert proc.poll() is None, "desktop exited before the simulated UI crash"
+        finally:
+            proc.kill()
+            proc.wait(timeout=10)
+
+    def read(self, action):
+        args, env, path = self.args(action)
+        result = command(*args, env=env, check=False)
+        if result.returncode:
+            raise AssertionError(f"desktop {action} failed: {result.stderr}")
+        return json.loads(path.read_bytes())

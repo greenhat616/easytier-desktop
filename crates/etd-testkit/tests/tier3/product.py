@@ -9,7 +9,7 @@ import tempfile
 import time
 import uuid
 
-from service import Service, command, eventually, require_runner
+from service import Desktop, Service, command, eventually, require_runner
 from consistency import check_closed, check_generation, installed_image
 from inventory import file_identity
 import foreign
@@ -81,13 +81,16 @@ def recovery():
         baseline = inventory()
         keys.update(key for key in baseline.rows if key[0] == "runtime")
         revision = str(service.ctl("status")["revision"])
-        receipt = service.apply(spec(), instance, request, revision)
-        # The client is gone after the apply. The installed service keeps the
-        # request and the live core, including beyond the user-host lease grace.
+        desktop = Desktop(instance, request, revision, stack.enter_context(tempfile.TemporaryDirectory()))
+        with desktop.connected("apply"):
+            receipt = eventually("durable commit", lambda: service.receipt(request), bool)
+        # Abrupt desktop exit after the durable request does not cancel launch.
         first = service.ready(instance)
         before = inventory()
         check_generation(baseline, before, service.effects(), instance, first)
         assert_foreign(baseline, before, keys)
+        with desktop.connected("hold"):
+            assert desktop.read("logs") > 0
         time.sleep(31)
         assert service.ready(instance)["epoch"] == first["epoch"], "client exit restarted service core"
         for image in (service.core, service.host):
@@ -113,7 +116,9 @@ def recovery():
             check_generation(baseline, after, service.effects(), instance, first)
             # Replay the very first request across both restarts. Ticket,
             # revision and acceptance time must still be identical.
-            assert service.apply(spec(), instance, request, revision) == receipt
+            assert desktop.read("receipt") == desktop.read("replay") == receipt
+            status = service.ctl("status")
+            assert len(status["instances"]) == 1 and status["revision"] == receipt["revision"]
         service.ctl("stop", instance)
         eventually("stopped instance", lambda: service.view(instance),
                    lambda status: status.get("state") == "stopped")

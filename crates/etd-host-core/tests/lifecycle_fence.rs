@@ -77,6 +77,47 @@ async fn foreign_listener_kills_and_falls_back_to_deny_all() {
 }
 
 #[tokio::test]
+async fn a_restarted_instance_rechecks_the_management_listener_before_attach() {
+    let world = World::new();
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.apply("a", spec("net"), Desired::Running).await;
+    h.wait_state("a", S::ReadyFull).await;
+    h.set_desired("a", Desired::Stopped).await.unwrap();
+    h.wait_state("a", S::Stopped).await;
+    let trusted_attaches = world.driver.attach_calls();
+    assert!(trusted_attaches > 0);
+
+    // Change only the listener identity returned by the in-memory system.
+    world.behave(KernelBehaviour {
+        squatter: Some(4242),
+        ..KernelBehaviour::default()
+    });
+    h.set_desired("a", Desired::Running).await.unwrap();
+    h.until(
+        "ready with management disabled after rejecting epoch 2",
+        |h| {
+            h.status("a").is_some_and(|s| {
+                s.epoch == 3
+                    && s.state() == S::ReadyBasic
+                    && s.management() == ManagementAccess::DenyAll
+            })
+        },
+    )
+    .await;
+    assert_eq!(world.driver.attach_calls(), trusted_attaches);
+    let kernels = world.spawned();
+    assert_eq!(kernels.len(), 3);
+    assert_eq!(world.engine.liveness(&kernels[1]).await, Liveness::Gone);
+    let open = world.open_records("a").await;
+    assert!(!open.is_empty());
+    assert!(
+        open.iter()
+            .all(|e| e.scope.generation().is_some_and(|(_, ep)| ep.0 == 3))
+    );
+}
+
+#[tokio::test]
 async fn probe_mismatch_in_either_direction_kills() {
     for unprivileged in [
         DirectionResult::Connected,

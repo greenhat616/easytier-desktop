@@ -156,7 +156,10 @@ impl TestHarness {
         installer: Arc<dyn ServiceInstaller>,
         is_elevated: bool,
     ) -> Self {
-        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            etd_ui::theme::install_palette(cx);
+        });
         let (cmd_tx, cmd_rx) = async_channel::unbounded();
         let (_state_tx, state_rx) = async_channel::bounded(1);
         let bridge = AppBridge {
@@ -289,6 +292,35 @@ fn make_entry(
             None
         },
     }
+}
+
+#[gpui_kit::test]
+fn theme_menu_switches_live_without_reopening_window(cx: &mut TestAppContext) {
+    use gpui_kit::component::{Theme, ThemeMode};
+    let (tray, _, _) = FakeTray::available();
+    let (installer, _) = FakeInstaller::ok();
+    let harness = TestHarness::new(cx, Box::new(tray), installer, false);
+    harness.push_store(connected_store(&[capability::INSTANCES]), cx);
+
+    cx.update_window(harness.window, |_, window, cx| {
+        assert_eq!(
+            window.find("theme-follow-system").label(),
+            Some("Follow system (selected)")
+        );
+        let system_dark = ThemeMode::from(window.appearance()).is_dark();
+        for (id, choice, expected) in [
+            ("theme-dark", "Dark", true),
+            ("theme-light", "Light", false),
+            ("theme-follow-system", "Follow system", system_dark),
+        ] {
+            window.click(id, cx);
+            assert_eq!(Theme::global(cx).is_dark(), expected);
+            window.render_frame(cx);
+            let label = format!("{choice} (selected)");
+            assert_eq!(window.find(id).label(), Some(label.as_str()));
+        }
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]
@@ -959,7 +991,10 @@ async fn trayless_fallback_keeps_window_and_exit_gate_runs_before_quit(cx: &mut 
 
 #[gpui_kit::test]
 fn tray_hide_and_restore_preserves_state_and_exits_from_menu(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        etd_ui::theme::install_palette(cx);
+    });
     let (cmd_tx, _cmd_rx) = async_channel::unbounded();
     let (_state_tx, state_rx) = async_channel::bounded(1);
     let bridge = AppBridge {
@@ -1025,7 +1060,7 @@ fn tray_hide_and_restore_preserves_state_and_exits_from_menu(cx: &mut TestAppCon
 fn icon_asset_source_serves_eye_svg() {
     use gpui_kit::AssetSource as _;
 
-    let bytes = gpui_kit::assets::Assets
+    let bytes = etd_ui::assets::FluentAssets
         .load("icons/eye.svg")
         .expect("asset source should not error")
         .expect("icons/eye.svg must be embedded for Input::mask_toggle()");

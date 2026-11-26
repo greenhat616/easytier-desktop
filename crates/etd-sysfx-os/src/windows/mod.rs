@@ -1,5 +1,6 @@
 //! Windows system effects, using a persistent native WFP fence and independent
 //! Windows management provider queries. No request data is executed as code.
+pub mod appearance;
 pub mod driver_refs;
 mod execution;
 mod interfaces;

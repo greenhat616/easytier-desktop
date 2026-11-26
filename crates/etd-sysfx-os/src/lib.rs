@@ -6,6 +6,8 @@
 use etd_sysfx::{BootIdSource, PortFence, Reclaimer, Sweeper, SystemObserver};
 use std::{path::PathBuf, sync::Arc};
 
+pub mod appearance;
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "macos")]

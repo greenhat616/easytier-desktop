@@ -4,10 +4,13 @@
 //! through [`etd_app::AppBridge`]. Network secrets are never stored locally and are scrubbed
 //! from the editor immediately after submission.
 
+pub mod assets;
 pub mod composition;
 pub mod controller;
 pub mod editor;
 pub mod model;
+mod preferences;
+pub mod theme;
 pub mod tray;
 pub mod views;
 

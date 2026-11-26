@@ -1,0 +1,45 @@
+# Fluent System Icons subset
+
+Source: https://github.com/microsoft/fluentui-system-icons/tree/a3de63245b4fa49c30e20d9838593a105affe774
+
+Copyright (c) 2020 Microsoft Corporation; MIT license in `LICENSE.txt`. The files below are unmodified upstream 24px regular SVGs.
+
+- `eye.svg` — `assets/Eye/SVG/ic_fluent_eye_24_regular.svg`
+- `eye-off.svg` — `assets/Eye Off/SVG/ic_fluent_eye_off_24_regular.svg`
+- `checkmark.svg` — `assets/Checkmark/SVG/ic_fluent_checkmark_24_regular.svg`
+- `dismiss.svg` — `assets/Dismiss/SVG/ic_fluent_dismiss_24_regular.svg`
+- `chevron-down.svg` — `assets/Chevron Down/SVG/ic_fluent_chevron_down_24_regular.svg`
+- `chevron-up.svg` — `assets/Chevron Up/SVG/ic_fluent_chevron_up_24_regular.svg`
+- `chevron-left.svg` — `assets/Chevron Left/SVG/ic_fluent_chevron_left_24_regular.svg`
+- `chevron-right.svg` — `assets/Chevron Right/SVG/ic_fluent_chevron_right_24_regular.svg`
+- `add.svg` — `assets/Add/SVG/ic_fluent_add_24_regular.svg`
+- `subtract.svg` — `assets/Subtract/SVG/ic_fluent_subtract_24_regular.svg`
+- `search.svg` — `assets/Search/SVG/ic_fluent_search_24_regular.svg`
+- `arrow-clockwise.svg` — `assets/Arrow Clockwise/SVG/ic_fluent_arrow_clockwise_24_regular.svg`
+- `arrow-counterclockwise.svg` — `assets/Arrow Counterclockwise/SVG/ic_fluent_arrow_counterclockwise_24_regular.svg`
+- `arrow-download.svg` — `assets/Arrow Download/SVG/ic_fluent_arrow_download_24_regular.svg`
+- `arrow-upload.svg` — `assets/Arrow Upload/SVG/ic_fluent_arrow_upload_24_regular.svg`
+- `arrow-left.svg` — `assets/Arrow Left/SVG/ic_fluent_arrow_left_24_regular.svg`
+- `arrow-right.svg` — `assets/Arrow Right/SVG/ic_fluent_arrow_right_24_regular.svg`
+- `more-horizontal.svg` — `assets/More Horizontal/SVG/ic_fluent_more_horizontal_24_regular.svg`
+- `settings.svg` — `assets/Settings/SVG/ic_fluent_settings_24_regular.svg`
+- `info.svg` — `assets/Info/SVG/ic_fluent_info_24_regular.svg`
+- `warning.svg` — `assets/Warning/SVG/ic_fluent_warning_24_regular.svg`
+- `error-circle.svg` — `assets/Error Circle/SVG/ic_fluent_error_circle_24_regular.svg`
+- `checkmark-circle.svg` — `assets/Checkmark Circle/SVG/ic_fluent_checkmark_circle_24_regular.svg`
+- `link.svg` — `assets/Link/SVG/ic_fluent_link_24_regular.svg`
+- `link-dismiss.svg` — `assets/Link Dismiss/SVG/ic_fluent_link_dismiss_24_regular.svg`
+- `globe.svg` — `assets/Globe/SVG/ic_fluent_globe_24_regular.svg`
+- `shield.svg` — `assets/Shield/SVG/ic_fluent_shield_24_regular.svg`
+- `server.svg` — `assets/Server/SVG/ic_fluent_server_24_regular.svg`
+- `person.svg` — `assets/Person/SVG/ic_fluent_person_24_regular.svg`
+- `sign-out.svg` — `assets/Sign Out/SVG/ic_fluent_sign_out_24_regular.svg`
+- `copy.svg` — `assets/Copy/SVG/ic_fluent_copy_24_regular.svg`
+- `delete.svg` — `assets/Delete/SVG/ic_fluent_delete_24_regular.svg`
+- `edit.svg` — `assets/Edit/SVG/ic_fluent_edit_24_regular.svg`
+- `folder.svg` — `assets/Folder/SVG/ic_fluent_folder_24_regular.svg`
+- `document.svg` — `assets/Document/SVG/ic_fluent_document_24_regular.svg`
+- `network-check.svg` — `assets/Network Check/SVG/ic_fluent_network_check_24_regular.svg`
+- `arrow-sync.svg` — `assets/Arrow Sync/SVG/ic_fluent_arrow_sync_24_regular.svg`
+- `play.svg` — `assets/Play/SVG/ic_fluent_play_24_regular.svg`
+- `stop.svg` — `assets/Stop/SVG/ic_fluent_stop_24_regular.svg`

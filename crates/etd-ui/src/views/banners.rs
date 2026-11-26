@@ -34,7 +34,7 @@ pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
     let sec_fg = cx.theme().secondary_foreground;
     let warn = cx.theme().warning;
     let border = cx.theme().border;
-    let title_bar = cx.theme().title_bar;
+    let title_bar = crate::theme::chrome_fill(cx, cx.theme().title_bar);
 
     let (link_label, tray_available) = {
         let model = view.controller.model.read(cx);
@@ -102,7 +102,13 @@ pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
                 .px_2()
                 .py_1()
                 .rounded_sm()
-                .bg(warn.opacity(0.2))
+                // Keep the warning pill readable even over native Mica.
+                .bg(Hsla::from(
+                    cx.theme()
+                        .popover
+                        .to_rgb()
+                        .blend(warn.opacity(0.2).to_rgb()),
+                ))
                 .text_xs()
                 .text_color(warn)
                 .child(note),
@@ -112,7 +118,9 @@ pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
     let svc_btn = action_button(
         "btn-connect-service",
         "Service",
-        BtnStyle::new(ButtonVariant::Default, Size::XSmall).outline(),
+        BtnStyle::new(ButtonVariant::Default, Size::XSmall)
+            .outline()
+            .icon("fluent/server.svg"),
         cx.listener(|this, _, _, _| {
             this.controller
                 .send_command(UserCommand::Connect(HostMode::Service));
@@ -121,7 +129,9 @@ pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
     let user_btn = action_button(
         "btn-connect-user",
         "User Host",
-        BtnStyle::new(ButtonVariant::Default, Size::XSmall).outline(),
+        BtnStyle::new(ButtonVariant::Default, Size::XSmall)
+            .outline()
+            .icon("fluent/person.svg"),
         cx.listener(|this, _, _, _| {
             this.controller
                 .send_command(UserCommand::Connect(HostMode::User));
@@ -130,7 +140,7 @@ pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
     let refresh_btn = action_button(
         "btn-refresh",
         "Refresh",
-        BtnStyle::new(ButtonVariant::Ghost, Size::XSmall),
+        BtnStyle::new(ButtonVariant::Ghost, Size::XSmall).icon("fluent/arrow-clockwise.svg"),
         cx.listener(|this, _, _, _| {
             this.controller.send_command(UserCommand::Refresh);
         }),
@@ -138,7 +148,7 @@ pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
     let exit_btn = action_button(
         "btn-app-exit",
         "Exit",
-        BtnStyle::new(ButtonVariant::Danger, Size::XSmall),
+        BtnStyle::new(ButtonVariant::Danger, Size::XSmall).icon("fluent/sign-out.svg"),
         cx.listener(|this, _, _, cx| {
             this.controller.request_exit(ExitReason::AppMenu, cx);
         }),
@@ -302,6 +312,7 @@ pub fn render_banners(view: &MainView, cx: &mut Context<MainView>) -> AnyElement
         .id("banners-stack")
         .flex()
         .flex_col()
+        .bg(cx.theme().popover)
         .children(items)
         .into_any_element()
 }

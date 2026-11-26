@@ -1,3 +1,10 @@
-# Release packaging supplies rows: target-triple version lowercase-sha256
+# Release packaging supplies one executable row per bundle:
+# target-triple version lowercase-sha256
+# Optional companion rows (before or after the executable row):
+# target-triple version file:<plain-name> lowercase-sha256
+# Names use ASCII letters, digits, dots, hyphens, underscores; no path,
+# device name, leading/trailing dot, consecutive dots or executable name.
+# Companion names are unique ignoring ASCII case; executable hashes are
+# unique per target. Every file in the bundle directory must be listed.
 # Only the current Rust target's entries are embedded in etd-host.
 # An empty release table permits no kernels; no local manifest may add one.

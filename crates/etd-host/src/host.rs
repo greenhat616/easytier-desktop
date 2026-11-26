@@ -188,12 +188,18 @@ async fn dependencies(mode: HostMode, layout: &HostLayout) -> Result<Dependencie
         Some(reason) => Arc::new(BlockedDriver(reason.clone())),
         None => Arc::new(EasyTierDriver),
     };
-    let store = Arc::new(ManifestCoreStore::new(
-        layout.cores.clone(),
-        mode,
-        driver.clone(),
-        storage::trusted_cores(),
-    )?);
+    let store = Arc::new(
+        ManifestCoreStore::new(
+            layout.cores.clone(),
+            mode,
+            driver.clone(),
+            storage::trusted_cores(),
+        )?
+        .with_removal_guard(|dir| {
+            etd_sysfx_os::driver_bundle_referenced(dir)
+                .map_err(|error| etd_host_core::core_store::StoreError::Io(error.to_string()))
+        }),
+    );
     let mut reclaimers = os.reclaimers;
     reclaimers.extend(host_reclaimers(
         process.clone(),
@@ -748,7 +754,12 @@ async fn uninstall_locked(layout: &HostLayout, expected_id: Option<&str>) -> Res
             );
             return Ok(());
         }
-        NativeServiceManager.remove_install(layout)?;
+        if let Err(error) = NativeServiceManager.remove_install(layout) {
+            journal.set_deferred(DeferredOutcome::Failed {
+                error: error.to_string(),
+            })?;
+            return Err(anyhow::Error::from(error).context("uninstall incomplete"));
+        }
         journal.advance(Phase::InstallRemoved)?;
     }
     journal.clear()?;

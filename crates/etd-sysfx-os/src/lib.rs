@@ -66,3 +66,16 @@ pub enum OsError {
 pub fn adapters(config: &OsConfig) -> Result<OsAdapters, OsError> {
     platform::adapters(config)
 }
+
+/// Check whether a system driver references a protected kernel bundle.
+#[cfg(windows)]
+pub use windows::driver_refs::{driver_bundle_reference, driver_bundle_referenced};
+#[cfg(not(windows))]
+pub fn driver_bundle_referenced(_: &std::path::Path) -> Result<bool, OsError> {
+    Ok(false)
+}
+
+#[cfg(not(windows))]
+pub fn driver_bundle_reference(_: &std::path::Path) -> Result<Option<String>, OsError> {
+    Ok(None)
+}

@@ -1025,6 +1025,76 @@ async fn trayless_fallback_keeps_window_and_exit_gate_runs_before_quit(cx: &mut 
 }
 
 #[gpui_kit::test]
+fn session_end_runs_the_exit_gate_without_quitting_again(cx: &mut TestAppContext) {
+    struct StaticFactory(Arc<FakeHostClient>);
+    impl HostClientFactory for StaticFactory {
+        fn connect(&self, _: &HostTarget) -> Arc<dyn HostClient> {
+            self.0.clone()
+        }
+    }
+
+    let client = Arc::new(FakeHostClient::new(HostMode::User));
+    let launcher = Arc::new(FakeHostLauncher::default());
+    launcher.script_probe(Ok(Some(FakeHostLauncher::target(HostMode::User))));
+    let services = AppServices {
+        clients: Arc::new(StaticFactory(client.clone())),
+        launcher,
+        profiles: Arc::new(FakeProfileStore::default()),
+    };
+    let (bridge, runtime) = AppRuntime::start(services, BridgeConfig::default()).unwrap();
+    let (tray, removed, _) = FakeTray::available();
+    let (installer, _) = FakeInstaller::ok();
+    let quit_called = Arc::new(AtomicBool::new(false));
+    let quit_flag = quit_called.clone();
+
+    let controller = cx.update(|cx| {
+        let ctrl = UiController::new_for_window(
+            bridge,
+            Some(runtime),
+            Box::new(tray),
+            installer,
+            false,
+            std::rc::Rc::new(move |_| quit_flag.store(true, Ordering::SeqCst)),
+            cx,
+        );
+        ctrl.send_command(UserCommand::Connect(HostMode::User));
+        ctrl
+    });
+    for _ in 0..200 {
+        if client
+            .calls()
+            .iter()
+            .any(|call| matches!(call, HostCall::Snapshot))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    cx.background_executor.allow_parking();
+    cx.update(|cx| controller.end_session(cx));
+
+    assert!(controller.is_exiting());
+    assert!(controller.window_tray_snapshot().is_exiting());
+    assert_eq!(removed.load(Ordering::SeqCst), 1, "tray removed once");
+    assert!(
+        !quit_called.load(Ordering::SeqCst),
+        "GPUI is already quitting: the gate must not quit it again"
+    );
+    assert!(
+        client
+            .calls()
+            .iter()
+            .any(|call| matches!(call, HostCall::ReleaseLease(_))),
+        "the user-host lease is settled before the session ends"
+    );
+
+    // GPUI's quit hook also runs after an ordinary exit: nothing runs twice.
+    cx.update(|cx| controller.end_session(cx));
+    assert_eq!(removed.load(Ordering::SeqCst), 1);
+}
+
+#[gpui_kit::test]
 fn tray_hide_and_restore_preserves_state_and_exits_from_menu(cx: &mut TestAppContext) {
     cx.update(|cx| {
         gpui_kit::init(cx);

@@ -201,8 +201,8 @@ socket, which would make the fence unnecessary.
 
 ## Window and tray
 
-Closing the window is not quitting. Quitting (tray or app menu) follows one fixed
-order in `etd-app`'s exit gate: settle pending requests and give a session-form host its
+Closing the window is not quitting. Quitting (tray or app menu, or the operating
+system ending the session) follows one fixed order in `etd-app`'s exit gate: settle pending requests and give a session-form host its
 lease back, stop subscriptions, stop the Tokio runtime, then quit GPUI, all within about
 five seconds. The window and tray state table lives in `etd-app`, has no
 GPUI dependency and is tested with a fake tray backend under out-of-order events. While

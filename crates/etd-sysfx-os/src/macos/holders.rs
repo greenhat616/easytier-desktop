@@ -2,7 +2,7 @@ use super::observe::fields;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
-    net::SocketAddr,
+    net::IpAddr,
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
 };
@@ -35,11 +35,24 @@ fn sockets(port: u16) -> io::Result<BTreeMap<i32, BTreeSet<String>>> {
             pid = Some(p.parse().map_err(io::Error::other)?);
         }
         if let Some(n) = f.strip_prefix('n') {
-            let relevant = if let Some(p) = n.strip_prefix("*:") {
-                p.parse::<u16>().map_err(io::Error::other)? == port
+            let (host, service) = n
+                .rsplit_once(':')
+                .ok_or_else(|| io::Error::other("invalid TCP listener endpoint"))?;
+            if service.parse::<u16>().map_err(io::Error::other)? != port {
+                continue;
+            }
+            let relevant = if host == "*" {
+                true
             } else {
-                let addr = n.parse::<SocketAddr>().map_err(io::Error::other)?;
-                addr.port() == port && (addr.ip().is_loopback() || addr.ip().is_unspecified())
+                let host = host.trim_matches(['[', ']']);
+                let ip = host
+                    .split('%')
+                    .next()
+                    .unwrap_or(host)
+                    .parse::<IpAddr>()
+                    .map_err(io::Error::other)?
+                    .to_canonical();
+                ip.is_loopback() || ip.is_unspecified()
             };
             if relevant {
                 owners
@@ -182,7 +195,7 @@ impl CoreIdentity {
         }
         Ok(true)
     }
-    fn scan(&self, port: u16) -> io::Result<Vec<Holder>> {
+    pub(super) fn scan(&self, port: u16) -> io::Result<Vec<Holder>> {
         let owners = sockets(port)?;
         if owners.is_empty() {
             return Ok(vec![]);
@@ -199,11 +212,6 @@ impl CoreIdentity {
             return Err(io::Error::new(
                 io::ErrorKind::ResourceBusy,
                 "protected kernel still listens on the management port",
-            ));
-        }
-        if self.scan(port)? != first {
-            return Err(io::Error::other(
-                "listener identity changed before fence removal",
             ));
         }
         Ok(first)

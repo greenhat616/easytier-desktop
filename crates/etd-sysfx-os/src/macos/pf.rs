@@ -231,13 +231,18 @@ impl Writer {
         }
         Ok(cmd)
     }
-    fn load(&self, intended: &BTreeSet<Rule>) -> io::Result<()> {
+    fn load(
+        &self,
+        intended: &BTreeSet<Rule>,
+        precommit: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
         let mut input = tempfile::tempfile()?;
         for rule in intended {
             writeln!(input, "{}", rule.line(false))?;
             writeln!(input, "{}", rule.line(true))?;
         }
         input.rewind()?;
+        precommit()?;
         output(
             self.pf()?
                 .args(["-a", ANCHOR, "-R", "-f", "-"])
@@ -293,7 +298,7 @@ impl Writer {
         if !status.success() || token(&self.1)?.is_none() {
             return Err(io::Error::other("PF enable failed"));
         }
-        self.load(&current)?;
+        self.load(&current, || Ok(()))?;
         active()
     }
 }
@@ -361,12 +366,15 @@ fn reference_live(token: &str) -> io::Result<bool> {
     references(&output(command(PF).args(["-s", "References"]))?, token)
 }
 fn references(list: &str, token: &str) -> io::Result<bool> {
+    if list.trim() == "No pf starter references held" {
+        return Ok(false);
+    }
     let mut lines = list.lines().filter(|l| !l.trim().is_empty()).peekable();
     if lines.peek().is_some_and(|l| l.trim() == "TOKENS:") {
         lines.next();
     }
     let Some(header) = lines.next() else {
-        return Ok(false);
+        return Err(io::Error::other("missing PF reference table"));
     };
     let invalid = || io::Error::other("unexpected PF reference table format");
     if header.split_whitespace().collect::<Vec<_>>()
@@ -459,7 +467,14 @@ pub(super) fn change(rule: Rule, install: bool, cores: &CoreIdentity) -> io::Res
         all.remove(&rule)
     };
     if changed {
-        writer.load(&all)?;
+        writer.load(&all, || {
+            if !install && cores.scan(port)? != remaining {
+                return Err(io::Error::other(
+                    "listener identity changed before fence removal",
+                ));
+            }
+            Ok(())
+        })?;
     }
     for h in remaining {
         tracing::warn!(anchor=ANCHOR,port,pid=h.pid,euid=h.uid,image=%h.image.display(),"reclaimed fence; unrelated listener left running");
@@ -488,5 +503,7 @@ mod tests {
             assert!(!references(&table, other).unwrap());
         }
         assert!(references(&table.replace("567", "bad"), "42").is_err());
+        assert!(!references("No pf starter references held\n", "42").unwrap());
+        assert!(references("", "42").is_err());
     }
 }

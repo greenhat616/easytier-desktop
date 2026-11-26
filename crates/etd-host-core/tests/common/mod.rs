@@ -3,7 +3,7 @@ use etd_contract::{v1::*, *};
 use etd_host_core::{
     api::{Command, HostView, OrchestratorPort, Planned, orchestrator_channel},
     auth::allow_list::AllowListAuthorizer,
-    service::ContractService,
+    service::{AllowListSink, ContractService},
 };
 use etd_ipc::{OsUserId, PeerIdentity};
 use etd_sysfx::{Change, ChangeSet, Ledger, RequestDigest, RequestRecord};
@@ -59,6 +59,9 @@ pub struct Fixture {
 }
 impl Fixture {
     pub async fn new() -> Self {
+        Self::with_allow_list_sink(None).await
+    }
+    pub async fn with_allow_list_sink(sink: Option<Arc<dyn AllowListSink>>) -> Self {
         let ledger = Arc::new(MemoryLedger::default());
         ledger
             .commit(
@@ -92,16 +95,32 @@ impl Fixture {
                 },
             },
         );
-        let service = ContractService::new(
-            HostMode::Service,
-            ledger.clone(),
-            etd_sysfx::InstallKey([7; 32]),
-            auth.clone(),
-            Arc::new(FakeCoreStore::default()),
-            handle,
-            vec![capability::INSTANCES.into(), capability::RECLAIM.into()],
-            16,
-        );
+        let capabilities = vec![capability::INSTANCES.into(), capability::RECLAIM.into()];
+        let store = Arc::new(FakeCoreStore::default());
+        let service = if let Some(sink) = sink {
+            ContractService::with_allow_list_sink(
+                HostMode::Service,
+                ledger.clone(),
+                etd_sysfx::InstallKey([7; 32]),
+                auth.clone(),
+                store,
+                handle,
+                capabilities,
+                16,
+                sink,
+            )
+        } else {
+            ContractService::new(
+                HostMode::Service,
+                ledger.clone(),
+                etd_sysfx::InstallKey([7; 32]),
+                auth.clone(),
+                store,
+                handle,
+                capabilities,
+                16,
+            )
+        };
         Self {
             service,
             ledger,

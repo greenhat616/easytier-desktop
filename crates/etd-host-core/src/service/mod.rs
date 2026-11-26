@@ -31,17 +31,52 @@ use tonic::{Request, Response, Status};
 pub struct ContractService {
     inner: Arc<Inner>,
 }
+
+/// The composition root supplies the real listener ACL updater. Applying an
+/// allow-list is synchronous: a successful reply must never precede the ACL
+/// update. An error leaves contract authorization disabled until recovery.
+pub trait AllowListSink: Send + Sync {
+    fn apply(&self, entries: &[AllowEntry]) -> std::io::Result<()>;
+}
+
+struct NoopAllowListSink;
+impl AllowListSink for NoopAllowListSink {
+    fn apply(&self, _: &[AllowEntry]) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 struct Inner {
     mode: HostMode,
     ledger: Arc<dyn Ledger>,
     install_key: InstallKey,
     authorizer: Arc<AllowListAuthorizer>,
+    allow_list_sink: Arc<dyn AllowListSink>,
     store: Arc<dyn CoreStore>,
     handle: OrchestratorHandle,
     journal: EventJournal,
     mutations: Mutex<()>,
     presence: watch::Sender<ClientPresence>,
     capabilities: Vec<String>,
+}
+impl Inner {
+    fn apply_authorization(&self, entries: Vec<AllowEntry>) -> std::io::Result<()> {
+        // Stop authorization before an external ACL change, including on
+        // already-open HTTP/2 connections. Re-enable only once both agree.
+        self.authorizer.invalidate();
+        if self.mode == HostMode::Service {
+            self.allow_list_sink.apply(&entries)?;
+        }
+        self.authorizer.replace(entries);
+        Ok(())
+    }
+
+    async fn reload_authorization(&self) -> Result<(), ()> {
+        self.authorizer.invalidate();
+        let settings = self.ledger.settings().await.map_err(|_| ())?;
+        self.apply_authorization(settings.allow_list)
+            .map_err(|_| ())
+    }
 }
 impl ContractService {
     /// The composition root must initialize the authorizer from the ledger
@@ -56,6 +91,34 @@ impl ContractService {
         handle: OrchestratorHandle,
         capabilities: Vec<String>,
         event_capacity: usize,
+    ) -> Self {
+        Self::with_allow_list_sink(
+            mode,
+            ledger,
+            install_key,
+            authorizer,
+            store,
+            handle,
+            capabilities,
+            event_capacity,
+            Arc::new(NoopAllowListSink),
+        )
+    }
+
+    /// For real service listeners. Initialize both the listener ACL and the
+    /// authorizer from the same ledger settings under the host lock before
+    /// passing this service to the transport.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_allow_list_sink(
+        mode: HostMode,
+        ledger: Arc<dyn Ledger>,
+        install_key: InstallKey,
+        authorizer: Arc<AllowListAuthorizer>,
+        store: Arc<dyn CoreStore>,
+        handle: OrchestratorHandle,
+        capabilities: Vec<String>,
+        event_capacity: usize,
+        allow_list_sink: Arc<dyn AllowListSink>,
     ) -> Self {
         let journal = EventJournal::new(&handle, event_capacity);
         let (presence, mut updates) = watch::channel(ClientPresence::default());
@@ -74,6 +137,7 @@ impl ContractService {
                 ledger,
                 install_key,
                 authorizer,
+                allow_list_sink,
                 store,
                 handle,
                 journal,
@@ -239,9 +303,12 @@ impl ContractService {
             };
             match self.inner.ledger.commit(expected, changes).await {
                 Ok(receipt) => {
-                    if let Mutation::AllowList(entries) = &mutation {
-                        self.inner.authorizer.replace(entries.clone());
-                    }
+                    let acl_ok = match &mutation {
+                        Mutation::AllowList(entries) => {
+                            self.inner.apply_authorization(entries.clone()).is_ok()
+                        }
+                        _ => true,
+                    };
                     // Durable tickets are also replayed by H1 after restart.
                     let _ = self
                         .inner
@@ -250,6 +317,12 @@ impl ContractService {
                             receipt: receipt.clone(),
                         })
                         .await;
+                    if !acl_ok {
+                        self.retry_authorization_reload();
+                        // The mutation is durable. Its receipt is recoverable
+                        // once the listener and authorization agree again.
+                        return Err(host_closed());
+                    }
                     return Ok(receipt);
                 }
                 Err(LedgerError::EpochOpen { .. } | LedgerError::EpochNotNext { .. })
@@ -275,13 +348,7 @@ impl ContractService {
             // A storage error may follow a durable transaction (e.g. the
             // purge checkpoint). No old authorization may survive ambiguity.
             self.inner.authorizer.invalidate();
-            if self
-                .inner
-                .authorizer
-                .load(self.inner.ledger.as_ref())
-                .await
-                .is_err()
-            {
+            if self.inner.reload_authorization().await.is_err() {
                 self.retry_authorization_reload();
             }
         }
@@ -305,9 +372,7 @@ impl ContractService {
                     return;
                 };
                 let _lock = inner.mutations.lock().await;
-                if inner.authorizer.is_loaded()
-                    || inner.authorizer.load(inner.ledger.as_ref()).await.is_ok()
-                {
+                if inner.authorizer.is_loaded() || inner.reload_authorization().await.is_ok() {
                     return;
                 }
             }

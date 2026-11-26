@@ -8,9 +8,13 @@ publish.workspace = true
 
 [dependencies]
 etd-app = { workspace = true }
+etd-client = { workspace = true }
 etd-contract = { workspace = true }
+etd-ipc = { workspace = true }
+etd-sysfx-os = { workspace = true }
 anyhow = { workspace = true }
 async-channel = { workspace = true }
+async-trait = { workspace = true }
 gpui-kit = { workspace = true, features = ["component", "assets", "x11"] }
 jiff = { workspace = true, features = ["std"] }
 muda = { workspace = true }
@@ -24,6 +28,8 @@ muda = { workspace = true, features = ["snapshot"] }
 
 [dev-dependencies]
 etd-testkit = { workspace = true }
+gpui-kit = { workspace = true, features = ["component", "assets", "x11", "test-support"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 
 [lints]
 workspace = true

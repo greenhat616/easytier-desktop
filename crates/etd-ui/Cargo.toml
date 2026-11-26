@@ -15,7 +15,7 @@ etd-sysfx-os = { workspace = true }
 anyhow = { workspace = true }
 async-channel = { workspace = true }
 async-trait = { workspace = true }
-gpui-kit = { workspace = true, features = ["component", "assets", "x11"] }
+gpui-kit = { workspace = true, features = ["component", "assets", "x11", "gpui-fast"] }
 jiff = { workspace = true, features = ["std"] }
 muda = { workspace = true }
 tracing = { workspace = true, features = ["std"] }
@@ -28,7 +28,7 @@ muda = { workspace = true, features = ["snapshot"] }
 
 [dev-dependencies]
 etd-testkit = { workspace = true }
-gpui-kit = { workspace = true, features = ["component", "assets", "x11", "test-support"] }
+gpui-kit = { workspace = true, features = ["component", "assets", "x11", "gpui-fast", "test-support"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 
 [lints]

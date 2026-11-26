@@ -24,6 +24,12 @@ jobs:
         include:
           - os: windows-latest
             suite: recovery
+          - os: windows-latest
+            suite: preflight
+          - os: windows-latest
+            suite: program
+          - os: windows-latest
+            suite: clean
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -170,13 +176,16 @@ jobs:
       - name: Complete install and uninstall (fresh administrator runner)
         if: matrix.suite == 'clean'
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=installed_network_uninstall_restores_machine)' --success-output immediate
+      - name: Pre-existing inactive program rule (fresh administrator runner)
+        if: matrix.suite == 'program'
+        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=preexisting_program_rule_blocks_start)' --success-output immediate
       - name: Installed service tests (root)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           cargo nextest archive --locked -p etd-testkit --test tier3 --archive-file "$RUNNER_TEMP/tier3.tar.zst"
           sudo env "PATH=$PATH" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
-            "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}" "RUNNER_TEMP=$RUNNER_TEMP" \
+            "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}" "RUNNER_TEMP=$RUNNER_TEMP" "GITHUB_WORKSPACE=$GITHUB_WORKSPACE" \
             "ETD_G2_CI=$ETD_G2_CI" "GITHUB_ACTIONS=$GITHUB_ACTIONS" "RUNNER_ENVIRONMENT=$RUNNER_ENVIRONMENT" \
             "ETD_G2_PYTHON=$ETD_G2_PYTHON" "ETD_G2_BIN=$ETD_G2_BIN" "ETD_G2_SHA=$ETD_G2_SHA" \
             "$(command -v cargo-nextest)" nextest run --profile privileged --run-ignored only --archive-file "$RUNNER_TEMP/tier3.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" --no-fail-fast --success-output immediate

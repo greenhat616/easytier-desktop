@@ -3,3 +3,9 @@
 /.vscode/
 *.pdb
 *.log
+
+# AI agent tooling: keep AGENTS.md, CLAUDE.md and shared .claude settings
+# tracked; exclude local and session state.
+.ccg/
+.claude/*
+!.claude/settings.json

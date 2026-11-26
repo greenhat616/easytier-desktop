@@ -65,7 +65,7 @@ def foreign_linux():
         command("systemctl", "daemon-reload")
         before = file_identity(unit)
         yield {("interface", device), ("route", device), ("resolver", device),
-               ("firewall", "inet/" + table), ("service", unit.name)}
+               ("firewall", "inet/" + table), ("service", unit.name), ("service", str(unit))}
         assert file_identity(unit) == before
 
 
@@ -133,9 +133,9 @@ def recovery(with_fixtures=True):
         inventory, keys = (recovery_fixtures(service, instance, stack) if with_fixtures
                            else (service.inventory, set()))
         baseline = inventory()
+        service.settle_workers(baseline, baseline)
         differences = []
         generation_processes = set()
-        workers_seen = set()
         def verify_generation(snapshot, view):
             end = time.monotonic() + 240
             while True:
@@ -146,7 +146,7 @@ def recovery(with_fixtures=True):
                 generation_processes.add((pid, born))
                 generation_processes.update(snapshot.descendants[pid])
                 workers = management_processes(baseline, snapshot, service.host)
-                workers_seen.update(workers)
+                service.workers_seen.update(workers)
                 worker_keys = {("process", str(pid)) for pid, _ in workers}
                 try:
                     check_generation(baseline, snapshot, service.effects(), instance, view, service.adapter_indices,
@@ -221,7 +221,7 @@ def recovery(with_fixtures=True):
         check_closed(service, instance, first["epoch"])
         stopped = inventory()
         assert_exited(generation_processes)
-        assert_exited(workers_seen)
+        service.settle_workers(baseline, stopped)
         assert_foreign(baseline, stopped, keys)
         remaining = baseline.delta(stopped) - managed_service_changes(baseline, stopped)
         remaining -= runner_noise(baseline, stopped) | tun_created(baseline, stopped)
@@ -295,11 +295,13 @@ def verify_shared_driver_purge(service, baseline, stopped, inventory, foreign_ke
     else:
         assert not open_rows, "completed purge left open ledger effects"
     after = inventory()
-    assert_foreign(stopped, after, {("service", name) for name in names})
+    kept = {("service", name) for name in names
+            if after.rows.get(("service", name)) == stopped.rows["service", name]}
+    assert len(kept) == len(names), "purge changed a retained shared driver registration"
     assert_foreign(baseline, after, foreign_keys)
     assert not program_rules & after.rows.keys(), "CoreBinary firewall rules survived purge"
     delta = baseline.delta(after) - managed_service_changes(baseline, after)
-    delta -= runner_noise(baseline, after) | {("service", name) for name in names}
+    delta -= runner_noise(baseline, after) | kept
     delta -= adapter_defaults(baseline, after, service.adapter_indices)
     delta -= system_policy_changes(baseline, after, "purged", fixture_tunnel=bool(interfaces))
     # The installed baseline included a running host. Purge is an offline
@@ -322,6 +324,25 @@ def verify_shared_driver_purge(service, baseline, stopped, inventory, foreign_ke
     assert not delta, f"post-purge native differences: {sorted(delta)}"
 
 
+def driver_registration(name):
+    import winreg
+    def subtree(key):
+        subkeys, values, _ = winreg.QueryInfoKey(key)
+        entries = {}
+        for i in range(values):
+            field, value, kind = winreg.EnumValue(key, i)
+            entries[field] = (kind, value)
+        children = {}
+        for i in range(subkeys):
+            child_name = winreg.EnumKey(key, i)
+            with winreg.OpenKey(key, child_name) as child:
+                children[child_name] = subtree(child)
+        return entries, children
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, rf"SYSTEM\CurrentControlSet\Services\{name}") as key:
+        registry = subtree(key)
+    return registry, command("sc.exe", "sdshow", name).stdout, command("sc.exe", "query", name).stdout
+
+
 @contextmanager
 def disabled_drivers(service, with_images):
     names = {"wintun", "windivert"}
@@ -340,6 +361,7 @@ def disabled_drivers(service, with_images):
                     "binPath=", image)
             stack.callback(command, "sc.exe", "delete", name)
         foreign_state = service.inventory()
+        registrations = {name: driver_registration(name) for name in names}
         for name in sorted(names):
             native = foreign_state.rows.get(("service", name))
             print(f"pre-existing driver {name}: {native}", flush=True)
@@ -348,6 +370,7 @@ def disabled_drivers(service, with_images):
             yield foreign_state
         finally:
             assert_foreign(foreign_state, service.inventory(), {("service", n) for n in names})
+            assert {n: driver_registration(n) for n in names} == registrations, "foreign driver registration changed"
             assert all(file_identity(file) == identity for file, identity in files.items())
             print(f"foreign registrations and {len(files)} driver images preserved", flush=True)
 

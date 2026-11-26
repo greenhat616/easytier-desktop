@@ -1,6 +1,6 @@
 //! Where each host form listens and what its server process must prove.
 use crate::{cli::HostKind, error::CtlError};
-use etd_ipc::{Endpoint, ServerExpectation};
+use etd_ipc::{Endpoint, ServerExpectation, ServerRequirement};
 use std::path::PathBuf;
 
 pub fn endpoint(host: HostKind, custom: Option<String>) -> Result<Endpoint, CtlError> {
@@ -67,8 +67,10 @@ pub fn expectation(host: HostKind, dir: Option<PathBuf>) -> Result<ServerExpecta
     };
     Ok(ServerExpectation {
         exe_dir,
-        user: None,
-        privileged: host == HostKind::Service,
+        requirement: match host {
+            HostKind::Service => ServerRequirement::Service,
+            HostKind::User => ServerRequirement::CurrentUser,
+        },
     })
 }
 

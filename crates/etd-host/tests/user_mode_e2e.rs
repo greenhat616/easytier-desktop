@@ -22,7 +22,7 @@ use etd_host_core::{
     reclaimers::host_reclaimers,
 };
 use etd_ipc::{
-    Endpoint, HostForm, ServerExpectation,
+    Endpoint, HostForm, ServerExpectation, ServerRequirement,
     platform::{LocalConnector, current_user},
     tonic_io::ClientIo,
 };
@@ -224,8 +224,7 @@ async fn apply_ready_stop_and_reclaim_over_real_transport() {
     let connector = Arc::new(LocalConnector {
         expectation: ServerExpectation {
             exe_dir: dir,
-            user: None,
-            privileged: false,
+            requirement: ServerRequirement::CurrentUser,
         },
     });
     let channel = tokio::time::timeout(Duration::from_secs(10), async {

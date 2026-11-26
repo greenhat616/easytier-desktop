@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 use etd_ipc::{
-    Endpoint, ListenerPolicy, ServerExpectation,
+    Endpoint, ListenerPolicy, ServerExpectation, ServerRequirement,
     platform::{LocalConnector, LocalListener},
 };
 use etd_testkit::no_window::NoWindow;
@@ -51,8 +51,7 @@ pub fn connector() -> LocalConnector {
     LocalConnector {
         expectation: ServerExpectation {
             exe_dir: std::env::current_exe().unwrap().parent().unwrap().into(),
-            user: None,
-            privileged: false,
+            requirement: ServerRequirement::CurrentUser,
         },
     }
 }

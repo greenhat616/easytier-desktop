@@ -23,6 +23,7 @@ futures-util = { workspace = true, features = ["std"] }
 rand = { workspace = true }
 serde = { workspace = true, features = ["std", "derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 tonic = { workspace = true, features = ["transport", "router"] }
 uuid = { workspace = true, features = ["v4", "std"] }

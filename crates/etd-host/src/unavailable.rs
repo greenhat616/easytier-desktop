@@ -2,6 +2,7 @@
 //! have not landed. No observation can imply absence and no OS effect is
 //! reclaimed. A fresh installation that has never enabled native adapters
 //! has no adapter-owned objects to sweep; all other sweeps fail closed.
+use etd_contract::{DesiredInstance, InstanceId, Receipt, RequestId, Revision};
 use etd_core_api::*;
 use etd_core_easytier::EasyTierDriver;
 use etd_sysfx::*;
@@ -106,6 +107,90 @@ impl CoreDriver for BlockedDriver {
     }
 }
 
+/// Last line of defence: neither a newly committed generation nor a direct
+/// record/begin_epoch can reach the real ledger while native adapters are
+/// unavailable. Existing records still support transition/reclaim and
+/// diagnostics; no new ownership claims may be invented by the fallback.
+pub struct NoNewEffects(pub Arc<dyn Ledger>);
+fn unavailable_write() -> LedgerError {
+    LedgerError::Unavailable(StorageFault::Io(
+        "native adapters unavailable; creation records refused".into(),
+    ))
+}
+#[async_trait::async_trait]
+impl Ledger for NoNewEffects {
+    async fn commit(&self, expected: Revision, change: ChangeSet) -> Result<Receipt, LedgerError> {
+        if !change.generations.is_empty() {
+            return Err(unavailable_write());
+        }
+        self.0.commit(expected, change).await
+    }
+    async fn request_status(&self, request: &RequestRecord) -> Result<RequestStatus, LedgerError> {
+        self.0.request_status(request).await
+    }
+    async fn receipt(&self, request: &RequestId) -> Result<Option<Receipt>, LedgerError> {
+        self.0.receipt(request).await
+    }
+    async fn receipt_for(
+        &self,
+        request: &RequestId,
+        caller: Option<&str>,
+    ) -> Result<Option<Receipt>, LedgerError> {
+        self.0.receipt_for(request, caller).await
+    }
+    async fn pending_tickets(&self) -> Result<Vec<Ticket>, LedgerError> {
+        self.0.pending_tickets().await
+    }
+    async fn complete_ticket(&self, ticket: &str) -> Result<(), LedgerError> {
+        self.0.complete_ticket(ticket).await
+    }
+    async fn desired(&self) -> Result<(Revision, Vec<DesiredInstance>), LedgerError> {
+        self.0.desired().await
+    }
+    async fn spec_revision(&self, instance: &InstanceId) -> Result<Revision, LedgerError> {
+        self.0.spec_revision(instance).await
+    }
+    async fn settings(&self) -> Result<HostSettings, LedgerError> {
+        self.0.settings().await
+    }
+    async fn claims(&self) -> Result<Vec<ClaimHold>, LedgerError> {
+        self.0.claims().await
+    }
+    async fn next_epoch(&self, instance: &InstanceId) -> Result<Epoch, LedgerError> {
+        self.0.next_epoch(instance).await
+    }
+    async fn begin_epoch(&self, _: GenerationPlan) -> Result<Vec<Effect>, LedgerError> {
+        Err(unavailable_write())
+    }
+    async fn generation(
+        &self,
+        instance: &InstanceId,
+        epoch: Epoch,
+    ) -> Result<Option<StoredGeneration>, LedgerError> {
+        self.0.generation(instance, epoch).await
+    }
+    async fn record(&self, _: EffectIntent) -> Result<Effect, LedgerError> {
+        Err(unavailable_write())
+    }
+    async fn transition(
+        &self,
+        id: &EffectId,
+        to: EffectState,
+        obs: Option<Observation>,
+    ) -> Result<(), LedgerError> {
+        self.0.transition(id, to, obs).await
+    }
+    async fn record_failure(&self, id: &EffectId, error: &str) -> Result<u32, LedgerError> {
+        self.0.record_failure(id, error).await
+    }
+    async fn open_effects(&self, filter: &ScopeFilter) -> Result<Vec<Effect>, LedgerError> {
+        self.0.open_effects(filter).await
+    }
+    async fn compact(&self) -> Result<usize, LedgerError> {
+        self.0.compact().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +219,51 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+    #[tokio::test]
+    async fn all_effect_creation_entry_points_refuse_without_native_adapters() {
+        let inner = Arc::new(etd_testkit::fakes::ledger::MemoryLedger::default());
+        let ledger = NoNewEffects(inner.clone());
+        let plan = etd_testkit::conformance::ledger::plan_at("fixture", 1, &[], 1);
+        assert!(ledger.begin_epoch(plan.clone()).await.is_err());
+        assert!(
+            ledger
+                .commit(
+                    0,
+                    ChangeSet {
+                        request: RequestRecord {
+                            request_id: "fixture".into(),
+                            caller: "fixture".into(),
+                            digest: RequestDigest([1; 32])
+                        },
+                        changes: vec![],
+                        generations: vec![plan]
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            ledger
+                .record(EffectIntent {
+                    scope: EffectScope::Product,
+                    kind: EffectKind::ServiceRegistration,
+                    key: ObjectKey::Service {
+                        name: "fixture".into()
+                    },
+                    undo: Undo::EnsureAbsent,
+                    persistence: Persistence::Persistent
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            inner
+                .open_effects(&ScopeFilter::all())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(inner.desired().await.unwrap().0, 0);
     }
 }

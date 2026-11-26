@@ -1,0 +1,331 @@
+//! Durable maintenance journal outside all product directories. The stable
+//! machine lock serializes every writer. An intent is persisted *before* each
+//! creation, and cleanup only touches resources named by this installation.
+use super::HostLayout;
+use serde::{Deserialize, Serialize};
+use std::{
+    fs,
+    io::{self, Write},
+    path::{Path, PathBuf},
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Resource {
+    InstallDir,
+    StateDir,
+    RunDir,
+    CoreDir,
+    SocketDir,
+    HostImage,
+    Group,
+    Data,
+    Registration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Phase {
+    Installing,
+    Installed,
+    Disabled,
+    Reclaimed,
+    Unregistered,
+    IpcRemoved,
+    GroupRemoved,
+    StateRemoved,
+    InstallRemoved,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Record {
+    phase: Phase,
+    planned: Vec<Resource>,
+    completed: Vec<Resource>,
+    group_gid: Option<u32>,
+}
+
+pub struct LifecycleJournal {
+    path: PathBuf,
+    record: Record,
+}
+impl LifecycleJournal {
+    fn path(layout: &HostLayout) -> PathBuf {
+        layout.maintenance.join("lifecycle.json")
+    }
+    pub fn open(layout: &HostLayout) -> io::Result<Option<Self>> {
+        Self::read(Self::path(layout))
+    }
+    fn read(path: PathBuf) -> io::Result<Option<Self>> {
+        let file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let record: Record = serde_json::from_reader(file).map_err(io::Error::other)?;
+        Ok(Some(Self { path, record }))
+    }
+    pub fn begin(layout: &HostLayout) -> io::Result<Self> {
+        Self::new_at(Self::path(layout))
+    }
+    fn new_at(path: PathBuf) -> io::Result<Self> {
+        if path.try_exists()? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "maintenance journal already exists",
+            ));
+        }
+        let journal = Self {
+            path,
+            record: Record {
+                phase: Phase::Installing,
+                planned: vec![],
+                completed: vec![],
+                group_gid: None,
+            },
+        };
+        journal.save()?;
+        Ok(journal)
+    }
+    pub fn phase(&self) -> Phase {
+        self.record.phase
+    }
+    pub fn planned(&self, resource: Resource) -> bool {
+        self.record.planned.contains(&resource)
+    }
+    pub fn group_gid(&self) -> Option<u32> {
+        self.record.group_gid
+    }
+    pub fn set_group_gid(&mut self, gid: u32) -> io::Result<()> {
+        self.record.group_gid = Some(gid);
+        self.save()
+    }
+    pub fn plan(&mut self, resource: Resource) -> io::Result<()> {
+        if !self.planned(resource) {
+            self.record.planned.push(resource);
+            if let Err(error) = self.save() {
+                self.record.planned.pop();
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+    pub fn complete(&mut self, resource: Resource) -> io::Result<()> {
+        if !self.planned(resource) {
+            return Err(io::Error::other("unplanned install resource"));
+        }
+        if !self.record.completed.contains(&resource) {
+            self.record.completed.push(resource);
+            self.save()?;
+        }
+        Ok(())
+    }
+    pub fn create(
+        &mut self,
+        resource: Resource,
+        action: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.plan(resource)?;
+        if let Err(error) = action() {
+            // Collision means the atomic create did not establish ownership.
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                self.record.planned.retain(|planned| *planned != resource);
+                self.save()?;
+            }
+            return Err(error);
+        }
+        self.complete(resource)
+    }
+    pub fn rollback_resources(&self) -> Vec<Resource> {
+        [
+            Resource::Registration,
+            Resource::SocketDir,
+            Resource::Group,
+            Resource::StateDir,
+            Resource::InstallDir,
+        ]
+        .into_iter()
+        .filter(|resource| self.planned(*resource))
+        .collect()
+    }
+    pub fn advance(&mut self, phase: Phase) -> io::Result<()> {
+        if phase < self.record.phase {
+            return Err(io::Error::other("maintenance phase cannot go backwards"));
+        }
+        self.record.phase = phase;
+        self.save()
+    }
+    pub fn resume_service(&mut self) -> io::Result<()> {
+        if self.record.phase != Phase::Disabled {
+            return Err(io::Error::other(
+                "service can only resume before reclaim has completed",
+            ));
+        }
+        self.record.phase = Phase::Installed;
+        self.save()
+    }
+    /// Retrying a completed stage performs no action; retrying an incomplete
+    /// stage invokes its idempotent operation again.
+    pub fn step(
+        &mut self,
+        phase: Phase,
+        action: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        if self.phase() >= phase {
+            return Ok(());
+        }
+        action()?;
+        self.advance(phase)
+    }
+    pub fn clear(self) -> io::Result<()> {
+        match fs::remove_file(&self.path) {
+            Ok(()) => sync_parent(&self.path),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+    fn save(&self) -> io::Result<()> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| io::Error::other("journal has no parent"))?;
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        serde_json::to_writer(&mut file, &self.record).map_err(io::Error::other)?;
+        file.flush()?;
+        file.as_file().sync_all()?;
+        file.persist(&self.path).map_err(|error| error.error)?;
+        sync_parent(&self.path)
+    }
+}
+fn sync_parent(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    fs::File::open(
+        path.parent()
+            .ok_or_else(|| io::Error::other("journal has no parent"))?,
+    )?
+    .sync_all()?;
+    #[cfg(windows)]
+    let _ = path;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn every_creation_failure_preserves_intent_for_rollback_and_reinstall() {
+        let resources = [
+            Resource::InstallDir,
+            Resource::StateDir,
+            Resource::RunDir,
+            Resource::CoreDir,
+            Resource::SocketDir,
+            Resource::HostImage,
+            Resource::Group,
+            Resource::Data,
+            Resource::Registration,
+        ];
+        for failed in 0..resources.len() {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("journal");
+            let mut journal = LifecycleJournal::new_at(path.clone()).unwrap();
+            let mut existing = Vec::new();
+            for (index, resource) in resources.iter().copied().enumerate() {
+                let result = journal.create(resource, || {
+                    existing.push(resource);
+                    if index == failed {
+                        Err(io::Error::other("injected after creation"))
+                    } else {
+                        Ok(())
+                    }
+                });
+                if result.is_err() {
+                    break;
+                }
+            }
+            let journal = LifecycleJournal::read(path.clone()).unwrap().unwrap();
+            assert_eq!(journal.phase(), Phase::Installing);
+            for resource in journal.rollback_resources() {
+                existing.retain(|r| match resource {
+                    Resource::InstallDir => !matches!(
+                        r,
+                        Resource::InstallDir | Resource::CoreDir | Resource::HostImage
+                    ),
+                    Resource::StateDir => {
+                        !matches!(r, Resource::StateDir | Resource::RunDir | Resource::Data)
+                    }
+                    _ => *r != resource,
+                });
+            }
+            assert!(existing.is_empty());
+            journal.clear().unwrap();
+            assert!(LifecycleJournal::new_at(path).is_ok());
+        }
+    }
+    #[test]
+    fn collision_is_not_owned_by_rollback() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("journal");
+        let mut journal = LifecycleJournal::new_at(path.clone()).unwrap();
+        assert!(
+            journal
+                .create(Resource::InstallDir, || Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "foreign path"
+                )))
+                .is_err()
+        );
+        let journal = LifecycleJournal::read(path).unwrap().unwrap();
+        assert!(journal.rollback_resources().is_empty());
+    }
+    #[test]
+    fn every_uninstall_phase_can_retry_after_failure() {
+        let phases = [
+            Phase::Disabled,
+            Phase::Reclaimed,
+            Phase::Unregistered,
+            Phase::IpcRemoved,
+            Phase::GroupRemoved,
+            Phase::StateRemoved,
+            Phase::InstallRemoved,
+        ];
+        for failed in 0..phases.len() {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("journal");
+            let mut journal = LifecycleJournal::new_at(path.clone()).unwrap();
+            journal.advance(Phase::Installed).unwrap();
+            let mut removed = Vec::new();
+            for (index, phase) in phases.iter().copied().enumerate() {
+                if journal
+                    .step(phase, || {
+                        if !removed.contains(&phase) {
+                            removed.push(phase);
+                        }
+                        if index == failed {
+                            Err(io::Error::other("injected"))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let mut journal = LifecycleJournal::read(path).unwrap().unwrap();
+            for (index, phase) in phases.iter().copied().enumerate() {
+                journal
+                    .step(phase, || {
+                        assert!(index >= failed);
+                        if !removed.contains(&phase) {
+                            removed.push(phase);
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            assert_eq!(journal.phase(), Phase::InstallRemoved);
+            assert_eq!(removed, phases);
+            journal.clear().unwrap();
+        }
+    }
+}

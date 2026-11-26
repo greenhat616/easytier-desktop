@@ -202,11 +202,39 @@ async fn install_connect_uninstall() {
     .await;
     #[cfg(windows)]
     let after_revoke = standard_user_handshake(&account, connector.clone(), endpoint.clone());
+    #[cfg(windows)]
+    let cleanup = Command::new(&installed_image)
+        .arg("uninstall")
+        .output()
+        .unwrap();
+    #[cfg(unix)]
     let cleanup = Command::new(binary).arg("uninstall").output().unwrap();
     assert!(
         cleanup.status.success(),
         "{}",
         String::from_utf8_lossy(&cleanup.stderr)
+    );
+    tokio::time::timeout(Duration::from_secs(45), async {
+        while layout.state.exists()
+            || layout.executable.parent().unwrap().exists()
+            || etd_sysfx_os::service::LifecycleJournal::open(&layout)
+                .unwrap()
+                .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("uninstall helper did not finish removing product directories");
+    let replay = Command::new(binary).arg("uninstall").output().unwrap();
+    assert!(
+        replay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert!(
+        layout.maintenance.join("host.lock").is_file(),
+        "stable lock must survive uninstall"
     );
     let identity = identity.expect("installed service never accepted a verified local connection");
     let welcome = handshake
@@ -278,4 +306,19 @@ async fn install_connect_uninstall() {
     println!(
         "uninstall reclaimed the ledger and removed service registration, owned directories and group"
     );
+    let reinstall = Command::new(binary).arg("install").output().unwrap();
+    assert!(
+        reinstall.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reinstall.stderr)
+    );
+    let cleanup = Command::new(binary).arg("uninstall").output().unwrap();
+    assert!(
+        cleanup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cleanup.stderr)
+    );
+    assert!(!layout.state.exists() && !layout.executable.parent().unwrap().exists());
+    assert!(layout.maintenance.join("host.lock").is_file());
+    println!("reinstall/uninstall succeeded through the same stable machine lock");
 }

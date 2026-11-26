@@ -1,6 +1,6 @@
 //! Composition root: all OS work is performed by the adapters it assembles.
 use crate::storage::{self, FileIndex};
-use crate::unavailable::{BlockedDriver, MissingNative};
+use crate::unavailable::{BlockedDriver, MissingNative, NoNewEffects};
 use anyhow::{Context, Result, bail, ensure};
 use etd_contract::{
     AllowEntry, HostMode, Role, capability,
@@ -35,8 +35,8 @@ use etd_sysfx::{
 use etd_sysfx_os::{
     OsConfig, OsError,
     service::{
-        HostFilesystem, HostLayout, HostLock, NativeHostFilesystem, NativeServiceManager,
-        ServiceManager,
+        HostFilesystem, HostLayout, HostLock, LifecycleJournal, NativeHostFilesystem,
+        NativeServiceManager, Phase, Resource, ServiceManager,
     },
 };
 use std::{
@@ -267,8 +267,23 @@ async fn dependencies(mode: HostMode, layout: &HostLayout) -> Result<Dependencie
     };
     let install_key = index.initialize(ledger_exists)?;
     let sqlite = Arc::new(SqliteLedger::open(layout.state.join(LEDGER), boot).await?);
-    let ledger: Arc<dyn Ledger> = sqlite.clone();
-    storage::initialize_manifest(&layout.cores)?;
+    let ledger: Arc<dyn Ledger> = if missing.is_some() {
+        Arc::new(NoNewEffects(sqlite.clone()))
+    } else {
+        sqlite.clone()
+    };
+    if mode == HostMode::User && !storage::manifest_exists(&layout.cores)? {
+        storage::install_bundled_cores(
+            layout
+                .executable
+                .parent()
+                .context("missing user host image directory")?,
+            &layout.cores,
+        )
+        .await?;
+    } else {
+        storage::initialize_manifest(&layout.cores)?;
+    }
     let driver: Arc<dyn CoreDriver> = match &missing {
         Some(reason) => Arc::new(BlockedDriver(reason.clone())),
         None => Arc::new(EasyTierDriver),
@@ -277,6 +292,7 @@ async fn dependencies(mode: HostMode, layout: &HostLayout) -> Result<Dependencie
         layout.cores.clone(),
         mode,
         driver.clone(),
+        storage::trusted_cores(),
     )?);
     let mut reclaimers = os.reclaimers;
     reclaimers.extend(host_reclaimers(
@@ -383,6 +399,13 @@ pub async fn run_until(mode: HostMode, managed_stop: Option<watch::Receiver<bool
         endpoint(mode, &layout)?,
         form,
     );
+    if mode == HostMode::Service {
+        ensure!(
+            LifecycleJournal::open(&layout)?
+                .is_some_and(|journal| journal.phase() == Phase::Installed),
+            "service installation is incomplete or disabled for uninstall; retry maintenance"
+        );
+    }
     let _logging = logging(&layout)?;
     let deps = dependencies(mode, &layout).await?;
     serve_with_deps(mode, guard, deps.host, managed_stop, deps.missing).await
@@ -688,15 +711,125 @@ pub async fn install(users: &[String]) -> Result<()> {
         NativeServiceManager.entry_is_elevated()?,
         "administrator privileges required"
     );
-    NativeServiceManager.prepare_install(&layout)?;
-    let guard = NativeHostFilesystem.lock(&layout)?;
-    let deps = dependencies(mode, &layout).await?;
-    let entries = seed_entries(users)?;
-    policy(mode, &entries)?;
-    maintenance_change(deps.host.ledger.as_ref(), Change::SetAllowList(entries)).await?;
-    deps.close().await?;
+    let guard = LayoutLock::new(
+        NativeHostFilesystem.lock(&layout)?,
+        endpoint(mode, &layout)?,
+        HostForm::Service,
+    );
+    if let Some(journal) = LifecycleJournal::open(&layout)? {
+        ensure!(
+            journal.phase() == Phase::Installing,
+            "service already installed or uninstall incomplete; run uninstall first"
+        );
+        rollback_install(&layout, &guard, journal)?;
+    }
+    NativeServiceManager.preflight_install(&layout)?;
+    let mut journal = LifecycleJournal::begin(&layout)?;
+    let result: Result<()> = async {
+        NativeServiceManager.prepare_install(&layout, &mut journal)?;
+        journal.plan(Resource::Data)?;
+        let source = etd_sysfx_os::service::current_exe()?;
+        storage::install_bundled_cores(
+            source.parent().context("missing installer directory")?,
+            &layout.cores,
+        )
+        .await?;
+        let deps = dependencies(mode, &layout).await?;
+        let seed: Result<()> = async {
+            let entries = seed_entries(users)?;
+            policy(mode, &entries)?;
+            maintenance_change(deps.host.ledger.as_ref(), Change::SetAllowList(entries)).await?;
+            Ok(())
+        }
+        .await;
+        let closed = deps.close().await;
+        seed?;
+        closed?;
+        journal.complete(Resource::Data)?;
+        NativeServiceManager.register(&layout, &mut journal)?;
+        journal.advance(Phase::Installed)?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        if let Err(rollback) = rollback_install(&layout, &guard, journal) {
+            bail!(
+                "install failed: {error:#}; rollback incomplete: {rollback:#}; retry uninstall to resume cleanup"
+            );
+        }
+        return Err(error.context("install rolled back"));
+    }
+    // Register under the stable lock; the newly launched service must acquire
+    // it itself, so release only after the journal records Installed.
     drop(guard);
-    NativeServiceManager.register(&layout)?;
+    if let Err(error) = start_and_verify(&layout).await {
+        if let Err(rollback) = uninstall().await {
+            bail!(
+                "service start failed: {error:#}; rollback incomplete: {rollback:#}; retry uninstall"
+            );
+        }
+        return Err(error.context("install rolled back after start failure"));
+    }
+    Ok(())
+}
+
+async fn start_and_verify(layout: &HostLayout) -> Result<()> {
+    use etd_ipc::{Connector, ServerExpectation, platform::LocalConnector};
+    NativeServiceManager.start(layout)?;
+    let connector = LocalConnector {
+        expectation: ServerExpectation {
+            exe_dir: layout
+                .executable
+                .parent()
+                .context("missing installed image directory")?
+                .to_owned(),
+            user: None,
+            privileged: true,
+        },
+    };
+    let endpoint = endpoint(HostMode::Service, layout)?;
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if connector.connect(&endpoint).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("registered service never published a verified endpoint")?;
+    Ok(())
+}
+
+fn clean_ipc(layout: &HostLayout, guard: &LayoutLock) -> Result<()> {
+    if NativeServiceManager.ipc_dir_exists(layout)? {
+        // Reuse I1's stale-endpoint and staging-directory ownership/liveness
+        // checks while holding the very same exclusive listener claim.
+        drop(LocalListener::bind_replacing_stale(
+            guard.listener_claim(),
+            &ListenerPolicy::default(),
+        )?);
+        NativeServiceManager.remove_ipc_dir(layout)?;
+    }
+    Ok(())
+}
+
+fn rollback_install(
+    layout: &HostLayout,
+    guard: &LayoutLock,
+    journal: LifecycleJournal,
+) -> Result<()> {
+    for resource in journal.rollback_resources() {
+        match resource {
+            Resource::Registration => NativeServiceManager.unregister(layout, true)?,
+            Resource::SocketDir => clean_ipc(layout, guard)?,
+            Resource::Group => NativeServiceManager.remove_group(layout, journal.group_gid())?,
+            Resource::StateDir => NativeServiceManager.remove_state(layout)?,
+            Resource::InstallDir => NativeServiceManager.remove_install(layout)?,
+            _ => unreachable!("only top-level rollback resources"),
+        }
+    }
+    journal.clear()?;
     Ok(())
 }
 
@@ -767,15 +900,83 @@ pub async fn uninstall() -> Result<()> {
         NativeServiceManager.entry_is_elevated()?,
         "administrator privileges required"
     );
-    NativeServiceManager.stop_and_disable(&layout)?;
-    let _guard = NativeHostFilesystem.lock(&layout)?;
-    // Exactly the reclaim --all --purge path, whilst holding the same lock.
-    // Unregister and remove only after all ownership records are closed.
-    let deps = dependencies(mode, &layout).await?;
-    reclaim_locked(&deps.host, true).await?;
-    deps.close().await?;
-    NativeServiceManager.remove(&layout)?;
+    NativeHostFilesystem.prepare_maintenance(&layout)?;
+    // The running service itself holds the machine lock. Stopping and
+    // disabling it is the only step that must precede acquiring that lock.
+    if let Some(journal) = LifecycleJournal::open(&layout)?
+        && journal.phase() == Phase::Installed
+    {
+        NativeServiceManager.stop_and_disable(&layout)?;
+    }
+    let guard = LayoutLock::new(
+        NativeHostFilesystem.lock(&layout)?,
+        endpoint(mode, &layout)?,
+        HostForm::Service,
+    );
+    let Some(mut journal) = LifecycleJournal::open(&layout)? else {
+        // A second uninstall is success only if there are no foreign or
+        // unjournaled resources; never adopt a name merely because it exists.
+        NativeServiceManager.preflight_install(&layout)?;
+        return Ok(());
+    };
+    if journal.phase() == Phase::Installing {
+        return rollback_install(&layout, &guard, journal);
+    }
+    journal.step(Phase::Disabled, || {
+        NativeServiceManager.stop_and_disable(&layout)
+    })?;
+    if journal.phase() < Phase::Reclaimed {
+        let result: Result<()> = async {
+            NativeHostFilesystem.validate_service(&layout)?;
+            ensure!(
+                storage::ledger_exists(&layout.state)?,
+                "ownership ledger missing; refusing unverified purge"
+            );
+            let deps = dependencies(mode, &layout).await?;
+            reclaim_locked(&deps.host, true).await?;
+            deps.close().await?;
+            Ok(())
+        }
+        .await;
+        result.context("service is disabled and ownership data retained; retry etd-host uninstall, or etd-host resume-service to re-enable before completed reclaim")?;
+        journal.advance(Phase::Reclaimed)?;
+    }
+    journal.step(Phase::Unregistered, || {
+        NativeServiceManager.unregister(&layout, false)
+    })?;
+    if journal.phase() < Phase::IpcRemoved {
+        clean_ipc(&layout, &guard)?;
+        journal.advance(Phase::IpcRemoved)?;
+    }
+    let gid = journal.group_gid();
+    journal.step(Phase::GroupRemoved, || {
+        NativeServiceManager.remove_group(&layout, gid)
+    })?;
+    journal.step(Phase::StateRemoved, || {
+        NativeServiceManager.remove_state(&layout)
+    })?;
+    if journal.phase() < Phase::InstallRemoved {
+        if NativeServiceManager.defer_install_removal(&layout)? {
+            println!(
+                "service and data removed; protected helper will finish the install directory after this process exits"
+            );
+            return Ok(());
+        }
+        NativeServiceManager.remove_install(&layout)?;
+        journal.advance(Phase::InstallRemoved)?;
+    }
+    journal.clear()?;
     Ok(())
+}
+
+pub async fn resume_service() -> Result<()> {
+    let layout = layout(HostMode::Service)?;
+    let guard = NativeHostFilesystem.lock(&layout)?;
+    NativeHostFilesystem.validate_service(&layout)?;
+    let mut journal = LifecycleJournal::open(&layout)?.context("no service installation")?;
+    journal.resume_service()?;
+    drop(guard);
+    start_and_verify(&layout).await
 }
 
 pub async fn remove_core(mode: HostMode, version: &str) -> Result<()> {

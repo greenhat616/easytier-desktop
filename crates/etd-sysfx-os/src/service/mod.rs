@@ -10,8 +10,10 @@ use std::{
 
 #[cfg(all(windows, feature = "ci-test-fixtures"))]
 pub mod ci_fixture;
+mod journal;
 #[cfg(unix)]
 mod unix;
+pub use journal::{LifecycleJournal, Phase, Resource};
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
@@ -29,6 +31,8 @@ pub struct HostLayout {
     pub cores: PathBuf,
     pub executable: PathBuf,
     pub socket_dir: Option<PathBuf>,
+    /// Stable protected directory never removed by install/uninstall.
+    pub maintenance: PathBuf,
     user_host: bool,
 }
 
@@ -93,6 +97,7 @@ pub trait HostFilesystem {
     fn service_layout(&self) -> io::Result<HostLayout>;
     fn prepare_user(&self, layout: &HostLayout) -> io::Result<()>;
     fn validate_service(&self, layout: &HostLayout) -> io::Result<()>;
+    fn prepare_maintenance(&self, layout: &HostLayout) -> io::Result<()>;
     fn is_installed_image(&self, layout: &HostLayout) -> io::Result<bool>;
     fn lock(&self, layout: &HostLayout) -> io::Result<HostLock>;
 }
@@ -103,29 +108,73 @@ pub trait ServiceManager {
     /// Create *fresh*, protected directories; copy the host before any
     /// registration. Refuse pre-existing product paths rather than claiming
     /// objects that may belong to someone else.
-    fn prepare_install(&self, layout: &HostLayout) -> io::Result<()>;
+    fn preflight_install(&self, layout: &HostLayout) -> io::Result<()>;
+    fn prepare_install(
+        &self,
+        layout: &HostLayout,
+        journal: &mut LifecycleJournal,
+    ) -> io::Result<()>;
     /// Register with the service manager using the protected executable.
-    fn register(&self, layout: &HostLayout) -> io::Result<()>;
+    fn register(&self, layout: &HostLayout, journal: &mut LifecycleJournal) -> io::Result<()>;
+    fn start(&self, layout: &HostLayout) -> io::Result<()>;
     /// Disable restart and stop before invoking maintenance reclaim.
     fn stop_and_disable(&self, layout: &HostLayout) -> io::Result<()>;
     /// Remove registration and validated product directories after reclaim.
-    fn remove(&self, layout: &HostLayout) -> io::Result<()>;
+    fn unregister(&self, layout: &HostLayout, partial_install: bool) -> io::Result<()>;
+    fn ipc_dir_exists(&self, layout: &HostLayout) -> io::Result<bool>;
+    fn remove_ipc_dir(&self, layout: &HostLayout) -> io::Result<()>;
+    fn remove_group(&self, layout: &HostLayout, gid: Option<u32>) -> io::Result<()>;
+    fn remove_state(&self, layout: &HostLayout) -> io::Result<()>;
+    fn remove_install(&self, layout: &HostLayout) -> io::Result<()>;
+    /// Windows installed executable handoff for the last uninstall stage.
+    fn defer_install_removal(&self, layout: &HostLayout) -> io::Result<bool>;
     fn entry_is_elevated(&self) -> io::Result<bool>;
 }
 
 pub struct NativeServiceManager;
 impl ServiceManager for NativeServiceManager {
-    fn prepare_install(&self, layout: &HostLayout) -> io::Result<()> {
-        native::prepare_install(layout)
+    fn preflight_install(&self, layout: &HostLayout) -> io::Result<()> {
+        native::preflight_install(layout)
     }
-    fn register(&self, layout: &HostLayout) -> io::Result<()> {
-        native::register(layout)
+    fn prepare_install(
+        &self,
+        layout: &HostLayout,
+        journal: &mut LifecycleJournal,
+    ) -> io::Result<()> {
+        native::prepare_install(layout, journal)
+    }
+    fn register(&self, layout: &HostLayout, journal: &mut LifecycleJournal) -> io::Result<()> {
+        journal.create(Resource::Registration, || native::register(layout))
+    }
+    fn start(&self, layout: &HostLayout) -> io::Result<()> {
+        native::start(layout)
     }
     fn stop_and_disable(&self, layout: &HostLayout) -> io::Result<()> {
         native::stop_and_disable(layout)
     }
-    fn remove(&self, layout: &HostLayout) -> io::Result<()> {
-        native::remove(layout)
+    fn unregister(&self, layout: &HostLayout, partial_install: bool) -> io::Result<()> {
+        native::unregister(layout, partial_install)
+    }
+    fn ipc_dir_exists(&self, layout: &HostLayout) -> io::Result<bool> {
+        layout
+            .socket_dir
+            .as_ref()
+            .map_or(Ok(false), |path| path.try_exists())
+    }
+    fn remove_ipc_dir(&self, layout: &HostLayout) -> io::Result<()> {
+        native::remove_ipc_dir(layout)
+    }
+    fn remove_group(&self, layout: &HostLayout, gid: Option<u32>) -> io::Result<()> {
+        native::remove_group(layout, gid)
+    }
+    fn remove_state(&self, layout: &HostLayout) -> io::Result<()> {
+        native::remove_state(layout)
+    }
+    fn remove_install(&self, layout: &HostLayout) -> io::Result<()> {
+        native::remove_install(layout)
+    }
+    fn defer_install_removal(&self, layout: &HostLayout) -> io::Result<bool> {
+        native::defer_install_removal(layout)
     }
     fn entry_is_elevated(&self) -> io::Result<bool> {
         native::elevated()
@@ -138,10 +187,19 @@ pub fn user_temp_runtime() -> io::Result<PathBuf> {
 pub fn current_exe() -> io::Result<PathBuf> {
     std::env::current_exe()?.canonicalize()
 }
+/// Shared client-side executable directory for authenticating an installed
+/// service. The Windows location comes from Known Folders, not environment.
+pub fn installed_host_dir() -> io::Result<PathBuf> {
+    service_layout()?
+        .executable
+        .parent()
+        .map(Path::to_owned)
+        .ok_or_else(|| io::Error::other("installed host directory missing"))
+}
 #[cfg(unix)]
 pub use unix::group_id as service_group_id;
 #[cfg(windows)]
-pub use windows::dispatch_service;
+pub use windows::{dispatch_service, wait_uninstall_parent};
 
 #[derive(Default)]
 pub struct NativeHostFilesystem;
@@ -209,6 +267,7 @@ impl HostFilesystem for NativeHostFilesystem {
             run: state.join("run"),
             cores: state.join("cores"),
             executable: std::env::current_exe()?.canonicalize()?,
+            maintenance: state.clone(),
             state,
             socket_dir,
             user_host: true,
@@ -232,11 +291,17 @@ impl HostFilesystem for NativeHostFilesystem {
     fn validate_service(&self, layout: &HostLayout) -> io::Result<()> {
         native::validate_service(layout)
     }
+    fn prepare_maintenance(&self, layout: &HostLayout) -> io::Result<()> {
+        native::prepare_maintenance(layout)
+    }
     fn is_installed_image(&self, layout: &HostLayout) -> io::Result<bool> {
         Ok(current_exe()? == layout.executable.canonicalize()?)
     }
     fn lock(&self, layout: &HostLayout) -> io::Result<HostLock> {
-        let mut guard = HostLock::acquire(&layout.state)?;
+        if !layout.user_host {
+            native::prepare_maintenance(layout)?;
+        }
+        let mut guard = HostLock::acquire(&layout.maintenance)?;
         // A different XDG state directory must not permit a second claim
         // for the same user endpoint.
         if layout.user_host
@@ -280,6 +345,7 @@ fn service_layout() -> io::Result<HostLayout> {
         executable: install.join("etd-host.exe"),
         state,
         socket_dir: None,
+        maintenance: native::program_data()?.join("EasyTierDesk.maintenance"),
         user_host: false,
     })
 }
@@ -293,19 +359,21 @@ fn service_layout() -> io::Result<HostLayout> {
         executable: install.join("etd-host"),
         state,
         socket_dir: Some(PathBuf::from("/run/easytier-desk")),
+        maintenance: PathBuf::from("/var/lib/easytier-desk-maintenance"),
         user_host: false,
     })
 }
 #[cfg(target_os = "macos")]
 fn service_layout() -> io::Result<HostLayout> {
-    let state = PathBuf::from("/var/lib/easytier-desk");
     let install = PathBuf::from("/Library/Application Support/easytier-desk");
+    let state = install.join("state");
     Ok(HostLayout {
         run: state.join("run"),
         cores: install.join("cores"),
         executable: install.join("etd-host"),
         state,
         socket_dir: Some(install.join("run")),
+        maintenance: PathBuf::from("/Library/Application Support/easytier-desk-maintenance"),
         user_host: false,
     })
 }

@@ -127,7 +127,8 @@ fn create_protected(path: &Path, readable: bool) -> io::Result<()> {
         };
         // Atomic directory publication: an attacker-created path is refused,
         // not opened and subsequently granted trusted permissions.
-        CreateDirectoryW(&HSTRING::from(path.as_os_str()), Some(&attrs)).map_err(other)?;
+        CreateDirectoryW(&HSTRING::from(path.as_os_str()), Some(&attrs))
+            .map_err(|error| io::Error::from_raw_os_error(error.code().0 & 0xffff))?;
     }
     validate_acl(path, readable, true)
 }
@@ -321,7 +322,21 @@ pub(super) fn validate_service(layout: &HostLayout) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn prepare_install(layout: &HostLayout) -> io::Result<()> {
+pub(super) fn prepare_maintenance(layout: &HostLayout) -> io::Result<()> {
+    if !elevated()? {
+        return Err(denied());
+    }
+    if !layout.maintenance.try_exists()?
+        && let Err(error) = create_protected(&layout.maintenance, false)
+        && !layout.maintenance.try_exists()?
+    {
+        return Err(error);
+    }
+    validate_acl(&layout.maintenance, false, true)?;
+    Ok(())
+}
+
+pub(super) fn preflight_install(layout: &HostLayout) -> io::Result<()> {
     if !elevated()? {
         return Err(denied());
     }
@@ -344,20 +359,32 @@ pub(super) fn prepare_install(layout: &HostLayout) -> io::Result<()> {
             "service directories already exist; refusing to overwrite",
         ));
     }
-    create_protected(&layout.state, false)?;
-    create_protected(install, true)?;
-    fs::create_dir(&layout.run)?;
-    fs::create_dir(&layout.cores)?;
+    Ok(())
+}
+
+pub(super) fn prepare_install(
+    layout: &HostLayout,
+    journal: &mut LifecycleJournal,
+) -> io::Result<()> {
+    preflight_install(layout)?;
+    let install = layout.executable.parent().ok_or_else(denied)?;
+    let mut source = File::open(super::current_exe()?)?;
+    journal.create(Resource::InstallDir, || create_protected(install, true))?;
+    journal.create(Resource::StateDir, || {
+        create_protected(&layout.state, false)
+    })?;
+    journal.create(Resource::RunDir, || fs::create_dir(&layout.run))?;
+    journal.create(Resource::CoreDir, || fs::create_dir(&layout.cores))?;
     // Copy before service registration; do not run an executable in an
     // installer download directory as LocalSystem.
-    let mut source = File::open(super::current_exe()?)?;
-    let mut destination = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&layout.executable)?;
-    io::copy(&mut source, &mut destination)?;
-    destination.sync_all()?;
-    drop(destination);
+    journal.create(Resource::HostImage, || {
+        let mut destination = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&layout.executable)?;
+        io::copy(&mut source, &mut destination)?;
+        destination.sync_all()
+    })?;
     validate_service(layout)
 }
 
@@ -380,7 +407,10 @@ fn open_service(access: ServiceAccess) -> io::Result<Service> {
     ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(other)?
         .open_service(SERVICE_NAME, access)
-        .map_err(other)
+        .map_err(|error| match error {
+            windows_service::Error::Winapi(inner) => inner,
+            error => other(error),
+        })
 }
 
 pub(super) fn register(layout: &HostLayout) -> io::Result<()> {
@@ -395,7 +425,15 @@ pub(super) fn register(layout: &HostLayout) -> io::Result<()> {
             &info(layout, ServiceStartType::AutoStart),
             ServiceAccess::START | ServiceAccess::QUERY_STATUS | ServiceAccess::CHANGE_CONFIG,
         )
-        .map_err(other)?;
+        .map_err(|error| match error {
+            windows_service::Error::Winapi(inner) if inner.raw_os_error() == Some(1073) => {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "service name already registered",
+                )
+            }
+            error => other(error),
+        })?;
     use windows_service::service::{
         ServiceAction, ServiceActionType, ServiceFailureActions, ServiceFailureResetPeriod,
     };
@@ -409,7 +447,24 @@ pub(super) fn register(layout: &HostLayout) -> io::Result<()> {
         }]),
     })
     .map_err(other)?;
-    svc.start::<&str>(&[]).map_err(other)
+    Ok(())
+}
+
+pub(super) fn start(layout: &HostLayout) -> io::Result<()> {
+    validate_service(layout)?;
+    let svc = open_service(
+        ServiceAccess::QUERY_CONFIG
+            | ServiceAccess::CHANGE_CONFIG
+            | ServiceAccess::START
+            | ServiceAccess::QUERY_STATUS,
+    )?;
+    verify_service(&svc, layout)?;
+    svc.change_config(&info(layout, ServiceStartType::AutoStart))
+        .map_err(other)?;
+    if svc.query_status().map_err(other)?.current_state == ServiceState::Stopped {
+        svc.start::<&str>(&[]).map_err(other)?;
+    }
+    Ok(())
 }
 
 fn verify_service(svc: &Service, layout: &HostLayout) -> io::Result<()> {
@@ -435,17 +490,26 @@ fn verify_service(svc: &Service, layout: &HostLayout) -> io::Result<()> {
 }
 
 pub(super) fn stop_and_disable(layout: &HostLayout) -> io::Result<()> {
-    validate_service(layout)?;
-    let svc = open_service(
+    if !elevated()? {
+        return Err(denied());
+    }
+    let svc = match open_service(
         ServiceAccess::QUERY_CONFIG
             | ServiceAccess::CHANGE_CONFIG
             | ServiceAccess::STOP
             | ServiceAccess::QUERY_STATUS,
-    )?;
+    ) {
+        Ok(svc) => svc,
+        Err(error) if matches!(error.raw_os_error(), Some(1060 | 1072)) => return Ok(()),
+        Err(error) => return Err(error),
+    };
     verify_service(&svc, layout)?;
     svc.change_config(&info(layout, ServiceStartType::Disabled))
         .map_err(other)?;
-    if svc.query_status().map_err(other)?.current_state != ServiceState::Stopped {
+    if !matches!(
+        svc.query_status().map_err(other)?.current_state,
+        ServiceState::Stopped | ServiceState::StopPending
+    ) {
         svc.stop().map_err(other)?;
     }
     let limit = Instant::now() + Duration::from_secs(60);
@@ -461,19 +525,162 @@ pub(super) fn stop_and_disable(layout: &HostLayout) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn remove(layout: &HostLayout) -> io::Result<()> {
-    validate_service(layout)?;
-    let svc = open_service(
-        ServiceAccess::QUERY_CONFIG | ServiceAccess::QUERY_STATUS | ServiceAccess::DELETE,
-    )?;
-    verify_service(&svc, layout)?;
-    if svc.query_status().map_err(other)?.current_state != ServiceState::Stopped {
+pub(super) fn unregister(layout: &HostLayout, _: bool) -> io::Result<()> {
+    if !elevated()? {
         return Err(denied());
     }
-    svc.delete().map_err(other)?;
-    drop(svc);
-    fs::remove_dir_all(layout.executable.parent().ok_or_else(denied)?)?;
-    fs::remove_dir_all(&layout.state)
+    stop_and_disable(layout)?;
+    let svc = match open_service(
+        ServiceAccess::QUERY_CONFIG | ServiceAccess::QUERY_STATUS | ServiceAccess::DELETE,
+    ) {
+        Ok(svc) => Some(svc),
+        Err(error) if matches!(error.raw_os_error(), Some(1060 | 1072)) => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(svc) = svc {
+        verify_service(&svc, layout)?;
+        if svc.query_status().map_err(other)?.current_state != ServiceState::Stopped {
+            return Err(denied());
+        }
+        svc.delete().map_err(other)?;
+        drop(svc);
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match open_service(ServiceAccess::QUERY_STATUS) {
+            Err(error) if error.raw_os_error() == Some(1060) => return Ok(()),
+            Err(error) if error.raw_os_error() == Some(1072) => (),
+            Err(error) => return Err(error),
+            Ok(_) => (),
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "service registration still present",
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+pub(super) fn remove_ipc_dir(_: &HostLayout) -> io::Result<()> {
+    Ok(())
+}
+pub(super) fn remove_group(_: &HostLayout, _: Option<u32>) -> io::Result<()> {
+    Ok(())
+}
+fn remove_owned_tree(path: &Path, readable: bool) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+        Ok(_) => (),
+    }
+    validate_acl(path, readable, true)?;
+    verify_tree(path, readable)?;
+    fs::remove_dir_all(path)
+}
+pub(super) fn remove_state(layout: &HostLayout) -> io::Result<()> {
+    remove_owned_tree(&layout.state, false)
+}
+pub(super) fn remove_install(layout: &HostLayout) -> io::Result<()> {
+    remove_owned_tree(layout.executable.parent().ok_or_else(denied)?, true)
+}
+
+pub(super) fn defer_install_removal(layout: &HostLayout) -> io::Result<bool> {
+    use ::windows::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW};
+    use ::windows::core::PCWSTR;
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek};
+    if !layout.executable.try_exists()?
+        || super::current_exe()? != layout.executable.canonicalize()?
+    {
+        return Ok(false);
+    }
+    // The copy is made inside the protected, persistent maintenance root,
+    // never in the invoking user's temp directory.
+    let dir = tempfile::Builder::new()
+        .prefix("uninstall-")
+        .tempdir_in(&layout.maintenance)?;
+    validate_acl(dir.path(), false, false)?;
+    let helper = dir.path().join("etd-host.exe");
+    let mut source = File::open(&layout.executable)?;
+    let mut target = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&helper)?;
+    io::copy(&mut source, &mut target)?;
+    target.sync_all()?;
+    drop(target);
+    // Verify the transferred image bytes before executing any helper.
+    fn hash(mut reader: impl Read) -> io::Result<[u8; 32]> {
+        let mut hash = Sha256::new();
+        let mut buffer = [0u8; 65536];
+        loop {
+            let n = reader.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&buffer[..n]);
+        }
+        Ok(hash.finalize().into())
+    }
+    source.rewind()?;
+    if hash(source)? != hash(File::open(&helper)?)? {
+        return Err(denied());
+    }
+    validate_acl(&helper, false, false)?;
+    // The helper resumes only the final stage after this process exits.
+    // Windows cannot remove its own executing image; schedule only this
+    // temporary helper and directory for reboot cleanup.
+    unsafe {
+        MoveFileExW(
+            &HSTRING::from(helper.as_os_str()),
+            PCWSTR::null(),
+            MOVEFILE_DELAY_UNTIL_REBOOT,
+        )
+        .map_err(other)?;
+        MoveFileExW(
+            &HSTRING::from(dir.path().as_os_str()),
+            PCWSTR::null(),
+            MOVEFILE_DELAY_UNTIL_REBOOT,
+        )
+        .map_err(other)?;
+    }
+    let _keep = dir.keep();
+    std::process::Command::new(&helper)
+        .args([
+            "uninstall",
+            "--wait-parent",
+            &std::process::id().to_string(),
+        ])
+        .spawn()?;
+    Ok(true)
+}
+
+pub fn wait_uninstall_parent(pid: u32) -> io::Result<()> {
+    use ::windows::Win32::{
+        Foundation::{ERROR_INVALID_PARAMETER, WAIT_OBJECT_0},
+        System::Threading::{OpenProcess, PROCESS_ACCESS_RIGHTS, WaitForSingleObject},
+    };
+    if !elevated()? {
+        return Err(denied());
+    }
+    if pid == std::process::id() || pid == 0 {
+        return Err(denied());
+    }
+    let handle = match unsafe { OpenProcess(PROCESS_ACCESS_RIGHTS(0x0010_0000), false, pid) } {
+        Ok(handle) => handle,
+        Err(error) if error.code() == ERROR_INVALID_PARAMETER.to_hresult() => return Ok(()),
+        Err(error) => return Err(other(error)),
+    };
+    let result = unsafe { WaitForSingleObject(handle, 30_000) };
+    let _ = unsafe { CloseHandle(handle) };
+    if result != WAIT_OBJECT_0 {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "installed uninstall parent did not exit",
+        ));
+    }
+    Ok(())
 }
 
 type ServiceBody = Box<dyn FnOnce(tokio::sync::watch::Receiver<bool>) -> io::Result<()> + Send>;

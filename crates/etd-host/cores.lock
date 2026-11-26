@@ -1,0 +1,3 @@
+# Release packaging supplies rows: target-triple version lowercase-sha256
+# Only the current Rust target's entries are embedded in etd-host.
+# An empty release table permits no kernels; no local manifest may add one.

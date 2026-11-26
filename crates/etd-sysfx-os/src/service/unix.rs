@@ -11,7 +11,7 @@ const GROUP_RECORD: &str = "installed-group";
 #[cfg(target_os = "linux")]
 const UNIT: &str = "/etc/systemd/system/easytier-desk-host.service";
 #[cfg(target_os = "linux")]
-const UNIT_CONTENT: &str = "[Unit]\nDescription=EasyTier Desktop Host\nAfter=network.target\n[Service]\nType=simple\nExecStart=/usr/local/lib/easytier-desk/etd-host run --mode service\nRestart=on-failure\nRuntimeDirectory=easytier-desk\nRuntimeDirectoryMode=0755\nKillMode=control-group\n[Install]\nWantedBy=multi-user.target\n";
+const UNIT_CONTENT: &str = "[Unit]\nDescription=EasyTier Desktop Host\nAfter=network.target\n[Service]\nType=simple\nExecStart=/usr/local/lib/easytier-desk/etd-host run --mode service\nRestart=on-failure\nRuntimeDirectory=easytier-desk\nRuntimeDirectoryMode=0755\nRuntimeDirectoryPreserve=yes\nKillMode=control-group\nDelegate=yes\n[Install]\nWantedBy=multi-user.target\n";
 #[cfg(target_os = "macos")]
 const UNIT: &str = "/Library/LaunchDaemons/easytier-desk-host.plist";
 #[cfg(target_os = "macos")]
@@ -39,10 +39,31 @@ pub(super) fn elevated() -> io::Result<bool> {
 }
 pub(super) fn user_temp_runtime() -> io::Result<PathBuf> {
     #[cfg(target_os = "macos")]
-    let base = "/private/tmp";
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let size =
+            unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, std::ptr::null_mut(), 0) };
+        if size == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut bytes = vec![0u8; size];
+        let actual = unsafe {
+            libc::confstr(
+                libc::_CS_DARWIN_USER_TEMP_DIR,
+                bytes.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if actual == 0 || actual > size {
+            return Err(io::Error::last_os_error());
+        }
+        bytes.truncate(actual - 1);
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes))
+            .canonicalize()?
+            .join("easytier-desk"))
+    }
     #[cfg(target_os = "linux")]
-    let base = "/tmp";
-    Ok(PathBuf::from(base).join(format!("easytier-desk-{}", Uid::effective().as_raw())))
+    Ok(PathBuf::from("/tmp").join(format!("easytier-desk-{}", Uid::effective().as_raw())))
 }
 
 fn check(path: &Path, directory: bool) -> io::Result<()> {
@@ -206,7 +227,7 @@ fn await_group(present: bool) -> io::Result<Option<u32>> {
     }
 }
 
-fn create_group(layout: &HostLayout) -> io::Result<()> {
+fn create_group(layout: &HostLayout, gid: u32) -> io::Result<()> {
     if group_exists()? || Group::from_name(GROUP).map_err(other)?.is_some() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -214,16 +235,30 @@ fn create_group(layout: &HostLayout) -> io::Result<()> {
         ));
     }
     #[cfg(target_os = "linux")]
-    invoke("/usr/sbin/groupadd", &["--system", GROUP])?;
+    invoke(
+        "/usr/sbin/groupadd",
+        &["--system", "--gid", &gid.to_string(), GROUP],
+    )?;
     #[cfg(target_os = "macos")]
     invoke(
         "/usr/sbin/dseditgroup",
-        &["-o", "create", "-n", "/Local/Default", GROUP],
+        &[
+            "-o",
+            "create",
+            "-n",
+            "/Local/Default",
+            "-i",
+            &gid.to_string(),
+            GROUP,
+        ],
     )?;
     #[cfg(target_os = "macos")]
-    let gid = await_group(true)?.ok_or_else(denied)?;
+    let observed = await_group(true)?.ok_or_else(denied)?;
     #[cfg(target_os = "linux")]
-    let gid = group_id()?;
+    let observed = group_id()?;
+    if observed != gid {
+        return Err(denied());
+    }
     use std::{io::Write, os::unix::fs::OpenOptionsExt};
     let mut record = OpenOptions::new()
         .write(true)
@@ -245,17 +280,35 @@ fn verify_group(layout: &HostLayout) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn prepare_install(layout: &HostLayout) -> io::Result<()> {
+pub(super) fn prepare_maintenance(layout: &HostLayout) -> io::Result<()> {
     if !elevated()? {
         return Err(denied());
     }
     protect_creation();
-    // Open a stable source before any installation action. Linux exposes
-    // the executing image itself rather than re-resolving its old pathname.
-    #[cfg(target_os = "linux")]
-    let mut source = File::open("/proc/self/exe")?;
-    #[cfg(target_os = "macos")]
-    let mut source = File::open(super::current_exe()?)?;
+    if let Some(parent) = layout.maintenance.parent()
+        && !parent.try_exists()?
+    {
+        make(parent, 0o755)?;
+    }
+    if !layout.maintenance.try_exists()? {
+        match make(&layout.maintenance, 0o700) {
+            Ok(()) => (),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
+            Err(e) => return Err(e),
+        }
+    }
+    verify_parent(&layout.maintenance)?;
+    check(&layout.maintenance, true)?;
+    if fs::symlink_metadata(&layout.maintenance)?.mode() & 0o7777 != 0o700 {
+        return Err(denied());
+    }
+    Ok(())
+}
+
+pub(super) fn preflight_install(layout: &HostLayout) -> io::Result<()> {
+    if !elevated()? {
+        return Err(denied());
+    }
     let install = layout.executable.parent().ok_or_else(denied)?;
     let socket = layout.socket_dir.as_ref().ok_or_else(denied)?;
     // Check collisions before any creation. On macOS /var/lib may not exist.
@@ -265,33 +318,60 @@ pub(super) fn prepare_install(layout: &HostLayout) -> io::Result<()> {
         || Path::new(UNIT).try_exists()?
         || group_exists()?
         || Group::from_name(GROUP).map_err(other)?.is_some()
+        || service_loaded()?
     {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             "service installation paths or group already exist",
         ));
     }
-    if let Some(parent) = layout.state.parent()
-        && !parent.try_exists()?
-    {
-        make(parent, 0o755)?;
-    }
-    make(&layout.state, 0o700)?;
-    make(install, 0o755)?;
-    make(&layout.run, 0o700)?;
-    make(&layout.cores, 0o755)?;
-    make(socket, 0o755)?;
+    Ok(())
+}
+
+pub(super) fn prepare_install(
+    layout: &HostLayout,
+    journal: &mut LifecycleJournal,
+) -> io::Result<()> {
+    preflight_install(layout)?;
+    protect_creation();
+    #[cfg(target_os = "linux")]
+    let mut source = File::open("/proc/self/exe")?;
+    #[cfg(target_os = "macos")]
+    let mut source = File::open(super::current_exe()?)?;
+    let install = layout.executable.parent().ok_or_else(denied)?;
+    let socket = layout.socket_dir.as_ref().ok_or_else(denied)?;
+    journal.create(Resource::InstallDir, || make(install, 0o755))?;
+    journal.create(Resource::StateDir, || make(&layout.state, 0o700))?;
+    journal.create(Resource::RunDir, || make(&layout.run, 0o700))?;
+    journal.create(Resource::CoreDir, || make(&layout.cores, 0o755))?;
+    journal.create(Resource::SocketDir, || make(socket, 0o755))?;
     use std::os::unix::fs::OpenOptionsExt;
-    let mut target = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o700)
-        .open(&layout.executable)?;
-    io::copy(&mut source, &mut target)?;
-    target.sync_all()?;
-    drop(target);
-    fs::set_permissions(&layout.executable, fs::Permissions::from_mode(0o755))?;
-    create_group(layout)?;
+    journal.create(Resource::HostImage, || {
+        let mut target = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&layout.executable)?;
+        io::copy(&mut source, &mut target)?;
+        target.sync_all()?;
+        drop(target);
+        fs::set_permissions(&layout.executable, fs::Permissions::from_mode(0o755))
+    })?;
+    // Reserve a concrete unused gid before group creation. A crash in the
+    // create/record window can be rolled back only if both name and gid match.
+    let mut gid = None;
+    for candidate in 60000..65000 {
+        if Group::from_gid(nix::unistd::Gid::from_raw(candidate))
+            .map_err(other)?
+            .is_none()
+        {
+            gid = Some(candidate);
+            break;
+        }
+    }
+    let gid = gid.ok_or_else(|| other("no available service group ID"))?;
+    journal.set_group_gid(gid)?;
+    journal.create(Resource::Group, || create_group(layout, gid))?;
     validate_service(layout)
 }
 
@@ -319,10 +399,11 @@ pub(super) fn validate_service(layout: &HostLayout) -> io::Result<()> {
     Ok(())
 }
 
-fn verify_unit() -> io::Result<()> {
+fn verify_unit(partial_install: bool) -> io::Result<()> {
     let path = Path::new(UNIT);
     check(path, false)?;
-    if fs::read_to_string(path)? != UNIT_CONTENT {
+    let content = fs::read_to_string(path)?;
+    if content != UNIT_CONTENT && !(partial_install && UNIT_CONTENT.starts_with(&content)) {
         return Err(denied());
     }
     Ok(())
@@ -345,18 +426,80 @@ pub(super) fn register(layout: &HostLayout) -> io::Result<()> {
         invoke("/usr/bin/systemctl", &["daemon-reload"])?;
         invoke(
             "/usr/bin/systemctl",
+            &["enable", "easytier-desk-host.service"],
+        )
+    }
+    #[cfg(target_os = "macos")]
+    Ok(())
+}
+
+fn service_loaded() -> io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let output = Command::new("/usr/bin/systemctl")
+            .args([
+                "show",
+                "--property=LoadState",
+                "--value",
+                "easytier-desk-host.service",
+            ])
+            .env_clear()
+            .output()?;
+        if !output.status.success() {
+            return Err(other(format!("systemctl query failed: {}", output.status)));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim() != "not-found")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("/bin/launchctl")
+            .args(["print", "system/easytier-desk-host"])
+            .env_clear()
+            .output()?;
+        if output.status.success() {
+            return Ok(true);
+        }
+        if output.status.code() == Some(113)
+            || String::from_utf8_lossy(&output.stderr).contains("Could not find service")
+        {
+            return Ok(false);
+        }
+        Err(other(format!("launchctl query failed: {}", output.status)))
+    }
+}
+
+pub(super) fn start(layout: &HostLayout) -> io::Result<()> {
+    validate_service(layout)?;
+    verify_unit(false)?;
+    #[cfg(target_os = "linux")]
+    {
+        invoke(
+            "/usr/bin/systemctl",
             &["enable", "--now", "easytier-desk-host.service"],
         )
     }
     #[cfg(target_os = "macos")]
     {
-        invoke("/bin/launchctl", &["bootstrap", "system", UNIT])
+        if service_loaded()? {
+            Ok(())
+        } else {
+            invoke("/bin/launchctl", &["bootstrap", "system", UNIT])
+        }
     }
 }
 
-pub(super) fn stop_and_disable(layout: &HostLayout) -> io::Result<()> {
-    validate_service(layout)?;
-    verify_unit()?;
+pub(super) fn stop_and_disable(_: &HostLayout) -> io::Result<()> {
+    if !elevated()? {
+        return Err(denied());
+    }
+    if !Path::new(UNIT).try_exists()? {
+        return if service_loaded()? {
+            Err(denied())
+        } else {
+            Ok(())
+        };
+    }
+    verify_unit(false)?;
     #[cfg(target_os = "linux")]
     {
         invoke(
@@ -366,20 +509,53 @@ pub(super) fn stop_and_disable(layout: &HostLayout) -> io::Result<()> {
     }
     #[cfg(target_os = "macos")]
     {
-        invoke("/bin/launchctl", &["bootout", "system", UNIT])
+        if service_loaded()? {
+            invoke("/bin/launchctl", &["bootout", "system", UNIT])
+        } else {
+            Ok(())
+        }
     }
 }
 
-pub(super) fn remove(layout: &HostLayout) -> io::Result<()> {
-    validate_service(layout)?;
-    verify_unit()?;
-    verify_group(layout)?;
-    fs::remove_file(UNIT)?;
-    #[cfg(target_os = "linux")]
-    {
-        invoke("/usr/bin/systemctl", &["daemon-reload"])?;
-        invoke("/usr/sbin/groupdel", &[GROUP])?;
+pub(super) fn unregister(layout: &HostLayout, partial_install: bool) -> io::Result<()> {
+    if !elevated()? {
+        return Err(denied());
     }
+    if Path::new(UNIT).try_exists()? {
+        verify_unit(partial_install)?;
+        if fs::read_to_string(UNIT)? == UNIT_CONTENT {
+            stop_and_disable(layout)?;
+        }
+        fs::remove_file(UNIT)?;
+    }
+    #[cfg(target_os = "linux")]
+    invoke("/usr/bin/systemctl", &["daemon-reload"])?;
+    Ok(())
+}
+
+pub(super) fn remove_ipc_dir(layout: &HostLayout) -> io::Result<()> {
+    if let Some(socket) = &layout.socket_dir
+        && socket.try_exists()?
+    {
+        verify_parent(socket)?;
+        check(socket, true)?;
+        // The IPC adapter has already removed only proven stale sockets and
+        // stages. Do not recursively delete any unrecognized leftover.
+        fs::remove_dir(socket)?;
+    }
+    Ok(())
+}
+pub(super) fn remove_group(_: &HostLayout, gid: Option<u32>) -> io::Result<()> {
+    let observed = match group_id() {
+        Ok(value) => value,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if Some(observed) != gid {
+        return Err(denied());
+    }
+    #[cfg(target_os = "linux")]
+    invoke("/usr/sbin/groupdel", &[GROUP])?;
     #[cfg(target_os = "macos")]
     {
         invoke(
@@ -388,11 +564,24 @@ pub(super) fn remove(layout: &HostLayout) -> io::Result<()> {
         )?;
         let _ = await_group(false)?;
     }
-    if let Some(socket) = &layout.socket_dir
-        && socket.try_exists()?
-    {
-        fs::remove_dir(socket)?;
+    Ok(())
+}
+fn remove_owned_tree(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => (),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
     }
-    fs::remove_dir_all(layout.executable.parent().ok_or_else(denied)?)?;
-    fs::remove_dir_all(&layout.state)
+    verify_parent(path)?;
+    verify_tree(path)?;
+    fs::remove_dir_all(path)
+}
+pub(super) fn remove_state(layout: &HostLayout) -> io::Result<()> {
+    remove_owned_tree(&layout.state)
+}
+pub(super) fn remove_install(layout: &HostLayout) -> io::Result<()> {
+    remove_owned_tree(layout.executable.parent().ok_or_else(denied)?)
+}
+pub(super) fn defer_install_removal(_: &HostLayout) -> io::Result<bool> {
+    Ok(false)
 }

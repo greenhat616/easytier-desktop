@@ -250,6 +250,12 @@ async fn apply_ready_stop_and_reclaim_over_real_transport() {
         .unwrap()
         .into_inner();
     assert_eq!(hello.role(), Role::Admin);
+    assert!(
+        hello
+            .capabilities
+            .iter()
+            .any(|capability| capability == etd_contract::capability::LEASE)
+    );
     let snapshot = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let snapshot = client

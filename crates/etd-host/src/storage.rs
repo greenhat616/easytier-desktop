@@ -5,10 +5,20 @@ use etd_contract::InstanceId;
 use etd_sysfx::{InstallKey, LedgerError, RepairIndex, RepairIndexStore, StorageFault};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
 };
+
+include!(concat!(env!("OUT_DIR"), "/trusted_cores.rs"));
+
+pub fn trusted_cores() -> HashMap<String, String> {
+    TRUSTED_CORES
+        .iter()
+        .map(|(version, hash)| (version.to_string(), hash.to_string()))
+        .collect()
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -89,6 +99,80 @@ pub fn initialize_manifest(root: &Path) -> Result<()> {
         atomic_json(&path, &Manifest::default())?;
     }
     Ok(())
+}
+
+/// Install only the target-specific build-time release inventory. Hash the
+/// bytes inside the protected destination before identifying or publishing
+/// the kernel. A caller's local manifest is never a trust source.
+pub async fn install_bundled_cores(bundle_root: &Path, target: &Path) -> Result<()> {
+    use etd_core_api::CoreDriver;
+    use etd_host_core::core_store::manifest::{CORE_FILE, MANIFEST_FILE, Manifest, ManifestEntry};
+    let mut manifest = Manifest::default();
+    for &(version, expected) in TRUSTED_CORES {
+        let source = bundle_root.join("cores").join(version).join(CORE_FILE);
+        let final_dir = target.join(expected);
+        if final_dir.try_exists()? {
+            bail!("kernel hash directory already exists");
+        }
+        let stage = tempfile::tempdir_in(target)?;
+        let staged = stage.path().join(CORE_FILE);
+        let mut input =
+            fs::File::open(&source).with_context(|| format!("bundled core {version} missing"))?;
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)?;
+        io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+        drop(output);
+        if hash_file(&staged)? != expected {
+            bail!("bundled core {version} hash differs from embedded release table");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))?;
+        }
+        let descriptor = etd_core_easytier::EasyTierDriver.identify(&staged).await?;
+        if descriptor.version != version {
+            bail!("bundled kernel version differs from embedded release table");
+        }
+        fs::rename(stage.path(), &final_dir)?;
+        let _ = stage.keep();
+        manifest.cores.push(ManifestEntry {
+            version: version.into(),
+            proto_revision: descriptor.proto_revision,
+            sha256: expected.into(),
+        });
+    }
+    manifest.default_version = manifest.cores.first().map(|entry| entry.version.clone());
+    atomic_json(&target.join(MANIFEST_FILE), &manifest)
+}
+
+fn hash_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buffer[..n]);
+    }
+    Ok(hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+pub fn manifest_exists(root: &Path) -> Result<bool> {
+    Ok(root
+        .join(etd_host_core::core_store::manifest::MANIFEST_FILE)
+        .try_exists()?)
 }
 
 pub fn ledger_exists(state: &Path) -> Result<bool> {

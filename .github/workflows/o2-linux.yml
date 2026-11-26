@@ -42,7 +42,6 @@ jobs:
           sudo useradd --no-create-home --shell /usr/sbin/nologin etd_o2_probe
           sudo systemctl start systemd-resolved
           mkdir -p evidence
-          export ETD_O2_TABLE_EXPORT="$PWD/evidence/fence.nft"
           sudo -E env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" ETD_O2_PRIVILEGED=1 "$(command -v cargo)" nextest run --locked --profile privileged -p etd-sysfx-os --run-ignored only --test linux_reclaim --test linux_fence --success-output immediate |& tee evidence/privileged.txt
       - name: Resolver without resolve1
         shell: bash
@@ -60,7 +59,6 @@ jobs:
           path: evidence
 
   distribution-parser:
-    needs: privileged
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -69,10 +67,6 @@ jobs:
         image: ['debian:12', 'quay.io/fedora/fedora:44']
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: actions/download-artifact@v4
-        with:
-          name: o2-linux-evidence
-          path: evidence
       - name: Install pinned protoc
         shell: pwsh
         run: ./.github/scripts/setup-protoc.ps1
@@ -85,19 +79,22 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update && sudo apt-get install -y nftables libdbus-1-dev
+          parser=$(cargo test --locked -p etd-sysfx-os --lib --no-run --message-format=json | jq -rs '.[] | select(.target.name == "etd_sysfx_os" and .executable != null) | .executable')
+          test -x "$parser"
           container=$(docker run -d --cap-add NET_ADMIN "$IMAGE" sleep infinity)
           trap 'docker rm -f "$container" >/dev/null' EXIT
           case "$IMAGE" in
             debian:*) docker exec "$container" sh -ec 'apt-get update -qq && apt-get install -y -qq nftables' ;;
             *) docker exec "$container" dnf install -y nftables ;;
           esac
-          # Populate only the disposable network namespace, with the actual
-          # policy exported by the Ubuntu product test. Distro nft only lists.
+          # Run product install with the Ubuntu userspace in the disposable
+          # network namespace. The container's nft only enumerates this policy.
           pid=$(docker inspect -f '{{.State.Pid}}' "$container")
-          sudo nsenter -t "$pid" -n nft -f evidence/fence.nft
+          sudo nsenter -t "$pid" -n env ETD_O2_DISTRO_FIXTURE=1 "$parser" --ignored --exact linux::fence::tests::install_distribution_fixture
           docker exec "$container" nft --version
-          docker exec "$container" nft -j list ruleset > evidence/distro.json
-          ETD_O2_RULESET="$PWD/evidence/distro.json" cargo test --locked -p etd-sysfx-os --lib parse_distribution_ruleset -- --ignored --nocapture
+          docker exec "$container" nft -j list ruleset > "$RUNNER_TEMP/distro.json"
+          jq -c '.nftables[] | select(any(.[]; ((.table // .name // "") | startswith("etd_f_"))))' "$RUNNER_TEMP/distro.json"
+          ETD_O2_RULESET="$RUNNER_TEMP/distro.json" "$parser" --ignored --exact linux::fence::tests::parse_distribution_ruleset --nocapture
 
   core-capability:
     runs-on: ubuntu-latest

@@ -46,14 +46,6 @@ async fn installing_host() {
             .success()
     );
     installed.unwrap();
-    if let Some(file) = std::env::var_os("ETD_O2_TABLE_EXPORT") {
-        let dump = Command::new("nft")
-            .args(["-n", "list", "table", "inet", &container])
-            .output()
-            .unwrap();
-        assert!(dump.status.success());
-        std::fs::write(file, dump.stdout).unwrap();
-    }
     std::fs::write(dir.join("installed"), "ready").unwrap();
     std::future::pending::<()>().await;
 }

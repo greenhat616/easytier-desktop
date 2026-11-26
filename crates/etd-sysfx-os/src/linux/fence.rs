@@ -389,6 +389,22 @@ add rule inet {name} output ip6 daddr ::1 tcp dport {port} meta skuid != 0 count
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    #[ignore = "populates the private CI network namespace for distro nft to enumerate"]
+    async fn install_distribution_fixture() {
+        assert_eq!(std::env::var("ETD_O2_DISTRO_FIXTURE").as_deref(), Ok("1"));
+        let dir = tempfile::tempdir().unwrap();
+        let os = Linux {
+            run_dir: dir.path().into(),
+            core_store_dir: dir.path().into(),
+        };
+        let s = FenceSpec {
+            instance: InstanceId::from("distribution-parser"),
+            epoch: Epoch(1),
+            address: ([127, 0, 0, 1], 15888).into(),
+        };
+        os.install(&s).await.unwrap();
+    }
     #[test]
     #[ignore = "reads the nft JSON produced by a distribution compatibility job"]
     fn parse_distribution_ruleset() {

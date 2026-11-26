@@ -89,6 +89,11 @@ EasyTier 原型固定上游提交 c97f36b8d40f3bde7a95cc9ec99fe95fe35a6ff0，
 关闭默认 features。未实现的业务不盲目引入候选依赖；按需增加，并统一写在
 workspace.dependencies 中。上游间接依赖版本不做全局覆盖。
 
+发行包捆绑的 easytier-core 为上游官方 v2.7.1 发布包（提交 0d9c52b1，
+proto/CLI/TOML 与 c97f36b 逐字节一致），由 packaging/cores.toml 固定压缩包
+摘要；`cargo xtask fetch-cores` 下载校验并解出内核与 Windows 伴生文件，
+`--update-lock` 将其 SHA-256 写入 crates/etd-host/cores.lock。不提交二进制。
+
 ## 许可
 
 LGPL-3.0-or-later。见 LICENSE（LGPL 第 3 版）及 COPYING-GPL-3.0

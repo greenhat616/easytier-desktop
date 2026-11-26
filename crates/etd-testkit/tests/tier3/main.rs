@@ -2,6 +2,9 @@
 use etd_testkit::no_window::NoWindow;
 use std::{path::Path, process::Command};
 mod desktop;
+mod takeover_management;
+#[cfg(target_os = "macos")]
+mod takeover_utun;
 
 fn require_runner() {
     for (key, expected) in [
@@ -19,12 +22,18 @@ fn require_runner() {
 }
 
 fn run_case(case: &str) {
+    run_script("product.py", case);
+}
+
+fn run_script(script: &str, case: &str) {
     require_runner();
     let mut command = Command::new(std::env::var_os("ETD_G2_PYTHON").expect("CI Python"));
     command
         .no_window()
         .env("ETD_G2_TEST_IMAGE", std::env::current_exe().unwrap());
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/tier3/product.py");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/tier3")
+        .join(script);
     let status = command.args(["-B", "-u"]).arg(script).arg(case).status();
     assert!(status.expect("launch tier 3 case").success(), "{case}");
 }

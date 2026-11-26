@@ -116,8 +116,10 @@ fn execute(cli: Cli) -> Result<()> {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            runtime
-                .block_on(host::run_until(HostMode::Service, Some(stop)))
+            // The lock goes only after the runtime is down.
+            let (exit, settled) =
+                run_bounded(runtime, host::run_until(HostMode::Service, Some(stop)));
+            exit.finish(settled)
                 .map_err(|error| std::io::Error::other(format!("{error:#}")))
         })
         .context("Windows service dispatcher");
@@ -127,14 +129,17 @@ fn execute(cli: Cli) -> Result<()> {
         .build()?;
     match command {
         Action::Doctor => host::doctor(),
-        Action::Run { mode } => runtime.block_on(host::run(mode.into())),
+        Action::Run { mode } => {
+            let (exit, settled) = run_bounded(runtime, host::run(mode.into()));
+            exit.finish(settled)
+        }
         Action::Reclaim { mode, all, purge } => {
-            runtime.block_on(host::reclaim(mode.into(), all, purge))
+            run_bounded(runtime, host::reclaim(mode.into(), all, purge)).0
         }
         Action::RemoveCore { mode, version } => {
-            runtime.block_on(host::remove_core(mode.into(), &version))
+            run_bounded(runtime, host::remove_core(mode.into(), &version)).0
         }
-        Action::Install { allow_user } => runtime.block_on(host::install(&allow_user)),
+        Action::Install { allow_user } => run_bounded(runtime, host::install(&allow_user)).0,
         Action::Uninstall {
             status,
             wait_parent,
@@ -154,8 +159,67 @@ fn execute(cli: Cli) -> Result<()> {
                     bail!("uninstall worker is Windows-only");
                 }
             }
-            runtime.block_on(host::uninstall())
+            run_bounded(runtime, host::uninstall()).0
         }
-        Action::ResumeService => runtime.block_on(host::resume_service()),
+        Action::ResumeService => run_bounded(runtime, host::resume_service()).0,
+    }
+}
+
+/// Run `work` on `runtime`, then shut the runtime down within
+/// [`host::RUNTIME_SHUTDOWN`]. Dropping a runtime waits for its blocking
+/// tasks without limit: one stuck in a system call (an SCM or registry read,
+/// a management query) must never hold the process from exiting, whatever
+/// the command. Also returns whether the runtime settled: every thread
+/// ended before the timeout (`shutdown_timeout` returns early then).
+fn run_bounded<T>(
+    runtime: tokio::runtime::Runtime,
+    work: impl std::future::Future<Output = T>,
+) -> (T, bool) {
+    let output = runtime.block_on(work);
+    let started = std::time::Instant::now();
+    runtime.shutdown_timeout(host::RUNTIME_SHUTDOWN);
+    (output, started.elapsed() < host::RUNTIME_SHUTDOWN)
+}
+
+#[cfg(test)]
+mod run_bounded_tests {
+    use super::*;
+
+    #[test]
+    fn a_stuck_blocking_task_does_not_hold_the_exit() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (release, stuck) = std::sync::mpsc::channel::<()>();
+        let started = std::time::Instant::now();
+        let (output, settled) = run_bounded(runtime, async {
+            // Never awaited to completion: stands in for a system call that
+            // does not return.
+            let _task = tokio::task::spawn_blocking(move || {
+                let _ = stuck.recv_timeout(std::time::Duration::from_secs(60));
+            });
+            7
+        });
+        let took = started.elapsed();
+        drop(release);
+        assert_eq!(output, 7);
+        assert!(!settled, "the stuck task is reported");
+        assert!(
+            took < host::RUNTIME_SHUTDOWN + std::time::Duration::from_secs(1),
+            "took {took:?}"
+        );
+    }
+
+    #[test]
+    fn a_runtime_without_stuck_work_settles() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_, settled) = run_bounded(runtime, async {
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+        });
+        assert!(settled);
     }
 }

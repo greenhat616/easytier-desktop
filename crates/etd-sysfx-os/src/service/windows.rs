@@ -858,22 +858,30 @@ fn allow_identity_query() -> io::Result<()> {
     Ok(())
 }
 
-fn run_service() -> io::Result<()> {
-    use windows_service::{
-        service::{ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceStatus},
-        service_control_handler::{self, ServiceControlHandlerResult},
-    };
-    let (stop, receiver) = tokio::sync::watch::channel(false);
-    let handle = service_control_handler::register(SERVICE_NAME, move |control| match control {
-        ServiceControl::Stop | ServiceControl::Shutdown => {
-            stop.send_replace(true);
-            ServiceControlHandlerResult::NoError
-        }
-        ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-        _ => ServiceControlHandlerResult::NotImplemented,
-    })
-    .map_err(other)?;
-    let status = |state, exit| ServiceStatus {
+/// While stopping, the SCM is told every [`STOP_HEARTBEAT`] that the stop
+/// progresses (STOP_PENDING with an increasing checkpoint and a wait hint),
+/// for at most [`STOP_PROGRESS_LIMIT`]. The host bounds its own wind-down
+/// well below that; past the limit the checkpoint stops moving, so the SCM
+/// sees a hung stop instead of endless progress.
+const STOP_HEARTBEAT: Duration = Duration::from_secs(2);
+const STOP_WAIT_HINT: Duration = Duration::from_secs(10);
+const STOP_PROGRESS_LIMIT: Duration = Duration::from_secs(120);
+
+/// Status reports shared by the heartbeat thread and the service thread:
+/// once `finished`, no STOP_PENDING may follow the final STOPPED.
+struct StopProgress {
+    finished: bool,
+    checkpoint: u32,
+}
+
+fn service_status(
+    state: ServiceState,
+    exit: u32,
+    checkpoint: u32,
+    wait_hint: Duration,
+) -> windows_service::service::ServiceStatus {
+    use windows_service::service::{ServiceControlAccept, ServiceExitCode, ServiceStatus};
+    ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: state,
         controls_accepted: if state == ServiceState::Running {
@@ -882,10 +890,73 @@ fn run_service() -> io::Result<()> {
             ServiceControlAccept::empty()
         },
         exit_code: ServiceExitCode::Win32(exit),
-        checkpoint: 0,
-        wait_hint: Duration::ZERO,
+        checkpoint,
+        wait_hint,
         process_id: None,
+    }
+}
+
+/// Report STOP_PENDING progress from the moment a stop is requested until
+/// the service thread reports STOPPED.
+fn stop_heartbeat(
+    handle: windows_service::service_control_handler::ServiceStatusHandle,
+    requested: std::sync::mpsc::Receiver<()>,
+    progress: std::sync::Arc<std::sync::Mutex<StopProgress>>,
+) {
+    let finished = || {
+        progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .finished
     };
+    loop {
+        match requested.recv_timeout(Duration::from_secs(1)) {
+            Ok(()) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if !finished() => {}
+            Err(_) => return,
+        }
+    }
+    let since = Instant::now();
+    loop {
+        {
+            let mut p = progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if p.finished {
+                return;
+            }
+            if since.elapsed() < STOP_PROGRESS_LIMIT || p.checkpoint == 0 {
+                p.checkpoint += 1;
+                let _ = handle.set_service_status(service_status(
+                    ServiceState::StopPending,
+                    0,
+                    p.checkpoint,
+                    STOP_WAIT_HINT,
+                ));
+            }
+        }
+        std::thread::sleep(STOP_HEARTBEAT);
+    }
+}
+
+fn run_service() -> io::Result<()> {
+    use windows_service::{
+        service::ServiceControl,
+        service_control_handler::{self, ServiceControlHandlerResult},
+    };
+    let (stop, receiver) = tokio::sync::watch::channel(false);
+    let (requested, heard) = std::sync::mpsc::channel::<()>();
+    let handle = service_control_handler::register(SERVICE_NAME, move |control| match control {
+        ServiceControl::Stop | ServiceControl::Shutdown => {
+            stop.send_replace(true);
+            let _ = requested.send(());
+            ServiceControlHandlerResult::NoError
+        }
+        ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+        _ => ServiceControlHandlerResult::NotImplemented,
+    })
+    .map_err(other)?;
+    let status = |state, exit| service_status(state, exit, 0, Duration::ZERO);
     if let Err(error) = allow_identity_query() {
         let _ = handle.set_service_status(status(ServiceState::Stopped, 1));
         return Err(error);
@@ -897,13 +968,34 @@ fn run_service() -> io::Result<()> {
         .get()
         .and_then(|body| body.lock().ok()?.take())
         .ok_or_else(|| io::Error::other("no service body"))?;
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(StopProgress {
+        finished: false,
+        checkpoint: 0,
+    }));
+    // Without the thread the stop is still bounded; it only goes
+    // unreported until STOPPED.
+    let heartbeat = {
+        let progress = progress.clone();
+        std::thread::Builder::new()
+            .name("etd-service-stop".into())
+            .spawn(move || stop_heartbeat(handle, heard, progress))
+            .ok()
+    };
     let result = body(receiver);
-    handle
-        .set_service_status(status(
+    let stopped = {
+        let mut p = progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        p.finished = true;
+        handle.set_service_status(status(
             ServiceState::Stopped,
             if result.is_ok() { 0 } else { 1 },
         ))
-        .map_err(other)?;
+    };
+    // The thread checks `finished` at least every second; not waiting for
+    // it cannot delay STOPPED, which is already reported.
+    drop(heartbeat);
+    stopped.map_err(other)?;
     result
 }
 

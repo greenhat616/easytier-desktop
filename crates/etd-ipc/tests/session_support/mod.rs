@@ -145,6 +145,13 @@ struct ObjectAttributes {
 }
 #[link(name = "ntdll")]
 unsafe extern "system" {
+    fn NtQueryObject(
+        handle: HANDLE,
+        class: u32,
+        info: *mut core::ffi::c_void,
+        length: u32,
+        returned: *mut u32,
+    ) -> i32;
     fn NtCreateLowBoxToken(
         token: *mut HANDLE,
         existing: HANDLE,
@@ -187,6 +194,33 @@ pub fn app_container_token() -> OwnedHandle {
     };
     assert_eq!(status, 0, "NtCreateLowBoxToken: {status:#x}");
     unsafe { OwnedHandle::from_raw_handle(token.0) }
+}
+
+/// OBJECT_BASIC_INFORMATION.
+#[repr(C)]
+#[derive(Default)]
+struct ObjectBasicInformation {
+    attributes: u32,
+    granted_access: u32,
+    handle_count: u32,
+    pointer_count: u32,
+    reserved: [u32; 10],
+}
+
+/// The access the kernel actually granted to `file`'s handle.
+pub fn granted_access(file: &File) -> u32 {
+    let mut info = ObjectBasicInformation::default();
+    let status = unsafe {
+        NtQueryObject(
+            HANDLE(file.as_raw_handle()),
+            0, // ObjectBasicInformation
+            (&raw mut info).cast(),
+            size_of_val(&info) as u32,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, 0, "NtQueryObject: {status:#x}");
+    info.granted_access
 }
 
 /// Run `f` on this thread while impersonating `token`. No await happens

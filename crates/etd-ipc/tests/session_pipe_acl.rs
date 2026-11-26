@@ -15,7 +15,7 @@ use windows::{
     Win32::{
         Foundation::{HANDLE, HLOCAL, LocalFree},
         Security::{Authorization::*, *},
-        Storage::FileSystem::{READ_CONTROL, WRITE_DAC, WRITE_OWNER},
+        Storage::FileSystem::{FILE_APPEND_DATA, READ_CONTROL, WRITE_DAC, WRITE_OWNER},
     },
     core::PWSTR,
 };
@@ -158,10 +158,7 @@ async fn session_pipe_is_owner_only_medium_no_write_up_and_first_instance() {
     );
 
     // A same-user, non-elevated Medium token may open for client access
-    // only: never WRITE_DAC, WRITE_OWNER or a new server instance. A client
-    // open requesting FILE_APPEND_DATA succeeds on the runner although no
-    // ACE grants it; that bit means FILE_CREATE_PIPE_INSTANCE only to
-    // CreateNamedPipe, which is probed below with a real instance.
+    // only: never WRITE_DAC, WRITE_OWNER or a new server instance.
     let medium = restricted_token(MEDIUM);
     let mut granted = Vec::new();
     for access in [WRITE_DAC.0, WRITE_OWNER.0] {
@@ -175,6 +172,19 @@ async fn session_pipe_is_owner_only_medium_no_write_up_and_first_instance() {
         }
     }
     assert!(granted.is_empty(), "Medium copy was granted {granted:?}");
+    // A client open asking for FILE_APPEND_DATA (the FILE_CREATE_PIPE_INSTANCE
+    // bit) succeeds, but the pipe file system leaves that bit out of the
+    // access check and of the granted access: the handle carries none of it.
+    let file = impersonating(&medium, || open(pipe, FILE_APPEND_DATA.0 | READ_CONTROL.0)).unwrap();
+    let access = granted_access(&file);
+    assert_eq!(access & FILE_APPEND_DATA.0, 0, "granted {access:#x}");
+    assert_eq!(
+        access & (WRITE_DAC.0 | WRITE_OWNER.0),
+        0,
+        "granted {access:#x}"
+    );
+    drop(file);
+    assert!(listener.accept().await.is_err());
     let instance = impersonating(&medium, || ServerOptions::new().create(name));
     assert_eq!(instance.err().unwrap().kind(), ErrorKind::PermissionDenied);
     let squat = impersonating(&medium, || {

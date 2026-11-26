@@ -27,6 +27,10 @@ uuid = { workspace = true, features = ["std", "v4", "v5"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
+    "Foundation",
+    "UI_ViewManagement",
+    "Wdk_System_SystemServices",
+    "Win32_Graphics_Dwm",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",

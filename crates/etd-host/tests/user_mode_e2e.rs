@@ -364,5 +364,7 @@ async fn apply_ready_stop_and_reclaim_over_real_transport() {
         .await
         .unwrap()
         .unwrap()
+        .unwrap()
+        .result
         .unwrap();
 }

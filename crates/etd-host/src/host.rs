@@ -46,6 +46,8 @@ use serving::policy;
 #[cfg(windows)]
 use serving::valid_sid;
 pub(crate) use serving::{LayoutLock, serve_with_deps};
+/// See [`serving::RUNTIME_SHUTDOWN`].
+pub(crate) const RUNTIME_SHUTDOWN: std::time::Duration = serving::RUNTIME_SHUTDOWN;
 const LEDGER: &str = "ledger.sqlite3";
 
 fn layout(mode: HostMode) -> Result<HostLayout> {
@@ -255,11 +257,39 @@ async fn dependencies(mode: HostMode, layout: &HostLayout) -> Result<Dependencie
     })
 }
 
-pub async fn run(mode: HostMode) -> Result<()> {
+pub async fn run(mode: HostMode) -> HostExit {
     run_until(mode, None).await
 }
 
-pub async fn run_until(mode: HostMode, managed_stop: Option<watch::Receiver<bool>>) -> Result<()> {
+/// How a host run ended. The singleton lock stays held until [`HostExit::finish`],
+/// which the caller runs only after shutting the runtime down, so no task or
+/// blocking call of this host can still act once another process takes it.
+pub struct HostExit {
+    lock: Option<LayoutLock>,
+    result: Result<()>,
+}
+
+impl HostExit {
+    pub fn finish(self) -> Result<()> {
+        drop(self.lock);
+        self.result
+    }
+}
+
+pub async fn run_until(mode: HostMode, managed_stop: Option<watch::Receiver<bool>>) -> HostExit {
+    match serve_until(mode, managed_stop).await {
+        Ok(exit) => exit,
+        Err(error) => HostExit {
+            lock: None,
+            result: Err(error),
+        },
+    }
+}
+
+async fn serve_until(
+    mode: HostMode,
+    managed_stop: Option<watch::Receiver<bool>>,
+) -> Result<HostExit> {
     let layout = layout(mode)?;
     prepare(mode, &layout)?;
     if mode == HostMode::Service {
@@ -296,8 +326,41 @@ pub async fn run_until(mode: HostMode, managed_stop: Option<watch::Receiver<bool
         );
     }
     let _logging = logging(&layout)?;
-    let deps = dependencies(mode, &layout).await?;
-    serve_with_deps(mode, guard, deps.host, managed_stop, deps.missing).await
+    let Dependencies {
+        host,
+        missing,
+        sqlite,
+    } = dependencies(mode, &layout).await?;
+    let stopped = serve_with_deps(mode, guard, host, managed_stop, missing).await?;
+    // The ledger's writer thread is joined before the lock can go: no
+    // queued transition lands after another process owns the ledger.
+    let closed = tokio::time::timeout(serving::LEDGER_CLOSE, async {
+        Arc::try_unwrap(sqlite)
+            .map_err(|_| anyhow::anyhow!("ledger still has active owners"))?
+            .close()
+            .await
+            .map_err(anyhow::Error::from)
+    })
+    .await;
+    match closed {
+        Ok(Ok(())) => tracing::info!(
+            stage = "shutdown.ledger_closed",
+            "host shutdown: ledger closed"
+        ),
+        Ok(Err(error)) => tracing::error!(
+            stage = "shutdown.ledger_closed",
+            error = %error,
+            "host shutdown: ledger not closed; open records stay as they are"
+        ),
+        Err(_) => tracing::error!(
+            stage = "shutdown.ledger_closed",
+            "host shutdown: ledger close timed out; open records stay as they are"
+        ),
+    }
+    Ok(HostExit {
+        lock: Some(stopped.lock),
+        result: stopped.result,
+    })
 }
 
 fn logging(layout: &HostLayout) -> Result<tracing_appender::non_blocking::WorkerGuard> {

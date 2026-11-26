@@ -38,9 +38,31 @@ const SHUTDOWN_BACKSTOP_MARGIN: Duration = Duration::from_secs(5);
 const SERVER_DRAIN: Duration = Duration::from_secs(3);
 /// How long aborted supervisor tasks may take to end.
 const TASK_ABORT_WAIT: Duration = Duration::from_secs(2);
-/// How long system helper calls still in progress may take to finish
-/// before every helper process is terminated.
-const HELPER_DRAIN: Duration = Duration::from_secs(2);
+/// How long closing the ledger (joining its writer thread) may take.
+pub(crate) const LEDGER_CLOSE: Duration = Duration::from_secs(3);
+/// How long a finished host waits for blocking work still running in its
+/// runtime (a system call past its own deadline) before exiting anyway.
+pub(crate) const RUNTIME_SHUTDOWN: Duration = Duration::from_secs(2);
+
+/// The longest a host stop can take once asked, everything included:
+/// within the uninstaller's 60 s wait for STOPPED.
+pub(crate) fn stop_worst_case() -> Duration {
+    etd_host_core::lifecycle::LifecycleConfig::default().shutdown_budget
+        + SHUTDOWN_BACKSTOP_MARGIN
+        + SERVER_DRAIN
+        + TASK_ABORT_WAIT
+        + etd_sysfx_os::HELPERS_SHUTDOWN_WORST
+        + LEDGER_CLOSE
+        + RUNTIME_SHUTDOWN
+}
+
+/// A host that has stopped serving. Its singleton lock is handed back, to
+/// be released only once nothing of the host can act any more (ledger
+/// closed, runtime shut down).
+pub(crate) struct Stopped {
+    pub(crate) lock: LayoutLock,
+    pub(crate) result: Result<()>,
+}
 
 pub(crate) struct LayoutLock {
     _guard: HostLock,
@@ -168,7 +190,7 @@ pub(crate) async fn serve_with_deps(
     deps: Arc<HostDeps>,
     mut managed_stop: Option<watch::Receiver<bool>>,
     start_blocker: Option<String>,
-) -> Result<()> {
+) -> Result<Stopped> {
     // Load the exact durable settings before publishing the endpoint; no
     // mutation task exists until the new listener is bound with that policy.
     let entries = deps.ledger.settings().await?.allow_list;
@@ -239,6 +261,7 @@ pub(crate) async fn serve_with_deps(
     if let Some(outcome) = outcome {
         tracing::info!(
             stage = "shutdown.requested",
+            worst_case_ms = millis(stop_worst_case()),
             "host shutdown: asking the orchestrator to stop"
         );
         // The orchestrator bounds its own wind-down (`shutdown_budget`);
@@ -306,8 +329,7 @@ pub(crate) async fn serve_with_deps(
             "host shutdown: aborted supervisors did not end in time"
         ),
     }
-    let helpers =
-        tokio::task::spawn_blocking(|| etd_sysfx_os::shutdown_helpers(HELPER_DRAIN)).await;
+    let helpers = tokio::task::spawn_blocking(etd_sysfx_os::shutdown_helpers).await;
     match helpers {
         Ok(Ok(())) => tracing::info!(
             stage = "shutdown.helpers_ended",
@@ -325,13 +347,15 @@ pub(crate) async fn serve_with_deps(
             "host shutdown: helper shutdown failed"
         ),
     }
-    drop(guard);
     tracing::info!(
-        stage = "shutdown.done",
+        stage = "shutdown.served",
         elapsed_ms = millis(started.elapsed()),
-        "host shutdown: listener closed and lock released"
+        "host shutdown: listener closed; the lock is released once the runtime is down"
     );
-    result
+    Ok(Stopped {
+        lock: guard,
+        result,
+    })
 }
 
 fn millis(d: Duration) -> u64 {
@@ -438,5 +462,21 @@ impl AsyncWrite for TrackedConnection {
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.conn).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod stop_bound_tests {
+    use super::*;
+
+    #[test]
+    fn a_host_stop_fits_the_uninstaller_wait() {
+        let worst = stop_worst_case();
+        // The uninstaller waits 60 s for STOPPED after its STOP; keep a
+        // margin for the SCM and the service thread.
+        assert!(
+            worst <= Duration::from_secs(55),
+            "worst-case host stop {worst:?} exceeds 55 s"
+        );
     }
 }

@@ -55,6 +55,38 @@ jobs:
           }
           exit $LASTEXITCODE
       - run: cargo xtask check-boundaries
+  privileged-install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CI: 'true'
+      ETD_HOST_CI_INSTALL: '1'
+      CARGO_BUILD_JOBS: '4'
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install Linux development libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang cmake pkg-config libssl-dev libdbus-1-dev
+      - name: Install pinned protoc
+        shell: pwsh
+        run: ./.github/scripts/setup-protoc.ps1
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.152
+      - name: Install roundtrip on Windows (administrator runner)
+        if: runner.os == 'Windows'
+        run: cargo nextest run --locked --profile privileged -p etd-host --run-ignored only --test install_roundtrip --success-output immediate
+      - name: Install roundtrip on Unix (root on disposable runner)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cargo nextest list --locked --profile privileged -p etd-host --test install_roundtrip
+          sudo -E env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "CI=true" "ETD_HOST_CI_INSTALL=1" "$(command -v cargo)" nextest run --locked --profile privileged -p etd-host --run-ignored only --test install_roundtrip --success-output immediate
   dependencies:
     runs-on: ubuntu-latest
     steps:

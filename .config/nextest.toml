@@ -1,0 +1,4 @@
+# Privileged tests are marked ignored and selected explicitly with
+# `--run-ignored only`; never execute them on a developer machine.
+[profile.privileged]
+test-threads = 1

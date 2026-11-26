@@ -1,7 +1,10 @@
 //! Windows system effects, using a persistent native WFP fence and independent
 //! Windows management provider queries. No request data is executed as code.
+mod execution;
 mod interfaces;
+mod magic;
 mod probe;
+mod registry;
 mod wfp;
 
 use crate::{OsAdapters, OsConfig, OsError};
@@ -11,7 +14,6 @@ use etd_sysfx::*;
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
-use tokio::process::Command;
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -69,17 +71,12 @@ fn opaque(value: impl Into<String>) -> Credential {
         value: value.into(),
     }
 }
-fn system_powershell() -> Result<PathBuf, WinError> {
-    let mut buf = [0u16; 32768];
-    let n =
-        unsafe { ::windows::Win32::System::SystemInformation::GetSystemDirectoryW(Some(&mut buf)) }
-            as usize;
-    if n == 0 || n >= buf.len() {
-        return Err(WinError::invalid("GetSystemDirectoryW failed"));
-    }
-    use std::os::windows::ffi::OsStringExt;
-    Ok(PathBuf::from(std::ffi::OsString::from_wide(&buf[..n]))
-        .join("WindowsPowerShell/v1.0/powershell.exe"))
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, WinError> + Send + 'static,
+) -> Result<T, WinError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| WinError::invalid(format!("Windows blocking worker: {e}")))?
 }
 // Windows PowerShell expects UTF-16LE for -EncodedCommand. Encoding the
 // constant script avoids command-line quoting and newline ambiguities.
@@ -107,40 +104,7 @@ fn encoded_command(script: &str) -> String {
     out
 }
 async fn query(request: Value) -> Result<Vec<Value>, WinError> {
-    let exe = system_powershell()?;
-    let modules = exe
-        .parent()
-        .ok_or_else(|| WinError::invalid("invalid system PowerShell path"))?
-        .join("Modules");
-    let mut cmd = Command::new(&exe);
-    cmd.args([
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-EncodedCommand",
-        &encoded_command(include_str!("system.ps1")),
-    ])
-    .env("ETD_OS_REQUEST", request.to_string())
-    .env("PSModulePath", modules)
-    .current_dir(exe.parent().unwrap())
-    .kill_on_drop(true)
-    .creation_flags(0x08000000);
-    let output = tokio::time::timeout(Duration::from_secs(60), cmd.output())
-        .await
-        .map_err(|_| WinError::invalid("Windows management query timed out"))?
-        .map_err(|e| WinError::new(e.raw_os_error().unwrap_or(-1) as i64, e.to_string()))?;
-    if !output.status.success() {
-        return Err(WinError::new(
-            output.status.code().unwrap_or(-1) as i64,
-            String::from_utf8_lossy(&output.stderr).trim(),
-        ));
-    }
-    let mut response: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|e| WinError::invalid(format!("invalid management response: {e}")))?;
-    response["result"]
-        .as_array_mut()
-        .map(std::mem::take)
-        .ok_or_else(|| WinError::invalid("missing management result"))
+    blocking(move || execution::run(request)).await
 }
 async fn single(request: Value) -> Result<Value, WinError> {
     let mut rows = query(request).await?;
@@ -310,8 +274,14 @@ async fn observe_kind(kind: EffectKind, key: &ObjectKey) -> Result<Option<Observ
         )));
     }
     match kind {
-        EffectKind::WinFenceFilter => wfp::observe(key),
-        EffectKind::WinTunAdapter => interfaces::observe(key),
+        EffectKind::WinFenceFilter => {
+            let key = key.clone();
+            blocking(move || wfp::observe(&key)).await
+        }
+        EffectKind::WinTunAdapter => {
+            let key = key.clone();
+            blocking(move || interfaces::observe(&key)).await
+        }
         EffectKind::WinRegistryValue => {
             let (key_path, value) = registry_value_key(key)?;
             let current: SettingValue = serde_json::from_value(
@@ -419,7 +389,7 @@ impl Reclaimer for WindowsReclaimer {
             return Ok(Reclaimed::AlreadyAbsent);
         };
         let response = match self.0 {
-            EffectKind::WinFenceFilter => return wfp::remove(&e.key).map_err(WinError::reclaim),
+            EffectKind::WinFenceFilter => {let key=e.key.clone();return blocking(move||wfp::remove(&key)).await.map_err(WinError::reclaim);},
             EffectKind::WinTunAdapter => return Err(ReclaimError::Busy("live adapter; never uninstall live wintun".into())),
             EffectKind::Route => return Err(ReclaimError::Busy("routes still present; never delete routes blindly".into())),
             EffectKind::WinRegistryValue => {
@@ -429,7 +399,7 @@ impl Reclaimer for WindowsReclaimer {
             }
             EffectKind::WinMagicDnsRecovery => {
                 if e.undo != Undo::ReplayUpstreamRecovery { return Err(ReclaimError::CredentialMismatch); }
-                single(json!({"op":"replay_magic","core_store":self.1})).await
+                let root=self.1.clone();return blocking(move||magic::replay(&root)).await.map_err(WinError::reclaim);
             }
             EffectKind::WinFirewallRule | EffectKind::WinProgramFirewallRule | EffectKind::WinNrptRule | EffectKind::WinNetworkProfile => {
                 if e.undo != Undo::EnsureAbsent { return Err(ReclaimError::CredentialMismatch); }
@@ -514,24 +484,53 @@ impl SystemObserver for WindowsObserver {
 }
 async fn listener(address: SocketAddr) -> Result<Option<ListenerInfo>, WinError> {
     let rows = query(json!({"op":"listeners"})).await?;
-    let mut matches = rows.iter().filter(|r| {
-        r["port"].as_u64() == Some(address.port() as u64)
-            && r["address"]
-                .as_str()
-                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
-                .is_some_and(|ip| ip == address.ip())
-    });
-    let Some(row) = matches.next() else {
-        return Ok(None);
-    };
-    if matches.next().is_some() {
-        return Err(WinError::invalid("multiple listeners"));
+    listener_rows(address, &rows)
+}
+fn listener_rows(address: SocketAddr, rows: &[Value]) -> Result<Option<ListenerInfo>, WinError> {
+    let mut found = None;
+    for row in rows
+        .iter()
+        .filter(|r| r["port"].as_u64() == Some(address.port() as u64))
+    {
+        let ip = row["address"]
+            .as_str()
+            .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+            .ok_or_else(|| WinError::invalid("unreadable listener address on management port"))?;
+        if ip != address.ip() {
+            return Err(WinError::invalid(format!(
+                "wildcard or unexpected listener address {ip} on management port"
+            )));
+        }
+        if found.is_some() {
+            return Err(WinError::invalid("multiple listeners on management port"));
+        }
+        let pid = row["pid"]
+            .as_u64()
+            .and_then(|p| u32::try_from(p).ok())
+            .ok_or_else(|| WinError::invalid("missing listener PID"))?;
+        found = Some(ListenerInfo { address, pid });
     }
-    let pid = row["pid"]
-        .as_u64()
-        .and_then(|p| u32::try_from(p).ok())
-        .ok_or_else(|| WinError::invalid("missing listener PID"))?;
-    Ok(Some(ListenerInfo { address, pid }))
+    Ok(found)
+}
+async fn listener_check(address: SocketAddr, pid: u32) -> ListenerCheck {
+    match listener(address).await {
+        Ok(Some(l)) if l.pid == pid => ListenerCheck::Expected,
+        Ok(Some(l)) => ListenerCheck::Other { pid: l.pid },
+        Ok(None) => ListenerCheck::NotListening,
+        Err(e) => ListenerCheck::Indeterminate(e.to_string()),
+    }
+}
+async fn host_connect(address: SocketAddr) -> DirectionResult {
+    match tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::net::TcpStream::connect(address),
+    )
+    .await
+    {
+        Ok(Ok(_)) => DirectionResult::Connected,
+        Ok(Err(e)) => DirectionResult::Error(e.to_string()),
+        Err(_) => DirectionResult::Error("host connection timed out".into()),
+    }
 }
 async fn enumerate(
     class: SystemClass,
@@ -571,7 +570,7 @@ async fn enumerate(
                     string(&r, "description")?.into(),
                 );
             }
-            for (key, o) in wfp::enumerate()? {
+            for (key, o) in blocking(wfp::enumerate).await? {
                 push(key, o.credential, o.detail.unwrap_or_default());
             }
         }
@@ -697,14 +696,39 @@ async fn enumerate(
     }
     Ok(entries)
 }
-struct WindowsBoot;
+struct WindowsBoot {
+    machine: bool,
+}
 impl BootIdSource for WindowsBoot {
     fn current(&self) -> Result<BootId, ReclaimError> {
-        probe::boot_id().map_err(WinError::reclaim)
+        registry::boot_id(self.machine).map_err(WinError::reclaim)
     }
 }
 struct WindowsSweeper {
     core_store_dir: PathBuf,
+}
+fn sweep_or_default<T: Default>(class: &str, result: Result<T, WinError>) -> T {
+    match result {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(%class,error=%e,"sweep query failed; continuing other object classes");
+            T::default()
+        }
+    }
+}
+async fn sweep_rows(class: &str) -> Vec<Value> {
+    sweep_or_default(class,query(json!({"op":class,"sweep":true})).await).into_iter().filter(|row|{
+        if let Some(warning)=row["warning"].as_str(){tracing::warn!(%class,object=?row["object"],error=%warning,"sweep object query failed; continuing");false}else{true}
+    }).collect()
+}
+fn sweep_field<'a>(class: &str, row: &'a Value, field: &str) -> Option<&'a str> {
+    match string(row, field) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(%class,object=?row["id"],error=%e,"skipping malformed sweep object");
+            None
+        }
+    }
 }
 impl Sweeper for WindowsSweeper {
     fn find_marked<'a>(
@@ -714,7 +738,7 @@ impl Sweeper for WindowsSweeper {
     ) -> BoxFuture<'a, Result<Vec<FoundObject>, ReclaimError>> {
         Box::pin(async move {
             let mut found = Vec::new();
-            for (key, observation) in wfp::enumerate().map_err(WinError::reclaim)? {
+            for (key, observation) in sweep_or_default("wfp", blocking(wfp::sweep).await) {
                 found.push(FoundObject {
                     kind: EffectKind::WinFenceFilter,
                     key,
@@ -729,7 +753,7 @@ impl Sweeper for WindowsSweeper {
                     })
                     .unwrap_or(FoundBy::PrefixOnly)
             };
-            for (object, info) in interfaces::enumerate().await.map_err(WinError::reclaim)? {
+            for (object, info) in sweep_or_default("interfaces", interfaces::sweep().await) {
                 if !owned_name(&info.name) {
                     continue;
                 }
@@ -744,11 +768,10 @@ impl Sweeper for WindowsSweeper {
                     origin: origin(&info.name),
                 });
             }
-            for row in query(json!({"op":"firewall"}))
-                .await
-                .map_err(WinError::reclaim)?
-            {
-                let name = string(&row, "name").map_err(WinError::reclaim)?;
+            for row in sweep_rows("firewall").await {
+                let Some(name) = sweep_field("firewall", &row, "name") else {
+                    continue;
+                };
                 if let Some((program, _)) = program_name(name) {
                     let root = format!(
                         "{}\\",
@@ -760,11 +783,18 @@ impl Sweeper for WindowsSweeper {
                             name: name.into(),
                             group: row["group"].as_str().map(str::to_owned),
                         };
+                        let credential = match program_identity(&row) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!(class="firewall",%name,error=%e,"skipping unconfirmed program rule");
+                                continue;
+                            }
+                        };
                         found.push(FoundObject {
                             kind: EffectKind::WinProgramFirewallRule,
                             key: object.clone(),
                             observation: observation(
-                                Some(program_identity(&row).map_err(WinError::reclaim)?),
+                                Some(credential),
                                 object,
                                 "program rule under protected core store".into(),
                             ),
@@ -787,33 +817,38 @@ impl Sweeper for WindowsSweeper {
                     name: name.into(),
                     group: row["group"].as_str().map(str::to_owned),
                 };
+                let Some(id) = sweep_field("firewall", &row, "id") else {
+                    continue;
+                };
                 found.push(FoundObject {
                     kind: EffectKind::WinFirewallRule,
                     key: object.clone(),
                     observation: observation(
-                        Some(opaque(string(&row, "id").map_err(WinError::reclaim)?)),
+                        Some(opaque(id)),
                         object,
                         "marked firewall rule".into(),
                     ),
                     origin: origin(iface),
                 });
             }
-            for row in query(json!({"op":"profiles"}))
-                .await
-                .map_err(WinError::reclaim)?
-            {
-                let name = string(&row, "name").map_err(WinError::reclaim)?;
+            for row in sweep_rows("profiles").await {
+                let Some(name) = sweep_field("profiles", &row, "name") else {
+                    continue;
+                };
                 if !owned_name(name) {
                     continue;
                 }
                 let object = ObjectKey::NetworkProfile {
                     profile_name: name.into(),
                 };
+                let Some(id) = sweep_field("profiles", &row, "id") else {
+                    continue;
+                };
                 found.push(FoundObject {
                     kind: EffectKind::WinNetworkProfile,
                     key: object.clone(),
                     observation: observation(
-                        Some(opaque(string(&row, "id").map_err(WinError::reclaim)?)),
+                        Some(opaque(id)),
                         object,
                         "marked profile; ownership not proved".into(),
                     ),
@@ -831,19 +866,21 @@ impl Sweeper for WindowsSweeper {
                         )
                     })
                     .collect();
-                for row in query(json!({"op":"registry_rows"}))
-                    .await
-                    .map_err(WinError::reclaim)?
-                {
-                    let path = string(&row, "key").map_err(WinError::reclaim)?;
+                for row in sweep_rows("registry_rows").await {
+                    let Some(path) = sweep_field("registry_rows", &row, "key") else {
+                        continue;
+                    };
                     let Some((instance, _)) = names.iter().find(|(_, guid)| {
                         path.to_ascii_lowercase().ends_with(&format!("{{{guid}}}"))
                     }) else {
                         continue;
                     };
+                    let Some(value) = sweep_field("registry_rows", &row, "value") else {
+                        continue;
+                    };
                     let object = ObjectKey::Registry {
                         key: path.into(),
-                        value: Some(string(&row, "value").map_err(WinError::reclaim)?.into()),
+                        value: Some(value.into()),
                     };
                     if registry_value_key(&object).is_err() {
                         continue;
@@ -868,10 +905,10 @@ impl Sweeper for WindowsSweeper {
                 key: r"HKLM\SOFTWARE\EasyTier\MagicDNS".into(),
                 value: None,
             };
-            if let Some(obs) = observe_kind(EffectKind::WinMagicDnsRecovery, &magic)
-                .await
-                .map_err(WinError::reclaim)?
-            {
+            if let Some(obs) = sweep_or_default(
+                "magic",
+                observe_kind(EffectKind::WinMagicDnsRecovery, &magic).await,
+            ) {
                 found.push(FoundObject {
                     kind: EffectKind::WinMagicDnsRecovery,
                     key: magic,
@@ -879,11 +916,10 @@ impl Sweeper for WindowsSweeper {
                     origin: FoundBy::PrefixOnly,
                 });
             }
-            for row in query(json!({"op":"drivers"}))
-                .await
-                .map_err(WinError::reclaim)?
-            {
-                let name = string(&row, "name").map_err(WinError::reclaim)?;
+            for row in sweep_rows("drivers").await {
+                let Some(name) = sweep_field("drivers", &row, "name") else {
+                    continue;
+                };
                 if !["wintun", "WinDivert"]
                     .iter()
                     .any(|n| n.eq_ignore_ascii_case(name))
@@ -925,22 +961,24 @@ impl PortFence for WindowsFence {
                 "only exact loopback endpoints can be fenced".into(),
             ));
         }
-        wfp::install(&wfp::key(spec)).map_err(WinError::fence)
+        let key = wfp::key(spec);
+        blocking(move || wfp::install(&key))
+            .await
+            .map_err(WinError::fence)
     }
     async fn verify(
         &self,
         spec: &FenceSpec,
         listener_pid: u32,
     ) -> Result<FenceVerification, FenceError> {
-        if !wfp::complete(&wfp::key(spec)).map_err(WinError::fence)? {
+        let key = wfp::key(spec);
+        if !blocking(move || wfp::complete(&key))
+            .await
+            .map_err(WinError::fence)?
+        {
             return Err(FenceError::Probe("persistent fence is incomplete".into()));
         }
-        let before = listener(spec.address).await.map_err(WinError::fence)?;
-        let check = match before {
-            Some(l) if l.pid == listener_pid => ListenerCheck::Expected,
-            Some(l) => ListenerCheck::Other { pid: l.pid },
-            None => ListenerCheck::NotListening,
-        };
+        let check = listener_check(spec.address, listener_pid).await;
         if check != ListenerCheck::Expected {
             return Ok(FenceVerification {
                 listener: check,
@@ -948,32 +986,25 @@ impl PortFence for WindowsFence {
                 unprivileged: DirectionResult::NoListener,
             });
         }
-        let host = match tokio::time::timeout(
-            Duration::from_secs(3),
-            tokio::net::TcpStream::connect(spec.address),
-        )
-        .await
-        {
-            Ok(Ok(_)) => DirectionResult::Connected,
-            Ok(Err(e)) => DirectionResult::Error(e.to_string()),
-            Err(_) => DirectionResult::Error("host connection timed out".into()),
-        };
+        let mut host = host_connect(spec.address).await;
         let address = spec.address;
         let unprivileged =
             tokio::task::spawn_blocking(move || probe::unprivileged_connect(address))
                 .await
                 .map_err(|e| FenceError::Probe(e.to_string()))??;
-        let after = listener(spec.address).await.map_err(WinError::fence)?;
-        if !wfp::complete(&wfp::key(spec)).map_err(WinError::fence)? {
+        let check = listener_check(spec.address, listener_pid).await;
+        let key = wfp::key(spec);
+        if !blocking(move || wfp::complete(&key))
+            .await
+            .map_err(WinError::fence)?
+        {
             return Err(FenceError::Probe(
                 "persistent fence changed during verification".into(),
             ));
         }
-        let check = match after {
-            Some(l) if l.pid == listener_pid => ListenerCheck::Expected,
-            Some(l) => ListenerCheck::Other { pid: l.pid },
-            None => ListenerCheck::NotListening,
-        };
+        if host == DirectionResult::Connected && check == ListenerCheck::Expected {
+            host = host_connect(spec.address).await;
+        }
         Ok(FenceVerification {
             listener: check,
             host,
@@ -981,7 +1012,10 @@ impl PortFence for WindowsFence {
         })
     }
     async fn remove(&self, spec: &FenceSpec) -> Result<Reclaimed, FenceError> {
-        wfp::remove(&wfp::key(spec)).map_err(WinError::fence)
+        let key = wfp::key(spec);
+        blocking(move || wfp::remove(&key))
+            .await
+            .map_err(WinError::fence)
     }
 }
 pub(crate) fn adapters(config: &OsConfig) -> Result<OsAdapters, OsError> {
@@ -1007,7 +1041,12 @@ pub(crate) fn adapters(config: &OsConfig) -> Result<OsAdapters, OsError> {
         sweeper: Arc::new(WindowsSweeper {
             core_store_dir: config.core_store_dir.clone(),
         }),
-        boot_id: Arc::new(WindowsBoot),
+        boot_id: Arc::new(WindowsBoot {
+            machine: registry::elevated().map_err(|e| OsError::Os {
+                code: e.code,
+                message: e.message,
+            })?,
+        }),
         observer: Arc::new(WindowsObserver {
             run_dir: config.run_dir.clone(),
         }),
@@ -1017,6 +1056,30 @@ pub(crate) fn adapters(config: &OsConfig) -> Result<OsAdapters, OsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn listener_rejects_wildcards_and_unexpected_addresses() {
+        let addr: SocketAddr = "127.0.0.1:23456".parse().unwrap();
+        let expected = json!({"address":"127.0.0.1","port":23456,"pid":42});
+        assert_eq!(
+            listener_rows(addr, std::slice::from_ref(&expected))
+                .unwrap()
+                .unwrap()
+                .pid,
+            42
+        );
+        for unexpected in ["0.0.0.0", "::", "::1", "127.0.0.2", "invalid"] {
+            assert!(
+                listener_rows(
+                    addr,
+                    &[
+                        expected.clone(),
+                        json!({"address":unexpected,"port":23456,"pid":99})
+                    ]
+                )
+                .is_err()
+            );
+        }
+    }
     #[test]
     fn names() {
         assert!(owned_name("etd-1234abcd"));

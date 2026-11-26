@@ -1,6 +1,6 @@
 //! Probe a live listener from a different, non-privileged service identity.
 //! No saved account password, arbitrary executable, or caller-provided script.
-use super::{WinError, encoded_command, system_powershell};
+use super::{WinError, encoded_command, execution::Environment};
 use ::windows::{
     Win32::{
         Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
@@ -12,8 +12,8 @@ use ::windows::{
     },
     core::{HSTRING, PCWSTR, PWSTR},
 };
-use etd_sysfx::{BootId, DirectionResult, FenceError};
-use std::{net::SocketAddr, os::windows::process::CommandExt};
+use etd_sysfx::{DirectionResult, FenceError};
+use std::net::SocketAddr;
 
 struct Handle(HANDLE);
 impl Drop for Handle {
@@ -29,6 +29,7 @@ pub fn unprivileged_connect(address: SocketAddr) -> Result<DirectionResult, Fenc
     // Retry it once, but never retry a successful unauthorized connection.
     let first = connect_once(address)?;
     if let DirectionResult::Error(first_error) = first {
+        tracing::warn!(error=%first_error,%address,"unprivileged probe first attempt failed; retrying once");
         std::thread::sleep(std::time::Duration::from_millis(100));
         match connect_once(address)? {
             DirectionResult::Error(second_error) => Ok(DirectionResult::Error(format!(
@@ -59,7 +60,8 @@ fn connect_once(address: SocketAddr) -> Result<DirectionResult, FenceError> {
         .map_err(error)?;
     }
     let token = Handle(token);
-    let exe = system_powershell().map_err(WinError::fence)?;
+    let environment = Environment::new().map_err(WinError::fence)?;
+    let exe = &environment.exe;
     let family = if address.is_ipv6() {
         "InterNetworkV6"
     } else {
@@ -76,20 +78,7 @@ fn connect_once(address: SocketAddr) -> Result<DirectionResult, FenceError> {
         encoded_command(&code)
     );
     let mut command: Vec<u16> = command.encode_utf16().chain(Some(0)).collect();
-    // Never pass the privileged host's environment to the low-privilege
-    // probe. Give it only the system directory and fixed Windows paths.
-    let system_dir = exe
-        .ancestors()
-        .nth(3)
-        .ok_or_else(|| FenceError::Probe("invalid system PowerShell path".into()))?;
-    let system_root = system_dir.parent().unwrap();
-    let environment = format!(
-        "Path={}\0SystemRoot={}\0windir={}\0\0",
-        system_dir.display(),
-        system_root.display(),
-        system_root.display()
-    );
-    let environment: Vec<u16> = environment.encode_utf16().collect();
+    let block = environment.block();
     let startup = STARTUPINFOW {
         cb: size_of::<STARTUPINFOW>() as u32,
         ..Default::default()
@@ -104,8 +93,8 @@ fn connect_once(address: SocketAddr) -> Result<DirectionResult, FenceError> {
             None,
             false,
             CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-            Some(environment.as_ptr().cast()),
-            &HSTRING::from(system_dir.as_os_str()),
+            Some(block.as_ptr().cast()),
+            &HSTRING::from(environment.cwd.as_os_str()),
             &startup,
             &mut process,
         )
@@ -115,30 +104,24 @@ fn connect_once(address: SocketAddr) -> Result<DirectionResult, FenceError> {
     let _thread = Handle(process.hThread);
     unsafe {
         if WaitForSingleObject(process_handle.0, 10000) != WAIT_OBJECT_0 {
-            let _ = TerminateProcess(process_handle.0, 2);
-            return Err(FenceError::Probe("probe timed out".into()));
+            // Reap the process even when the deadline expired. Termination
+            // can race normal exit, so wait for the actual process object.
+            let killed = TerminateProcess(process_handle.0, 2);
+            if WaitForSingleObject(process_handle.0, 5000) != WAIT_OBJECT_0 {
+                return Err(FenceError::Probe(format!(
+                    "probe timed out; termination not confirmed: {killed:?}"
+                )));
+            }
+            return Err(FenceError::Probe("probe timed out; child reaped".into()));
         }
         let mut rc = 0;
         GetExitCodeProcess(process_handle.0, &mut rc).map_err(error)?;
         match rc {
             0 => Ok(DirectionResult::Connected),
-            10013 | 10061 => Ok(DirectionResult::Refused),
+            10013 => Ok(DirectionResult::Refused),
             _ => Ok(DirectionResult::Error(format!(
                 "unprivileged probe exit {rc}"
             ))),
         }
     }
-}
-pub fn boot_id() -> Result<BootId, WinError> {
-    // CIM's LastBootUpTime is the actual boot timestamp, not a wall-clock
-    // minus uptime approximation that changes on clock adjustments.
-    let output=std::process::Command::new(system_powershell()?).args(["-NoProfile","-NonInteractive","-Command","$ErrorActionPreference='Stop'; (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().Ticks.ToString()"]).creation_flags(0x08000000).output().map_err(|e|WinError::invalid(e.to_string()))?;
-    if !output.status.success() {
-        return Err(WinError::invalid("boot timestamp query failed"));
-    }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if value.parse::<u64>().is_err() {
-        return Err(WinError::invalid("invalid boot timestamp"));
-    }
-    Ok(BootId(value))
 }

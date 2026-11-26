@@ -9,13 +9,13 @@ use ::windows::{
         },
         NetworkManagement::WindowsFilteringPlatform::*,
         Security::{
-            ACCESS_ALLOWED_ACE, ACL,
+            ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
             Authorization::{
                 ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
             },
-            DACL_SECURITY_INFORMATION, GetAce, GetSecurityDescriptorDacl, IsWellKnownSid,
-            OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, WinBuiltinAdministratorsSid,
-            WinLocalSystemSid,
+            DACL_SECURITY_INFORMATION, GetAce, GetSecurityDescriptorDacl, IsValidSid,
+            IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+            WinBuiltinAdministratorsSid, WinLocalSystemSid,
         },
     },
     core::{BOOL, GUID, HSTRING, PCWSTR, PWSTR},
@@ -156,25 +156,54 @@ unsafe fn display_name(ptr: PWSTR) -> String {
 
 // BFE owns and validates the security descriptors returned by its APIs.
 // Never treat a container as exclusive if its ACL admits an ordinary user.
-unsafe fn trusted_acl(dacl: *const ACL, system_only: bool) -> Result<bool, WinError> {
+pub(super) unsafe fn trusted_acl(dacl: *const ACL, system_only: bool) -> Result<bool, WinError> {
     if dacl.is_null() {
         return Ok(false);
     }
     let mut system = false;
     let mut admin = false;
+    let start = dacl as usize;
+    let size = unsafe { (*dacl).AclSize } as usize;
+    if size < size_of::<ACL>() {
+        return Ok(false);
+    }
+    let Some(end) = start.checked_add(size) else {
+        return Ok(false);
+    };
     for index in 0..unsafe { (*dacl).AceCount } as u32 {
         let mut ptr = null_mut();
         unsafe {
             GetAce(dacl, index, &mut ptr).map_err(WinError::windows)?;
         }
-        if ptr.is_null() {
+        let ace_start = ptr as usize;
+        if ptr.is_null()
+            || ace_start < start + size_of::<ACL>()
+            || ace_start
+                .checked_add(size_of::<ACE_HEADER>())
+                .is_none_or(|p| p > end)
+        {
             return Ok(false);
         }
-        let ace = unsafe { &*ptr.cast::<ACCESS_ALLOWED_ACE>() };
-        if ace.Header.AceType != 0 {
+        // Inspect only the generic header before interpreting the ACE body.
+        let header = unsafe { ptr.cast::<ACE_HEADER>().read_unaligned() };
+        let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+        let ace_size = header.AceSize as usize;
+        if header.AceType != 0
+            || ace_size < sid_offset + 8
+            || ace_start.checked_add(ace_size).is_none_or(|p| p > end)
+        {
             return Ok(false);
         }
-        let sid = PSID(std::ptr::addr_of!(ace.SidStart).cast_mut().cast());
+        let sid_ptr = unsafe { ptr.cast::<u8>().add(sid_offset) };
+        let count = unsafe { *sid_ptr.add(1) } as usize;
+        if sid_offset + 8 + count * 4 > ace_size {
+            return Ok(false);
+        }
+        let sid = PSID(sid_ptr.cast());
+        if !unsafe { IsValidSid(sid).as_bool() } {
+            return Ok(false);
+        }
+        let ace = unsafe { ptr.cast::<ACCESS_ALLOWED_ACE>().read_unaligned() };
         if unsafe { IsWellKnownSid(sid, WinLocalSystemSid).as_bool() } {
             if system_only && ace.Mask != 1 {
                 return Ok(false);
@@ -666,39 +695,60 @@ pub fn remove(key: &ObjectKey) -> Result<Reclaimed, WinError> {
 }
 
 pub fn enumerate() -> Result<Vec<(ObjectKey, Observation)>, WinError> {
+    enumerate_impl(false)
+}
+pub fn sweep() -> Result<Vec<(ObjectKey, Observation)>, WinError> {
+    enumerate_impl(true)
+}
+fn filter_key(f: &Filter) -> Result<ObjectKey, WinError> {
+    let rest = f
+        .label
+        .strip_prefix("etd-fence:")
+        .ok_or_else(|| WinError::invalid("unrecognized object in WFP product container"))?;
+    let (id, port) = rest
+        .split_once(':')
+        .ok_or_else(|| WinError::invalid("unrecognized WFP fence label"))?;
+    let (Ok(id), Ok(port)) = (Uuid::parse_str(id), port.parse::<u16>()) else {
+        return Err(WinError::invalid("unrecognized WFP fence identifier"));
+    };
+    if !f.owned || !f.persistent || !(0..4).any(|i| child(id, i) == f.key) {
+        return Err(WinError::invalid("unrecognized WFP filter identity"));
+    }
+    Ok(ObjectKey::Fence {
+        container: CONTAINER.into(),
+        rule: id.to_string(),
+        port,
+    })
+}
+fn enumerate_impl(tolerant: bool) -> Result<Vec<(ObjectKey, Observation)>, WinError> {
     let e = Engine::open()?;
     let mut out = Vec::new();
     for f in filters(&e)? {
-        let Some(rest) = f.label.strip_prefix("etd-fence:") else {
-            return Err(WinError::invalid(
-                "unrecognized object in WFP product container",
-            ));
+        let key = match filter_key(&f) {
+            Ok(key) => key,
+            Err(e) if tolerant => {
+                tracing::warn!(class="wfp",filter=?f.key,label=%f.label,error=%e,"skipping unrecognized WFP object");
+                continue;
+            }
+            Err(e) => return Err(e),
         };
-        let Some((id, port)) = rest.split_once(':') else {
-            return Err(WinError::invalid("unrecognized WFP fence label"));
-        };
-        let (Ok(id), Ok(port)) = (Uuid::parse_str(id), port.parse::<u16>()) else {
-            return Err(WinError::invalid("unrecognized WFP fence identifier"));
-        };
-        if !f.owned || !f.persistent || !(0..4).any(|i| child(id, i) == f.key) {
-            return Err(WinError::invalid("unrecognized WFP filter identity"));
+        if out.iter().any(|(k, _)| k == &key) {
+            continue;
         }
-        let key = ObjectKey::Fence {
-            container: CONTAINER.into(),
-            rule: id.to_string(),
-            port,
-        };
-        if !out.iter().any(|(k, _)| k == &key)
-            && let Some(obs) = observe(&key)?
-        {
-            out.push((key, obs));
+        match observe(&key) {
+            Ok(Some(obs)) => out.push((key, obs)),
+            Ok(None) => {}
+            Err(e) if tolerant => {
+                tracing::warn!(class="wfp",key=?key,error=%e,"skipping unconfirmed WFP fence")
+            }
+            Err(e) => return Err(e),
         }
     }
     if out.is_empty() {
         // Both parent objects are added/deleted transactionally with the
         // filters. An empty but existing parent is unexpected residue, not
         // evidence of a clean system; don't silently hide it from sysdiff.
-        unsafe {
+        let parent_result = (|| unsafe {
             let mut provider = null_mut();
             let rc = FwpmProviderGetByKey0(e.0, &PROVIDER, &mut provider);
             if rc == 0 {
@@ -716,6 +766,14 @@ pub fn enumerate() -> Result<Vec<(ObjectKey, Observation)>, WinError> {
             }
             if rc != FWP_E_SUBLAYER_NOT_FOUND.0 as u32 {
                 check(rc, "look up WFP sublayer")?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = parent_result {
+            if tolerant {
+                tracing::warn!(class="wfp",error=%e,"unconfirmed WFP parent residue");
+            } else {
+                return Err(e);
             }
         }
     }

@@ -6,6 +6,7 @@ $ProgressPreference = 'SilentlyContinue'
 $q = ConvertFrom-Json $env:ETD_OS_REQUEST
 $nrpt = 'SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig'
 $profiles = 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles'
+$signatures = 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Signatures\Unmanaged'
 $magic = 'SOFTWARE\EasyTier\MagicDNS'
 $tcpip = 'SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces'
 $tcpip6 = 'SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces'
@@ -43,6 +44,8 @@ function FirewallRows {
     $store = RegOpen 'SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules'
     try {
         Get-NetFirewallRule -PolicyStore PersistentStore | ForEach-Object {
+            $ruleId=$_.Name
+            try {
             $raw = if ($store) { $store.GetValue($_.Name) } else { $null }
             if (!$q.name -or $_.DisplayName -eq $q.name) {
                 $program = $null
@@ -56,58 +59,15 @@ function FirewallRows {
                 }
                 @{name=$_.DisplayName;group=$_.Group;id=$_.Name;program=$program;direction=$_.Direction.ToString();description=if ($null -ne $raw) { [string]$raw } else { ($_ | Select-Object DisplayName,Group,Direction,Action,Enabled,Profile,Description | ConvertTo-Json -Compress) }}
             }
+            } catch { if ($q.sweep) { @{warning=$_.Exception.Message;object=$ruleId} } else { throw } }
         }
     } finally { if ($store) { $store.Dispose() } }
 }
 function NrptRows {
-    foreach ($id in @(RegNames $nrpt)) { $k = RegOpen "$nrpt\$id"; if ($k) { try { @{name=$id;group=[string]$k.GetValue('Comment');id=$id;description=($k.GetValueNames() | Sort-Object | ForEach-Object { "$_=$($k.GetValue($_) -join ',')" }) -join ';'} } finally { $k.Dispose() } } }
+    foreach ($id in @(RegNames $nrpt)) { try { $k = RegOpen "$nrpt\$id"; if ($k) { try { @{name=$id;group=[string]$k.GetValue('Comment');id=$id;description=($k.GetValueNames() | Sort-Object | ForEach-Object { "$_=$($k.GetValue($_) -join ',')" }) -join ';'} } finally { $k.Dispose() } } } catch { if ($q.sweep) { @{warning=$_.Exception.Message;object=$id} } else { throw } } }
 }
 function ProfileRows {
-    foreach ($id in @(RegNames $profiles)) { $k = RegOpen "$profiles\$id"; if ($k) { try { @{name=[string]$k.GetValue('ProfileName');id=$id;description=($k.GetValueNames() | Sort-Object | ForEach-Object { "$_=$($k.GetValue($_) -join ',')" }) -join ';'} } finally { $k.Dispose() } } }
-}
-function NoEasyTier {
-    # Upstream's shared recovery record cannot be attributed to one instance.
-    # Fail closed when WMI cannot enumerate processes.
-    $root = if ($q.core_store) { ([string]$q.core_store).Replace('\\?\','').TrimEnd('\') + '\' } else { $null }
-    $running = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^easytier(?:-core|-cli)?(?:\.exe)?$' -or $_.ExecutablePath -match '(?i)\\easytier(?:-core)?\.exe$' -or ($root -and $_.ExecutablePath -and $_.ExecutablePath.Replace('\\?\','').StartsWith($root,[StringComparison]::OrdinalIgnoreCase)) })
-    if ($running.Count) { throw 'BUSY: another EasyTier process is running' }
-}
-function ReplayMagic {
-    NoEasyTier
-    $k = RegOpen $magic
-    if (!$k) { return 'absent' }
-    try {
-        $ids = @($k.GetValue('NRPTRuleIDs', [string[]]@()))
-        # Validate entire ownership list and saved interface paths before writes.
-        foreach ($id in $ids) { if ((GuidText $id) -ine $id) { throw 'Invalid NRPT ID' } }
-        $saves = @()
-        foreach ($guid in @(RegNames "$magic\SearchLists")) {
-            if ((GuidText $guid) -ine $guid) { throw 'Invalid search list GUID' }
-            foreach ($protocol in @('IPv4','IPv6')) {
-                $saved = RegOpen "$magic\SearchLists\$guid\$protocol"
-                if ($saved) { try {
-                    if ($saved.GetValue('Ready',0) -eq 1) {
-                        $prefix = if ($protocol -eq 'IPv4') { $tcpip } else { $tcpip6 }
-                        $value = $saved.GetValue('OriginalSearchList',$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
-                        $kind = if ($saved.GetValueNames() -contains 'OriginalSearchList') { $saved.GetValueKind('OriginalSearchList') } else { $null }
-                        $saves += @{path="$prefix\$guid";value=$value;kind=$kind}
-                    }
-                } finally { $saved.Dispose() } }
-            }
-        }
-        NoEasyTier
-        foreach ($id in $ids) { $hklm.DeleteSubKey("$nrpt\$id",$false) }
-        foreach ($save in $saves) {
-            $target = RegOpen $save.path $true
-            if ($target) { try {
-                if ($null -eq $save.kind) { $target.DeleteValue('SearchList',$false) }
-                else { $target.SetValue('SearchList',$save.value,$save.kind) }
-            } finally { $target.Dispose() } }
-        }
-    } finally { $k.Dispose() }
-    NoEasyTier
-    $hklm.DeleteSubKeyTree($magic,$false)
-    return 'removed'
+    foreach ($id in @(RegNames $profiles)) { try { $k = RegOpen "$profiles\$id"; if ($k) { try { @{name=[string]$k.GetValue('ProfileName');id=$id;description=($k.GetValueNames() | Sort-Object | ForEach-Object { "$_=$($k.GetValue($_) -join ',')" }) -join ';'} } finally { $k.Dispose() } } } catch { if ($q.sweep) { @{warning=$_.Exception.Message;object=$id} } else { throw } } }
 }
 function Execute-Request {
     switch ($q.op) {
@@ -136,6 +96,22 @@ function Execute-Request {
             $k = RegOpen "$profiles\$($q.id)"
             if (!$k) { return 'absent' }
             try { if ($k.GetValue('ProfileName') -ine $q.name) { throw 'Profile credential mismatch' } } finally { $k.Dispose() }
+            # Remove only signatures pointing to this verified profile GUID.
+            # Do this first so a failure can be retried while the profile
+            # record is still present. Never infer signature ownership by name.
+            foreach ($signature in @(RegNames $signatures)) {
+                $s = RegOpen "$signatures\$signature"
+                if (!$s) { continue }
+                $matching = $false
+                try {
+                    $pg = [guid]::Empty
+                    if ([guid]::TryParse([string]$s.GetValue('ProfileGuid'),[ref]$pg)) { $matching = $pg -eq [guid]$q.id }
+                } finally { $s.Dispose() }
+                if ($matching) { $hklm.DeleteSubKeyTree("$signatures\$signature",$false) }
+            }
+            $k = RegOpen "$profiles\$($q.id)"
+            if (!$k) { throw 'Profile disappeared during signature cleanup' }
+            try { if ($k.GetValue('ProfileName') -ine $q.name) { throw 'Profile credential changed during signature cleanup' } } finally { $k.Dispose() }
             $hklm.DeleteSubKeyTree("$profiles\$($q.id)",$false); return 'removed'
         }
         'registry' {
@@ -156,19 +132,19 @@ function Execute-Request {
             } finally { $k.Dispose() }
         }
         'magic' { $k = RegOpen $magic; if ($k) { $k.Dispose(); return $true }; return $false }
-        'replay_magic' { return ReplayMagic }
         'ip_addresses' { return @(Get-NetIPAddress | ForEach-Object { @{index=$_.InterfaceIndex;address=$_.IPAddress;prefix=$_.PrefixLength} }) }
         'routes' { return @(Get-NetRoute | ForEach-Object { @{name=$_.InterfaceAlias;index=$_.InterfaceIndex;description="$($_.DestinationPrefix) via $($_.NextHop) metric $($_.RouteMetric)"} }) }
         'listeners' { return @(Get-NetTCPConnection -State Listen | ForEach-Object { @{address=$_.LocalAddress;port=$_.LocalPort;pid=$_.OwningProcess} }) }
-        'boot' { return (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().Ticks.ToString() }
         'services' { return @(Get-CimInstance Win32_Service | ForEach-Object { @{name=$_.Name;description="$($_.PathName)|$($_.StartMode)|$($_.State)"} }) }
         'drivers' { return @(Get-CimInstance Win32_SystemDriver | ForEach-Object { @{name=$_.Name;description="$($_.PathName)|$($_.StartMode)|$($_.State)"} }) }
         'processes' { return @(Get-CimInstance Win32_Process | ForEach-Object { @{pid=$_.ProcessId;name=$_.Name;path=$_.ExecutablePath;start=$_.CreationDate.ToUniversalTime().Ticks.ToString()} }) }
         'registry_rows' {
             foreach ($prefix in @($tcpip,$tcpip6,$netbt)) {
                 foreach ($name in @(RegNames $prefix)) {
-                    $path = "$prefix\$name"; $k = RegOpen $path
-                    if ($k) { try { foreach ($value in @($k.GetValueNames())) { @{key="HKLM\$path";value=$value;description=($k.GetValue($value) -join ',')} } } finally { $k.Dispose() } }
+                    $path = "$prefix\$name"
+                    try { $k = RegOpen $path
+                    if ($k) { try { foreach ($value in @($k.GetValueNames())) { try { @{key="HKLM\$path";value=$value;description=($k.GetValue($value) -join ',')} } catch { if ($q.sweep) { @{warning=$_.Exception.Message;object="$path\$value"} } else { throw } } } } finally { $k.Dispose() } }
+                    } catch { if ($q.sweep) { @{warning=$_.Exception.Message;object=$path} } else { throw } }
                 }
             }
         }

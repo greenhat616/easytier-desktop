@@ -1,6 +1,6 @@
 //! GetIfTable2 can include phantom devices. An IP interface or a live PnP
 //! devnode is required before a Wintun adapter counts as present (S2).
-use super::{WinError, observation, opaque, owned_name, query};
+use super::{WinError, blocking, observation, opaque, owned_name, query};
 use ::windows::{
     Win32::{
         Devices::DeviceAndDriverInstallation::{
@@ -208,7 +208,8 @@ fn info_row(row: &Row, addresses: &[serde_json::Value]) -> Result<InterfaceInfo,
     })
 }
 pub async fn info(key: &ObjectKey) -> Result<Option<InterfaceInfo>, WinError> {
-    let Some(row) = find(key)? else {
+    let requested = key.clone();
+    let Some(row) = blocking(move || find(&requested)).await? else {
         return Ok(None);
     };
     // Observation deliberately locates by name *or* GUID to report a
@@ -227,8 +228,10 @@ pub async fn info(key: &ObjectKey) -> Result<Option<InterfaceInfo>, WinError> {
             "interface identity differs from the expected name/GUID",
         ));
     }
-    let info = info_row(&row, &addresses().await?)?;
-    if owned_name(&row.name) && !matches!(info.credential, Credential::WinAdapter { .. }) {
+    let addresses = addresses().await?;
+    let product_name = owned_name(&row.name);
+    let info = blocking(move || info_row(&row, &addresses)).await?;
+    if product_name && !matches!(info.credential, Credential::WinAdapter { .. }) {
         return Err(WinError::invalid(
             "Wintun is live but its device identity is not yet confirmed",
         ));
@@ -237,16 +240,44 @@ pub async fn info(key: &ObjectKey) -> Result<Option<InterfaceInfo>, WinError> {
 }
 pub async fn enumerate() -> Result<Vec<(ObjectKey, InterfaceInfo)>, WinError> {
     let addresses = addresses().await?;
+    blocking(move || enumerate_rows(&addresses, false)).await
+}
+pub async fn sweep() -> Result<Vec<(ObjectKey, InterfaceInfo)>, WinError> {
+    let addresses = match addresses().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(class="interfaces",error=%e,"sweep address query failed; interface identity sweep continues");
+            Vec::new()
+        }
+    };
+    blocking(move || enumerate_rows(&addresses, true)).await
+}
+fn enumerate_rows(
+    addresses: &[serde_json::Value],
+    tolerant: bool,
+) -> Result<Vec<(ObjectKey, InterfaceInfo)>, WinError> {
     let mut out = Vec::new();
     for row in rows()? {
-        if row.ip_live || devnode_live(row.guid)? {
-            out.push((
-                ObjectKey::Interface {
-                    name: Some(row.name.clone()),
-                    guid: Some(guid_text(row.guid)),
-                },
-                info_row(&row, &addresses)?,
-            ));
+        let result = (|| {
+            if row.ip_live || devnode_live(row.guid)? {
+                Ok(Some((
+                    ObjectKey::Interface {
+                        name: Some(row.name.clone()),
+                        guid: Some(guid_text(row.guid)),
+                    },
+                    info_row(&row, addresses)?,
+                )))
+            } else {
+                Ok(None)
+            }
+        })();
+        match result {
+            Ok(Some(v)) => out.push(v),
+            Ok(None) => {}
+            Err(e) if tolerant => {
+                tracing::warn!(class="interfaces",name=%row.name,guid=%row.guid,error=%e,"skipping unobservable interface")
+            }
+            Err(e) => return Err(e),
         }
     }
     Ok(out)

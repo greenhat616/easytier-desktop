@@ -47,15 +47,150 @@ impl Drop for RegistryFixture {
     }
 }
 
+#[test]
+#[ignore = "creates native volatile machine boot marker on disposable CI"]
+fn boot_marker_stable_and_volatile() {
+    use ::windows::{
+        Win32::{Foundation::ERROR_CHILD_MUST_BE_VOLATILE, System::Registry::*},
+        core::{HSTRING, PCWSTR},
+    };
+    assert_eq!(std::env::var("CI").as_deref(), Ok("true"));
+    let dir = tempfile::tempdir().unwrap();
+    let config = OsConfig {
+        state_dir: dir.path().into(),
+        run_dir: dir.path().join("run"),
+        core_store_dir: dir.path().join("core"),
+    };
+    let first = adapters(&config).unwrap().boot_id.current().unwrap();
+    let second = adapters(&config).unwrap().boot_id.current().unwrap();
+    assert_eq!(first, second);
+    assert!(uuid::Uuid::parse_str(&first.0).is_ok());
+    // The Win32 registry rejects a nonvolatile child of a volatile key.
+    // Query the actual production marker, not just the creation flag.
+    unsafe {
+        let mut key = HKEY::default();
+        assert_eq!(
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                &HSTRING::from(r"SOFTWARE\EasyTierDesk\Volatile"),
+                None,
+                KEY_READ | KEY_CREATE_SUB_KEY | KEY_WOW64_64KEY,
+                &mut key
+            )
+            .0,
+            0
+        );
+        let name = HSTRING::from(format!("proof-{}", uuid::Uuid::new_v4()));
+        let mut child = HKEY::default();
+        let rc = RegCreateKeyExW(
+            key,
+            &name,
+            None,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_READ,
+            None,
+            &mut child,
+            None,
+        );
+        if rc.0 == 0 {
+            let _ = RegCloseKey(child);
+            let _ = RegDeleteKeyW(key, &name);
+        }
+        let _ = RegCloseKey(key);
+        assert_eq!(rc, ERROR_CHILD_MUST_BE_VOLATILE);
+    }
+    println!("BOOT marker stable UUID; actual registry key rejects nonvolatile child");
+}
+
 #[tokio::test]
-#[ignore = "creates isolated registry, NRPT, and Magic DNS recovery fixtures on CI"]
-async fn registry_and_magic_dns() {
+#[ignore = "creates isolated network profile and signature fixtures on disposable CI"]
+async fn profile_signature_cleanup() {
     assert_eq!(std::env::var("CI").as_deref(), Ok("true"));
     let dir = tempfile::tempdir().unwrap();
     let os = adapters(&OsConfig {
         state_dir: dir.path().into(),
         run_dir: dir.path().join("run"),
         core_store_dir: dir.path().join("core"),
+    })
+    .unwrap();
+    let id = format!("{{{}}}", uuid::Uuid::new_v4().to_string().to_uppercase());
+    let foreign_id = format!("{{{}}}", uuid::Uuid::new_v4().to_string().to_uppercase());
+    let name = format!("etd-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let profile =
+        format!(r"HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles\{id}");
+    let signature = format!(
+        r"HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Signatures\Unmanaged\{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    let foreign = format!(
+        r"HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Signatures\Unmanaged\{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    let _fixture = RegistryFixture(vec![profile.clone(), signature.clone(), foreign.clone()]);
+    ps(&format!(
+        "$ErrorActionPreference='Stop'; New-Item -Path '{profile}' -Force | Out-Null; New-ItemProperty -Path '{profile}' -Name ProfileName -Value '{name}' -PropertyType String | Out-Null; New-Item -Path '{signature}' -Force | Out-Null; New-ItemProperty -Path '{signature}' -Name ProfileGuid -Value '{id}' -PropertyType String | Out-Null; New-Item -Path '{foreign}' -Force | Out-Null; New-ItemProperty -Path '{foreign}' -Name ProfileGuid -Value '{foreign_id}' -PropertyType String | Out-Null"
+    ));
+    let key = ObjectKey::NetworkProfile { profile_name: name };
+    let observation = os
+        .observer
+        .observe(EffectKind::WinNetworkProfile, &key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        observation.credential,
+        Some(Credential::Opaque { value: id })
+    );
+    let effect = Effect {
+        id: EffectId(uuid::Uuid::new_v4().to_string()),
+        scope: EffectScope::Instance {
+            instance: InstanceId::from("profile-test"),
+            epoch: Epoch(1),
+        },
+        kind: EffectKind::WinNetworkProfile,
+        key: key.clone(),
+        undo: Undo::EnsureAbsent,
+        persistence: Persistence::Persistent,
+        state: EffectState::Applied,
+        boot: os.boot_id.current().unwrap(),
+        observation: Some(observation),
+        failures: 0,
+        last_error: None,
+        recorded_at: jiff::Timestamp::now(),
+    };
+    let reclaim = os
+        .reclaimers
+        .iter()
+        .find(|r| r.kind() == effect.kind)
+        .unwrap();
+    assert_eq!(reclaim.reclaim(&effect).await.unwrap(), Reclaimed::Removed);
+    assert!(
+        os.observer
+            .observe(effect.kind, &key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        ps(&format!("Test-Path -LiteralPath '{signature}'")),
+        "False"
+    );
+    assert_eq!(ps(&format!("Test-Path -LiteralPath '{foreign}'")), "True");
+    println!("PROFILE matching signature removed, foreign ProfileGuid untouched");
+}
+
+#[tokio::test]
+#[ignore = "creates isolated registry, NRPT, and Magic DNS recovery fixtures on CI"]
+async fn registry_and_magic_dns() {
+    assert_eq!(std::env::var("CI").as_deref(), Ok("true"));
+    let dir = tempfile::tempdir().unwrap();
+    let core_store = dir.path().join("core");
+    std::fs::create_dir(&core_store).unwrap();
+    let os = adapters(&OsConfig {
+        state_dir: dir.path().into(),
+        run_dir: dir.path().join("run"),
+        core_store_dir: core_store.clone(),
     })
     .unwrap();
     let guid = format!("{{{}}}", uuid::Uuid::new_v4().to_string().to_uppercase());
@@ -186,10 +321,59 @@ async fn registry_and_magic_dns() {
         Undo::ReplayUpstreamRecovery,
         obs,
     );
+    // A candidate outside the protected store blocks the shared record.
+    // A candidate opened under the actual store directory is ignored. Use
+    // an inert renamed command interpreter, not an actual external VPN.
+    let fixture = |location: &std::path::Path| {
+        let image = location.join("easytier-gate-fixture.exe");
+        std::fs::copy(
+            std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+                .join("System32/cmd.exe"),
+            &image,
+        )
+        .unwrap();
+        let mut child = Child(
+            Command::new(image)
+                .args(["/d", "/c", "pause"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "gate fixture must still be running"
+        );
+        child
+    };
+    let foreign = fixture(dir.path());
+    assert!(matches!(
+        reclaimer(effect.kind).reclaim(&effect).await,
+        Err(ReclaimError::Busy(_))
+    ));
+    assert!(
+        os.observer
+            .observe(effect.kind, &magic_key)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        os.observer
+            .observe(EffectKind::WinNrptRule, &nrpt_key)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    drop(foreign);
+    let own = fixture(&core_store);
     assert_eq!(
         reclaimer(effect.kind).reclaim(&effect).await.unwrap(),
         Reclaimed::Removed
     );
+    drop(own);
     assert!(
         os.observer
             .observe(effect.kind, &magic_key)

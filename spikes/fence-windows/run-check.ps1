@@ -72,6 +72,7 @@ function Run-Probe($suffix, $endpoint, $expectation, $identity) {
     Write-Host $content
     $expectedSid = if ($identity -eq 'SYSTEM') { 'S-1-5-18' } else { (Get-LocalUser -Name $user).SID.Value }
     if ($content -notmatch [regex]::Escape("SID=$expectedSid")) { throw "Wrong probe account" }
+    if ($content -notmatch [regex]::Escape("PROBE $endpoint expected=$expectation actual=$expectation")) { throw "Missing probe verdict" }
     if ((Get-Content -LiteralPath $marker) -ne '0') { throw "Probe failed: $suffix" }
 }
 function Invoke-Wfp($verb) {
@@ -106,9 +107,11 @@ try {
     @'
 param($endpoint,$token,$expectation,$log,$marker)
 $ErrorActionPreference = 'Continue'
-"SID=$([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)" | Set-Content -LiteralPath $log
-& "$PSScriptRoot/fixture.exe" probe $endpoint $token $expectation *>> $log
-$LASTEXITCODE | Set-Content -LiteralPath $marker
+"SID=$([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)" | Set-Content -LiteralPath $log -Encoding UTF8
+$output = & "$PSScriptRoot/fixture.exe" probe $endpoint $token $expectation 2>&1
+$rc = $LASTEXITCODE
+$output | Out-File -LiteralPath $log -Append -Encoding UTF8
+$rc | Set-Content -LiteralPath $marker
 '@ | Set-Content -LiteralPath "$folder/probe.ps1" -Encoding UTF8
     Invoke-Wfp absent
     $c4 = Start-Listener control4 "127.0.0.1:$control"

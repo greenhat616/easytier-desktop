@@ -12,7 +12,8 @@ loopback address and target port. Use a transaction for the four filters.
 Never grant a hard permit overriding unrelated firewall policy.
 
 The check uses LocalSystem scheduled tasks for the installer, both listeners
-and positive probes; a distinct non-admin account for negative probes. The
+and positive probes; secondary logon launches a distinct non-admin account
+for negative probes. The
 control endpoint must be reachable from that account, and every failed
 connection to the fenced endpoint is bracketed by successful challenge reads
 from the same listener. The installer alone is killed, then the probes and

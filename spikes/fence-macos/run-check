@@ -20,7 +20,7 @@ cleanup() {
   local rc=$?
   trap - EXIT
   for p in $(jobs -pr); do kill -KILL "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; done
-  if (( owned )); then pfctl -a "$anchor" -F rules || rc=1; fi
+  if (( owned )); then pfctl -a "$anchor" -f /dev/null || rc=1; fi
   if [[ -n $pf_token ]]; then pfctl -X "$pf_token" || rc=1; fi
   if (( created )); then sysadminctl -deleteUser "$user" || rc=1; fi
   exit "$rc"
@@ -56,8 +56,10 @@ pfctl -sr | tee "$work/top-rules.txt"
 if ! grep -F 'anchor "com.apple/*"' "$work/top-rules.txt"; then
   echo "UNPROVEN: missing active wildcard anchor hook"; exit 1
 fi
-pfctl -a "$anchor" -sr > "$work/before.txt"
-[[ ! -s "$work/before.txt" ]]
+pfctl -a com.apple -s Anchors > "$work/before.txt"
+if grep -F 'etd-s1-fence' "$work/before.txt"; then
+  echo "unexpected pre-existing S1 anchor"; exit 1
+fi
 pfctl -E > "$work/enable.txt" 2>&1
 pf_token=$(awk '/Token *:/ {print $NF}' "$work/enable.txt")
 [[ -n $pf_token ]]
@@ -100,13 +102,22 @@ for marker in listener4 listener6; do
   kill -KILL "$pid"; wait "$pid" || true
   ! kill -0 "$pid" 2>/dev/null
 done
-pfctl -a "$anchor" -F rules
+# Replace the entire private anchor atomically with an empty ruleset (not
+# a global flush). Darwin may keep an empty anchor while a reference exists.
+pfctl -a "$anchor" -f /dev/null
 owned=0
-# Enumerate the anchor rules and the recursive active rules independently.
-pfctl -a "$anchor" -sr | tee "$work/post-anchor.txt"
-[[ ! -s "$work/post-anchor.txt" ]]
+# Enumerate its parent first so a direct query cannot create a placeholder.
+for _ in {1..20}; do
+  pfctl -a com.apple -s Anchors > "$work/post-anchors.txt"
+  if ! grep -Fq 'etd-s1-fence' "$work/post-anchors.txt"; then break; fi
+  sleep .5
+done
+cat "$work/post-anchors.txt"
+if grep -F 'etd-s1-fence' "$work/post-anchors.txt"; then
+  pfctl -a "$anchor" -sr | tee "$work/post-anchor.txt"
+  echo "UNPROVEN: empty anchor name still present after reclaim"
+  exit 1
+fi
 pfctl -a '*' -sr | tee "$work/post-rules.txt"
 if grep -F "$anchor" "$work/post-rules.txt"; then exit 1; fi
-pfctl -a com.apple -s Anchors | tee "$work/post-anchors.txt"
-if grep -F 'etd-s1-fence' "$work/post-anchors.txt"; then exit 1; fi
 echo "PASS macOS IPv4 + IPv6: identity fence persists after host death; no S1 rules remain"

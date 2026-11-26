@@ -163,7 +163,7 @@ jobs:
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=installed_kernel_and_host_crash_recovery)' --success-output immediate
       - name: Pre-existing shared drivers (fresh administrator runner)
         if: matrix.suite == 'preflight'
-        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=preexisting_shared_drivers_are_conflicts)' --success-output immediate
+        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=preexisting_shared_drivers_are_conflicts) | test(=preexisting_shared_drivers_survive_uninstall)' --success-output immediate
       - name: Pre-existing inactive program rule (fresh administrator runner)
         if: matrix.suite == 'program'
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=preexisting_program_rule_blocks_start)' --success-output immediate

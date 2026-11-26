@@ -24,10 +24,10 @@ use etd_proc::{
     processkit_engine::ProcessKitEngine,
 };
 use etd_sysfx::{
-    BootId, Change, ChangeSet, Effect, EffectKind, EffectScope, EffectState, GenerationOutcome,
-    Ledger, ObjectKey, Observation, ReclaimDeps, ReclaimReport, ReclaimScope, RepairIndexStore,
-    RequestDigest, RequestRecord, ScopeFilter, SystemObserver, engine::ReclaimEngineImpl,
-    sqlite::SqliteLedger,
+    BootId, Change, ChangeSet, Effect, EffectId, EffectKind, EffectScope, EffectState,
+    GenerationOutcome, Ledger, ObjectKey, Observation, ReclaimDeps, ReclaimReport, ReclaimScope,
+    RepairIndexStore, RequestDigest, RequestRecord, ScopeFilter, SystemObserver,
+    engine::ReclaimEngineImpl, sqlite::SqliteLedger,
 };
 use etd_sysfx_os::{
     OsConfig, OsError,
@@ -609,9 +609,25 @@ async fn reclaim_locked(deps: &HostDeps, purge: bool) -> Result<()> {
         ScopeFilter::default()
     };
     let open = deps.ledger.open_effects(&filter).await?;
-    for (key, observation) in reclaim_outcome(&report, &open, purge)? {
-        let line = left_in_place(&key, observation.as_ref(), deps.observer.as_ref()).await;
+    let left = reclaim_outcome(&report, &open, purge)?;
+    for item in &left {
+        let line = left_in_place(item, deps.observer.as_ref()).await;
         println!("  {line}");
+    }
+    if !left.is_empty() {
+        // Their records close: the drivers stay, never ours to delete.
+        let decisions: Vec<_> = left
+            .iter()
+            .map(|item| etd_contract::CandidateDecision {
+                candidate_id: item.id.clone(),
+                action: etd_contract::v1::CandidateAction::Keep as i32,
+            })
+            .collect();
+        deps.reclaim.resolve(&decisions).await?;
+        ensure!(
+            deps.ledger.open_effects(&filter).await?.is_empty(),
+            "reclaim incomplete; keeping ownership data for retry"
+        );
     }
     if let Some(receipt) = receipt {
         deps.ledger.complete_ticket(&receipt.ticket).await?;
@@ -635,55 +651,94 @@ fn image_path(observation: Option<&Observation>) -> Option<String> {
         .and_then(|v| v["image_path"].as_str().map(str::to_owned))
 }
 
+/// A shared driver service a purge leaves in place: a candidate (ours to
+/// list, never to delete), or a conflict (it already existed or belongs to
+/// other software).
+#[derive(Debug, Clone, PartialEq)]
+struct LeftInPlace {
+    /// Candidate or conflict id, for closing the record (KEEP).
+    id: String,
+    key: ObjectKey,
+    observation: Option<Observation>,
+    preexisting: bool,
+}
+
 /// What to tell about a shared driver left in place. The image path comes
 /// from what was recorded, else from asking the observer now (SCM
 /// `QueryServiceConfig`), so a record read back without one still names
 /// its file (topic#40 msg#1390).
-async fn left_in_place(
-    key: &ObjectKey,
-    observation: Option<&Observation>,
-    observer: &dyn SystemObserver,
-) -> String {
+async fn left_in_place(item: &LeftInPlace, observer: &dyn SystemObserver) -> String {
+    let (key, observation) = (&item.key, item.observation.as_ref());
     let name = match key {
         ObjectKey::Service { name } => name.clone(),
         other => format!("{other:?}"),
     };
+    // Informational only, a point-in-time observation: never authority
+    // to delete anything (topic#40 msg#1450).
     let image = match image_path(observation) {
-        Some(image) => image,
-        None => match observer.observe(EffectKind::Driver, key).await {
-            Ok(Some(now)) => image_path(Some(&now))
-                .unwrap_or_else(|| "unknown (not reported by the system)".into()),
-            Ok(None) => "unknown (the service is no longer registered)".into(),
-            Err(e) => format!("unknown (query failed: {e})"),
+        Some(image) => format!("{image} (as recorded)"),
+        None => match tokio::time::timeout(
+            IMAGE_LOOKUP_DEADLINE,
+            observer.observe(EffectKind::Driver, key),
+        )
+        .await
+        {
+            Ok(Ok(Some(now))) => image_path(Some(&now)).map_or_else(
+                || "unknown (not reported by the system)".into(),
+                |image| format!("{image} (from SCM, now)"),
+            ),
+            Ok(Ok(None)) => "unknown (the service is no longer registered)".into(),
+            Ok(Err(e)) => format!("unknown (query failed: {e})"),
+            Err(_) => "unknown (query timed out)".into(),
         },
     };
-    format!(
-        "left in place: shared driver service {name} image {image}; remove it yourself if no other software uses it"
-    )
+    if item.preexisting {
+        format!(
+            "left in place: pre-existing shared driver service {name} image {image}; it belongs to other software"
+        )
+    } else {
+        format!(
+            "left in place: shared driver service {name} image {image}; remove it yourself if no other software uses it"
+        )
+    }
 }
 
-/// Whether a reclaim is complete, and what to tell about what it left. A
-/// purge (uninstall) does not wait on shared driver services that are only
-/// candidates: they are never ours to delete, so they are listed and left
-/// in place (ruling topic#40 msg#1279). Any other candidate, any conflict,
-/// any other open record, an unclosed generation or a failed sweep still
-/// blocks, so ownership data stays for a retry.
+/// How long the uninstall notice waits for a driver's image path.
+const IMAGE_LOOKUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether a reclaim is complete, and which shared driver services it
+/// leaves in place. A purge (uninstall) does not wait on shared driver
+/// services (Product scope): we never delete one, so a candidate (ruling
+/// topic#40 msg#1279) and a conflict, a driver that already existed or
+/// belongs to other software (msg#1453), are listed and their records
+/// closed. Any other candidate, any other conflict, any other open record,
+/// an unclosed generation or a failed sweep still blocks, so ownership data
+/// stays for a retry.
 fn reclaim_outcome(
     report: &ReclaimReport,
     open: &[Effect],
     purge: bool,
-) -> Result<Vec<(ObjectKey, Option<Observation>)>> {
+) -> Result<Vec<LeftInPlace>> {
+    let record = |id: &EffectId| open.iter().find(|e| &e.id == id);
     let (shared, candidates): (Vec<_>, Vec<_>) = report
         .candidates
         .iter()
         .partition(|c| purge && shared_driver(c.kind, c.scope.as_ref()));
+    let (preexisting, conflicts): (Vec<_>, Vec<_>) = report.conflicts.iter().partition(|c| {
+        purge
+            && record(&c.effect).is_some_and(|e| {
+                e.state == EffectState::Conflict && shared_driver(e.kind, Some(&e.scope))
+            })
+    });
     let open_blocking = open.iter().any(|e| {
-        !(purge && e.state == EffectState::Candidate && shared_driver(e.kind, Some(&e.scope)))
+        !(purge
+            && matches!(e.state, EffectState::Candidate | EffectState::Conflict)
+            && shared_driver(e.kind, Some(&e.scope)))
     });
     ensure!(
         !open_blocking
             && candidates.is_empty()
-            && report.conflicts.is_empty()
+            && conflicts.is_empty()
             && report
                 .generations
                 .iter()
@@ -696,7 +751,18 @@ fn reclaim_outcome(
     );
     Ok(shared
         .iter()
-        .map(|c| (c.key.clone(), c.observation.clone()))
+        .map(|c| LeftInPlace {
+            id: c.id.clone(),
+            key: c.key.clone(),
+            observation: c.observation.clone(),
+            preexisting: false,
+        })
+        .chain(preexisting.iter().map(|c| LeftInPlace {
+            id: c.id.clone(),
+            key: c.key.clone(),
+            observation: record(&c.effect).and_then(|e| e.observation.clone()),
+            preexisting: true,
+        }))
         .collect())
 }
 
@@ -1094,11 +1160,14 @@ mod reclaim_outcome_tests {
         )];
         let left = reclaim_outcome(&report, &open, true).unwrap();
         assert_eq!(left.len(), 1);
-        assert_eq!(left[0].0, driver("wintun"));
+        assert_eq!(left[0].key, driver("wintun"));
+        assert_eq!(left[0].id, "1");
+        assert!(!left[0].preexisting);
     }
 
-    /// An observer that only answers driver lookups, as told.
-    struct Drivers(Result<Option<Observation>, ObserveError>);
+    /// An observer that only answers driver lookups, as told (`None`:
+    /// never answers).
+    struct Drivers(Option<Result<Option<Observation>, ObserveError>>);
 
     #[async_trait::async_trait]
     impl SystemObserver for Drivers {
@@ -1108,7 +1177,10 @@ mod reclaim_outcome_tests {
             _key: &ObjectKey,
         ) -> Result<Option<Observation>, ObserveError> {
             assert_eq!(kind, EffectKind::Driver);
-            self.0.clone()
+            match &self.0 {
+                Some(answer) => answer.clone(),
+                None => std::future::pending().await,
+            }
         }
         async fn interface(&self, _: &ObjectKey) -> Result<Option<InterfaceInfo>, ObserveError> {
             unreachable!()
@@ -1127,46 +1199,106 @@ mod reclaim_outcome_tests {
         }
     }
 
+    fn item(observation: Option<Observation>, preexisting: bool) -> LeftInPlace {
+        LeftInPlace {
+            id: "1".into(),
+            key: driver("wintun"),
+            observation,
+            preexisting,
+        }
+    }
+
     const IMAGE: &str = r"\SystemRoot\System32\drivers\wintun.sys";
 
     #[tokio::test]
     async fn the_image_comes_from_the_record_or_else_from_the_system_now() {
-        let wintun = driver("wintun");
         let line = |image: &str| {
             format!(
                 "left in place: shared driver service wintun image {image}; remove it yourself if no other software uses it"
             )
         };
         // Recorded.
-        let unused = Drivers(Err(ObserveError::Os {
+        let unused = Drivers(Some(Err(ObserveError::Os {
             code: 1,
             message: "not asked".into(),
-        }));
+        })));
         assert_eq!(
-            left_in_place(&wintun, Some(&found(IMAGE)), &unused).await,
-            line(IMAGE)
+            left_in_place(&item(Some(found(IMAGE)), false), &unused).await,
+            line(&format!("{IMAGE} (as recorded)"))
         );
         // Read back without one: asked now.
         let bare = Observation {
             detail: None,
             ..found(IMAGE)
         };
+        let now = line(&format!("{IMAGE} (from SCM, now)"));
         assert_eq!(
-            left_in_place(&wintun, Some(&bare), &Drivers(Ok(Some(found(IMAGE))))).await,
-            line(IMAGE)
+            left_in_place(
+                &item(Some(bare.clone()), false),
+                &Drivers(Some(Ok(Some(found(IMAGE)))))
+            )
+            .await,
+            now
         );
         assert_eq!(
-            left_in_place(&wintun, None, &Drivers(Ok(Some(found(IMAGE))))).await,
-            line(IMAGE)
+            left_in_place(&item(None, false), &Drivers(Some(Ok(Some(found(IMAGE)))))).await,
+            now
         );
         // The query fails: said so, with the reason.
-        let failed = Drivers(Err(ObserveError::Os {
+        let failed = Drivers(Some(Err(ObserveError::Os {
             code: 5,
             message: "access denied".into(),
-        }));
-        let text = left_in_place(&wintun, Some(&bare), &failed).await;
+        })));
+        let text = left_in_place(&item(Some(bare.clone()), false), &failed).await;
         assert!(text.contains("image unknown (query failed: "), "{text}");
         assert!(text.contains("access denied"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_that_never_answers_times_out() {
+        let bare = Observation {
+            detail: None,
+            ..found(IMAGE)
+        };
+        let text = left_in_place(&item(Some(bare), false), &Drivers(None)).await;
+        assert!(text.contains("image unknown (query timed out)"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_pre_existing_shared_driver_conflict_does_not_block_and_is_named_as_foreign() {
+        let wintun = driver("wintun");
+        let mut held = record(
+            "7",
+            EffectKind::Driver,
+            wintun.clone(),
+            EffectScope::Product,
+        );
+        held.state = EffectState::Conflict;
+        let mut report = report(Vec::new());
+        report.conflicts.push(Conflict {
+            id: "c7".into(),
+            effect: EffectId("7".into()),
+            kind: EffectKind::Driver,
+            key: wintun.clone(),
+            expected: None,
+            found: None,
+        });
+        let left = reclaim_outcome(&report, std::slice::from_ref(&held), true).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, "c7", "closed through its conflict id");
+        assert!(left[0].preexisting);
+        let unused = Drivers(Some(Err(ObserveError::Os {
+            code: 1,
+            message: "not asked".into(),
+        })));
+        assert_eq!(
+            left_in_place(&left[0], &unused).await,
+            format!(
+                "left in place: pre-existing shared driver service wintun image {IMAGE} (as recorded); it belongs to other software"
+            )
+        );
+        // Outside a purge it still blocks.
+        assert!(reclaim_outcome(&report, &[held], false).is_err());
     }
 
     #[test]

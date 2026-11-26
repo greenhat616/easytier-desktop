@@ -1,6 +1,7 @@
 """Compare persisted launch intents with native observations, in both directions."""
 
 from pathlib import Path
+import json
 import stat
 
 
@@ -73,7 +74,19 @@ def check_generation(base, live, records, instance, view):
         elif kind in ("win.firewall_rule", "win.program_firewall_rule"):
             matches = {k for k, v in live.rows.items() if k[0] == "firewall"
                        and k[1].startswith("policy/") and v[:2] == [key["name"], key["group"]]}
-            assert len(matches) == 1 and obs.get("credential"), f"rule identity for {key['name']}"
+            assert len(matches) == 1, f"ambiguous or missing rule {key['name']}"
+            match = next(iter(matches))
+            value = obs["credential"]["value"]
+            rule_id = match[1].removeprefix("policy/")
+            if kind == "win.program_firewall_rule":
+                assert "core_binary" in record["scope"]
+                name, group, direction, _, _, image, *_ = live.rows[match]
+                assert json.loads(value) == {
+                    "id": rule_id, "name": name.lower(), "group": group.lower(),
+                    "direction": direction.lower(), "program": image.removeprefix("\\\\?\\").lower(),
+                }, f"stale program rule credential for {name}"
+            else:
+                assert value == rule_id, f"stale interface rule credential for {key['name']}"
         elif kind == "win.registry_value":
             matches = {("registry", key["key"] + "\\" + key["value"])}
         elif kind == "win.network_profile":

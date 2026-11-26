@@ -32,6 +32,8 @@ Get-NetRoute -PolicyStore ActiveStore | Group-Object InterfaceAlias | ForEach-Ob
 foreach ($rule in Get-DnsClientNrptRule) {
     $inventory.resolver[$rule.Name] = @($rule.Namespace, $rule.NameServers, $rule.Comment)
 }
+$rulesPath = 'SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules'
+$ruleStore = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($rulesPath)
 foreach ($rule in Get-NetFirewallRule -PolicyStore ActiveStore | Where-Object {
     $_.Group -eq 'EasyTier' -or $_.DisplayName -like 'EasyTier *'
 }) {
@@ -39,9 +41,11 @@ foreach ($rule in Get-NetFirewallRule -PolicyStore ActiveStore | Where-Object {
     $ports = $rule | Get-NetFirewallPortFilter
     $inventory.firewall["policy/$($rule.Name)"] = @(
         $rule.DisplayName, $rule.Group, [string]$rule.Direction, [string]$rule.Action,
-        [string]$rule.Enabled, $app.Program, [string]$ports.Protocol, $ports.LocalPort
+        [string]$rule.Enabled, $app.Program, [string]$ports.Protocol, $ports.LocalPort,
+        $ruleStore.GetValue($rule.Name)
     )
 }
+$ruleStore.Dispose()
 $system = 'HKLM:\SYSTEM\CurrentControlSet\Services'
 $network = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles'
 $product = 'HKLM:\SOFTWARE\EasyTier'

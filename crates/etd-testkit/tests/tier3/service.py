@@ -151,8 +151,8 @@ class Service:
                     print(f"{entry.get('source')}: {text[:500]}")
             raise
 
-    def inventory(self, extra=()):
-        return capture(self.runtime, [self.host, self.cores, *extra])
+    def inventory(self, extra=(), other_run_dirs=()):
+        return capture(self.runtime, [self.host, self.cores, *extra], other_run_dirs)
 
     def stop(self):
         if os.name == "nt":

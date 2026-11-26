@@ -95,8 +95,15 @@ def windows():
             return output("powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
                           "$ErrorActionPreference='Stop'; " + script).strip()
         nic = "etd-" + tag[:8]
+        import ipaddress
+        local = ipaddress.IPv4Address(ps(
+            "Start-Service iphlpsvc; (Get-NetIPConfiguration | Where-Object IPv4DefaultGateway "
+            "| Select-Object -First 1).IPv4Address[0].IPAddress"
+        ))
+        if local.is_loopback or local.is_unspecified:
+            raise ValueError("no configured IPv4 endpoint for the foreign interface")
         command("netsh.exe", "interface", "ipv6", "add", "v6v4tunnel",
-                "interface=" + nic, "localaddress=127.0.0.1", "remoteaddress=127.0.0.2")
+                "interface=" + nic, f"localaddress={local}", "remoteaddress=192.0.2.253")
         stack.callback(command, "netsh.exe", "interface", "ipv6", "delete", "interface", nic)
         # Use the loopback link, never the runner's management interface.
         index = int(ps("(Get-NetIPAddress -IPAddress 127.0.0.1).InterfaceIndex"))

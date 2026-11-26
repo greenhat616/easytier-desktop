@@ -23,7 +23,10 @@ def command(*args, check=True, **kwargs):
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), **kwargs,
     )
     if check and result.returncode:
-        raise RuntimeError(f"{Path(args[0]).name} failed ({result.returncode}): {result.stderr.strip()}")
+        message = result.stderr.strip()
+        if not message and Path(args[0]).name.lower() in ("sc.exe", "netsh.exe"):
+            message = result.stdout.strip()[:400]
+        raise RuntimeError(f"{Path(args[0]).name} failed ({result.returncode}): {message}")
     return result
 
 
@@ -194,9 +197,10 @@ def windows(inv):
                         [label, ElementTree.tostring(item, encoding="unicode")])
 
 
-def capture(run_dir, images):
+def capture(run_dir, images, other_run_dirs=()):
     inv = Inventory()
-    directories(inv, run_dir)
+    for root in (run_dir, *other_run_dirs):
+        directories(inv, root)
     {"linux": linux, "darwin": darwin, "win32": windows}[sys.platform](inv)
     processes(inv, images)
     return inv

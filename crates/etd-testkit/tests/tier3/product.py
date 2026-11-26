@@ -22,14 +22,19 @@ def spec():
 
 
 @contextmanager
-def foreign_runtime(service):
-    with tempfile.TemporaryDirectory(prefix="etd-g2-", dir=service.runtime) as root:
-        path = Path(root) / "42"
-        path.mkdir()
+def foreign_runtime(service, instance):
+    # The service owns its private runtime container and can sweep orphans
+    # inside it. Give another installation its own adjacent state root and
+    # the *same* instance/epoch path and retain its directory/file identity.
+    parent = service.host.parent.parent if sys.platform == "darwin" else service.state.parent
+    with tempfile.TemporaryDirectory(prefix="easytier-desk-g2-", dir=parent) as root:
+        runtime = Path(root) / "run"
+        path = runtime / instance / "1"
+        path.mkdir(parents=True)
         marker = path / "marker"
         marker.write_bytes(uuid.uuid4().bytes)
         ident = file_identity(marker)
-        yield
+        yield runtime
         assert file_identity(marker) == ident, "foreign runtime file changed"
 
 
@@ -88,13 +93,13 @@ def recovery():
     instance = str(uuid.uuid4())
     request = str(uuid.uuid4())
     with service.installed(), ExitStack() as stack:
-        stack.enter_context(foreign_runtime(service))
+        other_runtime = stack.enter_context(foreign_runtime(service, instance))
         natives = {"linux": foreign_linux, "darwin": foreign.macos, "win32": foreign.windows}
         keys = stack.enter_context(natives[sys.platform]())
         foreign_image, process_key = stack.enter_context(foreign.idle_process())
         keys.add(process_key)
         def inventory():
-            return service.inventory([foreign_image])
+            return service.inventory([foreign_image], [other_runtime])
         baseline = inventory()
         keys.update(key for key in baseline.rows if key[0] == "runtime")
         revision = str(service.ctl("status")["revision"])

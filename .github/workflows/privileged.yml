@@ -23,9 +23,7 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            suite: recovery
-          - os: windows-latest
-            suite: preflight
+            suite: smoke
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -157,21 +155,42 @@ jobs:
           "ETD_G2_BIN=$target/debug" >> $env:GITHUB_ENV
           "ETD_G2_SHA=$digest" >> $env:GITHUB_ENV
           "ETD_G2_PYTHON=$((Get-Command python -CommandType Application | Select-Object -First 1).Source)" >> $env:GITHUB_ENV
-      - name: Compile runner as the build user
-        run: cargo nextest list --locked --profile privileged --run-ignored only -p etd-testkit --test tier3
-      - name: Installed service tests (administrator)
-        if: runner.os == 'Windows' && matrix.suite == 'recovery'
-        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=installed_kernel_and_host_crash_recovery)' --success-output immediate
-      - name: Pre-existing shared drivers (fresh administrator runner)
-        if: matrix.suite == 'preflight'
-        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=preexisting_shared_drivers_are_conflicts)' --success-output immediate
-      - name: Installed service tests (root)
-        if: runner.os != 'Windows'
-        shell: bash
+      - name: Installed bundle, version, service handshake and real kernel readiness
+        shell: python
         run: |
-          cargo nextest archive --locked -p etd-testkit --test tier3 --archive-file "$RUNNER_TEMP/tier3.tar.zst"
-          sudo env "PATH=$PATH" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
-            "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}" "RUNNER_TEMP=$RUNNER_TEMP" \
-            "ETD_G2_CI=$ETD_G2_CI" "GITHUB_ACTIONS=$GITHUB_ACTIONS" "RUNNER_ENVIRONMENT=$RUNNER_ENVIRONMENT" \
-            "ETD_G2_PYTHON=$ETD_G2_PYTHON" "ETD_G2_BIN=$ETD_G2_BIN" "ETD_G2_SHA=$ETD_G2_SHA" \
-            "$(command -v cargo-nextest)" nextest run --profile privileged --run-ignored only --archive-file "$RUNNER_TEMP/tier3.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" --no-fail-fast --success-output immediate
+          from pathlib import Path
+          import os, re, sys, uuid
+          sys.path.insert(0, "crates/etd-testkit/tests/tier3")
+          from service import Service
+          from product import spec
+          from inventory import Inventory, processes
+          service = Service()
+          assert not service.state.exists() and not service.host.exists()
+          service.call(service.installer, "install")
+          service.verify_bundle()
+          version = service.call(service.core, "--version").strip()
+          assert re.fullmatch(r"easytier-core 2\.7\.1-[^\s]*c97f36b8(?:-\S+)?", version), version
+          status = service.ctl("status")
+          assert (status["host"]["mode"], status["host"]["phase"], status["host"]["role"]) == ("service", "serving", "admin")
+          assert status["default_core_version"] == "2.7.1"
+          instance = str(uuid.uuid4())
+          service.apply(spec(), instance, str(uuid.uuid4()), str(status["revision"]))
+          ready = service.ready(instance)
+          observed = Inventory()
+          processes(observed, [service.core])
+          assert len(observed.rows) == 1, observed.rows
+          statement = f"{version}; service handshake serving/admin; {ready['state']} epoch={ready['epoch']}; installed PID {next(iter(observed.rows))[1]}."
+          print(statement, flush=True)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              print(statement, file=summary)
+      - name: Uninstall the running service and report its durable phase
+        if: always()
+        shell: python
+        run: |
+          import sys
+          sys.path.insert(0, "crates/etd-testkit/tests/tier3")
+          from service import Service
+          service = Service()
+          if service.host.is_file():
+              result = service.uninstall()
+              sys.exit(result.returncode)

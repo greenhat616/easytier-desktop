@@ -35,7 +35,7 @@ There is no fake `TrayBackend` here; the `etd-app` and `etd-ui` tests define the
 | `scripted_server` | `ScriptedHost`: real tonic `etd.v1.HostService` stubs over in-memory connections, with host semantics a client relies on (version metadata, idempotency, receipts, event resume with `ResyncRequired`) and scripted Welcome, replies, rejections, lost replies, drops, refusal and an impostor host. `ContractHost`: the real contract service on the same connections. |
 | `transport` | `duplex()` in-memory `BoxConn` pair; `user_host()` builds the real contract service over `MemoryLedger` with a user-host allow-list authorizer. |
 | `no_window` | `NoWindow` trait: `.no_window()` on `std` and tokio `Command` sets `CREATE_NO_WINDOW` on Windows (replacing earlier creation flags) and does nothing elsewhere. Every test spawn on Windows must use it. |
-| `sysdiff` | Placeholder: only a module doc describing a planned before/after system enumeration for side-effect consistency tests. No code yet. |
+| `sysdiff` | Independent native inventory for tier 3 (`inventory.py`, Windows enumeration in `windows.ps1`): interfaces, routes, resolvers, firewall and WFP, registry, services, runtime directories and product processes. Snapshots are compared before and after; no product observer or ledger takes part. |
 
 ### `fake-core` binary
 
@@ -77,7 +77,7 @@ cargo nextest run -p etd-testkit
 | `tests/real_process.rs` | Real `ProcessKitEngine` against `fake-core`: graceful stop, exit codes, tree kill on timeout, PID reuse, orphans, closed output pipes, parent death. |
 | `tests/console_ctrl.rs` | Windows only: the hidden console helper delivers Ctrl+C exactly once. |
 | `tests/tier2/` (`--test tier2`) | Tier 2: real host subprocess, native pipe/socket IPC, SQLite ledger and `fake-core`, with fake kernel driver and OS observations; no OS changes. Scenarios and the one privileged case are described in [`tests/tier2/README.md`](tests/tier2/README.md). |
-| `tests/tier3/` (`--test tier3`) | Tier 3 entry point for privileged real-kernel tests. Placeholder: it contains no tests yet. |
+| `tests/tier3/` (`--test tier3`) | Tier 3: the installed, unmodified service with the pinned release kernel on disposable GitHub-hosted runners only (`#[ignore]`, `require_runner()`). Rust entries run Python drivers: `product.py` (kernel and host crash recovery, native inventory, Magic DNS refusal, shared drivers, program rule conflict, bounded service stop, clean uninstall) and `takeover.py` with the `impostor.py` helper process (a foreign listener on the crashed kernel's management port and on the next generation's planned port; on macOS, reused utuns). Each running generation is compared with `sysdiff`, and the machine before install with the machine after uninstall. Run by `.github/workflows/privileged.yml`. |
 
 The tier 2 privileged case (`killed_ui_does_not_stop_service_host_after_lease_grace`)
 is `#[ignore]` and needs root / LocalSystem plus `ETD_G1_SERVICE_RUNTIME`; it runs only

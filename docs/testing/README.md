@@ -72,14 +72,17 @@ checks every workflow for this.
 | `etd-ipc --test pipe_acl` | Windows pipe ACL with a temporary second account. Not `#[ignore]`: the account case runs only with `ETD_IPC_CI_ACCOUNTS=1` and an elevated token. Never set that variable on a desktop | `ci.yml` `check` job on Windows |
 | `etd-testkit --test tier2` (ignored case) | UI crash against a service-form test host | Root / LocalSystem with `ETD_G1_SERVICE_RUNTIME`; not yet wired into a workflow |
 | `etd-core-easytier --test session_real` | Identify, start, readiness and queries against the bundled v2.7.1 release kernel | Unprivileged; `ci.yml` `check` job on all three OSes (`--profile ci --run-ignored only`, kernel from `cargo xtask fetch-cores`) |
+| `etd-testkit --test tier3` | Installed service with the release kernel: crash recovery, native inventory, Magic DNS refusal (macOS), shared drivers, program rule conflict, bounded stop and clean uninstall (Windows), management port and utun takeover by a test-owned impostor | `privileged.yml`, one job per suite on fresh hosted runners |
 
 `o1-windows.yml`, `o2-linux.yml` and `o3-macos.yml` run on pushes to their adapter
 branches and on manual dispatch (`workflow_dispatch`); run them by hand after changing
 `crates/etd-sysfx-os`. They upload their logs as evidence artifacts.
 
-`crates/etd-testkit/tests/tier3` is the planned home of end-to-end privileged tests with
-the real kernel and a before/after system diff (`etd-testkit::sysdiff`); both are
-placeholders today.
+`crates/etd-testkit/tests/tier3` holds the end-to-end privileged tests: the installed
+service with the pinned release kernel, checked against an independent native inventory
+(`etd-testkit::sysdiff`) for every running generation and from before install to after
+uninstall. They refuse to run outside a GitHub-hosted runner. See the
+[etd-testkit README](../../crates/etd-testkit/README.md#testing) for the cases.
 
 ## CI workflows
 
@@ -89,6 +92,7 @@ placeholders today.
 | `o1-windows.yml` | Windows adapter branch, manual | Windows privileged adapters with the bundled release kernel and its Wintun |
 | `o2-linux.yml` | Linux adapter branch, manual | Linux privileged adapters, distribution parser matrix (Debian 12, Fedora), kernel capability check |
 | `o3-macos.yml` | macOS adapter branch, manual | macOS PF, utun, resolver and service reinstall |
+| `privileged.yml` | `main` pushes and pull requests touching the code, nightly, manual | Tier 3 product suites (`etd-testkit --test tier3`) on Windows, macOS and Linux |
 
 Notes:
 

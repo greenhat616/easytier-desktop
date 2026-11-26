@@ -158,7 +158,27 @@
         "editor.background": "#FFFFFF",
         "editor.line_number": "#5D5D5D",
         "editor.active_line.background": "#E7E7E7",
-        "editor.active_line_number": "#1B1B1B"
+        "editor.active_line_number": "#1B1B1B",
+        "syntax": {
+          "comment": {
+            "color": "#5D5D5D"
+          },
+          "string": {
+            "color": "#0F6B32"
+          },
+          "keyword": {
+            "color": "#005FB8"
+          },
+          "number": {
+            "color": "#881798"
+          },
+          "constant": {
+            "color": "#007C91"
+          },
+          "function": {
+            "color": "#005FB8"
+          }
+        }
       }
     },
     {
@@ -317,7 +337,27 @@
         "editor.background": "#2B2B2B",
         "editor.line_number": "#C5C5C5",
         "editor.active_line.background": "#3B3B3B",
-        "editor.active_line_number": "#F3F3F3"
+        "editor.active_line_number": "#F3F3F3",
+        "syntax": {
+          "comment": {
+            "color": "#C5C5C5"
+          },
+          "string": {
+            "color": "#6CCB5F"
+          },
+          "keyword": {
+            "color": "#60CDFF"
+          },
+          "number": {
+            "color": "#E3A0FF"
+          },
+          "constant": {
+            "color": "#4DD6E8"
+          },
+          "function": {
+            "color": "#60CDFF"
+          }
+        }
       }
     }
   ]

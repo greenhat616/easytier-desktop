@@ -4,6 +4,7 @@
 //! as well. Only the actual window root and its chrome become transparent
 //! when native Mica has been selected successfully.
 
+use etd_sysfx_os::appearance::AccentRamp;
 use std::rc::Rc;
 
 use gpui_kit::{
@@ -14,19 +15,10 @@ use gpui_kit::{
 };
 
 const PALETTE: &str = include_str!("../assets/fluent-theme.json");
-#[cfg(any(test, target_os = "windows"))]
-const MICA_MIN_BUILD: u32 = 22621;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct AccentRamp {
-    base: u32,
-    hover: u32,
-    active: u32,
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct SystemStyle {
     mica_requested: bool,
+    dark: Option<bool>,
     light_accent: Option<AccentRamp>,
     dark_accent: Option<AccentRamp>,
 }
@@ -78,8 +70,11 @@ fn apply_theme(appearance: WindowAppearance, cx: &mut App) {
     if !cx.has_global::<FluentChrome>() {
         return;
     }
-    let dark = ThemeMode::from(appearance).is_dark();
     let chrome = cx.global::<FluentChrome>();
+    let dark = chrome
+        .system
+        .dark
+        .unwrap_or(ThemeMode::from(appearance).is_dark());
     let font = chrome.font.clone();
     let accent = if dark {
         chrome.system.dark_accent
@@ -184,18 +179,11 @@ fn sync_material(window: &mut Window, cx: &mut App) {
     }
     let appearance = window_background(cx);
     window.set_background_appearance(appearance);
-    let active = if appearance == WindowBackgroundAppearance::MicaBackdrop {
-        #[cfg(target_os = "windows")]
-        {
-            windows::ensure_mica(window)
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            false
-        }
-    } else {
-        false
-    };
+    #[cfg(target_os = "windows")]
+    let active =
+        appearance == WindowBackgroundAppearance::MicaBackdrop && windows::mica_accepted(window);
+    #[cfg(not(target_os = "windows"))]
+    let active = false;
     if !active && appearance != WindowBackgroundAppearance::Opaque {
         window.set_background_appearance(WindowBackgroundAppearance::Opaque);
     }
@@ -211,8 +199,18 @@ fn sync_material(window: &mut Window, cx: &mut App) {
 }
 
 #[cfg(any(test, target_os = "windows"))]
-fn mica_supported(build: u32, transparency: bool, direct_composition: bool) -> bool {
-    build >= MICA_MIN_BUILD && transparency && direct_composition
+fn system_style(
+    snapshot: etd_sysfx_os::appearance::AppearanceSnapshot,
+    direct_composition: bool,
+) -> SystemStyle {
+    SystemStyle {
+        mica_requested: snapshot.supports_mica() && direct_composition,
+        dark: snapshot.dark,
+        light_accent: snapshot
+            .light_accent
+            .and_then(|r| readable_accent(r, false)),
+        dark_accent: snapshot.dark_accent.and_then(|r| readable_accent(r, true)),
+    }
 }
 
 #[cfg(any(test, target_os = "windows"))]
@@ -267,177 +265,45 @@ fn readable_accent(ramp: AccentRamp, dark: bool) -> Option<AccentRamp> {
 #[cfg(target_os = "windows")]
 mod windows {
     use super::*;
-    use ::windows::{
-        Foundation::TypedEventHandler,
-        UI::ViewManagement::{UIColorType, UISettings},
-        Wdk::System::SystemServices::RtlGetVersion,
-        Win32::{
-            Foundation::HWND,
-            Graphics::Dwm::{
-                DWM_SYSTEMBACKDROP_TYPE, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
-                DwmGetWindowAttribute, DwmSetWindowAttribute,
-            },
-            System::SystemInformation::OSVERSIONINFOW,
-        },
-    };
+    use etd_sysfx_os::appearance::{AppearanceWatch, mica_backdrop_accepted};
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-    fn windows_build() -> u32 {
-        let mut version = OSVERSIONINFOW {
-            dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
-            ..Default::default()
-        };
-        // SAFETY: `version` has the correct initialized size and is writable.
-        if unsafe { RtlGetVersion(&mut version) }.is_ok() {
-            version.dwBuildNumber
-        } else {
-            0
-        }
-    }
-
-    fn read_color(settings: &UISettings, kind: UIColorType) -> Option<u32> {
-        let c = settings.GetColorValue(kind).ok()?;
-        Some((u32::from(c.R) << 16) | (u32::from(c.G) << 8) | u32::from(c.B))
-    }
-
-    fn ramp(settings: &UISettings, dark: bool) -> Option<AccentRamp> {
-        let (base, hover, active) = if dark {
-            (
-                UIColorType::AccentLight2,
-                UIColorType::AccentLight3,
-                UIColorType::AccentLight1,
-            )
-        } else {
-            (
-                UIColorType::AccentDark1,
-                UIColorType::AccentDark2,
-                UIColorType::AccentDark3,
-            )
-        };
-        readable_accent(
-            AccentRamp {
-                base: read_color(settings, base)?,
-                hover: read_color(settings, hover)?,
-                active: read_color(settings, active)?,
-            },
-            dark,
-        )
-    }
-
-    fn read_style(settings: &UISettings, build: u32) -> SystemStyle {
+    fn read_style(watch: &AppearanceWatch) -> SystemStyle {
         let dcomp = !std::env::var("GPUI_DISABLE_DIRECT_COMPOSITION")
             .is_ok_and(|v| v == "1" || v == "true");
-        SystemStyle {
-            mica_requested: mica_supported(
-                build,
-                settings.AdvancedEffectsEnabled().unwrap_or(false),
-                dcomp,
-            ),
-            light_accent: ramp(settings, false),
-            dark_accent: ramp(settings, true),
-        }
+        system_style(watch.snapshot(), dcomp)
     }
 
-    // The Kit Windows backend applies Mica through DwmSetWindowAttribute but
-    // does not expose the HRESULT. Verify it and retry the documented DWM call
-    // if necessary before uncovering the transparent GPUI root.
-    pub(super) fn ensure_mica(window: &Window) -> bool {
+    pub(super) fn mica_accepted(window: &Window) -> bool {
         let Ok(handle) = HasWindowHandle::window_handle(window) else {
             return false;
         };
         let RawWindowHandle::Win32(handle) = handle.as_raw() else {
             return false;
         };
-        let hwnd = HWND(handle.hwnd.get() as *mut std::ffi::c_void);
-        let mut actual = DWM_SYSTEMBACKDROP_TYPE::default();
-        let size = std::mem::size_of::<DWM_SYSTEMBACKDROP_TYPE>() as u32;
-        // SAFETY: borrowed native HWND is live for this call; the buffer is the
-        // exact type and size required for DWMWA_SYSTEMBACKDROP_TYPE.
-        if unsafe {
-            DwmGetWindowAttribute(
-                hwnd,
-                DWMWA_SYSTEMBACKDROP_TYPE,
-                (&mut actual as *mut DWM_SYSTEMBACKDROP_TYPE).cast(),
-                size,
-            )
-        }
-        .is_ok()
-            && actual == DWMSBT_MAINWINDOW
-        {
-            return true;
-        }
-        let backdrop = DWMSBT_MAINWINDOW;
-        // SAFETY: same live HWND and a correctly sized read-only enum value.
-        unsafe {
-            DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_SYSTEMBACKDROP_TYPE,
-                (&backdrop as *const DWM_SYSTEMBACKDROP_TYPE).cast(),
-                size,
-            )
-        }
-        .is_ok()
-    }
-
-    struct Watch {
-        settings: UISettings,
-        effect_token: Option<i64>,
-        color_token: Option<i64>,
-    }
-
-    impl Drop for Watch {
-        fn drop(&mut self) {
-            if let Some(token) = self.effect_token {
-                let _ = self.settings.RemoveAdvancedEffectsEnabledChanged(token);
-            }
-            if let Some(token) = self.color_token {
-                let _ = self.settings.RemoveColorValuesChanged(token);
-            }
-        }
+        // The OS adapter only reads DWM's result. If the backend failed to set
+        // Mica, keep the solid fallback instead of exposing a blank root.
+        mica_backdrop_accepted(handle.hwnd)
     }
 
     pub(super) fn init(cx: &mut App) {
         let font = preferred_windows_font(&cx.text_system().all_font_names());
-        let build = windows_build();
-        let Ok(settings) = UISettings::new() else {
-            cx.global_mut::<FluentChrome>().font = font;
+        cx.global_mut::<FluentChrome>().font = font;
+        // Native callbacks may arrive off the GPUI thread. Only signal from
+        // the adapter; all UI mutations happen in the foreground task.
+        let (tx, rx) = async_channel::bounded(1);
+        let Some(watch) = AppearanceWatch::new(move || {
+            let _ = tx.try_send(());
+        }) else {
             apply_theme(cx.window_appearance(), cx);
             return;
         };
-        cx.global_mut::<FluentChrome>().font = font;
-        cx.global_mut::<FluentChrome>().system = read_style(&settings, build);
+        cx.global_mut::<FluentChrome>().system = read_style(&watch);
         apply_theme(cx.window_appearance(), cx);
-        // UISettings callbacks may be invoked off the GPUI thread. Coalesce
-        // notifications via a bounded channel; only the UI task mutates App.
-        let (tx, rx) = async_channel::bounded(1);
-        let effects = tx.clone();
-        let effect_token = settings
-            .AdvancedEffectsEnabledChanged(&TypedEventHandler::<
-                UISettings,
-                ::windows::core::IInspectable,
-            >::new(move |_, _| {
-                let _ = effects.try_send(());
-                Ok(())
-            }))
-            .ok();
-        let color_token = settings
-            .ColorValuesChanged(&TypedEventHandler::<
-                UISettings,
-                ::windows::core::IInspectable,
-            >::new(move |_, _| {
-                let _ = tx.try_send(());
-                Ok(())
-            }))
-            .ok();
-        let watch = Watch {
-            settings,
-            effect_token,
-            color_token,
-        };
         cx.spawn(async move |cx| {
             let watch = watch;
             while rx.recv().await.is_ok() {
-                let next = read_style(&watch.settings, build);
+                let next = read_style(&watch);
                 cx.update(|cx| {
                     let previous = cx.global::<FluentChrome>().system;
                     if previous == next {
@@ -445,8 +311,10 @@ mod windows {
                     }
                     cx.global_mut::<FluentChrome>().system = next;
                     apply_theme(cx.window_appearance(), cx);
-                    for handle in cx.windows() {
-                        let _ = handle.update(cx, |_, window, cx| sync_material(window, cx));
+                    if previous.mica_requested != next.mica_requested {
+                        for handle in cx.windows() {
+                            let _ = handle.update(cx, |_, window, cx| sync_material(window, cx));
+                        }
                     }
                 });
             }
@@ -462,11 +330,15 @@ mod tests {
 
     #[test]
     fn mica_policy_conservatively_falls_back() {
-        assert!(!mica_supported(19045, true, true));
-        assert!(!mica_supported(22000, true, true));
-        assert!(!mica_supported(22621, false, true));
-        assert!(!mica_supported(22621, true, false));
-        assert!(mica_supported(22621, true, true));
+        use etd_sysfx_os::appearance::AppearanceSnapshot;
+        let supported = AppearanceSnapshot {
+            windows_build: Some(22621),
+            transparency: Some(true),
+            ..Default::default()
+        };
+        assert!(system_style(supported, true).mica_requested);
+        assert!(!system_style(supported, false).mica_requested);
+        assert!(!system_style(AppearanceSnapshot::default(), true).mica_requested);
     }
 
     #[test]

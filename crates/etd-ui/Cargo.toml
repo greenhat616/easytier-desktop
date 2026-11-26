@@ -25,14 +25,6 @@ tray-icon = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 raw-window-handle = "0.6.2"
-windows = { workspace = true, features = [
-    "Foundation",
-    "UI_ViewManagement",
-    "Wdk_System_SystemServices",
-    "Win32_Foundation",
-    "Win32_Graphics_Dwm",
-    "Win32_System_SystemInformation",
-] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tray-icon = { workspace = true, features = ["ksni"] }

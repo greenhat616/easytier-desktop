@@ -26,7 +26,8 @@ use etd_proc::{
 use etd_sysfx::{
     BootId, Change, ChangeSet, Effect, EffectKind, EffectScope, EffectState, GenerationOutcome,
     Ledger, ObjectKey, Observation, ReclaimDeps, ReclaimReport, ReclaimScope, RepairIndexStore,
-    RequestDigest, RequestRecord, ScopeFilter, engine::ReclaimEngineImpl, sqlite::SqliteLedger,
+    RequestDigest, RequestRecord, ScopeFilter, SystemObserver, engine::ReclaimEngineImpl,
+    sqlite::SqliteLedger,
 };
 use etd_sysfx_os::{
     OsConfig, OsError,
@@ -608,7 +609,8 @@ async fn reclaim_locked(deps: &HostDeps, purge: bool) -> Result<()> {
         ScopeFilter::default()
     };
     let open = deps.ledger.open_effects(&filter).await?;
-    for line in reclaim_outcome(&report, &open, purge)? {
+    for (key, observation) in reclaim_outcome(&report, &open, purge)? {
+        let line = left_in_place(&key, observation.as_ref(), deps.observer.as_ref()).await;
         println!("  {line}");
     }
     if let Some(receipt) = receipt {
@@ -624,17 +626,37 @@ fn shared_driver(kind: EffectKind, scope: Option<&EffectScope>) -> bool {
     kind == EffectKind::Driver && scope == Some(&EffectScope::Product)
 }
 
-/// What to tell about a shared driver left in place.
-fn left_in_place(key: &ObjectKey, observation: Option<&Observation>) -> String {
+/// The image path in a driver observation (the Windows observer's detail,
+/// read from SCM).
+fn image_path(observation: Option<&Observation>) -> Option<String> {
+    observation
+        .and_then(|o| o.detail.as_deref())
+        .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+        .and_then(|v| v["image_path"].as_str().map(str::to_owned))
+}
+
+/// What to tell about a shared driver left in place. The image path comes
+/// from what was recorded, else from asking the observer now (SCM
+/// `QueryServiceConfig`), so a record read back without one still names
+/// its file (topic#40 msg#1390).
+async fn left_in_place(
+    key: &ObjectKey,
+    observation: Option<&Observation>,
+    observer: &dyn SystemObserver,
+) -> String {
     let name = match key {
         ObjectKey::Service { name } => name.clone(),
         other => format!("{other:?}"),
     };
-    let image = observation
-        .and_then(|o| o.detail.as_deref())
-        .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
-        .and_then(|v| v["image_path"].as_str().map(str::to_owned))
-        .unwrap_or_else(|| "unknown".into());
+    let image = match image_path(observation) {
+        Some(image) => image,
+        None => match observer.observe(EffectKind::Driver, key).await {
+            Ok(Some(now)) => image_path(Some(&now))
+                .unwrap_or_else(|| "unknown (not reported by the system)".into()),
+            Ok(None) => "unknown (the service is no longer registered)".into(),
+            Err(e) => format!("unknown (query failed: {e})"),
+        },
+    };
     format!(
         "left in place: shared driver service {name} image {image}; remove it yourself if no other software uses it"
     )
@@ -646,7 +668,11 @@ fn left_in_place(key: &ObjectKey, observation: Option<&Observation>) -> String {
 /// in place (ruling topic#40 msg#1279). Any other candidate, any conflict,
 /// any other open record, an unclosed generation or a failed sweep still
 /// blocks, so ownership data stays for a retry.
-fn reclaim_outcome(report: &ReclaimReport, open: &[Effect], purge: bool) -> Result<Vec<String>> {
+fn reclaim_outcome(
+    report: &ReclaimReport,
+    open: &[Effect],
+    purge: bool,
+) -> Result<Vec<(ObjectKey, Option<Observation>)>> {
     let (shared, candidates): (Vec<_>, Vec<_>) = report
         .candidates
         .iter()
@@ -670,7 +696,7 @@ fn reclaim_outcome(report: &ReclaimReport, open: &[Effect], purge: bool) -> Resu
     );
     Ok(shared
         .iter()
-        .map(|c| left_in_place(&c.key, c.observation.as_ref()))
+        .map(|c| (c.key.clone(), c.observation.clone()))
         .collect())
 }
 
@@ -993,7 +1019,10 @@ mod maintenance_handoff_tests {
 #[cfg(test)]
 mod reclaim_outcome_tests {
     use super::*;
-    use etd_sysfx::{Candidate, CandidateSource, Conflict, EffectId, Persistence, Undo};
+    use etd_sysfx::{
+        Candidate, CandidateSource, Conflict, EffectId, InterfaceInfo, ListenerInfo, ObserveError,
+        Persistence, SystemClass, SystemEntry, Undo,
+    };
 
     fn driver(name: &str) -> ObjectKey {
         ObjectKey::Service { name: name.into() }
@@ -1063,14 +1092,81 @@ mod reclaim_outcome_tests {
             wintun,
             EffectScope::Product,
         )];
-        let lines = reclaim_outcome(&report, &open, true).unwrap();
+        let left = reclaim_outcome(&report, &open, true).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].0, driver("wintun"));
+    }
+
+    /// An observer that only answers driver lookups, as told.
+    struct Drivers(Result<Option<Observation>, ObserveError>);
+
+    #[async_trait::async_trait]
+    impl SystemObserver for Drivers {
+        async fn observe(
+            &self,
+            kind: EffectKind,
+            _key: &ObjectKey,
+        ) -> Result<Option<Observation>, ObserveError> {
+            assert_eq!(kind, EffectKind::Driver);
+            self.0.clone()
+        }
+        async fn interface(&self, _: &ObjectKey) -> Result<Option<InterfaceInfo>, ObserveError> {
+            unreachable!()
+        }
+        async fn listener(
+            &self,
+            _: std::net::SocketAddr,
+        ) -> Result<Option<ListenerInfo>, ObserveError> {
+            unreachable!()
+        }
+        async fn interfaces_owned_by(&self, _: u32) -> Result<Vec<InterfaceInfo>, ObserveError> {
+            unreachable!()
+        }
+        async fn enumerate(&self, _: SystemClass) -> Result<Vec<SystemEntry>, ObserveError> {
+            unreachable!()
+        }
+    }
+
+    const IMAGE: &str = r"\SystemRoot\System32\drivers\wintun.sys";
+
+    #[tokio::test]
+    async fn the_image_comes_from_the_record_or_else_from_the_system_now() {
+        let wintun = driver("wintun");
+        let line = |image: &str| {
+            format!(
+                "left in place: shared driver service wintun image {image}; remove it yourself if no other software uses it"
+            )
+        };
+        // Recorded.
+        let unused = Drivers(Err(ObserveError::Os {
+            code: 1,
+            message: "not asked".into(),
+        }));
         assert_eq!(
-            lines,
-            vec![
-                r"left in place: shared driver service wintun image \SystemRoot\System32\drivers\wintun.sys; remove it yourself if no other software uses it"
-                    .to_string()
-            ]
+            left_in_place(&wintun, Some(&found(IMAGE)), &unused).await,
+            line(IMAGE)
         );
+        // Read back without one: asked now.
+        let bare = Observation {
+            detail: None,
+            ..found(IMAGE)
+        };
+        assert_eq!(
+            left_in_place(&wintun, Some(&bare), &Drivers(Ok(Some(found(IMAGE))))).await,
+            line(IMAGE)
+        );
+        assert_eq!(
+            left_in_place(&wintun, None, &Drivers(Ok(Some(found(IMAGE))))).await,
+            line(IMAGE)
+        );
+        // The query fails: said so, with the reason.
+        let failed = Drivers(Err(ObserveError::Os {
+            code: 5,
+            message: "access denied".into(),
+        }));
+        let text = left_in_place(&wintun, Some(&bare), &failed).await;
+        assert!(text.contains("image unknown (query failed: "), "{text}");
+        assert!(text.contains("access denied"), "{text}");
     }
 
     #[test]

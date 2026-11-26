@@ -43,20 +43,35 @@ def tun_created(base, live):
                      and os.major(native[1]) == 10 and os.minor(native[1]) == 200) else set()
 
 
-def adapter_defaults(base, live, guids):
+def adapter_defaults(base, live, adapter_indices):
     # Windows retains these exact defaults under a newly created adapter's
     # GUID after it goes away (paired run 45854603162, ruling msg#1321).
+    # The DHCPv6 IAID high byte identifies the recorded live adapter index.
+    # Run 45861957387, ruling msg#1388. No assumption on its low 24 bits.
     expected = {}
-    for guid in guids:
+    iaids = {}
+    for guid, index in adapter_indices.items():
         for stack in ("Tcpip", "Tcpip6"):
             prefix = rf"HKLM\SYSTEM\CurrentControlSet\Services\{stack}\Parameters\Interfaces\{{{guid}}}"
             fields = {"EnableDHCP": ["DWord", 0]}
             if stack == "Tcpip":
                 fields.update(NameServer=["String", ""], Domain=["String", ""])
+            else:
+                fields["Dhcpv6State"] = ["DWord", 0]
+                iaids[(prefix + "\\Dhcpv6Iaid").casefold()] = index
             expected.update({(prefix + "\\" + name).casefold(): value for name, value in fields.items()})
-    return {key for key, value in live.rows.items()
-            if key[0] == "registry" and key not in base.rows
-            and key[1].casefold() in expected and value == expected[key[1].casefold()]}
+    allowed = set()
+    for key, setting in live.rows.items():
+        if key[0] != "registry" or key in base.rows:
+            continue
+        path = key[1].casefold()
+        if path in expected and setting == expected[path]:
+            allowed.add(key)
+        elif path in iaids:
+            kind, value = setting
+            if kind == "DWord" and type(value) is int and 0 <= value <= 0xffffffff and value >> 24 == iaids[path]:
+                allowed.add(key)
+    return allowed
 
 
 def runner_noise(base, live):
@@ -96,9 +111,9 @@ def system_policy_changes(base, live, phase, retained_app=None):
     return allowed
 
 
-def check_generation(base, live, records, instance, view, adapter_guids):
+def check_generation(base, live, records, instance, view, adapter_indices):
     try:
-        return compare_generation(base, live, records, instance, view, adapter_guids)
+        return compare_generation(base, live, records, instance, view, adapter_indices)
     except FirewallReadbackPending:
         raise
     except (AssertionError, KeyError, OSError):
@@ -126,7 +141,7 @@ def check_generation(base, live, records, instance, view, adapter_guids):
         raise
 
 
-def compare_generation(base, live, records, instance, view, adapter_guids):
+def compare_generation(base, live, records, instance, view, adapter_indices):
     changed = base.delta(live)
     expected = set()
     active = [r for r in records if r["state"] != "reclaimed"
@@ -164,7 +179,7 @@ def compare_generation(base, live, records, instance, view, adapter_guids):
                            if cls == "interface" and v.get("guid"))
                 if key.get("guid"):
                     assert UUID(key["guid"]) == guid
-                adapter_guids.add(guid)
+                adapter_indices[guid] = live.rows["interface", name]["index"]
         elif key["type"] == "routes_via":
             matches = {("route", name)}
         elif key["type"] == "path" and kind == "run_dir":
@@ -262,7 +277,7 @@ def compare_generation(base, live, records, instance, view, adapter_guids):
     # These changes intentionally have no separate ownership record.
     # Match the precise object and transition, never a registry subtree.
     exempt = managed_service_changes(base, live) | tun_created(base, live)
-    exempt |= adapter_defaults(base, live, adapter_guids) | system_policy_changes(base, live, "active")
+    exempt |= adapter_defaults(base, live, adapter_indices) | system_policy_changes(base, live, "active")
     for kind, path in expected:
         if kind == "registry" and path.endswith("\\ProfileName"):
             category = ("registry", path.removesuffix("ProfileName") + "Category")

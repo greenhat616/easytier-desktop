@@ -50,6 +50,13 @@ fn preexisting_shared_drivers_are_conflicts() {
 
 #[cfg(windows)]
 #[test]
+#[ignore = "requires a fresh Windows runner for the full pre-install to post-uninstall comparison"]
+fn installed_network_uninstall_restores_machine() {
+    run_case("clean_install");
+}
+
+#[cfg(windows)]
+#[test]
 #[ignore = "pending topic 40: H1 must reject a foreign same-name program firewall rule before spawn"]
 fn preexisting_program_rule_blocks_start() {
     run_case("program_rule_conflict");

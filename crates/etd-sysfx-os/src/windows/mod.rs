@@ -339,16 +339,12 @@ async fn observe_kind(kind: EffectKind, key: &ObjectKey) -> Result<Option<Observ
             let ObjectKey::Service { name } = key else {
                 return Err(WinError::invalid("expected driver service key"));
             };
-            let rows = query(json!({"op":"drivers"})).await?;
+            // From SCM, cross-checked with the Services registry key: WMI
+            // omits disabled drivers without a file (topic#40 msg#1179).
             // Shared drivers have no creation credential in the upstream API.
-            Ok(rows
-                .iter()
-                .find(|r| {
-                    r["name"]
-                        .as_str()
-                        .is_some_and(|s| s.eq_ignore_ascii_case(name))
-                })
-                .map(|r| observation(None, key.clone(), r["description"].to_string())))
+            let name = name.clone();
+            let found = blocking(move || driver_refs::driver_service(&name)).await?;
+            Ok(found.map(|d| observation(None, key.clone(), d.detail())))
         }
         _ => Err(WinError::invalid(format!(
             "unsupported Windows effect {kind}"

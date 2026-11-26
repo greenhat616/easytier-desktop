@@ -318,7 +318,8 @@ impl CoreStore for ManifestCoreStore {
         let version = version.to_owned();
         let trusted = self.trusted.clone();
         let guard = self.removal_guard.clone();
-        blocking(move || remove_entry(&root, &version, &trusted, guard.as_deref())).await
+        let mode = self.mode;
+        blocking(move || remove_entry(&root, &version, &trusted, mode, guard.as_deref())).await
     }
 }
 async fn blocking<T: Send + 'static>(
@@ -490,10 +491,46 @@ fn hash_core(
     Ok(parse_hash(&entry.sha256).expect("verified executable hash"))
 }
 
+/// User stores are not a privileged trust boundary. A non-elevated user
+/// may remove an ordinary tree only if it contains no Windows driver image.
+fn check_user_tree(dir: &Path) -> Result<(), StoreError> {
+    check_type(dir, true)?;
+    for entry in fs::read_dir(dir).map_err(io_error)? {
+        let entry = entry.map_err(io_error)?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            StoreError::Manifest("Unexpected non-Unicode kernel file name".into())
+        })?;
+        if name.ends_with('.') || name.ends_with(' ') {
+            return Err(StoreError::Manifest(
+                "Unexpected aliased kernel file name".into(),
+            ));
+        }
+        if name.to_ascii_lowercase().ends_with(".sys") {
+            return Err(StoreError::Manifest(
+                "Driver-bearing bundle: remove it from the system service or ask an administrator"
+                    .into(),
+            ));
+        }
+        let file_type = entry.file_type().map_err(io_error)?;
+        if file_type.is_dir() {
+            check_user_tree(&entry.path())?;
+        } else {
+            check_type(&entry.path(), false)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn check_user_bundle_removal(dir: &Path) -> Result<(), StoreError> {
+    check_user_tree(dir)
+}
+
 fn remove_entry(
     root: &Path,
     version: &str,
     trusted: &HashMap<String, TrustedBundle>,
+    mode: HostMode,
     guard: Option<&RemovalGuard>,
 ) -> Result<(), StoreError> {
     let mut manifest = read_trusted_manifest(root, trusted)?;
@@ -511,20 +548,24 @@ fn remove_entry(
     match fs::symlink_metadata(&dir) {
         Ok(_) => {
             check_type(&dir, true)?;
-            if let Some(guard) = guard {
+            if mode == HostMode::User {
+                if bundle
+                    .companions
+                    .keys()
+                    .any(|name| name.to_ascii_lowercase().ends_with(".sys"))
+                {
+                    return Err(StoreError::Manifest("Driver-bearing bundle: remove it from the system service or ask an administrator".into()));
+                }
+                check_user_bundle_removal(&dir)?;
+            } else {
+                let guard = guard.ok_or_else(|| {
+                    StoreError::Manifest("Driver reference check unavailable".into())
+                })?;
                 if guard(&dir)? {
                     return Err(StoreError::InUse {
                         version: version.into(),
                     });
                 }
-            } else if bundle
-                .companions
-                .keys()
-                .any(|name| name.to_ascii_lowercase().ends_with(".sys"))
-            {
-                return Err(StoreError::Manifest(
-                    "Driver reference check unavailable".into(),
-                ));
             }
             let expected: HashMap<_, _> = bundle.files().collect();
             let mut remaining = Vec::new();

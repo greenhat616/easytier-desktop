@@ -12,8 +12,8 @@ use ::windows::{
             TOKEN_PRIVILEGES, TOKEN_QUERY,
         },
         Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle, GetLogicalDriveStringsW,
-            QueryDosDeviceW,
+            FILE_ID_INFO, FILE_READ_ATTRIBUTES, FileIdInfo, GetFileInformationByHandleEx,
+            GetLogicalDriveStringsW, QueryDosDeviceW,
         },
         System::{
             ProcessStatus::{EnumDeviceDrivers, GetDeviceDriverFileNameW},
@@ -21,17 +21,18 @@ use ::windows::{
                 HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_READ, REG_DWORD, REG_EXPAND_SZ, REG_SZ,
             },
             Services::*,
-            SystemInformation::GetWindowsDirectoryW,
+            SystemInformation::GetSystemWindowsDirectoryW,
             Threading::{GetCurrentThread, OpenThreadToken},
         },
     },
     core::{PCWSTR, w},
 };
 use std::{
+    collections::BTreeMap,
     ffi::c_void,
     fs, io,
     os::windows::io::AsRawHandle,
-    path::{Component, Path, PathBuf},
+    path::{Component, Path, PathBuf, Prefix},
 };
 
 struct ServiceHandle(SC_HANDLE);
@@ -105,10 +106,17 @@ fn service_image(manager: SC_HANDLE, name: &str) -> Result<String, WinError> {
     .map_err(WinError::windows)?;
     // SAFETY: successful query wrote a QUERY_SERVICE_CONFIGW to the aligned buffer.
     let config = unsafe { &*buffer.as_ptr().cast::<QUERY_SERVICE_CONFIGW>() };
-    buffer_string(&buffer, config.lpBinaryPathName.0)
+    if config.lpBinaryPathName.0.is_null() {
+        Ok(String::new())
+    } else {
+        buffer_string(&buffer, config.lpBinaryPathName.0)
+    }
 }
 
-fn registered_images() -> Result<Vec<(String, String)>, WinError> {
+type ImageResult = Result<Option<String>, WinError>;
+type Images = BTreeMap<String, (String, ImageResult)>;
+
+fn registered_images() -> Result<Images, WinError> {
     // SAFETY: null names select the local active SCM database.
     let manager = ServiceHandle(
         unsafe {
@@ -121,7 +129,7 @@ fn registered_images() -> Result<Vec<(String, String)>, WinError> {
         .map_err(WinError::windows)?,
     );
     let mut resume = 0;
-    let mut images = Vec::new();
+    let mut images = Images::new();
     // SCM limits this call to 256 KiB; resume handles paginate larger inventories.
     let mut buffer = vec![0usize; 256 * 1024 / std::mem::size_of::<usize>()];
     loop {
@@ -168,13 +176,14 @@ fn registered_images() -> Result<Vec<(String, String)>, WinError> {
         };
         for entry in entries {
             let name = buffer_string(&buffer, entry.lpServiceName.0)?;
-            let image = service_image(manager.0, &name)?;
-            if image.is_empty() {
-                // The documented default SCM driver image path.
-                images.push((name.clone(), format!(r"System32\Drivers\{name}.sys")));
-            } else {
-                images.push((name, image));
-            }
+            let image = service_image(manager.0, &name).map(|image| {
+                Some(if image.is_empty() {
+                    format!(r"System32\Drivers\{name}.sys")
+                } else {
+                    image
+                })
+            });
+            images.insert(name.to_uppercase(), (name, image));
         }
         if !more {
             return Ok(images);
@@ -188,51 +197,60 @@ fn registered_images() -> Result<Vec<(String, String)>, WinError> {
 // SCM silently omits services whose query-status ACL denies access. Check
 // the native Services registration inventory too; never treat that omission
 // as proof that no stopped driver points into the store.
-fn registry_images() -> Result<Vec<(String, String)>, WinError> {
+fn registry_image(services: &Key, name: &str) -> ImageResult {
+    let key = Key::open(services.0, name, KEY_QUERY_VALUE)?
+        .ok_or_else(|| error("service registration changed during enumeration"))?;
+    let Some(kind) = key.read("Type")? else {
+        return Ok(None);
+    };
+    // When a stale key has a malformed type, still resolve its image path:
+    // an image provably outside the bundle poses no risk regardless of type.
+    if kind.ty == REG_DWORD && kind.bytes.len() == 4 {
+        let kind = u32::from_le_bytes(kind.bytes.try_into().expect("checked size"));
+        if kind & SERVICE_DRIVER.0 == 0 {
+            return Ok(None);
+        }
+    }
+    let default = || format!(r"System32\Drivers\{name}.sys");
+    let path = match key.read("ImagePath")? {
+        None => default(),
+        Some(value) => {
+            if !matches!(value.ty, REG_SZ | REG_EXPAND_SZ) || !value.bytes.len().is_multiple_of(2) {
+                return Err(error(format!("invalid driver ImagePath for {name}")));
+            }
+            let units: Vec<_> = value
+                .bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|chunk| u16::from_le_bytes(*chunk))
+                .collect();
+            // RegQueryValueEx does not promise a terminator, even for REG_SZ.
+            let end = units
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(units.len());
+            if units[end..].iter().any(|unit| *unit != 0) {
+                return Err(error(format!("ambiguous driver ImagePath for {name}")));
+            }
+            let path = decode(&units[..end])?;
+            if path.is_empty() { default() } else { path }
+        }
+    };
+    Ok(Some(path))
+}
+
+fn registry_images() -> Result<Images, WinError> {
     let services = Key::open(
         HKEY_LOCAL_MACHINE,
         r"SYSTEM\CurrentControlSet\Services",
         KEY_READ,
     )?
     .ok_or_else(|| error("SCM registry database unavailable"))?;
-    let mut images = Vec::new();
+    let mut images = Images::new();
     for name in services.children()? {
-        let key = Key::open(services.0, &name, KEY_QUERY_VALUE)?
-            .ok_or_else(|| error("service registration changed during enumeration"))?;
-        let Some(kind) = key.read("Type")? else {
-            continue;
-        };
-        if kind.ty != REG_DWORD || kind.bytes.len() != 4 {
-            return Err(error(format!("invalid service type for {name}")));
-        }
-        let kind = u32::from_le_bytes(kind.bytes.try_into().expect("checked size"));
-        if kind & SERVICE_DRIVER.0 == 0 {
-            continue;
-        }
-        let path = match key.read("ImagePath")? {
-            None => format!(r"System32\Drivers\{name}.sys"),
-            Some(value) => {
-                if !matches!(value.ty, REG_SZ | REG_EXPAND_SZ)
-                    || !value.bytes.len().is_multiple_of(2)
-                {
-                    return Err(error(format!("invalid driver ImagePath for {name}")));
-                }
-                let units: Vec<_> = value
-                    .bytes
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|chunk| u16::from_le_bytes(*chunk))
-                    .collect();
-                let path = nul_string(&units)?;
-                if path.is_empty() {
-                    format!(r"System32\Drivers\{name}.sys")
-                } else {
-                    path
-                }
-            }
-        };
-        images.push((name, path));
+        let result = registry_image(&services, &name);
+        images.insert(name.to_uppercase(), (name, result));
     }
     Ok(images)
 }
@@ -326,7 +344,7 @@ fn loaded_images() -> Result<Vec<String>, WinError> {
 fn windows_dir() -> Result<PathBuf, WinError> {
     let mut buffer = vec![0u16; 32768];
     // SAFETY: buffer is writable.
-    let n = unsafe { GetWindowsDirectoryW(Some(&mut buffer)) } as usize;
+    let n = unsafe { GetSystemWindowsDirectoryW(Some(&mut buffer)) } as usize;
     if n == 0 || n >= buffer.len() {
         return Err(error("cannot determine Windows directory"));
     }
@@ -365,7 +383,72 @@ fn device_path(value: &str) -> Result<PathBuf, WinError> {
     }
     // Unmounted volumes still have a global NT namespace. Canonicalization
     // must succeed there; otherwise the caller cannot rule out an alias.
-    fs::canonicalize(format!(r"\\?\GLOBALROOT{value}")).map_err(io_error)
+    Ok(PathBuf::from(format!(r"\\?\GLOBALROOT{value}")))
+}
+
+fn machine_var(name: &str) -> Result<String, WinError> {
+    let environment = Key::open(
+        HKEY_LOCAL_MACHINE,
+        r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        KEY_QUERY_VALUE,
+    )?
+    .ok_or_else(|| error("machine environment registry unavailable"))?;
+    let value = environment
+        .read(name)?
+        .ok_or_else(|| error(format!("unknown machine environment variable {name}")))?;
+    if !matches!(value.ty, REG_SZ | REG_EXPAND_SZ) || !value.bytes.len().is_multiple_of(2) {
+        return Err(error(format!(
+            "invalid machine environment variable {name}"
+        )));
+    }
+    let units: Vec<_> = value
+        .bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|unit| u16::from_le_bytes(*unit))
+        .collect();
+    let end = units
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(units.len());
+    if units[end..].iter().any(|unit| *unit != 0) {
+        return Err(error(format!(
+            "ambiguous machine environment variable {name}"
+        )));
+    }
+    decode(&units[..end])
+}
+
+fn expand_vars(value: &str, system_root: &Path) -> Result<String, WinError> {
+    let mut value = value.to_owned();
+    // Expand Windows environment syntax (case-insensitive on Windows).
+    // Bound recursion to fail closed on a cyclic environment value.
+    for _ in 0..16 {
+        let Some(start) = value.find('%') else {
+            return Ok(value);
+        };
+        let Some(end) = value[start + 1..].find('%').map(|n| start + 1 + n) else {
+            return Ok(value); // an unmatched percent is an ordinary filename character
+        };
+        let name = &value[start + 1..end];
+        let replacement =
+            if name.eq_ignore_ascii_case("SystemRoot") || name.eq_ignore_ascii_case("windir") {
+                system_root.to_string_lossy().into_owned()
+            } else if name.eq_ignore_ascii_case("SystemDrive") {
+                system_root
+                    .ancestors()
+                    .last()
+                    .ok_or_else(|| error("invalid Windows directory"))?
+                    .to_string_lossy()
+                    .trim_end_matches('\\')
+                    .to_owned()
+            } else {
+                machine_var(name)?
+            };
+        value.replace_range(start..=end, &replacement);
+    }
+    Err(error("cyclic driver path environment expansion"))
 }
 
 fn image_path(raw: &str, system_root: &Path) -> Result<PathBuf, WinError> {
@@ -379,35 +462,42 @@ fn image_path(raw: &str, system_root: &Path) -> Result<PathBuf, WinError> {
     };
     let value = raw.replace('/', "\\");
     let value = strip_prefix_ci(&value, r"\??\").unwrap_or(&value);
-    let path = if let Some(tail) = strip_prefix_ci(value, r"\SystemRoot\")
-        .or_else(|| strip_prefix_ci(value, r"%SystemRoot%\"))
-        .or_else(|| strip_prefix_ci(value, r"%windir%\"))
-    {
+    let path = if let Some(tail) = strip_prefix_ci(value, r"\SystemRoot\") {
         system_root.join(tail)
-    } else if strip_prefix_ci(value, r"System32\").is_some() {
-        system_root.join(value)
     } else if strip_prefix_ci(value, r"\Device\").is_some() {
         device_path(value)?
-    } else if let Some(tail) = strip_prefix_ci(value, r"%SystemDrive%\") {
-        let root = system_root
-            .ancestors()
-            .last()
-            .ok_or_else(|| error("invalid Windows directory"))?;
-        root.join(tail)
     } else if strip_prefix_ci(value, "Volume{").is_some() {
         PathBuf::from(format!(r"\\?\{value}"))
-    } else if strip_prefix_ci(value, r"UNC\").is_some() {
-        PathBuf::from(format!(r"\\{}", &value[4..]))
+    } else if let Some(tail) = strip_prefix_ci(value, r"UNC\") {
+        PathBuf::from(format!(r"\\{tail}"))
     } else {
-        PathBuf::from(value)
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            path
+        } else if path.has_root() || matches!(path.components().next(), Some(Component::Prefix(_)))
+        {
+            return Err(error(format!("ambiguous driver image path: {raw}")));
+        } else {
+            system_root.join(path)
+        }
     };
-    if !path.is_absolute()
-        || path.components().any(|c| matches!(c, Component::ParentDir))
-        || path.to_str().is_none_or(|path| path.contains('%'))
-    {
+    if !path.is_absolute() {
         return Err(error(format!("cannot normalize driver image path: {raw}")));
     }
-    Ok(path)
+    // Canonicalize dot components, without resolving filesystem aliases yet.
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => (),
+            Component::ParentDir => {
+                if !normalized.pop() || !normalized.is_absolute() {
+                    return Err(error(format!("driver path escapes its volume: {raw}")));
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Ok(normalized)
 }
 
 fn normalized(path: &Path) -> Result<String, WinError> {
@@ -428,40 +518,81 @@ fn inside(path: &str, dir: &str) -> bool {
             .is_some_and(|tail| tail.starts_with('\\'))
 }
 
-fn identity(path: &Path) -> Result<(u32, u64), WinError> {
+type FileIdentity = (u64, [u8; 16]);
+
+fn identity(path: &Path) -> Result<FileIdentity, WinError> {
     use std::os::windows::fs::OpenOptionsExt;
-    // Query only metadata: reading another driver image is unnecessary.
     let file = fs::OpenOptions::new()
-        .access_mode(0)
+        .access_mode(FILE_READ_ATTRIBUTES.0)
         .open(path)
         .map_err(io_error)?;
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    let mut info = FILE_ID_INFO::default();
     // SAFETY: file owns the live handle and info is writable.
-    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }
-        .map_err(WinError::windows)?;
-    Ok((
-        info.dwVolumeSerialNumber,
-        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-    ))
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(file.as_raw_handle()),
+            FileIdInfo,
+            (&mut info as *mut FILE_ID_INFO).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    }
+    .map_err(WinError::windows)?;
+    Ok((info.VolumeSerialNumber, info.FileId.Identifier))
+}
+
+fn unavailable_volume(path: &Path) -> bool {
+    // A local drive or NT volume which no longer exists cannot contain the
+    // existing store. Do not classify access denied/network failures as absent.
+    let root = match path.components().next() {
+        Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)) =>
+        {
+            path.ancestors().last()
+        }
+        _ => None,
+    };
+    root.is_some_and(|root| {
+        fs::metadata(root).is_err_and(|e| {
+            e.kind() == io::ErrorKind::NotFound || matches!(e.raw_os_error(), Some(15 | 21))
+        })
+    })
 }
 
 // If the image is missing, canonicalize its closest existing ancestor to
 // account for directory junctions; any error other than NotFound is ambiguous.
-fn canonical_even_missing(path: &Path) -> Result<PathBuf, WinError> {
+fn canonical_even_missing(
+    path: &Path,
+    allow_missing_volume: bool,
+) -> Result<Option<PathBuf>, WinError> {
     match fs::canonicalize(path) {
-        Ok(path) => Ok(path),
+        Ok(path) => Ok(Some(path)),
+        Err(e)
+            if (e.kind() == io::ErrorKind::NotFound
+                || matches!(e.raw_os_error(), Some(15 | 21)))
+                && unavailable_volume(path) =>
+        {
+            if allow_missing_volume {
+                Ok(None)
+            } else {
+                Err(error(format!(
+                    "loaded driver volume is no longer available: {}",
+                    path.display()
+                )))
+            }
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             let parent = path.parent().ok_or_else(|| io_error(e))?;
             let name = path
                 .file_name()
                 .ok_or_else(|| error("missing driver path name"))?;
-            Ok(canonical_even_missing(parent)?.join(name))
+            Ok(canonical_even_missing(parent, allow_missing_volume)?
+                .map(|parent| parent.join(name)))
         }
         Err(e) => Err(io_error(e)),
     }
 }
 
-fn collect_identities(dir: &Path, identities: &mut Vec<(u32, u64)>) -> Result<(), WinError> {
+fn collect_identities(dir: &Path, identities: &mut Vec<FileIdentity>) -> Result<(), WinError> {
     use std::os::windows::fs::MetadataExt;
     let meta = fs::symlink_metadata(dir).map_err(io_error)?;
     if !meta.is_dir() || meta.file_attributes() & 0x400 != 0 {
@@ -497,12 +628,14 @@ fn referenced(dir: &Path) -> Result<Option<String>, WinError> {
     let normalized_dir = normalized(&dir)?;
     let system_root = windows_dir()?;
     // Check SCM first: a stopped driver registration is also a reference.
-    let check = |raw: &str| -> Result<bool, WinError> {
+    let check_path = |raw: &str, allow_missing_volume: bool| -> Result<bool, WinError> {
         let path = image_path(raw, &system_root)?;
         if inside(&normalized(&path)?, &normalized_dir) {
             return Ok(true);
         }
-        let canonical = canonical_even_missing(&path)?;
+        let Some(canonical) = canonical_even_missing(&path, allow_missing_volume)? else {
+            return Ok(false);
+        };
         if inside(&normalized(&canonical)?, &normalized_dir) {
             return Ok(true);
         }
@@ -512,20 +645,75 @@ fn referenced(dir: &Path) -> Result<Option<String>, WinError> {
             Err(e) => Err(io_error(e)),
         }
     };
+    let check = |raw: &str| -> Result<bool, WinError> {
+        // The kernel understands NT paths and \SystemRoot, not arbitrary
+        // percent variables. The literal registered path is authoritative.
+        // Also consider any machine-environment expansion conservatively.
+        let literal = check_path(raw, true);
+        if matches!(literal, Ok(true)) {
+            return Ok(true);
+        }
+        if !raw.contains('%') {
+            return literal;
+        }
+        let expanded = expand_vars(raw, &system_root).and_then(|path| check_path(&path, true));
+        match (literal, expanded) {
+            (Ok(true), _) | (_, Ok(true)) => Ok(true),
+            (Ok(false), _) | (_, Ok(false)) => Ok(false),
+            (Err(error), Err(_)) => Err(error),
+        }
+    };
     let mut unresolved = None;
-    let mut registered = registered_images()?;
-    registered.extend(registry_images()?);
-    for (name, raw) in registered {
-        match check(&raw) {
-            Ok(true) => return Ok(Some(format!("driver service {name} references {raw}"))),
-            Ok(false) => (),
-            Err(e) => {
+    let mut scm = registered_images()?;
+    let registry = registry_images()?;
+    // Merge by case-insensitive service name. One failed query is not
+    // indeterminate if the other inventory has a parseable driver entry.
+    for (key, (name, reg)) in registry {
+        let other = scm.remove(&key).map(|(_, result)| result);
+        let mut paths = Vec::new();
+        let mut failure = None;
+        for result in std::iter::once(reg).chain(other) {
+            match result {
+                Ok(Some(path)) => paths.push(path),
+                Ok(None) => (),
+                Err(e) => {
+                    failure.get_or_insert(e);
+                }
+            }
+        }
+        if paths.is_empty() {
+            if let Some(e) = failure {
                 unresolved.get_or_insert(e);
+            }
+            continue;
+        }
+        for raw in paths {
+            match check(&raw) {
+                Ok(true) => return Ok(Some(format!("driver service {name} references {raw}"))),
+                Ok(false) => (),
+                Err(e) => {
+                    unresolved.get_or_insert(error(format!("driver service {name} ({raw}): {e}")));
+                }
+            }
+        }
+    }
+    for (_, (name, result)) in scm {
+        match result {
+            Ok(Some(raw)) => match check(&raw) {
+                Ok(true) => return Ok(Some(format!("driver service {name} references {raw}"))),
+                Ok(false) => (),
+                Err(e) => {
+                    unresolved.get_or_insert(error(format!("driver service {name} ({raw}): {e}")));
+                }
+            },
+            Ok(None) => (),
+            Err(e) => {
+                unresolved.get_or_insert(error(format!("driver service {name}: {e}")));
             }
         }
     }
     for raw in loaded_images()? {
-        match check(&raw) {
+        match check_path(&raw, false) {
             Ok(true) => return Ok(Some(format!("loaded driver image {raw}"))),
             Ok(false) => (),
             Err(e) => {
@@ -559,11 +747,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn registered_missing_volume_is_absent_but_loaded_volume_is_unknown() {
+        let missing = (b'A'..=b'Z')
+            .map(|letter| PathBuf::from(format!(r"{}:\unused-driver.sys", char::from(letter))))
+            .find(|path| unavailable_volume(path));
+        if let Some(path) = missing {
+            assert_eq!(canonical_even_missing(&path, true).unwrap(), None);
+            assert!(canonical_even_missing(&path, false).is_err());
+        }
+    }
+
+    #[test]
     fn resolves_supported_driver_path_forms_and_rejects_ambiguity() {
         let root = Path::new(r"C:\Windows");
         for raw in [
             r"\SystemRoot\System32\Drivers\Example.sys",
-            r"%SystemRoot%\System32\Drivers\Example.sys",
             r"system32\drivers\example.sys",
             r"\??\C:\Windows\System32\Drivers\Example.sys",
             r#""C:\Windows\System32\Drivers\Example.sys""#,
@@ -575,15 +773,45 @@ mod tests {
             );
         }
         for raw in [
-            r"..\example.sys",
-            r"%Unknown%\example.sys",
+            r"..\..\example.sys",
             r"C:example.sys",
-            r"\SystemRoot\..\example.sys",
             r#" "C:\example.sys" arguments "#,
         ] {
             assert!(image_path(raw, root).is_err(), "{raw}");
         }
+        assert_eq!(
+            normalized(&image_path(r"drivers\example.sys", root).unwrap()).unwrap(),
+            r"C:\WINDOWS\DRIVERS\EXAMPLE.SYS"
+        );
+        let variable = r"%SystemRoot%\System32\Drivers\Example.sys";
+        assert_eq!(
+            normalized(&image_path(variable, root).unwrap()).unwrap(),
+            r"C:\WINDOWS\%SYSTEMROOT%\SYSTEM32\DRIVERS\EXAMPLE.SYS"
+        );
+        let expanded = expand_vars(variable, root).unwrap();
+        assert_eq!(
+            normalized(&image_path(&expanded, root).unwrap()).unwrap(),
+            r"C:\WINDOWS\SYSTEM32\DRIVERS\EXAMPLE.SYS"
+        );
+        assert!(expand_vars(r"%ETD_CB_UNKNOWN_TEST_ENV_VAR%\example.sys", root).is_err());
+
         assert!(inside(r"C:\STORE\HASH\DRIVER.SYS", r"C:\STORE\HASH"));
         assert!(!inside(r"C:\STORE\HASH2\DRIVER.SYS", r"C:\STORE\HASH"));
     }
+}
+
+#[cfg(feature = "ci-test-fixtures")]
+pub fn ci_short_path(path: &Path) -> Result<PathBuf, OsError> {
+    use ::windows::{Win32::Storage::FileSystem::GetShortPathNameW, core::HSTRING};
+    let mut buffer = vec![0u16; 32768];
+    let n =
+        unsafe { GetShortPathNameW(&HSTRING::from(path.as_os_str()), Some(&mut buffer)) } as usize;
+    if n == 0 || n >= buffer.len() {
+        return Err(OsError::Os {
+            code: -1,
+            message: "cannot query fixture short path".into(),
+        });
+    }
+    use std::os::windows::ffi::OsStringExt;
+    Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer[..n])))
 }

@@ -1,7 +1,7 @@
 //! The repair index and manifest filesystem adapter. Index data is a hint,
 //! never authorization for reclaim or kernel launch.
 use anyhow::{Context, Result, bail};
-use etd_contract::InstanceId;
+use etd_contract::{HostMode, InstanceId};
 use etd_sysfx::{InstallKey, LedgerError, RepairIndex, RepairIndexStore, StorageFault};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -11,7 +11,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use etd_host_core::core_store::manifest::{CORE_FILE, TrustedBundle, check_bundle_directory};
+use etd_host_core::core_store::manifest::{
+    CORE_FILE, TrustedBundle, check_bundle_directory, check_user_bundle_removal,
+};
 
 include!(concat!(env!("OUT_DIR"), "/trusted_cores.rs"));
 
@@ -116,11 +118,16 @@ pub fn initialize_manifest(root: &Path) -> Result<()> {
 /// Install only the target-specific build-time release inventory. Hash the
 /// bytes inside the protected destination before identifying or publishing
 /// the kernel. A caller's local manifest is never a trust source.
-pub async fn install_bundled_cores(bundle_root: &Path, target: &Path) -> Result<()> {
+pub async fn install_bundled_cores(
+    bundle_root: &Path,
+    target: &Path,
+    mode: HostMode,
+) -> Result<()> {
     install_bundles(
         bundle_root,
         target,
         TRUSTED_CORES,
+        mode,
         &etd_core_easytier::EasyTierDriver,
         etd_sysfx_os::driver_bundle_reference,
     )
@@ -131,6 +138,7 @@ async fn install_bundles(
     bundle_root: &Path,
     target: &Path,
     table: &[TrustedCoreRow],
+    mode: HostMode,
     driver: &dyn etd_core_api::CoreDriver,
     driver_ref: impl Fn(&Path) -> Result<Option<String>, etd_sysfx_os::OsError>,
 ) -> Result<()> {
@@ -178,7 +186,11 @@ async fn install_bundles(
         for dir in published.iter().rev() {
             // --version should not register a driver. Still, never remove
             // a published bundle if the OS cannot rule out a shared reference.
-            if let Some(reference) = driver_ref(dir).with_context(|| {
+            if mode == HostMode::User {
+                check_user_bundle_removal(dir).with_context(|| {
+                    format!("bundle install failed: {error:#}; bundle retained")
+                })?;
+            } else if let Some(reference) = driver_ref(dir).with_context(|| {
                 format!("bundle install failed: {error:#}; cannot determine driver references")
             })? {
                 bail!("bundle install failed: {error:#}; bundle retained: {reference}");
@@ -296,16 +308,8 @@ pub fn cleanup_user_core_orphans(root: &Path) -> Result<()> {
                 plain_directory(&entry.path())?,
                 "untrusted orphan kernel directory"
             );
-            // Never garbage-collect a driver-bearing orphan without knowing
-            // whether a driver is loaded or registered against it. User-only
-            // recovery has no required SCM access, so preserve these orphans.
-            if fs::read_dir(entry.path())?.any(|item| {
-                item.map_or(true, |item| {
-                    item.file_name()
-                        .to_str()
-                        .is_none_or(|name| name.to_ascii_lowercase().ends_with(".sys"))
-                })
-            }) {
+            if let Err(error) = check_user_bundle_removal(&entry.path()) {
+                tracing::warn!(path = %entry.path().display(), %error, "retaining orphan kernel bundle");
                 continue;
             }
             fs::remove_dir_all(entry.path())?;
@@ -433,6 +437,23 @@ mod tests {
         assert!(!target.join(bundle.sha256).exists());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn orphan_cleanup_preserves_nested_drivers_and_removes_ordinary_tree() {
+        let (_root, _source, target, bundle) = fixture();
+        let dir = target.join(&bundle.sha256);
+        let nested = dir.join("nested").join("driver.SYS");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(&nested, b"fixture").unwrap();
+        initialize_manifest(&target).unwrap();
+        cleanup_user_core_orphans(&target).unwrap();
+        assert!(nested.exists());
+        fs::remove_file(&nested).unwrap();
+        fs::write(nested.with_extension("dll"), b"fixture").unwrap();
+        cleanup_user_core_orphans(&target).unwrap();
+        assert!(!dir.exists());
+    }
+
     #[test]
     fn missing_extra_or_tampered_source_never_publishes() {
         for variant in 0..3 {
@@ -490,15 +511,42 @@ mod tests {
             &[],
         ));
         assert!(
-            install_bundles(&bundle_root, &target, &invalid, &driver, |_| Ok(None))
-                .await
-                .is_err()
+            install_bundles(
+                &bundle_root,
+                &target,
+                &invalid,
+                HostMode::Service,
+                &driver,
+                |_| Ok(None)
+            )
+            .await
+            .is_err()
         );
         assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
         assert!(
-            install_bundles(&bundle_root, &target, TABLE, &driver, |_| Ok(None))
-                .await
-                .is_ok()
+            install_bundles(
+                &bundle_root,
+                &target,
+                &invalid,
+                HostMode::User,
+                &driver,
+                |_| panic!("user rollback must not query drivers")
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+        assert!(
+            install_bundles(
+                &bundle_root,
+                &target,
+                TABLE,
+                HostMode::Service,
+                &driver,
+                |_| Ok(None)
+            )
+            .await
+            .is_ok()
         );
         assert_eq!(
             fs::read(target.join(TABLE[0].1).join("runtime.dll")).unwrap(),

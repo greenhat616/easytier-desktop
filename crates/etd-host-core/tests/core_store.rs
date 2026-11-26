@@ -178,7 +178,8 @@ async fn remove_only_selected_hash_directory_and_clear_default() {
         Arc::new(Driver::new(true, "rev")),
         trusted(),
     )
-    .unwrap();
+    .unwrap()
+    .with_removal_guard(|_| Ok(false));
     store.remove("1.2.3").await.unwrap();
     assert!(!binary.exists());
     assert!(!binary.parent().unwrap().exists());
@@ -401,4 +402,42 @@ async fn bundle_removal_refuses_driver_reference_and_query_failure() {
     free.remove("1.2.3").await.unwrap();
     assert!(!dir.exists());
     assert!(free.list().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn user_executable_only_removes_without_privileged_driver_query() {
+    let (root, binary) = Root::new();
+    let store = ManifestCoreStore::new(
+        root.0.clone(),
+        HostMode::User,
+        Arc::new(Driver::new(true, "rev")),
+        trusted(),
+    )
+    .unwrap()
+    .with_removal_guard(|_| Err(StoreError::Io("user cannot query drivers".into())));
+    store.remove("1.2.3").await.unwrap();
+    assert!(!binary.exists());
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn user_driver_bundle_removal_is_refused_even_without_guard() {
+    let (root, binary) = Root::new();
+    let trust = companion_bundle(&binary, "driver.sys");
+    let store = ManifestCoreStore::new(
+        root.0.clone(),
+        HostMode::User,
+        Arc::new(Driver::new(true, "rev")),
+        trust,
+    )
+    .unwrap();
+    assert!(
+        store
+            .remove("1.2.3")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("ask an administrator")
+    );
+    assert!(binary.exists());
 }

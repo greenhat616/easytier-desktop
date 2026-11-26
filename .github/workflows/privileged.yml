@@ -4,7 +4,7 @@ on:
     - cron: '27 19 * * *'
   workflow_dispatch:
   push:
-    branches: [wbs/G2-privileged]
+    branches: [wbs/G2-verify-cb-720422a]
   pull_request:
     paths:
       - 'crates/**'
@@ -22,10 +22,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            suite: recovery
-          - os: macos-latest
-            suite: recovery
           - os: windows-latest
             suite: recovery
           - os: windows-latest

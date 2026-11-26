@@ -10,7 +10,7 @@ use etd_core_api::{CoreDescriptor, CoreDriver};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -25,6 +25,34 @@ pub const CORE_FILE: &str = if cfg!(windows) {
 } else {
     "easytier-core"
 };
+
+/// Build-time trust entry. Companion digests never come from the inventory.
+#[derive(Debug, Clone)]
+pub struct TrustedBundle {
+    pub sha256: String,
+    pub companions: BTreeMap<String, String>,
+}
+
+impl From<String> for TrustedBundle {
+    fn from(sha256: String) -> Self {
+        Self {
+            sha256,
+            companions: BTreeMap::new(),
+        }
+    }
+}
+impl TrustedBundle {
+    pub fn files(&self) -> impl Iterator<Item = (&str, &str)> {
+        std::iter::once((CORE_FILE, self.sha256.as_str())).chain(
+            self.companions
+                .iter()
+                .map(|(name, hash)| (name.as_str(), hash.as_str())),
+        )
+    }
+}
+
+/// Read-only platform consultation before deleting a driver-bearing bundle.
+type RemovalGuard = dyn Fn(&Path) -> Result<bool, StoreError> + Send + Sync;
 
 /// Installation manifest, written by the maintenance command under the
 /// machine singleton lock. Entries map versions to immutable SHA directories.
@@ -84,10 +112,10 @@ struct FileStamp {
 }
 struct OpenCore {
     binary: PathBuf,
-    stamp: Arc<FileStamp>,
+    stamps: BTreeMap<String, Arc<FileStamp>>,
 }
 struct CachedCore {
-    stamp: Arc<FileStamp>,
+    stamps: BTreeMap<String, Arc<FileStamp>>,
     descriptor: CoreDescriptor,
     support: CoreSupport,
 }
@@ -96,7 +124,8 @@ pub struct ManifestCoreStore {
     root: PathBuf,
     mode: HostMode,
     driver: Arc<dyn CoreDriver>,
-    trusted: Arc<HashMap<String, String>>,
+    trusted: Arc<HashMap<String, TrustedBundle>>,
+    removal_guard: Arc<RemovalGuard>,
     // Short manifest/removal critical sections only: hashing and identify
     // never hold this lock during normal resolution or ListCores.
     operations: Mutex<()>,
@@ -104,11 +133,11 @@ pub struct ManifestCoreStore {
     list_verification: Mutex<()>,
 }
 impl ManifestCoreStore {
-    pub fn new(
+    pub fn new<B: Into<TrustedBundle>>(
         root: PathBuf,
         mode: HostMode,
         driver: Arc<dyn CoreDriver>,
-        trusted: HashMap<String, String>,
+        trusted: HashMap<String, B>,
     ) -> Result<Self, StoreError> {
         check_type(&root, true)?;
         let root = fs::canonicalize(root).map_err(io_error)?;
@@ -117,11 +146,28 @@ impl ManifestCoreStore {
             root,
             mode,
             driver,
-            trusted: Arc::new(trusted),
+            trusted: Arc::new(
+                trusted
+                    .into_iter()
+                    .map(|(version, bundle)| (version, bundle.into()))
+                    .collect(),
+            ),
+            removal_guard: Arc::new(|_| {
+                Err(StoreError::Manifest(
+                    "Driver reference check unavailable".into(),
+                ))
+            }),
             operations: Mutex::new(()),
             cache: SyncMutex::new(HashMap::new()),
             list_verification: Mutex::new(()),
         })
+    }
+    pub fn with_removal_guard(
+        mut self,
+        guard: impl Fn(&Path) -> Result<bool, StoreError> + Send + Sync + 'static,
+    ) -> Self {
+        self.removal_guard = Arc::new(guard);
+        self
     }
     async fn manifest(&self) -> Result<Manifest, StoreError> {
         let _guard = self.operations.lock().await;
@@ -132,7 +178,8 @@ impl ManifestCoreStore {
     async fn open(&self, entry: &ManifestEntry) -> Result<OpenCore, StoreError> {
         let root = self.root.clone();
         let entry = entry.clone();
-        blocking(move || open_core(&root, &entry)).await
+        let trusted = self.trusted.clone();
+        blocking(move || open_core(&root, &entry, &trusted[&entry.version])).await
     }
     async fn verify(
         &self,
@@ -140,8 +187,9 @@ impl ManifestCoreStore {
         open: OpenCore,
     ) -> Result<VerifiedCore, StoreError> {
         let item = entry.clone();
+        let trusted = self.trusted.clone();
         let (open, sha256) = blocking(move || {
-            let sha256 = hash_core(&open, &item)?;
+            let sha256 = hash_core(&open, &item, &trusted[&item.version])?;
             Ok((open, sha256))
         })
         .await?;
@@ -164,7 +212,7 @@ impl ManifestCoreStore {
         }
         // Detect replacement between opening, hashing and identification.
         let current = self.open(entry).await?;
-        if current.stamp != open.stamp || current.binary != open.binary {
+        if current.stamps != open.stamps || current.binary != open.binary {
             return Err(StoreError::Manifest(
                 "Kernel changed during verification".into(),
             ));
@@ -201,12 +249,12 @@ impl ManifestCoreStore {
             .lock()
             .unwrap()
             .get(&entry.sha256)
-            .filter(|cached| cached.stamp == open.stamp && cached.descriptor == descriptor)
+            .filter(|cached| cached.stamps == open.stamps && cached.descriptor == descriptor)
             .map(|cached| cached.support)
         {
             return support;
         }
-        let stamp = open.stamp.clone();
+        let stamps = open.stamps.clone();
         let support = match self.verify(entry, open).await {
             Ok(VerifiedCore {
                 usage: CoreUsage::Profiled(_),
@@ -221,7 +269,7 @@ impl ManifestCoreStore {
         self.cache.lock().unwrap().insert(
             entry.sha256.clone(),
             CachedCore {
-                stamp,
+                stamps,
                 descriptor,
                 support,
             },
@@ -273,7 +321,8 @@ impl CoreStore for ManifestCoreStore {
         let root = self.root.clone();
         let version = version.to_owned();
         let trusted = self.trusted.clone();
-        blocking(move || remove_entry(&root, &version, &trusted)).await
+        let guard = self.removal_guard.clone();
+        blocking(move || remove_entry(&root, &version, &trusted, &*guard)).await
     }
 }
 async fn blocking<T: Send + 'static>(
@@ -333,51 +382,89 @@ fn read_manifest(root: &Path) -> Result<Manifest, StoreError> {
 }
 fn read_trusted_manifest(
     root: &Path,
-    trusted: &HashMap<String, String>,
+    trusted: &HashMap<String, TrustedBundle>,
 ) -> Result<Manifest, StoreError> {
     let manifest = read_manifest(root)?;
     // The on-disk manifest is only an installation inventory, never the
     // source of trust. The composition root supplies the build-time table.
-    if manifest
-        .cores
-        .iter()
-        .any(|entry| trusted.get(&entry.version) != Some(&entry.sha256))
-    {
+    if manifest.cores.iter().any(|entry| {
+        trusted.get(&entry.version).map(|bundle| &bundle.sha256) != Some(&entry.sha256)
+    }) {
         return Err(StoreError::Manifest(
             "kernel inventory is not in the embedded release hash table".into(),
         ));
     }
     Ok(manifest)
 }
-fn open_core(root: &Path, entry: &ManifestEntry) -> Result<OpenCore, StoreError> {
+/// Require exactly the pinned ordinary files; no extra entries, symlinks or
+/// reparse points. Used both by installation and launch resolution.
+pub fn check_bundle_directory(dir: &Path, bundle: &TrustedBundle) -> Result<(), StoreError> {
+    check_type(dir, true)?;
+    let mut expected: HashSet<_> = bundle.files().map(|(name, _)| name).collect();
+    for item in fs::read_dir(dir).map_err(io_error)? {
+        let item = item.map_err(io_error)?;
+        let name = item.file_name();
+        if !name.to_str().is_some_and(|name| expected.remove(name)) {
+            return Err(StoreError::Manifest(
+                "Unexpected file in kernel SHA directory".into(),
+            ));
+        }
+        check_type(&item.path(), false)?;
+    }
+    if !expected.is_empty() {
+        return Err(StoreError::Manifest("Missing file in kernel bundle".into()));
+    }
+    Ok(())
+}
+
+fn open_core(
+    root: &Path,
+    entry: &ManifestEntry,
+    bundle: &TrustedBundle,
+) -> Result<OpenCore, StoreError> {
     if parse_hash(&entry.sha256).is_none() {
         return Err(StoreError::Manifest("Invalid SHA-256".into()));
     }
     check_type(root, true)?;
     let dir = root.join(&entry.sha256);
-    check_type(&dir, true)?;
-    let binary = dir.join(CORE_FILE);
-    check_type(&binary, false)?;
-    let binary = fs::canonicalize(binary).map_err(io_error)?;
-    if !binary.starts_with(root) || binary.parent() != Some(dir.as_path()) {
-        return Err(StoreError::Manifest(
-            "Kernel path escapes its SHA directory".into(),
-        ));
+    check_bundle_directory(&dir, bundle)?;
+    let mut stamps = BTreeMap::new();
+    let mut binary = None;
+    for (name, _) in bundle.files() {
+        let path = fs::canonicalize(dir.join(name)).map_err(io_error)?;
+        if !path.starts_with(root) || path.parent() != Some(dir.as_path()) {
+            return Err(StoreError::Manifest(
+                "Kernel file escapes its SHA directory".into(),
+            ));
+        }
+        let identity = same_file::Handle::from_file(fs::File::open(&path).map_err(io_error)?)
+            .map_err(io_error)?;
+        let meta = identity.as_file().metadata().map_err(io_error)?;
+        stamps.insert(
+            name.to_string(),
+            Arc::new(FileStamp {
+                size: meta.len(),
+                modified: meta.modified().map_err(io_error)?,
+                identity,
+            }),
+        );
+        if name == CORE_FILE {
+            binary = Some(path);
+        }
     }
-    let identity = same_file::Handle::from_file(fs::File::open(&binary).map_err(io_error)?)
-        .map_err(io_error)?;
-    let meta = identity.as_file().metadata().map_err(io_error)?;
-    let stamp = Arc::new(FileStamp {
-        size: meta.len(),
-        modified: meta.modified().map_err(io_error)?,
-        identity,
-    });
-    Ok(OpenCore { binary, stamp })
+    Ok(OpenCore {
+        binary: binary.expect("bundle includes executable"),
+        stamps,
+    })
 }
-fn hash_core(open: &OpenCore, entry: &ManifestEntry) -> Result<[u8; 32], StoreError> {
+
+fn hash_matches(
+    mut file: &fs::File,
+    expected: &str,
+    version: &str,
+) -> Result<[u8; 32], StoreError> {
     let expected =
-        parse_hash(&entry.sha256).ok_or_else(|| StoreError::Manifest("Invalid SHA-256".into()))?;
-    let mut file = open.stamp.identity.as_file();
+        parse_hash(expected).ok_or_else(|| StoreError::Manifest("Invalid SHA-256".into()))?;
     let mut hash = Sha256::new();
     let mut buf = [0; 64 * 1024];
     loop {
@@ -390,15 +477,28 @@ fn hash_core(open: &OpenCore, entry: &ManifestEntry) -> Result<[u8; 32], StoreEr
     let actual: [u8; 32] = hash.finalize().into();
     if actual != expected {
         return Err(StoreError::HashMismatch {
-            version: entry.version.clone(),
+            version: version.to_owned(),
         });
     }
     Ok(actual)
 }
+
+fn hash_core(
+    open: &OpenCore,
+    entry: &ManifestEntry,
+    bundle: &TrustedBundle,
+) -> Result<[u8; 32], StoreError> {
+    for (name, digest) in bundle.files() {
+        hash_matches(open.stamps[name].identity.as_file(), digest, &entry.version)?;
+    }
+    Ok(parse_hash(&entry.sha256).expect("verified executable hash"))
+}
+
 fn remove_entry(
     root: &Path,
     version: &str,
-    trusted: &HashMap<String, String>,
+    trusted: &HashMap<String, TrustedBundle>,
+    guard: &RemovalGuard,
 ) -> Result<(), StoreError> {
     let mut manifest = read_trusted_manifest(root, trusted)?;
     let entry = manifest
@@ -406,29 +506,43 @@ fn remove_entry(
             version: Some(version.into()),
         })?
         .clone();
-    // Caller already holds the machine singleton lock and has run reclaim_core.
-    // Only remove the registered hash directory and its known binary; never
-    // recursively delete unknown store contents. Missing binary/dir permits
-    // retry after interruption between deletion and manifest replacement.
+    // Caller holds the singleton lock and has run reclaim_core. Do not
+    // delete a driver image still referenced by the system, even if stopped.
+    // Validate all remaining members before deleting any; missing members
+    // permit retry after a crash during removal.
+    let bundle = &trusted[version];
     let dir = root.join(&entry.sha256);
     match fs::symlink_metadata(&dir) {
         Ok(_) => {
             check_type(&dir, true)?;
-            for item in fs::read_dir(&dir).map_err(io_error)? {
-                if item.map_err(io_error)?.file_name() != CORE_FILE {
-                    return Err(StoreError::Manifest(
-                        "Unexpected file in kernel SHA directory".into(),
-                    ));
-                }
+            if bundle
+                .companions
+                .keys()
+                .any(|name| name.to_ascii_lowercase().ends_with(".sys"))
+                && guard(&dir)?
+            {
+                return Err(StoreError::InUse {
+                    version: version.into(),
+                });
             }
-            let binary = dir.join(CORE_FILE);
-            match fs::symlink_metadata(&binary) {
-                Ok(_) => {
-                    hash_core(&open_core(root, &entry)?, &entry)?;
-                    fs::remove_file(&binary).map_err(io_error)?;
-                }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(io_error(e)),
+            let expected: HashMap<_, _> = bundle.files().collect();
+            let mut remaining = Vec::new();
+            for item in fs::read_dir(&dir).map_err(io_error)? {
+                let item = item.map_err(io_error)?;
+                let name = item.file_name();
+                let digest = name
+                    .to_str()
+                    .and_then(|name| expected.get(name))
+                    .ok_or_else(|| {
+                        StoreError::Manifest("Unexpected file in kernel SHA directory".into())
+                    })?;
+                let path = item.path();
+                check_type(&path, false)?;
+                hash_matches(&fs::File::open(&path).map_err(io_error)?, digest, version)?;
+                remaining.push(path);
+            }
+            for path in remaining {
+                fs::remove_file(path).map_err(io_error)?;
             }
             fs::remove_dir(&dir).map_err(io_error)?;
         }

@@ -2,7 +2,9 @@ use etd_contract::HostMode;
 use etd_core_api::*;
 use etd_host_core::core_store::{
     CoreSelector, CoreStore, CoreUsage, StoreError,
-    manifest::{CORE_FILE, MANIFEST_FILE, Manifest, ManifestCoreStore, ManifestEntry},
+    manifest::{
+        CORE_FILE, MANIFEST_FILE, Manifest, ManifestCoreStore, ManifestEntry, TrustedBundle,
+    },
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -313,3 +315,90 @@ async fn list_cores_rpc_never_resolves_default_for_each_call() {
     assert_eq!(driver.2.load(Ordering::SeqCst), 1);
 }
 mod common;
+
+fn companion_bundle(binary: &Path, name: &str) -> std::collections::HashMap<String, TrustedBundle> {
+    let mut bundle = TrustedBundle::from(trusted().remove("1.2.3").unwrap());
+    fs::write(binary.parent().unwrap().join(name), b"trusted companion").unwrap();
+    let digest = Sha256::digest(b"trusted companion")
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    bundle.companions.insert(name.to_owned(), digest);
+    std::collections::HashMap::from([("1.2.3".to_owned(), bundle)])
+}
+
+#[tokio::test]
+async fn launch_revalidates_all_companions_and_exact_inventory() {
+    use std::sync::atomic::Ordering;
+    for variant in 0..3 {
+        let (root, binary) = Root::new();
+        let dir = binary.parent().unwrap();
+        let trust = companion_bundle(&binary, "runtime.dll");
+        let driver = Arc::new(Driver::new(true, "rev"));
+        let store =
+            ManifestCoreStore::new(root.0.clone(), HostMode::Service, driver.clone(), trust)
+                .unwrap();
+        assert!(store.resolve(&CoreSelector::default()).await.is_ok());
+        assert_eq!(
+            store.list().await.unwrap()[0].support(),
+            etd_contract::v1::CoreSupport::Profiled
+        );
+        match variant {
+            0 => fs::remove_file(dir.join("runtime.dll")).unwrap(),
+            1 => fs::write(dir.join("unexpected.dll"), b"not trusted").unwrap(),
+            _ => fs::write(dir.join("runtime.dll"), b"tampered companion").unwrap(),
+        }
+        let calls = driver.2.load(Ordering::SeqCst);
+        assert!(store.resolve(&CoreSelector::default()).await.is_err());
+        assert_eq!(
+            store.list().await.unwrap()[0].support(),
+            etd_contract::v1::CoreSupport::Rejected
+        );
+        assert_eq!(driver.2.load(Ordering::SeqCst), calls);
+    }
+}
+
+#[tokio::test]
+async fn bundle_removal_refuses_driver_reference_and_query_failure() {
+    let (root, binary) = Root::new();
+    let trust = companion_bundle(&binary, "driver.sys");
+    let driver = Arc::new(Driver::new(true, "rev"));
+    let dir = fs::canonicalize(binary.parent().unwrap()).unwrap();
+    let expected = dir.clone();
+    let busy = ManifestCoreStore::new(
+        root.0.clone(),
+        HostMode::Service,
+        driver.clone(),
+        trust.clone(),
+    )
+    .unwrap()
+    .with_removal_guard(move |actual| {
+        assert_eq!(actual, expected);
+        Ok(true)
+    });
+    assert!(matches!(
+        busy.remove("1.2.3").await,
+        Err(StoreError::InUse { .. })
+    ));
+    assert!(binary.exists());
+    assert!(dir.join("driver.sys").exists());
+    assert_eq!(busy.list().await.unwrap().len(), 1);
+    drop(busy);
+    let unknown = ManifestCoreStore::new(
+        root.0.clone(),
+        HostMode::Service,
+        driver.clone(),
+        trust.clone(),
+    )
+    .unwrap()
+    .with_removal_guard(|_| Err(StoreError::Io("enumeration failed".into())));
+    assert!(unknown.remove("1.2.3").await.is_err());
+    assert!(binary.exists());
+    drop(unknown);
+    let free = ManifestCoreStore::new(root.0.clone(), HostMode::Service, driver, trust)
+        .unwrap()
+        .with_removal_guard(|_| Ok(false));
+    free.remove("1.2.3").await.unwrap();
+    assert!(!dir.exists());
+    assert!(free.list().await.unwrap().is_empty());
+}

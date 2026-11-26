@@ -25,6 +25,45 @@ fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+fn assert_wfp_container_absent() {
+    use ::windows::{
+        Win32::{
+            Foundation::{FWP_E_PROVIDER_NOT_FOUND, FWP_E_SUBLAYER_NOT_FOUND, HANDLE},
+            NetworkManagement::WindowsFilteringPlatform::*,
+        },
+        core::{GUID, PCWSTR},
+    };
+    // Independent BFE handle and direct queries for both container keys.
+    unsafe {
+        let mut handle = HANDLE::default();
+        assert_eq!(
+            FwpmEngineOpen0(PCWSTR::null(), 10, None, None, &mut handle),
+            0
+        );
+        let mut provider = std::ptr::null_mut();
+        let mut sublayer = std::ptr::null_mut();
+        let p = FwpmProviderGetByKey0(
+            handle,
+            &GUID::from_u128(0x51e7d001_7bc3_43b9_a795_7b80c196382f),
+            &mut provider,
+        );
+        let s = FwpmSubLayerGetByKey0(
+            handle,
+            &GUID::from_u128(0x51e7d002_7bc3_43b9_a795_7b80c196382f),
+            &mut sublayer,
+        );
+        if !provider.is_null() {
+            FwpmFreeMemory0((&mut provider as *mut *mut FWPM_PROVIDER0).cast());
+        }
+        if !sublayer.is_null() {
+            FwpmFreeMemory0((&mut sublayer as *mut *mut FWPM_SUBLAYER0).cast());
+        }
+        FwpmEngineClose0(handle);
+        assert_eq!(p, FWP_E_PROVIDER_NOT_FOUND.0 as u32);
+        assert_eq!(s, FWP_E_SUBLAYER_NOT_FOUND.0 as u32);
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires LocalSystem and a disposable Windows CI runner"]
 async fn privileged_fence() {
@@ -133,6 +172,7 @@ async fn privileged_fence() {
         drop(listener);
         assert_eq!(reclaim.reclaim(&effect).await.unwrap(), Reclaimed::Removed);
         assert!(matches!(reclaim.probe(&effect).await, Probe::Absent));
+        assert_wfp_container_absent();
         assert!(
             os.observer
                 .enumerate(SystemClass::FirewallRules)

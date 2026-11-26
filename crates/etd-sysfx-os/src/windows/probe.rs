@@ -6,8 +6,8 @@ use ::windows::{
         Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
         Security::{LOGON32_LOGON_SERVICE, LOGON32_PROVIDER_DEFAULT, LogonUserW},
         System::Threading::{
-            CREATE_NO_WINDOW, CreateProcessAsUserW, GetExitCodeProcess, PROCESS_INFORMATION,
-            STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+            CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetExitCodeProcess,
+            PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
         },
     },
     core::{HSTRING, PCWSTR, PWSTR},
@@ -59,6 +59,20 @@ pub fn unprivileged_connect(address: SocketAddr) -> Result<DirectionResult, Fenc
         encoded_command(&code)
     );
     let mut command: Vec<u16> = command.encode_utf16().chain(Some(0)).collect();
+    // Never pass the privileged host's environment to the low-privilege
+    // probe. Give it only the system directory and fixed Windows paths.
+    let system_dir = exe
+        .ancestors()
+        .nth(3)
+        .ok_or_else(|| FenceError::Probe("invalid system PowerShell path".into()))?;
+    let system_root = system_dir.parent().unwrap();
+    let environment = format!(
+        "Path={}\0SystemRoot={}\0windir={}\0\0",
+        system_dir.display(),
+        system_root.display(),
+        system_root.display()
+    );
+    let environment: Vec<u16> = environment.encode_utf16().collect();
     let startup = STARTUPINFOW {
         cb: size_of::<STARTUPINFOW>() as u32,
         ..Default::default()
@@ -72,9 +86,9 @@ pub fn unprivileged_connect(address: SocketAddr) -> Result<DirectionResult, Fenc
             None,
             None,
             false,
-            CREATE_NO_WINDOW,
-            None,
-            PCWSTR::null(),
+            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+            Some(environment.as_ptr().cast()),
+            &HSTRING::from(system_dir.as_os_str()),
             &startup,
             &mut process,
         )

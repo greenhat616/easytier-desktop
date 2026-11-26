@@ -107,7 +107,12 @@ fn encoded_command(script: &str) -> String {
     out
 }
 async fn query(request: Value) -> Result<Vec<Value>, WinError> {
-    let mut cmd = Command::new(system_powershell()?);
+    let exe = system_powershell()?;
+    let modules = exe
+        .parent()
+        .ok_or_else(|| WinError::invalid("invalid system PowerShell path"))?
+        .join("Modules");
+    let mut cmd = Command::new(&exe);
     cmd.args([
         "-NoLogo",
         "-NoProfile",
@@ -116,6 +121,8 @@ async fn query(request: Value) -> Result<Vec<Value>, WinError> {
         &encoded_command(include_str!("system.ps1")),
     ])
     .env("ETD_OS_REQUEST", request.to_string())
+    .env("PSModulePath", modules)
+    .current_dir(exe.parent().unwrap())
     .kill_on_drop(true)
     .creation_flags(0x08000000);
     let output = tokio::time::timeout(Duration::from_secs(60), cmd.output())
@@ -714,6 +721,9 @@ impl PortFence for WindowsFence {
         spec: &FenceSpec,
         listener_pid: u32,
     ) -> Result<FenceVerification, FenceError> {
+        if !wfp::complete(&wfp::key(spec)).map_err(WinError::fence)? {
+            return Err(FenceError::Probe("persistent fence is incomplete".into()));
+        }
         let before = listener(spec.address).await.map_err(WinError::fence)?;
         let check = match before {
             Some(l) if l.pid == listener_pid => ListenerCheck::Expected,
@@ -743,6 +753,11 @@ impl PortFence for WindowsFence {
                 .await
                 .map_err(|e| FenceError::Probe(e.to_string()))??;
         let after = listener(spec.address).await.map_err(WinError::fence)?;
+        if !wfp::complete(&wfp::key(spec)).map_err(WinError::fence)? {
+            return Err(FenceError::Probe(
+                "persistent fence changed during verification".into(),
+            ));
+        }
         let check = match after {
             Some(l) if l.pid == listener_pid => ListenerCheck::Expected,
             Some(l) => ListenerCheck::Other { pid: l.pid },

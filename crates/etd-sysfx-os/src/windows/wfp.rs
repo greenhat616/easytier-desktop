@@ -143,6 +143,14 @@ fn label(id: Uuid, port: u16) -> String {
     format!("etd-fence:{id}:{port}")
 }
 
+unsafe fn display_name(ptr: PWSTR) -> String {
+    if ptr.is_null() {
+        String::new()
+    } else {
+        unsafe { ptr.to_string().unwrap_or_default() }
+    }
+}
+
 #[derive(Debug)]
 struct Filter {
     key: GUID,
@@ -179,8 +187,8 @@ fn filters(e: &Engine) -> Result<Vec<Filter>, WinError> {
                     {
                         out.push(Filter {
                             key: f.filterKey,
-                            label: f.displayData.name.to_string().unwrap_or_default(),
-                            persistent: f.flags & FWPM_FILTER_FLAG_PERSISTENT != 0,
+                            label: display_name(f.displayData.name),
+                            persistent: f.flags.contains(FWPM_FILTER_FLAG_PERSISTENT),
                             owned,
                         });
                     }
@@ -212,8 +220,8 @@ fn matching(e: &Engine, id: Uuid, port: u16) -> Result<Vec<Filter>, WinError> {
             let value = &*f;
             let found = Filter {
                 key: value.filterKey,
-                label: value.displayData.name.to_string().unwrap_or_default(),
-                persistent: value.flags & FWPM_FILTER_FLAG_PERSISTENT != 0,
+                label: display_name(value.displayData.name),
+                persistent: value.flags.contains(FWPM_FILTER_FLAG_PERSISTENT),
                 owned: value.subLayerKey == SUBLAYER
                     && !value.providerKey.is_null()
                     && *value.providerKey == PROVIDER,
@@ -247,8 +255,7 @@ fn ensure_container(e: &Engine, sd: &Sd) -> Result<(), WinError> {
         } else {
             check(rc, "lookup WFP provider")?;
             let valid = (*p).flags & FWPM_PROVIDER_FLAG_PERSISTENT != 0
-                && (*p).displayData.name.to_string().ok().as_deref()
-                    == Some("EasyTier Desktop fence provider");
+                && display_name((*p).displayData.name) == "EasyTier Desktop fence provider";
             FwpmFreeMemory0((&mut p as *mut *mut FWPM_PROVIDER0).cast());
             if !valid {
                 return Err(WinError::invalid("WFP provider identity mismatch"));
@@ -276,8 +283,7 @@ fn ensure_container(e: &Engine, sd: &Sd) -> Result<(), WinError> {
             let valid = (*s).flags & FWPM_SUBLAYER_FLAG_PERSISTENT != 0
                 && !(*s).providerKey.is_null()
                 && *(*s).providerKey == PROVIDER
-                && (*s).displayData.name.to_string().ok().as_deref()
-                    == Some("EasyTier Desktop fence sublayer");
+                && display_name((*s).displayData.name) == "EasyTier Desktop fence sublayer";
             FwpmFreeMemory0((&mut s as *mut *mut FWPM_SUBLAYER0).cast());
             if !valid {
                 return Err(WinError::invalid("WFP sublayer identity mismatch"));
@@ -374,7 +380,7 @@ pub fn install(key: &ObjectKey) -> Result<Observation, WinError> {
                     },
                     flags: FWPM_FILTER_FLAG_PERSISTENT
                         | if permit {
-                            0
+                            FWPM_FILTER_FLAGS(0)
                         } else {
                             FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT
                         },
@@ -432,6 +438,11 @@ pub fn observe(key: &ObjectKey) -> Result<Option<Observation>, WinError> {
     )))
 }
 
+pub fn complete(key: &ObjectKey) -> Result<bool, WinError> {
+    let (id, port) = parts(key)?;
+    Ok(matching(&Engine::open()?, id, port)?.len() == 4)
+}
+
 pub fn remove(key: &ObjectKey) -> Result<Reclaimed, WinError> {
     let (id, port) = parts(key)?;
     let e = Engine::open()?;
@@ -440,6 +451,16 @@ pub fn remove(key: &ObjectKey) -> Result<Reclaimed, WinError> {
         if found.is_empty() {
             return Ok(Reclaimed::AlreadyAbsent);
         }
+        // Confirm parent identities as well as each filter's membership.
+        let protected = Sd::new("D:P(A;;GA;;;SY)(A;;GA;;;BA)")?;
+        ensure_container(&e, &protected)?;
+        // Only delete the shared container when this is its entire filter
+        // population; enumerate before removing because BFE can snapshot an
+        // enumeration at transaction start.
+        let all = filters(&e)?;
+        let last = all
+            .iter()
+            .all(|f| found.iter().any(|ours| ours.key == f.key));
         for filter in found {
             unsafe {
                 check(
@@ -449,7 +470,7 @@ pub fn remove(key: &ObjectKey) -> Result<Reclaimed, WinError> {
             }
         }
         // Shared container stays while other logical fences exist.
-        if filters(&e)?.is_empty() {
+        if last {
             unsafe {
                 check(
                     FwpmSubLayerDeleteByKey0(e.0, &SUBLAYER),

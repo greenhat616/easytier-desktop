@@ -631,9 +631,11 @@ pub fn install(key: &ObjectKey) -> Result<Observation, WinError> {
 }
 
 pub fn observe(key: &ObjectKey) -> Result<Option<Observation>, WinError> {
+    observe_on(&Engine::open()?, key)
+}
+fn observe_on(e: &Engine, key: &ObjectKey) -> Result<Option<Observation>, WinError> {
     let (id, port) = parts(key)?;
-    let e = Engine::open()?;
-    let matching = matching(&e, id, port)?;
+    let matching = matching(e, id, port)?;
     if matching.is_empty() {
         return Ok(None);
     }
@@ -735,7 +737,7 @@ fn enumerate_impl(tolerant: bool) -> Result<Vec<(ObjectKey, Observation)>, WinEr
         if out.iter().any(|(k, _)| k == &key) {
             continue;
         }
-        match observe(&key) {
+        match observe_on(&e, &key) {
             Ok(Some(obs)) => out.push((key, obs)),
             Ok(None) => {}
             Err(e) if tolerant => {

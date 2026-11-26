@@ -9,7 +9,8 @@ use ::windows::{
         },
         Security::{
             Authorization::{
-                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+                SDDL_REVISION_1, SE_KERNEL_OBJECT,
             },
             DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
             GetTokenInformation, IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
@@ -27,6 +28,7 @@ use ::windows::{
     core::{BOOL, HSTRING, PCWSTR, PWSTR},
 };
 use etd_sysfx::BootId;
+use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
 pub(super) struct Handle(pub HANDLE);
@@ -278,7 +280,29 @@ pub(super) fn elevated() -> Result<bool, WinError> {
     }
 }
 
-fn machine_acl(key: &Key) -> Result<(), WinError> {
+fn machine_descriptor(sd: PSECURITY_DESCRIPTOR, label: &str) -> Result<(), WinError> {
+    unsafe {
+        let mut present = BOOL(0);
+        let mut defaulted = BOOL(0);
+        let mut dacl = std::ptr::null_mut();
+        let mut owner = PSID::default();
+        GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted)
+            .map_err(WinError::windows)?;
+        GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted).map_err(WinError::windows)?;
+        if !present.as_bool()
+            || !trusted_acl(dacl, false)?
+            || owner.0.is_null()
+            || !(IsWellKnownSid(owner, WinLocalSystemSid).as_bool()
+                || IsWellKnownSid(owner, WinBuiltinAdministratorsSid).as_bool())
+        {
+            return Err(WinError::invalid(format!(
+                "untrusted machine boot {label} ACL/owner; expected SYSTEM/Administrators only"
+            )));
+        }
+        Ok(())
+    }
+}
+fn machine_acl(key: &Key, label: &str) -> Result<(), WinError> {
     unsafe {
         let info = DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION;
         let mut len = 0;
@@ -295,23 +319,32 @@ fn machine_acl(key: &Key) -> Result<(), WinError> {
             RegGetKeySecurity(key.0, info, Some(sd), &mut len),
             "read boot marker security",
         )?;
-        let mut present = BOOL(0);
-        let mut defaulted = BOOL(0);
-        let mut dacl = std::ptr::null_mut();
-        let mut owner = PSID::default();
-        GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted)
-            .map_err(WinError::windows)?;
-        GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted).map_err(WinError::windows)?;
-        if !present.as_bool()
-            || !trusted_acl(dacl, false)?
-            || owner.0.is_null()
-            || !(IsWellKnownSid(owner, WinLocalSystemSid).as_bool()
-                || IsWellKnownSid(owner, WinBuiltinAdministratorsSid).as_bool())
-        {
-            return Err(WinError::invalid("untrusted machine boot-marker ACL/owner"));
-        }
-        Ok(())
+        machine_descriptor(sd, label)
     }
+}
+
+fn machine_mutex_acl(handle: &Handle) -> Result<(), WinError> {
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    let rc = unsafe {
+        GetSecurityInfo(
+            handle.0,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            None,
+            Some(&mut sd),
+        )
+    };
+    check(rc, "read machine boot Global mutex security")?;
+    if sd.0.is_null() {
+        return Err(WinError::invalid(
+            "empty machine boot Global mutex security descriptor",
+        ));
+    }
+    let sd = Descriptor(sd);
+    machine_descriptor(sd.0, "Global mutex")
 }
 
 struct MutexGuard(Handle);
@@ -342,9 +375,14 @@ fn marker_lock(machine: bool) -> Result<MutexGuard, WinError> {
             false,
             &HSTRING::from(name),
         )
-        .map_err(WinError::windows)?
+        .map_err(|e| WinError::invalid(format!("boot-marker mutex open/creation failed: {e}")))?
     };
     let handle = Handle(raw);
+    // CreateMutexW ignores the supplied security attributes if the named
+    // object already exists. Never wait on an untrusted machine mutex.
+    if machine {
+        machine_mutex_acl(&handle)?;
+    }
     let wait = unsafe { WaitForSingleObject(handle.0, 5000) };
     if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
         return Err(WinError::invalid("boot-marker lock unavailable"));
@@ -353,6 +391,25 @@ fn marker_lock(machine: bool) -> Result<MutexGuard, WinError> {
 }
 
 pub(super) fn boot_id(machine: bool) -> Result<BootId, WinError> {
+    static MACHINE: OnceLock<BootId> = OnceLock::new();
+    static USER: OnceLock<BootId> = OnceLock::new();
+    static INIT: Mutex<()> = Mutex::new(());
+    let cache = if machine { &MACHINE } else { &USER };
+    if let Some(id) = cache.get() {
+        return Ok(id.clone());
+    }
+    let _init = INIT
+        .lock()
+        .map_err(|_| WinError::invalid("boot marker initialization lock poisoned"))?;
+    if let Some(id) = cache.get() {
+        return Ok(id.clone());
+    }
+    let id = read_or_create_boot_id(machine)?;
+    // Cache only after all ACL, volatility and UUID checks succeeded.
+    let _ = cache.set(id.clone());
+    Ok(id)
+}
+fn read_or_create_boot_id(machine: bool) -> Result<BootId, WinError> {
     let _lock = marker_lock(machine)?;
     // HostMode::User rejects elevated entry tokens; it always uses HKCU.
     // This marker ends when that user's hive unloads (user session/logoff),
@@ -376,6 +433,9 @@ pub(super) fn boot_id(machine: bool) -> Result<BootId, WinError> {
         KEY_READ | KEY_CREATE_SUB_KEY,
         attrs.as_ref(),
     )?;
+    if machine {
+        machine_acl(&parent, "parent registry key")?;
+    }
     let key = Key::create(
         parent.0,
         "Volatile",
@@ -384,7 +444,7 @@ pub(super) fn boot_id(machine: bool) -> Result<BootId, WinError> {
         attrs.as_ref(),
     )?;
     if machine {
-        machine_acl(&key)?;
+        machine_acl(&key, "volatile marker key")?;
     }
     // RegCreateKeyEx ignores REG_OPTION_VOLATILE for an already-existing
     // key. Prove the existing marker is volatile before trusting its UUID.
@@ -429,4 +489,42 @@ pub(super) fn boot_id(machine: bool) -> Result<BootId, WinError> {
         .collect();
     key.set("BootId", &RawValue { ty: REG_SZ, bytes })?;
     Ok(BootId(id.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn machine_descriptor_rejects_foreign_owner_or_acl() {
+        let trusted = Descriptor::from_sddl("O:BAD:P(A;;KA;;;SY)(A;;KA;;;BA)").unwrap();
+        machine_descriptor(trusted.0, "parent registry key").unwrap();
+        for sddl in [
+            "O:BUD:P(A;;KA;;;SY)(A;;KA;;;BA)",
+            "O:BAD:P(A;;KA;;;SY)(A;;KA;;;BA)(A;;KA;;;WD)",
+        ] {
+            let sd = Descriptor::from_sddl(sddl).unwrap();
+            assert!(
+                machine_descriptor(sd.0, "parent registry key")
+                    .unwrap_err()
+                    .message
+                    .contains("untrusted machine boot parent registry key")
+            );
+        }
+    }
+    #[test]
+    fn existing_named_mutex_does_not_inherit_new_security_attributes() {
+        let name = HSTRING::from(format!(r"Local\etd-test-mutex-{}", Uuid::new_v4()));
+        let unsafe_sd = Descriptor::from_sddl("D:P(A;;GA;;;WD)").unwrap();
+        let attrs = unsafe_sd.attributes();
+        let _first = Handle(unsafe { CreateMutexW(Some(&attrs), false, &name).unwrap() });
+        let secure_sd = Descriptor::from_sddl("O:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)").unwrap();
+        let attrs = secure_sd.attributes();
+        let reopened = Handle(unsafe { CreateMutexW(Some(&attrs), false, &name).unwrap() });
+        let error = machine_mutex_acl(&reopened).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("untrusted machine boot Global mutex")
+        );
+    }
 }

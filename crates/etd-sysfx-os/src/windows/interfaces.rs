@@ -243,13 +243,9 @@ pub async fn enumerate() -> Result<Vec<(ObjectKey, InterfaceInfo)>, WinError> {
     blocking(move || enumerate_rows(&addresses, false)).await
 }
 pub async fn sweep() -> Result<Vec<(ObjectKey, InterfaceInfo)>, WinError> {
-    let addresses = match addresses().await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(class="interfaces",error=%e,"sweep address query failed; interface identity sweep continues");
-            Vec::new()
-        }
-    };
+    // A class-wide enumeration failure is indeterminate, not an empty
+    // address list. Only a failure of one individual row can be skipped.
+    let addresses = addresses().await?;
     blocking(move || enumerate_rows(&addresses, true)).await
 }
 fn enumerate_rows(

@@ -10,10 +10,10 @@ use ::windows::{
     Win32::{
         Foundation::ERROR_NO_MORE_FILES,
         Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
-            FILE_FLAG_BACKUP_SEMANTICS, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
-            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
-            GetFinalPathNameByHandleW, OPEN_EXISTING,
+            CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_ID_INFO, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, FileBasicInfo, FileIdInfo,
+            GetFileInformationByHandleEx, GetFinalPathNameByHandleW, OPEN_EXISTING,
         },
         System::{
             Diagnostics::ToolHelp::{
@@ -46,8 +46,8 @@ fn busy(message: impl std::fmt::Display) -> WinError {
 
 #[derive(PartialEq, Eq)]
 struct FileIdentity {
-    volume: u32,
-    index: u64,
+    volume: u64,
+    index: [u8; 16],
 }
 fn open_identity(path: &Path) -> Result<(Handle, FileIdentity, PathBuf, bool), WinError> {
     let handle = Handle(unsafe {
@@ -62,9 +62,23 @@ fn open_identity(path: &Path) -> Result<(Handle, FileIdentity, PathBuf, bool), W
         )
         .map_err(WinError::windows)?
     });
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    let mut id = FILE_ID_INFO::default();
+    let mut info = FILE_BASIC_INFO::default();
     unsafe {
-        GetFileInformationByHandle(handle.0, &mut info).map_err(WinError::windows)?;
+        GetFileInformationByHandleEx(
+            handle.0,
+            FileIdInfo,
+            (&mut id as *mut FILE_ID_INFO).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+        .map_err(WinError::windows)?;
+        GetFileInformationByHandleEx(
+            handle.0,
+            FileBasicInfo,
+            (&mut info as *mut FILE_BASIC_INFO).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+        .map_err(WinError::windows)?;
     }
     let mut buf = vec![0u16; 32768];
     let n = unsafe { GetFinalPathNameByHandleW(handle.0, &mut buf, FILE_NAME_NORMALIZED) } as usize;
@@ -77,15 +91,18 @@ fn open_identity(path: &Path) -> Result<(Handle, FileIdentity, PathBuf, bool), W
     Ok((
         handle,
         FileIdentity {
-            volume: info.dwVolumeSerialNumber,
-            index: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+            volume: id.VolumeSerialNumber,
+            index: id.FileId.Identifier,
         },
         canonical,
-        info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0,
+        info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0,
     ))
 }
 
 fn inside_store(root: &FileIdentity, image: &Path) -> Result<bool, WinError> {
+    // Accepted boundary: this proves the identity of an opened image path,
+    // not the kernel's already mapped executable image object. The gate
+    // re-enumerates and verifies these handles immediately before each stage.
     let (_file, _, canonical, is_dir) = open_identity(image)?;
     if is_dir {
         return Err(WinError::invalid("process image is not a file"));

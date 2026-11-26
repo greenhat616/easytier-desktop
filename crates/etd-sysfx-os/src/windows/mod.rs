@@ -704,22 +704,42 @@ impl BootIdSource for WindowsBoot {
         registry::boot_id(self.machine).map_err(WinError::reclaim)
     }
 }
-struct WindowsSweeper {
+struct WindowsSweeper<S = NativeSweep> {
     core_store_dir: PathBuf,
+    source: S,
 }
-fn sweep_or_default<T: Default>(class: &str, result: Result<T, WinError>) -> T {
-    match result {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(%class,error=%e,"sweep query failed; continuing other object classes");
-            T::default()
-        }
+#[async_trait]
+trait SweepSource: Send + Sync {
+    async fn wfp(&self) -> Result<Vec<(ObjectKey, Observation)>, WinError>;
+    async fn interfaces(&self) -> Result<Vec<(ObjectKey, InterfaceInfo)>, WinError>;
+    async fn rows(&self, class: &str) -> Result<Vec<Value>, WinError>;
+    async fn magic(&self, key: &ObjectKey) -> Result<Option<Observation>, WinError>;
+}
+struct NativeSweep;
+#[async_trait]
+impl SweepSource for NativeSweep {
+    async fn wfp(&self) -> Result<Vec<(ObjectKey, Observation)>, WinError> {
+        blocking(wfp::sweep).await
+    }
+    async fn interfaces(&self) -> Result<Vec<(ObjectKey, InterfaceInfo)>, WinError> {
+        interfaces::sweep().await
+    }
+    async fn rows(&self, class: &str) -> Result<Vec<Value>, WinError> {
+        query(json!({"op":class,"sweep":true})).await
+    }
+    async fn magic(&self, key: &ObjectKey) -> Result<Option<Observation>, WinError> {
+        observe_kind(EffectKind::WinMagicDnsRecovery, key).await
     }
 }
-async fn sweep_rows(class: &str) -> Vec<Value> {
-    sweep_or_default(class,query(json!({"op":class,"sweep":true})).await).into_iter().filter(|row|{
+fn class_result<T>(class: &str, result: Result<T, WinError>) -> Result<T, ReclaimError> {
+    result.map_err(|e| {
+        ReclaimError::Indeterminate(format!("Windows sweep class {class} failed: {e}"))
+    })
+}
+async fn sweep_rows(source: &impl SweepSource, class: &str) -> Result<Vec<Value>, ReclaimError> {
+    Ok(class_result(class,source.rows(class).await)?.into_iter().filter(|row|{
         if let Some(warning)=row["warning"].as_str(){tracing::warn!(%class,object=?row["object"],error=%warning,"sweep object query failed; continuing");false}else{true}
-    }).collect()
+    }).collect())
 }
 fn sweep_field<'a>(class: &str, row: &'a Value, field: &str) -> Option<&'a str> {
     match string(row, field) {
@@ -730,7 +750,7 @@ fn sweep_field<'a>(class: &str, row: &'a Value, field: &str) -> Option<&'a str> 
         }
     }
 }
-impl Sweeper for WindowsSweeper {
+impl<S: SweepSource> Sweeper for WindowsSweeper<S> {
     fn find_marked<'a>(
         &'a self,
         key: Option<&'a InstallKey>,
@@ -738,7 +758,7 @@ impl Sweeper for WindowsSweeper {
     ) -> BoxFuture<'a, Result<Vec<FoundObject>, ReclaimError>> {
         Box::pin(async move {
             let mut found = Vec::new();
-            for (key, observation) in sweep_or_default("wfp", blocking(wfp::sweep).await) {
+            for (key, observation) in class_result("wfp", self.source.wfp().await)? {
                 found.push(FoundObject {
                     kind: EffectKind::WinFenceFilter,
                     key,
@@ -753,7 +773,7 @@ impl Sweeper for WindowsSweeper {
                     })
                     .unwrap_or(FoundBy::PrefixOnly)
             };
-            for (object, info) in sweep_or_default("interfaces", interfaces::sweep().await) {
+            for (object, info) in class_result("interfaces", self.source.interfaces().await)? {
                 if !owned_name(&info.name) {
                     continue;
                 }
@@ -768,7 +788,7 @@ impl Sweeper for WindowsSweeper {
                     origin: origin(&info.name),
                 });
             }
-            for row in sweep_rows("firewall").await {
+            for row in sweep_rows(&self.source, "firewall").await? {
                 let Some(name) = sweep_field("firewall", &row, "name") else {
                     continue;
                 };
@@ -831,7 +851,7 @@ impl Sweeper for WindowsSweeper {
                     origin: origin(iface),
                 });
             }
-            for row in sweep_rows("profiles").await {
+            for row in sweep_rows(&self.source, "profiles").await? {
                 let Some(name) = sweep_field("profiles", &row, "name") else {
                     continue;
                 };
@@ -866,7 +886,7 @@ impl Sweeper for WindowsSweeper {
                         )
                     })
                     .collect();
-                for row in sweep_rows("registry_rows").await {
+                for row in sweep_rows(&self.source, "registry_rows").await? {
                     let Some(path) = sweep_field("registry_rows", &row, "key") else {
                         continue;
                     };
@@ -905,10 +925,7 @@ impl Sweeper for WindowsSweeper {
                 key: r"HKLM\SOFTWARE\EasyTier\MagicDNS".into(),
                 value: None,
             };
-            if let Some(obs) = sweep_or_default(
-                "magic",
-                observe_kind(EffectKind::WinMagicDnsRecovery, &magic).await,
-            ) {
+            if let Some(obs) = class_result("magic", self.source.magic(&magic).await)? {
                 found.push(FoundObject {
                     kind: EffectKind::WinMagicDnsRecovery,
                     key: magic,
@@ -916,7 +933,7 @@ impl Sweeper for WindowsSweeper {
                     origin: FoundBy::PrefixOnly,
                 });
             }
-            for row in sweep_rows("drivers").await {
+            for row in sweep_rows(&self.source, "drivers").await? {
                 let Some(name) = sweep_field("drivers", &row, "name") else {
                     continue;
                 };
@@ -1040,8 +1057,12 @@ pub(crate) fn adapters(config: &OsConfig) -> Result<OsAdapters, OsError> {
         reclaimers,
         sweeper: Arc::new(WindowsSweeper {
             core_store_dir: config.core_store_dir.clone(),
+            source: NativeSweep,
         }),
         boot_id: Arc::new(WindowsBoot {
+            // Frozen OsConfig carries paths only, not HostForm. The host's
+            // prepare(User) rejects an elevated entry token, so use the
+            // existing composition-root invariant until HostForm is passed.
             machine: registry::elevated().map_err(|e| OsError::Os {
                 code: e.code,
                 message: e.message,
@@ -1056,6 +1077,79 @@ pub(crate) fn adapters(config: &OsConfig) -> Result<OsAdapters, OsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct SweepFixture {
+        fail: Option<&'static str>,
+    }
+    impl SweepFixture {
+        fn check(&self, class: &str) -> Result<(), WinError> {
+            if self.fail == Some(class) {
+                Err(WinError::invalid("fixture class failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    #[async_trait]
+    impl SweepSource for SweepFixture {
+        async fn wfp(&self) -> Result<Vec<(ObjectKey, Observation)>, WinError> {
+            self.check("wfp")?;
+            Ok(Vec::new())
+        }
+        async fn interfaces(&self) -> Result<Vec<(ObjectKey, InterfaceInfo)>, WinError> {
+            self.check("interfaces")?;
+            Ok(Vec::new())
+        }
+        async fn rows(&self, class: &str) -> Result<Vec<Value>, WinError> {
+            self.check(class)?;
+            Ok(match class {
+                "firewall" => vec![
+                    json!({"object":"bad-id","warning":"ambiguous application filter"}),
+                    json!({"id":"valid-id","name":"EasyTier etd-1234abcd - TCP Protocol (Inbound)","group":"EasyTier"}),
+                ],
+                "drivers" => vec![json!({"name":"wintun"})],
+                _ => Vec::new(),
+            })
+        }
+        async fn magic(&self, _: &ObjectKey) -> Result<Option<Observation>, WinError> {
+            self.check("magic")?;
+            Ok(None)
+        }
+    }
+    #[tokio::test]
+    async fn sweep_class_failure_is_indeterminate_not_empty() {
+        for class in [
+            "wfp",
+            "interfaces",
+            "firewall",
+            "profiles",
+            "registry_rows",
+            "magic",
+            "drivers",
+        ] {
+            let sweeper = WindowsSweeper {
+                core_store_dir: PathBuf::from(r"C:\fixture"),
+                source: SweepFixture { fail: Some(class) },
+            };
+            let error = sweeper
+                .find_marked(Some(&InstallKey([0; 32])), &[])
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error,ReclaimError::Indeterminate(message) if message.contains(class))
+            );
+        }
+    }
+    #[tokio::test]
+    async fn sweep_single_object_failure_keeps_other_objects() {
+        let sweeper = WindowsSweeper {
+            core_store_dir: PathBuf::from(r"C:\fixture"),
+            source: SweepFixture { fail: None },
+        };
+        let found = sweeper.find_marked(None, &[]).await.unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().any(|e| e.kind == EffectKind::WinFirewallRule));
+        assert!(found.iter().any(|e| e.kind == EffectKind::Driver));
+    }
     #[test]
     fn listener_rejects_wildcards_and_unexpected_addresses() {
         let addr: SocketAddr = "127.0.0.1:23456".parse().unwrap();

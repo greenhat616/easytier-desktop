@@ -21,9 +21,14 @@ use windows::{
             HANDLE, HANDLE_FLAG_INHERIT, HLOCAL, LocalFree, SetHandleInformation, WAIT_OBJECT_0,
         },
         Security::{
-            Authorization::ConvertStringSidToSidW, CreateRestrictedToken, DISABLE_MAX_PRIVILEGE,
-            ImpersonateLoggedOnUser, PSID, RevertToSelf, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES,
-            SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_MANDATORY_LABEL, TokenIntegrityLevel,
+            Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
+                SDDL_REVISION_1,
+            },
+            CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, GetSecurityDescriptorDacl,
+            ImpersonateLoggedOnUser, PSECURITY_DESCRIPTOR, PSID, RevertToSelf, SECURITY_ATTRIBUTES,
+            SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_DEFAULT_DACL,
+            TOKEN_MANDATORY_LABEL, TOKEN_OWNER, TokenDefaultDacl, TokenIntegrityLevel, TokenOwner,
         },
         Storage::FileSystem::{
             FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_WRITE_DATA, READ_CONTROL,
@@ -90,9 +95,47 @@ pub fn restricted_token(rid: u32) -> OwnedHandle {
 /// A copy of the runner's elevated token lowered to integrity `rid`, with
 /// minimal privileges but Administrators still enabled. A process started
 /// with a deny-only copy fails user32 initialisation (0xC0000142) on the
-/// runner's window station, so child processes use this one.
+/// runner's window station, so child processes use this one. Like a UI's
+/// filtered token, it owns what it creates as the user and its default DACL
+/// grants the user, so a Medium UI can open its process, token and pipes.
 pub fn lowered_token(rid: u32) -> OwnedHandle {
-    copy_token(rid, false)
+    let token = copy_token(rid, false);
+    let etd_ipc::OsUserId::WindowsSid(user) = etd_ipc::platform::current_user().unwrap() else {
+        unreachable!()
+    };
+    let sid = Sid::parse(&user);
+    let owner = TOKEN_OWNER { Owner: sid.0 };
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    let mut present = false.into();
+    let mut defaulted = false.into();
+    let mut dacl = ptr::null_mut();
+    unsafe {
+        SetTokenInformation(
+            HANDLE(token.as_raw_handle()),
+            TokenOwner,
+            (&raw const owner).cast(),
+            size_of_val(&owner) as u32,
+        )
+        .unwrap();
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(wide(&format!("D:(A;;GA;;;{user})(A;;GA;;;SY)")).as_ptr()),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+        .unwrap();
+        GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted).unwrap();
+        let default = TOKEN_DEFAULT_DACL { DefaultDacl: dacl };
+        SetTokenInformation(
+            HANDLE(token.as_raw_handle()),
+            TokenDefaultDacl,
+            (&raw const default).cast(),
+            size_of_val(&default) as u32,
+        )
+        .unwrap();
+        LocalFree(Some(HLOCAL(descriptor.0)));
+    }
+    token
 }
 
 fn copy_token(rid: u32, deny_admins: bool) -> OwnedHandle {

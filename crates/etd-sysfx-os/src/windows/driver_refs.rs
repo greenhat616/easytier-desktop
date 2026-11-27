@@ -1,11 +1,13 @@
 use super::{WinError, registry::Key};
 use crate::OsError;
 use ::windows::{
+    Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS},
     Win32::{
         Foundation::{
             CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_NOT_ALL_ASSIGNED,
-            ERROR_SERVICE_DOES_NOT_EXIST, GetLastError, HANDLE, LUID,
+            ERROR_SERVICE_DOES_NOT_EXIST, GetLastError, HANDLE, LUID, STATUS_INFO_LENGTH_MISMATCH,
         },
+        Globalization::{CP_ACP, MB_ERR_INVALID_CHARS, MultiByteToWideChar},
         Security::{
             AdjustTokenPrivileges, ImpersonateSelf, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
             RevertToSelf, SE_PRIVILEGE_ENABLED, SecurityImpersonation, TOKEN_ADJUST_PRIVILEGES,
@@ -393,10 +395,175 @@ fn registry_images() -> Result<Images, WinError> {
     Ok(images)
 }
 
+/// Image paths of every loaded driver. SeDebugPrivilege comes first; a token
+/// that cannot enable it, such as a Windows Installer custom action (the
+/// msiserver service's RequiredPrivileges omit it), reads the kernel module
+/// list instead. Either way an incomplete list fails closed.
+fn loaded_images() -> Result<Vec<String>, WinError> {
+    match debug_images()? {
+        Some(images) => Ok(images),
+        None => module_images(),
+    }
+}
+
+/// Number of loaded drivers. Without SeDebugPrivilege the bases come back
+/// null, but the count is still the kernel's.
+fn driver_count() -> Result<usize, WinError> {
+    let mut bases = vec![std::ptr::null_mut::<c_void>(); 1024];
+    loop {
+        let mut needed = 0;
+        let capacity = u32::try_from(std::mem::size_of_val(bases.as_slice()))
+            .map_err(|_| error("too many loaded drivers"))?;
+        // SAFETY: bases has capacity bytes of initialized writable memory.
+        unsafe { EnumDeviceDrivers(bases.as_mut_ptr(), capacity, &mut needed) }
+            .map_err(WinError::windows)?;
+        if needed > capacity {
+            bases.resize(
+                (needed as usize).div_ceil(std::mem::size_of::<*mut c_void>()),
+                std::ptr::null_mut(),
+            );
+            continue;
+        }
+        if needed == 0 || !(needed as usize).is_multiple_of(std::mem::size_of::<*mut c_void>()) {
+            return Err(error("invalid loaded driver enumeration"));
+        }
+        return Ok(needed as usize / std::mem::size_of::<*mut c_void>());
+    }
+}
+
+const SYSTEM_MODULE_INFORMATION: SYSTEM_INFORMATION_CLASS = SYSTEM_INFORMATION_CLASS(11);
+/// `RTL_PROCESS_MODULES`: a ULONG count padded to pointer alignment, then
+/// `RTL_PROCESS_MODULE_INFORMATION` entries: Section, MappedBase and
+/// ImageBase pointers, ImageSize, Flags, four USHORTs (the last is
+/// OffsetToFileName), then `FullPathName`, 256 ANSI bytes, NUL-terminated.
+const MODULES_HEADER: usize = std::mem::size_of::<usize>();
+const MODULE_NAME: usize = 3 * std::mem::size_of::<usize>() + 16;
+const MODULE_NAME_LEN: usize = 256;
+const MODULE_ENTRY: usize = MODULE_NAME + MODULE_NAME_LEN;
+
+/// The paths in a `SystemModuleInformation` buffer. Any entry whose path is
+/// empty, unterminated, possibly truncated (255 bytes fill the field),
+/// inconsistent with its file-name offset, not decodable, or holding a `?`
+/// past a leading `\??\` (a character the kernel could not convert) fails
+/// the whole list.
+fn parse_modules(
+    bytes: &[u8],
+    ansi: impl Fn(&[u8]) -> Result<String, WinError>,
+) -> Result<Vec<String>, WinError> {
+    let count = bytes
+        .get(..4)
+        .map(|raw| u32::from_le_bytes(raw.try_into().expect("checked size")) as usize)
+        .ok_or_else(|| error("short kernel module list"))?;
+    let end = count
+        .checked_mul(MODULE_ENTRY)
+        .and_then(|size| size.checked_add(MODULES_HEADER))
+        .ok_or_else(|| error("invalid kernel module count"))?;
+    if count == 0 || end > bytes.len() {
+        return Err(error("invalid kernel module count"));
+    }
+    let mut images = Vec::with_capacity(count);
+    for entry in bytes[MODULES_HEADER..end].as_chunks::<MODULE_ENTRY>().0 {
+        let name = &entry[MODULE_NAME..];
+        let offset = u16::from_le_bytes([entry[MODULE_NAME - 2], entry[MODULE_NAME - 1]]) as usize;
+        let len = name
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| error("unterminated kernel module path"))?;
+        if len == 0 {
+            return Err(error("empty kernel module path"));
+        }
+        if len >= MODULE_NAME_LEN - 1 {
+            return Err(error("kernel module path may be truncated"));
+        }
+        if offset >= len || (offset > 0 && name[offset - 1] != b'\\') {
+            return Err(error("inconsistent kernel module path"));
+        }
+        let path = ansi(&name[..len])?;
+        if strip_prefix_ci(&path, r"\??\")
+            .unwrap_or(&path)
+            .contains('?')
+        {
+            return Err(error(format!(
+                "kernel module path not representable: {path}"
+            )));
+        }
+        images.push(path);
+    }
+    Ok(images)
+}
+
+/// Decode a path in the system ANSI code page; invalid bytes fail.
+fn ansi_path(bytes: &[u8]) -> Result<String, WinError> {
+    if bytes.is_ascii() {
+        return Ok(String::from_utf8(bytes.to_vec()).expect("ASCII"));
+    }
+    let mut wide = vec![0u16; bytes.len()];
+    // SAFETY: both buffers are valid for their lengths.
+    let n = unsafe { MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, bytes, Some(&mut wide)) };
+    if n <= 0 {
+        return Err(error(
+            "kernel module path is not valid in the ANSI code page",
+        ));
+    }
+    decode(&wide[..n as usize])
+}
+
+/// Loaded-driver paths from `NtQuerySystemInformation(SystemModuleInformation)`,
+/// which reports paths without SeDebugPrivilege (only the bases are hidden).
+/// The list must have exactly as many entries as `EnumDeviceDrivers`
+/// reports; a driver loading or unloading in between retries, a persistent
+/// difference fails.
+fn module_images() -> Result<Vec<String>, WinError> {
+    for _ in 0..4 {
+        let expected = driver_count()?;
+        let mut buffer = vec![0u64; 64 * 1024 / 8];
+        let images = loop {
+            let length = u32::try_from(std::mem::size_of_val(buffer.as_slice()))
+                .map_err(|_| error("kernel module list too large"))?;
+            let mut written = 0u32;
+            // SAFETY: buffer is writable for `length` bytes; written is a valid output.
+            let status = unsafe {
+                NtQuerySystemInformation(
+                    SYSTEM_MODULE_INFORMATION,
+                    buffer.as_mut_ptr().cast(),
+                    length,
+                    &mut written,
+                )
+            };
+            if status == STATUS_INFO_LENGTH_MISMATCH {
+                if written <= length || written > 64 << 20 {
+                    return Err(error("invalid kernel module list size"));
+                }
+                // Leave room for a driver that loads before the next call.
+                buffer.resize((written as usize).div_ceil(8) + 1024, 0);
+                continue;
+            }
+            if status.is_err() {
+                return Err(error(format!(
+                    "kernel module list unavailable: NTSTATUS {:#010x}",
+                    status.0
+                )));
+            }
+            let written = (written as usize).min(length as usize);
+            // SAFETY: the buffer is initialized; read its first `written` bytes.
+            let bytes =
+                unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), written) };
+            break parse_modules(bytes, ansi_path)?;
+        };
+        if images.len() == expected {
+            return Ok(images);
+        }
+    }
+    Err(error(
+        "kernel module list and loaded driver count keep disagreeing",
+    ))
+}
+
 // Recent Windows releases require SeDebugPrivilege for non-null loaded-driver
 // bases. Enable only on a private impersonation token of this worker thread,
-// never on the process token. Revert before returning to the caller.
-fn loaded_images() -> Result<Vec<String>, WinError> {
+// never on the process token. Revert before returning to the caller. `None`:
+// this token cannot enable the privilege.
+fn debug_images() -> Result<Option<Vec<String>>, WinError> {
     // SAFETY: creates a thread token derived from the current process token.
     unsafe { ImpersonateSelf(SecurityImpersonation) }.map_err(WinError::windows)?;
     let result = (|| {
@@ -426,14 +593,13 @@ fn loaded_images() -> Result<Vec<String>, WinError> {
             // SAFETY: owned token and initialized privilege struct.
             unsafe { AdjustTokenPrivileges(token, false, Some(&state), 0, None, None) }
                 .map_err(WinError::windows)?;
-            if unsafe { GetLastError() } == ERROR_NOT_ALL_ASSIGNED {
-                return Err(error("loaded driver enumeration privilege unavailable"));
-            }
-            Ok(())
+            Ok(unsafe { GetLastError() } != ERROR_NOT_ALL_ASSIGNED)
         })();
         // SAFETY: owned token.
         let _ = unsafe { CloseHandle(token) };
-        privilege?;
+        if !privilege? {
+            return Ok(None);
+        }
         let mut bases = vec![std::ptr::null_mut::<c_void>(); 1024];
         loop {
             let mut needed = 0;
@@ -467,7 +633,7 @@ fn loaded_images() -> Result<Vec<String>, WinError> {
                 }
                 images.push(decode(&path[..n])?);
             }
-            return Ok(images);
+            return Ok(Some(images));
         }
     })();
     // SAFETY: discard this worker's temporary impersonation token.
@@ -951,5 +1117,110 @@ mod tests {
 
         assert!(inside(r"C:\STORE\HASH\DRIVER.SYS", r"C:\STORE\HASH"));
         assert!(!inside(r"C:\STORE\HASH2\DRIVER.SYS", r"C:\STORE\HASH"));
+    }
+
+    /// A `SystemModuleInformation` buffer with one entry per path.
+    fn modules(paths: &[&[u8]]) -> Vec<u8> {
+        let mut bytes = vec![0u8; MODULES_HEADER];
+        bytes[..4].copy_from_slice(&(paths.len() as u32).to_le_bytes());
+        for path in paths {
+            let mut entry = vec![0u8; MODULE_ENTRY];
+            let offset = path
+                .iter()
+                .rposition(|byte| *byte == b'\\')
+                .map_or(0, |slash| slash + 1) as u16;
+            entry[MODULE_NAME - 2..MODULE_NAME].copy_from_slice(&offset.to_le_bytes());
+            let len = path.len().min(MODULE_NAME_LEN);
+            entry[MODULE_NAME..MODULE_NAME + len].copy_from_slice(&path[..len]);
+            bytes.extend(entry);
+        }
+        bytes
+    }
+
+    #[test]
+    fn the_kernel_module_list_yields_complete_paths_or_fails() {
+        let paths: [&[u8]; 3] = [
+            br"\SystemRoot\system32\ntoskrnl.exe",
+            br"\SystemRoot\System32\drivers\wintun.sys",
+            br"\??\C:\Program Files\EasyTierDesk\cores\abc\WinDivert64.sys",
+        ];
+        let parsed = parse_modules(&modules(&paths), ansi_path).unwrap();
+        assert_eq!(
+            parsed,
+            paths
+                .iter()
+                .map(|path| String::from_utf8(path.to_vec()).unwrap())
+                .collect::<Vec<_>>()
+        );
+
+        let long = [b'a'; MODULE_NAME_LEN - 1];
+        let mut unterminated = modules(&[br"\SystemRoot\x.sys"]);
+        unterminated[MODULES_HEADER + MODULE_NAME..MODULES_HEADER + MODULE_ENTRY].fill(b'a');
+        let mut bad_offset = modules(&[br"\SystemRoot\x.sys"]);
+        bad_offset[MODULES_HEADER + MODULE_NAME - 2] = 3;
+        let mut short = modules(&[br"\SystemRoot\x.sys", br"\SystemRoot\y.sys"]);
+        short.truncate(short.len() - 1);
+        let mut none = modules(&[]);
+        none.resize(MODULES_HEADER + MODULE_ENTRY, 0);
+        for (bytes, expected) in [
+            (modules(&[b""]), "empty"),
+            (modules(&[&long]), "truncated"),
+            (unterminated, "unterminated"),
+            (bad_offset, "inconsistent"),
+            (modules(&[br"\??\C:\Drivers\caf?.sys"]), "not representable"),
+            (short, "count"),
+            (none, "count"),
+            (vec![1, 0], "short"),
+        ] {
+            let error = parse_modules(&bytes, ansi_path).unwrap_err();
+            assert!(error.message.contains(expected), "{}", error.message);
+        }
+        let error = parse_modules(&modules(&[b"\\SystemRoot\\\xff.sys"]), |_| {
+            Err(error("not valid in the ANSI code page"))
+        })
+        .unwrap_err();
+        assert!(error.message.contains("ANSI"), "{}", error.message);
+    }
+
+    #[test]
+    fn module_paths_normalize_like_registered_ones() {
+        let root = Path::new(r"C:\Windows");
+        for raw in [
+            r"\SystemRoot\System32\drivers\WinDivert64.sys",
+            r"\??\C:\Windows\System32\drivers\WinDivert64.sys",
+        ] {
+            assert_eq!(
+                normalized(&image_path(raw, root).unwrap()).unwrap(),
+                r"C:\WINDOWS\SYSTEM32\DRIVERS\WINDIVERT64.SYS"
+            );
+        }
+
+        // An 8.3 alias of a store file resolves inside the store, as the
+        // existing comparison canonicalizes before comparing.
+        use ::windows::{Win32::Storage::FileSystem::GetShortPathNameW, core::HSTRING};
+        let base = tempfile::Builder::new()
+            .prefix("etd driver store long name ")
+            .tempdir()
+            .unwrap();
+        let store = base.path().join("kernel store directory");
+        fs::create_dir_all(&store).unwrap();
+        let file = store.join("WinDivert64-long-name.sys");
+        fs::write(&file, b"driver").unwrap();
+        let mut buffer = vec![0u16; 32768];
+        let n = unsafe { GetShortPathNameW(&HSTRING::from(file.as_os_str()), Some(&mut buffer)) }
+            as usize;
+        assert!(n > 0 && n < buffer.len());
+        let short = decode(&buffer[..n]).unwrap();
+        let store_dir = normalized(&fs::canonicalize(&store).unwrap()).unwrap();
+        let path = image_path(&format!(r"\??\{short}"), root).unwrap();
+        let canonical = canonical_even_missing(&path, false).unwrap().unwrap();
+        assert!(
+            inside(&normalized(&canonical).unwrap(), &store_dir),
+            "{short} -> {} not inside {store_dir}",
+            canonical.display()
+        );
+        if short.eq_ignore_ascii_case(file.to_str().unwrap()) {
+            println!("8.3 names are disabled on this volume; checked the long form only");
+        }
     }
 }

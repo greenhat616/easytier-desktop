@@ -6,6 +6,8 @@ name: Release packages
 on:
   push:
     tags: ['v*']
+    # TEMPORARY (PK5 review): workflow_dispatch needs the file on main. Removed before merge.
+    branches: ['wbs/PK5-release']
   workflow_dispatch:
 
 permissions:

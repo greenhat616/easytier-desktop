@@ -450,7 +450,8 @@ mod tests {
     }
 
     /// Text in the FL5 gallery controls meets WCAG AA (4.5:1) on the fills
-    /// it sits on, and the accent selection pills reach 3:1 against theirs.
+    /// it sits on, and the accent selection pills and the scroll bar thumb
+    /// reach 3:1 against theirs.
     /// Pressed text (TextFillColorTertiary) is a momentary WinUI state and
     /// disabled text is exempt, so neither is checked.
     #[gpui_kit::test]
@@ -480,6 +481,16 @@ mod tests {
                             over(surface, surface),
                         ),
                         ("selected nav item", over(fg, surface), selected),
+                        (
+                            "Expander content",
+                            over(fg, surface),
+                            over(theme::card_fill_secondary(cx), surface),
+                        ),
+                        (
+                            "Expander header",
+                            over(fg, surface),
+                            over(theme::card_fill(cx), surface),
+                        ),
                     ];
                     for (what, text, fill) in pairs {
                         assert!(contrast(text, fill) >= 4.5, "{what} {mode:?}");
@@ -491,6 +502,13 @@ mod tests {
                     assert!(
                         contrast(over(accent, surface), over(surface, surface)) >= 3.,
                         "SelectorBar pill {mode:?}"
+                    );
+                    assert!(
+                        contrast(
+                            over(crate::views::layout::scroll_thumb(cx), surface),
+                            over(surface, surface)
+                        ) >= 3.,
+                        "scroll bar thumb {mode:?}"
                     );
                 }
                 for (what, fill) in [

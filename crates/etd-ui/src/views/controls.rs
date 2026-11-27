@@ -29,7 +29,7 @@ use gpui_kit::{
 use crate::theme::{self, ControlState};
 use crate::views::ui::{BtnStyle, action_button, keyboard_focus};
 
-type Handler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+pub type Handler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 pub(crate) type DismissHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 
 fn icon(path: &'static str, size: f32, color: Hsla) -> Icon {

@@ -76,6 +76,7 @@ enum Page {
     Menus,
     Dialogs,
     Navigation,
+    Layout,
 }
 
 struct Gallery {
@@ -208,6 +209,14 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
         "fluent/navigation.svg",
         cx,
     );
+    let layout = nav(
+        Page::Layout,
+        "gallery-nav-layout",
+        "Layout",
+        "fluent/grid.svg",
+        "fluent/grid.svg",
+        cx,
+    );
     let mut sidebar = Sidebar::new("gallery-sidebar")
         .w(px(220.))
         .h_full()
@@ -220,6 +229,7 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
         .child(menus)
         .child(dialogs)
         .child(navigation)
+        .child(layout)
         .child(settings);
     if !view.collapsed {
         sidebar = sidebar.footer(div().w_full().child(theme_menu(cx)));
@@ -569,6 +579,7 @@ impl Render for Gallery {
             Page::Menus => ("Menus & toolbars", pages::menus_page(self, cx)),
             Page::Dialogs => ("Dialogs & flyouts", pages::dialogs_page(self, cx)),
             Page::Navigation => ("Navigation", pages::navigation_page(self, cx)),
+            Page::Layout => ("Layout", pages::layout_page(self, window, cx)),
         };
         div()
             .id("gallery-root")
@@ -961,6 +972,36 @@ mod tests {
             window.press("escape", cx);
             window.render_frame(cx);
             assert!(window.try_find("dialog").is_none());
+
+            // Layout: the Expander header toggles by click and by keyboard.
+            window.click("gallery-nav-layout", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_layout(), [true, false]);
+            assert!(window.find("layout-expander-content").visible());
+            assert_eq!(
+                window.find("layout-expander-header").bounds().size.height,
+                px(48.)
+            );
+            window.click("layout-expander-header", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("layout-expander-content").is_none());
+            tab_to(window, "layout-expander-2-header", cx);
+            window.press("enter", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_layout(), [false, true]);
+            assert_eq!(
+                window.find("layout-expander-2-header").expanded(),
+                Some(true)
+            );
+            // StackPanel: 40 px squares 8 apart, then laid out in a row.
+            let stack = window.find("layout-stack").bounds();
+            assert_eq!(stack.size.height, px(4. * 40. + 3. * 8.));
+            window.click("layout-orientation-0", cx);
+            window.render_frame(cx);
+            let stack = window.find("layout-stack").bounds();
+            assert_eq!(stack.size.height, px(40.));
+            // ScrollViewer: the area is 200 tall and its content overflows.
+            assert_eq!(window.find("layout-scroll").bounds().size.height, px(200.));
         })
         .unwrap();
     }
@@ -1188,6 +1229,18 @@ mod tests {
             cx.capture_screenshot(handle)
                 .unwrap()
                 .save(output.join(format!("gallery-dialogs-{name}-dialog.png")))
+                .unwrap();
+            // Layout page.
+            cx.update_window(handle, |_, window, cx| {
+                window.click("gallery-nav-layout", cx);
+                window.render_frame(cx);
+                assert!(window.find("layout-grid").visible());
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(format!("gallery-layout-{name}.png")))
                 .unwrap();
             // Navigation page.
             cx.update_window(handle, |_, window, cx| {

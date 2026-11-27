@@ -25,6 +25,7 @@ use crate::views::{
         split_button, toggle_button,
     },
     dialogs::{DialogButtons, DialogResult, content_dialog, flyout_panel, teaching_tip},
+    layout::{expander, scroll_viewer},
     menus::{BarCommand, MenuCheck, MenuEntry, MenuHandler, MenuItem, command_bar, menu_flyout},
     navigation::{IndexHandler, Tab, breadcrumb_bar, nav_view_item, selector_bar, tab_view},
     ui::{BtnStyle, action_button, settings_switch},
@@ -75,6 +76,11 @@ pub(super) struct DemoState {
     tabs: Vec<usize>,
     tab_selected: usize,
     next_tab: usize,
+    layout_open: [bool; 2],
+    stack_horizontal: bool,
+    stack_spacing: Entity<SliderState>,
+    grid_columns: Entity<SliderState>,
+    grid_rows: Entity<SliderState>,
 }
 
 impl DemoState {
@@ -93,6 +99,9 @@ impl DemoState {
                 .max(100.)
                 .default_value(SliderValue::Single(60.))
         });
+        let stack_spacing = spacing_slider(8., cx);
+        let grid_columns = spacing_slider(8., cx);
+        let grid_rows = spacing_slider(8., cx);
         let number = cx.new(|cx| InputState::new(window, cx).placeholder("0"));
         number.update(cx, |input, cx| input.set_value("12", window, cx));
         Self {
@@ -126,6 +135,11 @@ impl DemoState {
             tabs: vec![0, 1, 2],
             tab_selected: 0,
             next_tab: 3,
+            layout_open: [true, false],
+            stack_horizontal: false,
+            stack_spacing,
+            grid_columns,
+            grid_rows,
         }
     }
 }
@@ -143,6 +157,9 @@ impl Gallery {
     }
     pub(super) fn demo_dialog_result(&self) -> SharedString {
         self.demo.dialog_result.clone()
+    }
+    pub(super) fn demo_layout(&self) -> [bool; 2] {
+        self.demo.layout_open
     }
     pub(super) fn demo_nav(&self) -> (usize, usize, usize, usize) {
         (
@@ -1185,4 +1202,211 @@ fn index_handler(
         })
         .ok();
     })
+}
+
+/// The four squares of WinUI Gallery's StackPanel and Grid samples
+/// (StackPanelPage.xaml, GridPage.xaml: Red, Blue, Green, Yellow).
+const SAMPLE_FILLS: [u32; 4] = [0xFF0000, 0x0000FF, 0x008000, 0xFFFF00];
+
+fn spacing_slider(value: f32, cx: &mut Context<Gallery>) -> Entity<SliderState> {
+    // WinUI Gallery's spacing sliders: 0–16 in steps of 1, starting at 8.
+    let state = cx.new(|_| {
+        SliderState::new()
+            .min(0.)
+            .max(16.)
+            .step(1.)
+            .default_value(SliderValue::Single(value))
+    });
+    cx.observe(&state, |_, _, cx| cx.notify()).detach();
+    state
+}
+
+#[inline(never)]
+pub(super) fn layout_page(
+    view: &Gallery,
+    window: &mut Window,
+    cx: &mut Context<Gallery>,
+) -> Vec<AnyElement> {
+    let demo = &view.demo;
+    let fg = cx.theme().foreground;
+    let toggle = |ix: usize, cx: &mut Context<Gallery>| -> crate::views::controls::Handler {
+        Rc::new(cx.listener(move |this, _, _, cx| {
+            this.demo.layout_open[ix] = !this.demo.layout_open[ix];
+            cx.notify();
+        }))
+    };
+    let expanders = div()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .w(px(480.))
+        .child(expander(
+            "layout-expander",
+            "This text is in the header",
+            div().child("This is in the content").into_any_element(),
+            demo.layout_open[0],
+            toggle(0, cx),
+            cx,
+        ))
+        .child(expander(
+            "layout-expander-2",
+            "Expander with a longer body",
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child("The content grows with what it holds.")
+                .child("Closed, only the header shows.")
+                .into_any_element(),
+            demo.layout_open[1],
+            toggle(1, cx),
+            cx,
+        ))
+        .into_any_element();
+
+    // StackPanelPage.xaml: 40x40 squares.
+    let square = |fill: u32| div().size(px(40.)).flex_shrink_0().bg(gpui_kit::rgb(fill));
+    let stack_spacing = demo.stack_spacing.read(cx).value().end();
+    let mut stack = div()
+        .id("layout-stack")
+        .test_support()
+        .flex()
+        .gap(px(stack_spacing));
+    stack = if demo.stack_horizontal {
+        stack.flex_row()
+    } else {
+        stack.flex_col()
+    };
+    let stack = stack.children(SAMPLE_FILLS.map(square));
+    let orientation = fluent_radio_group(
+        "layout-orientation",
+        "Orientation",
+        &["Horizontal", "Vertical"],
+        if demo.stack_horizontal { 0 } else { 1 },
+        false,
+        cx.listener(|this, ix: &usize, _, cx| {
+            this.demo.stack_horizontal = *ix == 0;
+            cx.notify();
+        }),
+        cx,
+    );
+    let stack_slider = fluent_slider(
+        "layout-stack-spacing",
+        "Spacing",
+        &demo.stack_spacing,
+        false,
+        window,
+        cx,
+    );
+    let stack_row = div()
+        .flex()
+        .flex_row()
+        .gap(px(48.))
+        .child(div().w(px(240.)).child(stack))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .w(px(240.))
+                .child(orientation)
+                .child(stack_slider)
+                .child(SharedString::from(format!("Spacing: {stack_spacing:.0}"))),
+        )
+        .into_any_element();
+
+    let col = demo.grid_columns.read(cx).value().end();
+    let row = demo.grid_rows.read(cx).value().end();
+    // GridPage.xaml: a 240x160 grid of 3 columns and 3 rows with 50x50
+    // squares in four of its cells.
+    let cell = |fill: Option<u32>| {
+        let c = div().h(px(50.)).w(px(50.));
+        match fill {
+            Some(f) => c.bg(gpui_kit::rgb(f)),
+            None => c,
+        }
+    };
+    let grid = div()
+        .id("layout-grid")
+        .test_support()
+        .w(px(240.))
+        .h(px(160.))
+        .grid()
+        .grid_cols(3)
+        .gap_x(px(col))
+        .gap_y(px(row))
+        .child(cell(Some(SAMPLE_FILLS[0])))
+        .child(cell(None))
+        .child(cell(Some(SAMPLE_FILLS[1])))
+        .child(cell(None))
+        .child(cell(Some(SAMPLE_FILLS[2])))
+        .child(cell(None))
+        .child(cell(None))
+        .child(cell(None))
+        .child(cell(Some(SAMPLE_FILLS[3])));
+    let col_slider = fluent_slider(
+        "layout-grid-columns",
+        "ColumnSpacing",
+        &demo.grid_columns,
+        false,
+        window,
+        cx,
+    );
+    let row_slider = fluent_slider(
+        "layout-grid-rows",
+        "RowSpacing",
+        &demo.grid_rows,
+        false,
+        window,
+        cx,
+    );
+    let grid_row = div()
+        .flex()
+        .flex_row()
+        .gap(px(48.))
+        .child(grid)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .w(px(240.))
+                .child(col_slider)
+                .child(row_slider),
+        )
+        .into_any_element();
+
+    let lines = (1..=24).map(|n| {
+        div()
+            .py(px(6.))
+            .text_size(px(14.))
+            .line_height(px(20.))
+            .text_color(fg)
+            .child(SharedString::from(format!("Item {n}")))
+    });
+    let scroller = div()
+        .w(px(320.))
+        .rounded(px(4.))
+        .border_1()
+        .border_color(crate::theme::card_stroke(cx))
+        .child(scroll_viewer(
+            "layout-scroll",
+            200.,
+            div()
+                .px(px(12.))
+                .flex()
+                .flex_col()
+                .children(lines)
+                .into_any_element(),
+            window,
+            cx,
+        ))
+        .into_any_element();
+
+    vec![
+        section("Expander", [expanders], cx),
+        section("StackPanel", [stack_row], cx),
+        section("Grid", [grid_row], cx),
+        section("ScrollViewer", [scroller], cx),
+    ]
 }

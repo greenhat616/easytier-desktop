@@ -89,7 +89,7 @@ uninstall. They refuse to run outside a GitHub-hosted runner. See the
 
 | Workflow | Trigger | Jobs |
 | --- | --- | --- |
-| `ci.yml` | Every push and pull request | `boundaries` (rustfmt, `check-boundaries`); `contract` (`buf lint`, `buf breaking` against the start of the change); `check` on Windows, macOS and Linux (Clippy `-D warnings`, `nextest --profile ci`, `session_real` against the release kernel, doc tests); `privileged-install` on all three (on Linux and macOS also the root-only `etd-ipc` socket tests and tier 2's service-form case); `dependencies` (`cargo deny`) |
+| `ci.yml` | Every push and pull request | `boundaries` (rustfmt, `check-boundaries`); `contract` (`buf lint`, `buf breaking` against `freeze-v1` and against the start of the change); `check` on Windows, macOS and Linux (Clippy `-D warnings`, `nextest --profile ci`, `session_real` against the release kernel, doc tests); `privileged-install` on all three (on Linux and macOS also the root-only `etd-ipc` socket tests and tier 2's service-form case); `dependencies` (`cargo deny`) |
 | `o1-windows.yml` | Windows adapter branch, manual | Windows privileged adapters with the bundled release kernel and its Wintun |
 | `o2-linux.yml` | Linux adapter branch, manual | Linux privileged adapters, distribution parser matrix (Debian 12, Fedora), kernel capability check |
 | `o3-macos.yml` | macOS adapter branch, manual | macOS PF, utun, resolver and service reinstall |

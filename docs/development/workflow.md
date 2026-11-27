@@ -46,10 +46,10 @@ same commit.
 
 ## Checks
 
-Run these before pushing; CI runs all of them. Locally, run the two `buf` checks
-whenever you touch the contract. CI's `contract` job runs `buf lint` and `buf breaking`
-against the start of the change (the merge base with `main`, or `main`'s previous
-commit), so every change is checked once.
+Run these before pushing; CI runs all of them. Locally, run the `buf` checks
+whenever you touch the contract. CI's `contract` job runs `buf lint`, and `buf breaking`
+against `freeze-v1` and against the start of the change (the merge base with `main`,
+or `main`'s previous commit).
 
 | Check | Command |
 | --- | --- |
@@ -62,7 +62,7 @@ commit), so every change is checked once.
 | Repository tests | `cargo nextest run --locked -p xtask` |
 | Dependency policy | `cargo deny --locked check` |
 | Contract lint | `buf lint` |
-| Contract compatibility | `buf breaking --against ".git#ref=$(git merge-base origin/main HEAD)"` |
+| Contract compatibility | `buf breaking --against '.git#tag=freeze-v1'` and `buf breaking --against ".git#ref=$(git merge-base origin/main HEAD)"` |
 
 ### CI first
 
@@ -126,9 +126,10 @@ How a change is approved:
   Never edit generated code.
 - Every RPC method declares `(etd.v1.required_role)`; `etd_contract::required_role`
   reads the same table.
-- Within `etd.v1` only additive changes are allowed. `buf breaking` against the
-  start of the change must pass. Against the `freeze-v1` tag it reports the two
-  `NetworkFlags` fields that `3dcf200` gave explicit presence (wire compatible).
+- Within `etd.v1` only additive changes are allowed. `buf breaking` against
+  `freeze-v1` and against the start of the change must pass. `buf.yaml` exempts
+  `host.proto` from `FIELD_SAME_CARDINALITY` for the two `NetworkFlags` fields that
+  `3dcf200` gave explicit presence (wire compatible, approved).
 - The descriptor baseline `crates/etd-contract/tests/baseline/etd.v1.txt` is checked
   by the tests. After an approved additive change, regenerate it with
   `ETD_UPDATE_BASELINE=1 cargo nextest run -p etd-contract` and include the diff in

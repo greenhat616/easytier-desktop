@@ -479,7 +479,7 @@ fn loaded_images() -> Result<Vec<String>, WinError> {
     result
 }
 
-fn windows_dir() -> Result<PathBuf, WinError> {
+pub(super) fn windows_dir() -> Result<PathBuf, WinError> {
     let mut buffer = vec![0u16; 32768];
     // SAFETY: buffer is writable.
     let n = unsafe { GetSystemWindowsDirectoryW(Some(&mut buffer)) } as usize;

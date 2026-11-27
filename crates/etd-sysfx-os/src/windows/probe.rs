@@ -1,31 +1,23 @@
 //! Probe a live listener from an identity the fence must refuse. No saved
-//! account password, arbitrary executable, or caller-provided script.
+//! account password, child process, or script: a dedicated host thread
+//! impersonates the identity, checks that its effective token really is
+//! that identity, and connects once. Only an explicit refusal (the
+//! connect's own WSAEACCES) counts.
 //!
-//! - System service: a PowerShell probe logged on as LocalService.
-//! - Elevated session: no child process at all. A dedicated host thread
-//!   impersonates a restricted Medium copy of the host token
-//!   (Administrators deny-only), checks that its effective token is that
-//!   identity, and connects. A child process of the same user could be
-//!   ended by any of the user's processes with the "refused" exit code, and
-//!   a PowerShell child reads the user's profile and HKCU; neither applies
-//!   to a thread of the host. Only an explicit refusal counts.
+//! - System service: the built-in LocalService logon (not SYSTEM, no
+//!   enabled Administrators, System integrity).
+//! - Elevated session: a restricted Medium copy of the host token
+//!   (Administrators deny-only). A child process of the same user could be
+//!   ended by any of the user's processes with the "refused" exit code;
+//!   that does not apply to a thread of the host.
 use super::{
-    FenceForm, WinError, encoded_command, execution::Environment, registry::Handle, token,
+    FenceForm, WinError,
+    registry::Handle,
+    token::{self, ProbeIdentity},
 };
-use ::windows::{
-    Win32::{
-        Foundation::{HANDLE, WAIT_OBJECT_0},
-        Security::{LOGON32_LOGON_SERVICE, LOGON32_PROVIDER_DEFAULT, LogonUserW, RevertToSelf},
-        System::Threading::{
-            CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetExitCodeProcess,
-            PROCESS_INFORMATION, STARTUPINFOW, SetThreadToken, TerminateProcess,
-            WaitForSingleObject,
-        },
-    },
-    core::{HSTRING, PCWSTR, PWSTR},
-};
+use ::windows::Win32::{Security::RevertToSelf, System::Threading::SetThreadToken};
 use etd_sysfx::{DirectionResult, FenceError};
-use std::{net::SocketAddr, path::Path};
+use std::net::SocketAddr;
 
 /// WSAEACCES: the connection was refused by a filter, not by the listener.
 const ACCESS_DENIED: i32 = 10013;
@@ -61,63 +53,41 @@ fn connect_once(address: SocketAddr, form: FenceForm) -> Result<DirectionResult,
 }
 
 fn service_probe(address: SocketAddr) -> Result<DirectionResult, FenceError> {
-    let error = |e: ::windows::core::Error| FenceError::Probe(e.to_string());
-    let mut token = HANDLE::default();
-    // LogonUserW documents this exact built-in LocalService logon, which
-    // provides an identity distinct from SYSTEM without storing credentials.
-    // https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-logonuserw
-    unsafe {
-        LogonUserW(
-            &HSTRING::from("LocalService"),
-            &HSTRING::from("NT AUTHORITY"),
-            PCWSTR::null(),
-            LOGON32_LOGON_SERVICE,
-            LOGON32_PROVIDER_DEFAULT,
-            &mut token,
-        )
-        .map_err(error)?;
-    }
-    let token = Handle(token);
-    let environment = Environment::new().map_err(WinError::fence)?;
-    let family = if address.is_ipv6() {
-        "InterNetworkV6"
-    } else {
-        "InterNetwork"
-    };
-    let code = format!(
-        "$ErrorActionPreference='Stop'; if ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -ne 'S-1-5-19') {{ exit 3 }}; $s=$null; try {{ $s=[Net.Sockets.Socket]::new([Net.Sockets.AddressFamily]::{family},[Net.Sockets.SocketType]::Stream,[Net.Sockets.ProtocolType]::Tcp); $s.Connect([ipaddress]'{}',{}); exit 0 }} catch {{ $e=$_.Exception; while ($e -and $e -isnot [Net.Sockets.SocketException]) {{ $e=$e.InnerException }}; if ($e) {{ exit ([int]$e.NativeErrorCode) }}; exit 2 }} finally {{ if ($s) {{ $s.Dispose() }} }}",
-        address.ip(),
-        address.port()
-    );
-    let command = format!(
-        "\"{}\" -NoProfile -NonInteractive -EncodedCommand {}",
-        environment.exe.display(),
-        encoded_command(&code)
-    );
-    let rc = run(
-        &token,
-        &environment.exe,
-        &command,
-        &environment.block(),
-        &environment.cwd,
-    )?;
-    Ok(match rc {
-        0 => DirectionResult::Connected,
-        10013 => DirectionResult::Refused,
-        _ => DirectionResult::Error(format!("unprivileged probe exit {rc}")),
+    on_probe_thread(address, || {
+        Ok((
+            token::local_service_impersonation()?,
+            Box::new(ProbeIdentity::is_local_service) as Check,
+        ))
     })
 }
 
 fn session_probe(address: SocketAddr) -> Result<DirectionResult, FenceError> {
-    // A fresh thread: impersonation never leaks into a pooled one. The
-    // token is made on it, so no handle crosses threads.
+    on_probe_thread(address, || {
+        let token = token::restricted_impersonation()?;
+        let user = token::host_user()?;
+        Ok((
+            token,
+            Box::new(move |identity: &ProbeIdentity| identity.is_non_elevated(&user)) as Check,
+        ))
+    })
+}
+
+/// Whether the probe thread's effective identity is the expected one.
+type Check = Box<dyn Fn(&ProbeIdentity) -> bool>;
+
+/// On a fresh thread (impersonation never leaks into a pooled one, and the
+/// token is made on it, so no handle crosses threads): make the token,
+/// impersonate, check, connect, revert. The connect is bounded by
+/// TCP_MAXRT, so the join is too.
+fn on_probe_thread(
+    address: SocketAddr,
+    make: impl FnOnce() -> Result<(Handle, Check), WinError> + Send + 'static,
+) -> Result<DirectionResult, FenceError> {
     std::thread::Builder::new()
         .name("etd-fence-probe".into())
         .spawn(move || {
-            let probe = |e: WinError| FenceError::Probe(e.to_string());
-            let token = token::restricted_impersonation().map_err(probe)?;
-            let user = token::host_user().map_err(probe)?;
-            impersonated_connect(address, &token, &user)
+            let (token, check) = make().map_err(|e| FenceError::Probe(e.to_string()))?;
+            impersonated_connect(address, &token, &*check)
         })
         .map_err(|e| FenceError::Probe(e.to_string()))?
         .join()
@@ -129,15 +99,15 @@ fn session_probe(address: SocketAddr) -> Result<DirectionResult, FenceError> {
 fn impersonated_connect(
     address: SocketAddr,
     token: &Handle,
-    user: &str,
+    check: &dyn Fn(&ProbeIdentity) -> bool,
 ) -> Result<DirectionResult, FenceError> {
     // SAFETY: `token` is an impersonation token with TOKEN_IMPERSONATE.
     unsafe { SetThreadToken(None, Some(token.0)) }
         .map_err(|e| FenceError::Probe(format!("impersonate the probe identity: {e}")))?;
     let verdict = match token::thread_identity() {
-        Ok(identity) if identity.is_non_elevated(user) => connect_verdict(address),
+        Ok(identity) if check(&identity) => connect_verdict(address),
         Ok(identity) => DirectionResult::Error(format!(
-            "probe thread is not the restricted identity: {identity:?}"
+            "probe thread is not the expected identity: {identity:?}"
         )),
         Err(e) => DirectionResult::Error(format!("probe thread identity: {e}")),
     };
@@ -277,58 +247,4 @@ fn connect_verdict(address: SocketAddr) -> DirectionResult {
     // SAFETY: balances the successful WSAStartup above.
     unsafe { WSACleanup() };
     verdict
-}
-
-/// Start `exe` with `token`, wait for it and return its exit code.
-fn run(
-    token: &Handle,
-    exe: &Path,
-    command: &str,
-    block: &[u16],
-    cwd: &Path,
-) -> Result<u32, FenceError> {
-    let error = |e: ::windows::core::Error| FenceError::Probe(e.to_string());
-    let mut command: Vec<u16> = command.encode_utf16().chain(Some(0)).collect();
-    let startup = STARTUPINFOW {
-        cb: size_of::<STARTUPINFOW>() as u32,
-        ..Default::default()
-    };
-    let mut process = PROCESS_INFORMATION::default();
-    // SAFETY: every pointer refers to a live, NUL-terminated buffer of this
-    // frame; the block is a double-NUL-terminated Unicode environment; the
-    // returned handles are owned by `Handle` below.
-    unsafe {
-        CreateProcessAsUserW(
-            Some(token.0),
-            &HSTRING::from(exe.as_os_str()),
-            Some(PWSTR(command.as_mut_ptr())),
-            None,
-            None,
-            false,
-            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-            Some(block.as_ptr().cast()),
-            &HSTRING::from(cwd.as_os_str()),
-            &startup,
-            &mut process,
-        )
-        .map_err(error)?;
-    }
-    let process_handle = Handle(process.hProcess);
-    let _thread = Handle(process.hThread);
-    unsafe {
-        if WaitForSingleObject(process_handle.0, 10000) != WAIT_OBJECT_0 {
-            // Reap the process even when the deadline expired. Termination
-            // can race normal exit, so wait for the actual process object.
-            let killed = TerminateProcess(process_handle.0, 2);
-            if WaitForSingleObject(process_handle.0, 5000) != WAIT_OBJECT_0 {
-                return Err(FenceError::Probe(format!(
-                    "probe timed out; termination not confirmed: {killed:?}"
-                )));
-            }
-            return Err(FenceError::Probe("probe timed out; child reaped".into()));
-        }
-        let mut rc = 0;
-        GetExitCodeProcess(process_handle.0, &mut rc).map_err(error)?;
-        Ok(rc)
-    }
 }

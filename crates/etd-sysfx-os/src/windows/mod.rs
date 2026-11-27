@@ -11,6 +11,27 @@ pub fn remove_service_boot_marker() -> Result<(), crate::OsError> {
         message: e.message,
     })
 }
+/// Whether firewall cleanup supports this Windows build (doc#17 v2): `Err`
+/// carries [`FIREWALL_UNSUPPORTED_BUILD`] on a build the parity gate has not
+/// passed on. For doctor.
+pub fn firewall_cleanup_supported() -> Result<(), crate::OsError> {
+    native::firewall_supported().map_err(|e| crate::OsError::Os {
+        code: e.code,
+        message: e.message,
+    })
+}
+/// The message prefix of the error firewall operations fail with on an
+/// untested Windows build.
+pub const FIREWALL_UNSUPPORTED_BUILD: &str = native::UNSUPPORTED_BUILD;
+/// Disposable CI runners only: one management request answered by the
+/// native operations, for the parity gate.
+#[cfg(feature = "ci-test-fixtures")]
+pub fn native_rows(request: &Value) -> Result<Vec<Value>, crate::OsError> {
+    native::run(request).map_err(|e| crate::OsError::Os {
+        code: e.code,
+        message: e.message,
+    })
+}
 /// Disposable CI runners only: the management worker's own report of its
 /// environment, loaded modules and runtime settings, for the elevated
 /// session input tests. Uses the worker profile `adapters()` set.
@@ -32,6 +53,7 @@ pub fn worker_diagnostics() -> Result<Value, crate::OsError> {
 mod execution;
 mod interfaces;
 mod magic;
+mod native;
 mod probe;
 mod registry;
 mod token;
@@ -46,7 +68,7 @@ use serde_json::{Value, json};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use uuid::Uuid;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[error("Windows error {code}: {message}")]
 struct WinError {
     code: i64,
@@ -134,16 +156,32 @@ fn encoded_command(script: &str) -> String {
     out
 }
 /// See [`crate::shutdown_helpers`].
-pub(crate) const HELPERS_SHUTDOWN_WORST: Duration = execution::SHUTDOWN_WORST;
-/// See [`crate::shutdown_helpers`].
+pub(crate) const HELPERS_SHUTDOWN_WORST: Duration =
+    if native::SHUTDOWN_WAIT.as_millis() > execution::SHUTDOWN_WORST.as_millis() {
+        native::SHUTDOWN_WAIT
+    } else {
+        execution::SHUTDOWN_WORST
+    };
+/// See [`crate::shutdown_helpers`]: the firewall thread's call in flight
+/// and the PowerShell workers, together.
 pub(crate) fn shutdown_helpers() -> Result<(), crate::OsError> {
-    execution::shutdown().map_err(|e| crate::OsError::Os {
+    let (firewall, workers) = std::thread::scope(|s| {
+        let workers = s.spawn(execution::shutdown);
+        let firewall = native::shutdown();
+        (
+            firewall,
+            workers
+                .join()
+                .unwrap_or_else(|_| Err(WinError::invalid("worker shutdown panicked"))),
+        )
+    });
+    firewall.and(workers).map_err(|e| crate::OsError::Os {
         code: e.code,
         message: e.message,
     })
 }
 async fn query(request: Value) -> Result<Vec<Value>, WinError> {
-    blocking(move || execution::run(request)).await
+    blocking(move || native::run(&request)).await
 }
 async fn single(request: Value) -> Result<Value, WinError> {
     let mut rows = query(request).await?;

@@ -24,10 +24,7 @@ use std::os::windows::io::AsRawHandle;
 use std::{
     ffi::OsString,
     io::{Read, Seek, SeekFrom},
-    os::windows::{
-        ffi::{OsStrExt, OsStringExt},
-        process::CommandExt,
-    },
+    os::windows::{ffi::OsStringExt, process::CommandExt},
     path::{Component, Path, PathBuf, Prefix},
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -334,19 +331,6 @@ impl Environment {
             cwd,
             vars,
         })
-    }
-    pub fn block(&self) -> Vec<u16> {
-        // Windows requires a case-insensitively sorted, double-NUL terminated
-        // Unicode environment block for CreateProcessAsUserW.
-        let mut out = Vec::new();
-        for (name, value) in &self.vars {
-            out.extend(name.encode_wide());
-            out.push(b'=' as u16);
-            out.extend(value.encode_wide());
-            out.push(0);
-        }
-        out.push(0);
-        out
     }
     fn command(&self) -> Command {
         let mut cmd = Command::new(&self.exe);

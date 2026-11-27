@@ -1,9 +1,9 @@
 # Packaging
 
 Release packages are built by `cargo xtask dist` (see [`xtask/README.md`](../../xtask/README.md)).
-This release builds the Windows MSI (PK3). Linux `.deb`/`.rpm`/Arch packages come with PK4,
-the release workflow with PK5; macOS is not packaged this release. The plan is doc#16 v2
-in topic#53.
+This release builds the Windows MSI (PK3) and Linux `.deb`/`.rpm`/Arch packages (PK4); the
+release workflow comes with PK5, and macOS is not packaged this release. The plan is
+doc#16 v2 in topic#53.
 
 ## Two folders
 
@@ -144,6 +144,87 @@ App Paths, product registration). What happens to the service:
   version (or any upgrade package): with no service present it runs `etd-host install`
   instead of `upgrade`. Or uninstall the product and install it again.
 
+## Linux packages
+
+`packaging/linux/nfpm.yaml.tmpl` is rendered by `cargo xtask dist` and built with
+**nfpm 2.49.0** into three packages from one definition: `easytier-desktop_<v>-1_amd64.deb`,
+`easytier-desktop-<v>-1.x86_64.rpm` and `easytier-desktop-<v>-1-x86_64.pkg.tar.zst` (Arch).
+They are unsigned this release (the sign hook is a no-op).
+
+| Path | What |
+| --- | --- |
+| `/usr/lib/easytier-desktop/` | `etd-ui`, `etd-host`, `etd-ctl`, `cores/<version>/easytier-core` (the payload) |
+| `/usr/bin/easytier-desktop`, `/usr/bin/etd-ctl` | links into the payload |
+| `/usr/share/applications/easytier-desktop.desktop` | desktop entry |
+| `/usr/share/icons/hicolor/*/apps/easytier-desktop.{png,svg}` | icons |
+
+No systemd unit is packaged: `etd-host install` writes
+`/etc/systemd/system/easytier-desk-host.service`, creates the `easytier-desk` group and the
+protected folder `/usr/local/lib/easytier-desk`, and starts the service. State lives in
+`/var/lib/easytier-desk`, the maintenance lock in `/var/lib/easytier-desk-maintenance`.
+
+### Building
+
+```sh
+cargo build --release -p etd-ui -p etd-host -p etd-ctl
+cargo xtask fetch-cores --target host
+# nfpm 2.49.0 on PATH (https://github.com/goreleaser/nfpm/releases/tag/v2.49.0)
+cargo xtask dist        # target/dist/x86_64-unknown-linux-gnu/*.deb, *.rpm, *.pkg.tar.zst
+```
+
+Build on the oldest distribution you support (doc#16 plans Ubuntu 22.04 for PK5): the
+binaries need that glibc or newer.
+
+### Maintainer scripts
+
+`packaging/linux/scripts/maintainer.sh` is rendered once per format and hook. Every hook
+runs the payload's `etd-host`; a service is tagged with the owner `easytier-desktop-package`
+when the package installs it, and the package upgrades or removes only a service with that
+tag.
+
+| Step | deb | rpm | Arch | Runs |
+| --- | --- | --- | --- | --- |
+| before unpacking a first install | `preinst install` | `%pre` with `1` | none | refuses if the service already exists |
+| first install | `postinst configure` (no old version) | `%post` with `1` | `post_install` | `etd-host install --owner easytier-desktop-package` |
+| upgrade | `postinst configure <old>` | `%post` with `2`+ | `post_upgrade` | `etd-host upgrade --only-owner easytier-desktop-package` |
+| full removal | `prerm remove` | `%preun` with `0` | `pre_remove` | `etd-host uninstall --only-owner easytier-desktop-package` |
+| the old package during an upgrade | `prerm upgrade` | `%preun` with `1` | (not called) | nothing: the ledger and allow list stay |
+
+- **An upgrade with no service** (it was uninstalled by hand, or systemd was missing when
+  the package was installed): the hook runs `etd-host install` instead and says so.
+- **A service that already exists** (installed with the CLI): deb and rpm refuse before
+  anything is unpacked and name the command to remove it
+  (`/usr/local/lib/easytier-desk/etd-host uninstall`). pacman cannot abort from a hook, so
+  on Arch `post_install` leaves that service alone, prints how to remove it or let the
+  package manage it, and the package's upgrades and removal leave it alone too.
+- **No systemd** (a container): every hook prints a notice and succeeds; run
+  `/usr/lib/easytier-desktop/etd-host install` on a systemd host.
+
+### What a failed hook leaves behind
+
+Package managers do not restore files when a script fails.
+
+- **First install fails** (`etd-host install` exits non-zero): `etd-host install` rolls
+  back what it created; dpkg leaves the package unpacked but half-configured (`iF`), rpm
+  reports the scriptlet failure with the package installed. Fix the cause, then
+  `dpkg --configure -a` (or reinstall), or remove the package.
+- **Upgrade fails** (`etd-host upgrade` exits non-zero): `etd-host upgrade` restores and
+  restarts the previous service, which keeps running its own image from the protected
+  folder. The new payload stays unpacked: dpkg marks the package half-configured. Once
+  the cause is gone, `dpkg --configure -a` reruns the postinst and completes the upgrade
+  (the deb suite checks both).
+- **Removal fails** (`etd-host uninstall` exits non-zero): dpkg and rpm keep the package
+  installed; run the removal again, `etd-host uninstall` resumes from its journal. pacman
+  removes the files anyway: run `/usr/local/lib/easytier-desk/etd-host uninstall`.
+
+### Dependencies
+
+The Depends lists in `xtask/src/dist/linux.rs` name the libraries the release binaries
+load (`ldd`, mapped to Ubuntu packages by `dpkg -S` in the privileged `deb` job, which
+prints them) and the tools `etd-host` runs (`nftables`, `iproute2`). The deb names are
+installed by that job; the rpm and Arch names are their equivalents and are not
+installed by any test yet (PK5).
+
 ## Application icons
 
 The Triad application and tray icon assets live under `packaging/assets/icons/` (documented in [`packaging/assets/README.md`](../../packaging/assets/README.md)):
@@ -165,3 +246,13 @@ Installer); and an uninstall compared with the machine before install. Those tes
 packages carry the CI upgrade fault (`ci-test-fixtures`) and a debug `etd-ui`; without
 `--allow-test-fixtures`, `dist` refuses both, and the workflow checks that it refuses
 that `etd-host` (PK5 also checks the release artifacts).
+
+The `deb` suite (`tests/tier3/deb.py`) builds three test packages the same way and runs
+them on a fresh Ubuntu runner: a package over a CLI-installed service is refused by its
+preinst and the service keeps serving; a first install with its payload, links, desktop
+entry and icons, recorded as owned by the package; an upgrade keeping install id,
+install key and ledger settings; an upgrade whose new host never serves (rolled back by
+`etd-host`, the old service keeps serving, dpkg leaves the package half-configured) and
+its completion by `dpkg --configure -a`; and a purge compared with the machine before
+install. Every hook branch of the three formats, Arch `pre_remove` with a version
+argument included, is run against a stub `etd-host` by xtask's unit tests on Linux.

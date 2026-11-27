@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=EasyTier Desktop
+GenericName=Mesh VPN
+Comment=Manage EasyTier networks
+Exec=easytier-desktop
+Icon=easytier-desktop
+Terminal=false
+Categories=Network;
+Keywords=EasyTier;VPN;mesh;network;
+StartupWMClass=easytier-desktop

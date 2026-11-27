@@ -11,15 +11,17 @@
 //!    `packaging/<platform>/` and, unless `--dry-run`, runs its tool.
 //! 4. The sign hook runs over the package; v1 ships unsigned (issue #2).
 //!
-//! A packager is one module (`windows`; `linux` comes with PK4) with a
-//! `package(root, &Payload, dry_run)` function.
+//! A packager is one module (`windows`, `linux`) with a
+//! `package(root, &Payload, dry_run)` function returning what it built.
 
 mod cores;
+mod linux;
 mod sign;
 mod windows;
 
 use crate::fetch_cores::{self, LOCK, PIN};
 use anyhow::{Context, Result, bail, ensure};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -252,22 +254,48 @@ pub fn run(root: &Path, args: Args) -> Result<()> {
         out,
         test_build: args.allow_test_fixtures,
     };
-    let package = if payload.is_windows() {
+    let packages: Vec<PathBuf> = if payload.is_windows() {
         windows::package(root, &payload, args.dry_run)?
+            .into_iter()
+            .collect()
+    } else if payload.triple.contains("-linux-") {
+        linux::package(root, &payload, args.dry_run)?
     } else {
         bail!(
-            "no packager for {} yet (Linux: PK4; macOS: not this release)",
+            "no packager for {} (macOS is not packaged this release)",
             payload.triple
         );
     };
-    match package {
-        Some(package) => {
-            sign::run(args.sign_hook, &package)?;
-            println!("package: {}", package.display());
-        }
-        None => println!("dry run: package definition rendered; packaging tool skipped"),
+    if args.dry_run {
+        println!("dry run: package definition rendered; packaging tool skipped");
+    }
+    for package in packages {
+        sign::run(args.sign_hook, &package)?;
+        println!("package: {}", package.display());
     }
     Ok(())
+}
+
+/// Every `@NAME@` token (capital letters and underscores) in `template`.
+pub(super) fn placeholders(template: &str) -> BTreeSet<&str> {
+    let mut found = BTreeSet::new();
+    let mut rest = template;
+    while let Some(start) = rest.find('@') {
+        let after = &rest[start + 1..];
+        match after.find('@') {
+            Some(end)
+                if end > 0
+                    && after[..end]
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b == b'_') =>
+            {
+                found.insert(&rest[start..start + end + 2]);
+                rest = &after[end + 1..];
+            }
+            _ => rest = after,
+        }
+    }
+    found
 }
 
 #[cfg(test)]

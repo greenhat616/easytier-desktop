@@ -111,6 +111,31 @@ fn request<T>(body: T) -> tonic::Request<T> {
     request
 }
 
+/// `ReleaseLease(StopInstances)`. The pipe is up before the self-check
+/// ends; until then lease calls answer FailedPrecondition.
+async fn release_stop(
+    session: &mut HostServiceClient<tonic::transport::Channel>,
+) -> etd_contract::v1::ReleaseLeaseResponse {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match session
+            .release_lease(request(ReleaseLeaseRequest {
+                instances: LeaseRelease::StopInstances as i32,
+            }))
+            .await
+        {
+            Ok(response) => return response.into_inner(),
+            Err(status)
+                if status.code() == tonic::Code::FailedPrecondition
+                    && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(200)).await
+            }
+            Err(status) => panic!("release lease: {status:?}"),
+        }
+    }
+}
+
 async fn client(endpoint: &Endpoint) -> HostServiceClient<tonic::transport::Channel> {
     let connector = connector();
     tokio::time::timeout(Duration::from_secs(120), async {
@@ -311,26 +336,7 @@ async fn elevated_session_host_end_to_end() {
         .spawn()
         .unwrap();
     let mut session = client(&endpoint).await;
-    // The pipe is up before the self-check ends; until then lease calls
-    // answer FailedPrecondition.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let released = loop {
-        match session
-            .release_lease(request(ReleaseLeaseRequest {
-                instances: LeaseRelease::StopInstances as i32,
-            }))
-            .await
-        {
-            Ok(response) => break response.into_inner(),
-            Err(status)
-                if status.code() == tonic::Code::FailedPrecondition
-                    && Instant::now() < deadline =>
-            {
-                tokio::time::sleep(Duration::from_millis(200)).await
-            }
-            Err(status) => panic!("release lease: {status:?}"),
-        }
-    };
+    let released = release_stop(&mut session).await;
     assert!(released.host_exiting);
     let status = tokio::task::block_in_place(|| wait_exit(&mut child, Duration::from_secs(60)));
     assert!(status.success(), "{status:?}");
@@ -377,12 +383,7 @@ async fn elevated_session_host_end_to_end() {
         .spawn()
         .unwrap();
     let mut session = client(&endpoint).await;
-    session
-        .release_lease(request(ReleaseLeaseRequest {
-            instances: LeaseRelease::StopInstances as i32,
-        }))
-        .await
-        .unwrap();
+    assert!(release_stop(&mut session).await.host_exiting);
     let status = tokio::task::block_in_place(|| wait_exit(&mut child, Duration::from_secs(60)));
     assert!(status.success(), "{status:?}");
     drop(session);

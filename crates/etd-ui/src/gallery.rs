@@ -1,6 +1,7 @@
 //! Interactive, host-free specimen view of the same Fluent wrappers used
 //! by the desktop. All activation is in-memory; no bridge, tray, services,
 //! network profiles or production preferences are opened.
+mod motion_pages;
 mod pages;
 
 use crate::{
@@ -78,6 +79,8 @@ enum Page {
     Navigation,
     Layout,
     Feedback,
+    Transitions,
+    Easing,
 }
 
 struct Gallery {
@@ -90,6 +93,7 @@ struct Gallery {
     closed: [bool; 4],
     clicks: usize,
     pseudo: bool,
+    motion: motion_pages::MotionDemo,
 }
 
 impl Gallery {
@@ -113,6 +117,7 @@ impl Gallery {
             closed: [false; 4],
             clicks: 0,
             pseudo: false,
+            motion: motion_pages::MotionDemo::new(),
         }
     }
 }
@@ -228,6 +233,22 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
         "fluent/info.svg",
         cx,
     );
+    let page_transitions = nav(
+        Page::Transitions,
+        "gallery-nav-page-transitions",
+        "Page transitions",
+        "fluent/arrow-right.svg",
+        "fluent/arrow-right.svg",
+        cx,
+    );
+    let easing = nav(
+        Page::Easing,
+        "gallery-nav-easing",
+        "Easing functions",
+        "fluent/play.svg",
+        "fluent/play.svg",
+        cx,
+    );
     let mut sidebar = Sidebar::new("gallery-sidebar")
         .w(px(220.))
         .h_full()
@@ -242,6 +263,8 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
         .child(navigation)
         .child(layout)
         .child(feedback)
+        .child(page_transitions)
+        .child(easing)
         .child(settings);
     if !view.collapsed {
         sidebar = sidebar.footer(div().w_full().child(theme_menu(cx)));
@@ -603,6 +626,14 @@ impl Render for Gallery {
             Page::Navigation => ("Navigation", pages::navigation_page(self, cx)),
             Page::Layout => ("Layout", pages::layout_page(self, window, cx)),
             Page::Feedback => ("Status & info", pages::feedback_page(self, cx)),
+            Page::Transitions => (
+                "Page transitions",
+                motion_pages::page_transitions_page(self, cx),
+            ),
+            Page::Easing => (
+                "Easing functions",
+                motion_pages::easing_page(self, window, cx),
+            ),
         };
         div()
             .id("gallery-root")
@@ -855,6 +886,116 @@ mod tests {
     /// timings: a MenuFlyout fades for 83 ms, a ContentDialog for 83 ms and
     /// an Expander's content slides up for 167 ms. An Expander that is open
     /// when it first appears does not slide in.
+    /// Page transitions and easing functions run on WinUI's timing
+    /// (ThemeTransitions.cpp, EasingFunctions.cpp).
+    #[gpui_kit::test]
+    fn gallery_page_transitions_and_easings_follow_winui_timing(cx: &mut TestAppContext) {
+        use std::time::Duration;
+        let (handle, _view) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            theme::install_palette(cx);
+            cx.set_reduce_motion(false);
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Default::default(),
+                        size: size(px(1440.), px(1300.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| Gallery::new(window, cx)),
+            )
+            .unwrap()
+        });
+        let step = |cx: &mut TestAppContext, ms: u64| {
+            cx.executor().advance_clock(Duration::from_millis(ms));
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        };
+        // Entrance: the old page fades for 150 ms while the new one waits
+        // 140 px down, then rises by 450 ms.
+        let mut frame_top = px(0.);
+        let mut frame_left = px(0.);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("gallery-nav-page-transitions", cx);
+            window.render_frame(cx);
+            frame_top = window.find("sample-page-0").bounds().top();
+            window.click("page-forward", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 100);
+        cx.update_window(handle, |_, window, _| {
+            assert!(
+                window.try_find("sample-page-0").is_some(),
+                "old page leaving"
+            );
+            assert_eq!(
+                window.find("sample-page-1").bounds().top(),
+                frame_top + px(140.)
+            );
+        })
+        .unwrap();
+        step(cx, 200);
+        cx.update_window(handle, |_, window, _| {
+            let top = window.find("sample-page-1").bounds().top();
+            assert!(
+                top > frame_top && top < frame_top + px(140.),
+                "rising: {top:?}"
+            );
+        })
+        .unwrap();
+        step(cx, 200);
+        cx.update_window(handle, |_, window, cx| {
+            assert!(window.try_find("sample-page-0").is_none(), "old page gone");
+            assert_eq!(window.find("sample-page-1").bounds().top(), frame_top);
+            frame_left = window.find("sample-page-1").bounds().left();
+            // Slide from right: the new page waits 200 px to the right.
+            window.click("page-transition-kind-3", cx);
+            window.render_frame(cx);
+            window.click("page-forward", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 100);
+        cx.update_window(handle, |_, window, _| {
+            let old = window.find("sample-page-1").bounds().left();
+            let new = window.find("sample-page-0").bounds().left();
+            assert_eq!(new, frame_left + px(200.), "new page waits 200 px right");
+            assert!(
+                old < frame_left && old > frame_left - px(150.),
+                "old page leaving left"
+            );
+        })
+        .unwrap();
+        step(cx, 400);
+        // Easing: CircleEase InOut over 500 ms is halfway at 250 ms.
+        let mut start = px(0.);
+        cx.update_window(handle, |_, window, cx| {
+            window.click("gallery-nav-easing", cx);
+            window.render_frame(cx);
+            start = window.find("easing-square-0").bounds().left();
+            window.click("easing-animate-0", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 250);
+        cx.update_window(handle, |_, window, _| {
+            let x = window.find("easing-square-0").bounds().left() - start;
+            assert!((x - px(100.)).abs() < px(8.), "halfway at 250 ms: {x:?}");
+        })
+        .unwrap();
+        step(cx, 300);
+        cx.update_window(handle, |_, window, _| {
+            let x = window.find("easing-square-0").bounds().left() - start;
+            assert_eq!(x, px(200.));
+        })
+        .unwrap();
+    }
+
     #[gpui_kit::test]
     fn gallery_motion_follows_winui_timing(cx: &mut TestAppContext) {
         use std::time::Duration;
@@ -1649,6 +1790,19 @@ mod tests {
             })
             .unwrap();
             cx.run_until_parked();
+            // Motion pages, at rest.
+            for page in ["page-transitions", "easing"] {
+                cx.update_window(handle, |_, window, cx| {
+                    window.click(SharedString::from(format!("gallery-nav-{page}")), cx);
+                    window.render_frame(cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.capture_screenshot(handle)
+                    .unwrap()
+                    .save(output.join(format!("gallery-{page}-{name}.png")))
+                    .unwrap();
+            }
             // Navigation page.
             cx.update_window(handle, |_, window, cx| {
                 window.click("gallery-nav-navigation", cx);
@@ -1684,6 +1838,8 @@ mod tests {
                 "navigation",
                 "layout",
                 "feedback",
+                "page-transitions",
+                "easing",
                 "settings",
             ] {
                 cx.update_window(handle, |_, window, cx| {

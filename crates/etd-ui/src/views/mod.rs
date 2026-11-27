@@ -3,12 +3,14 @@
 pub mod banners;
 pub mod controls;
 pub mod dialogs;
+pub mod easing;
 pub mod feedback;
 pub mod instances;
 pub mod layout;
 pub mod menus;
 pub mod motion;
 pub mod navigation;
+pub mod page_transition;
 pub mod popout;
 pub mod progress;
 pub mod pseudo;

@@ -1,6 +1,8 @@
 //! Interactive, host-free specimen view of the same Fluent wrappers used
 //! by the desktop. All activation is in-memory; no bridge, tray, services,
 //! network profiles or production preferences are opened.
+mod pages;
+
 use crate::{
     assets::FluentAssets,
     preferences::ThemePreference,
@@ -65,10 +67,19 @@ pub fn run() {
         });
 }
 
+/// Gallery pages, grouped like WinUI Gallery's navigation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Page {
+    Controls,
+    Settings,
+    BasicInput,
+}
+
 struct Gallery {
     toggles: [bool; 2],
     inputs: [Entity<InputState>; 3],
-    nav_selected: usize,
+    page: Page,
+    demo: pages::DemoState,
     list_selected: usize,
     collapsed: bool,
     closed: [bool; 4],
@@ -89,7 +100,8 @@ impl Gallery {
         Self {
             toggles: [false, true],
             inputs: [normal, filled, secret],
-            nav_selected: 0,
+            page: Page::Controls,
+            demo: pages::DemoState::new(window, cx),
             list_selected: 1,
             collapsed: false,
             closed: [false; 4],
@@ -127,27 +139,47 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
                 .text_size(px(14.))
                 .child("Fluent gallery")
         }));
-    let first = FluentNavItem::new(
+    let nav = |page: Page,
+               id: &'static str,
+               label: &'static str,
+               icon: &'static str,
+               filled: &'static str,
+               cx: &mut Context<Gallery>| {
+        FluentNavItem::new(
+            id,
+            label,
+            icon,
+            filled,
+            view.page == page,
+            cx.listener(move |this, _, _, cx| {
+                this.page = page;
+                cx.notify();
+            }),
+        )
+    };
+    let first = nav(
+        Page::Controls,
         "gallery-nav-controls",
         "Controls",
         "fluent/globe.svg",
         "fluent/globe-filled.svg",
-        view.nav_selected == 0,
-        cx.listener(|this, _, _, cx| {
-            this.nav_selected = 0;
-            cx.notify();
-        }),
+        cx,
     );
-    let second = FluentNavItem::new(
-        "gallery-nav-other",
-        "Other item",
-        "fluent/shield.svg",
-        "fluent/shield-filled.svg",
-        view.nav_selected == 1,
-        cx.listener(|this, _, _, cx| {
-            this.nav_selected = 1;
-            cx.notify();
-        }),
+    let settings = nav(
+        Page::Settings,
+        "gallery-nav-settings",
+        "Settings",
+        "fluent/settings.svg",
+        "fluent/settings.svg",
+        cx,
+    );
+    let basic = nav(
+        Page::BasicInput,
+        "gallery-nav-basic-input",
+        "Basic input",
+        "fluent/checkmark-circle.svg",
+        "fluent/checkmark-circle-filled.svg",
+        cx,
     );
     let mut sidebar = Sidebar::new("gallery-sidebar")
         .w(px(220.))
@@ -157,7 +189,8 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
         .collapsed(view.collapsed)
         .header(header)
         .child(first)
-        .child(second);
+        .child(basic)
+        .child(settings);
     if !view.collapsed {
         sidebar = sidebar.footer(div().w_full().child(theme_menu(cx)));
     }
@@ -484,24 +517,77 @@ fn gallery_notifications(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElemen
 }
 
 impl Render for Gallery {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let sidebar = gallery_sidebar(self, cx);
-        let buttons = gallery_buttons(cx);
-        let inputs = gallery_inputs(self, cx);
-        let lists = gallery_lists(self, cx);
-        let notifications = gallery_notifications(self, cx);
-        div().id("gallery-root").test_support().size_full().flex_row_dir(cx)
-            .bg(theme::chrome_fill(cx, cx.theme().background)).text_color(cx.theme().foreground)
+        let (title, body): (&str, Vec<AnyElement>) = match self.page {
+            Page::Controls => (
+                "Component gallery",
+                vec![
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Hover or hold an enabled sample, or press Tab then Space/Enter. Appearance is session-only. No host is used.")
+                        .into_any_element(),
+                    gallery_buttons(cx),
+                    gallery_inputs(self, cx),
+                    gallery_lists(self, cx),
+                    gallery_notifications(self, cx),
+                ],
+            ),
+            Page::Settings => ("Settings", pages::settings_page(self, cx)),
+            Page::BasicInput => ("Basic input", pages::basic_input_page(self, window, cx)),
+        };
+        div()
+            .id("gallery-root")
+            .test_support()
+            .size_full()
+            .flex_row_dir(cx)
+            .bg(theme::chrome_fill(cx, cx.theme().background))
+            .text_color(cx.theme().foreground)
             .child(sidebar)
-            .child(div().flex_1().min_w_0().min_h_0().flex().flex_col()
-                .child(div().h(px(52.)).flex_shrink_0().flex_row_dir(cx).items_center().justify_between().px(px(24.))
-                    .child(div().font_semibold().text_size(px(24.)).child("Component gallery"))
-                    .child(div().text_sm().text_color(cx.theme().muted_foreground).child(format!("Local actions: {}", self.clicks))))
-                .child(div().id("gallery-scroll").test_support().flex_1().min_h_0().overflow_y_scroll()
-                    .bg(theme::content_layer(cx)).rounded_tl(px(8.)).border_t_1().border_l_1().border_color(theme::card_stroke(cx)).px(px(24.)).py_4().flex().flex_col().gap_4()
-                    .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                        .child("Hover or hold an enabled sample, or press Tab then Space/Enter. Appearance is session-only. No host is used."))
-                    .child(buttons).child(inputs).child(lists).child(notifications)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .h(px(52.))
+                            .flex_shrink_0()
+                            .flex_row_dir(cx)
+                            .items_center()
+                            .justify_between()
+                            .px(px(24.))
+                            .child(div().font_semibold().text_size(px(24.)).child(title))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("Local actions: {}", self.clicks)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("gallery-scroll")
+                            .test_support()
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .bg(theme::content_layer(cx))
+                            .rounded_tl(px(8.))
+                            .border_t_1()
+                            .border_l_1()
+                            .border_color(theme::card_stroke(cx))
+                            .px(px(24.))
+                            .py_4()
+                            .flex()
+                            .flex_col()
+                            .gap_4()
+                            .children(body),
+                    ),
+            )
     }
 }
 
@@ -551,6 +637,33 @@ mod tests {
             assert!(window.try_find("gallery-info-actionbar-0").is_none());
             window.click("gallery-info-reopen-0", cx);
             assert!(window.find("gallery-info-actionbar-0").visible());
+            window.click("gallery-nav-settings", cx);
+            window.render_frame(cx);
+            assert!(window.find("settings-spatial").visible());
+            // SettingsCardMinHeight 68; a title plus description is taller.
+            assert!(window.find("settings-nav-style-card").bounds().size.height >= px(68.));
+            window.click("settings-sound-chevron", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("settings-spatial").is_none());
+            window.click("settings-app-theme", cx);
+            window.render_frame(cx);
+            window.click("settings-app-theme-item-2", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_app_theme(), 2);
+            assert!(window.try_find("settings-app-theme-popup").is_none());
+            window.click("gallery-nav-basic-input", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("basic-check-two").checked(), Some(true));
+            window.click("basic-check-two", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("basic-check-two").checked(), Some(false));
+            assert_eq!(window.find("basic-check-d1").disabled(), Some(true));
+            window.click("basic-radio-1", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("basic-radio-1").checked(), Some(true));
+            window.click("basic-number-Increase", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_number(cx).as_ref(), "13");
         })
         .unwrap();
     }
@@ -643,6 +756,48 @@ mod tests {
             cx.capture_screenshot(handle)
                 .unwrap()
                 .save(output.join(format!("gallery-{name}-focus.png")))
+                .unwrap();
+            // A focused text box shows WinUI's 2 px accent bottom line.
+            cx.update_window(handle, |_, window, cx| {
+                window.click("gallery-input", cx);
+                window.render_frame(cx);
+                assert!(window.find("fluent-textbox-underline").visible());
+            })
+            .unwrap();
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(format!("gallery-{name}-textbox-focus.png")))
+                .unwrap();
+            for (page, nav) in [
+                ("settings", "gallery-nav-settings"),
+                ("basic-input", "gallery-nav-basic-input"),
+            ] {
+                cx.update_window(handle, |_, window, cx| {
+                    window.click(nav, cx);
+                    window.render_frame(cx);
+                })
+                .unwrap();
+                cx.advance_clock(Duration::from_millis(350));
+                cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                    .unwrap();
+                cx.capture_screenshot(handle)
+                    .unwrap()
+                    .save(output.join(format!("gallery-{page}-{name}.png")))
+                    .unwrap();
+            }
+            // Open drop-down and a hovered CheckBox on the Basic input page.
+            cx.update_window(handle, |_, window, cx| {
+                window.click("basic-combo", cx);
+                window.render_frame(cx);
+                assert!(window.find("basic-combo-popup").visible());
+                let center = window.find("basic-check-two").bounds().center();
+                window.pointer_move(center, None, cx);
+                window.render_frame(cx);
+            })
+            .unwrap();
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(format!("gallery-basic-input-{name}-open.png")))
                 .unwrap();
         }
     }

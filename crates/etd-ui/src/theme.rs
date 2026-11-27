@@ -322,6 +322,99 @@ pub(crate) fn control_strong_stroke(cx: &App) -> Hsla {
     winui_brush(cx, 0x00000072, 0xFFFFFF8B)
 }
 
+/// Pointer state of a WinUI control, for the brush ramps below.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlState {
+    Rest,
+    Hover,
+    Pressed,
+    Disabled,
+}
+
+/// `ControlFillColor{Default,Secondary,Tertiary,Disabled}`: standard
+/// controls (buttons, ComboBox, ToggleButton off, SettingsCard hover/press).
+pub fn control_fill(state: ControlState, cx: &App) -> Hsla {
+    match state {
+        ControlState::Rest => winui_brush(cx, 0xFFFFFFB3, 0xFFFFFF0F),
+        ControlState::Hover => winui_brush(cx, 0xF9F9F980, 0xFFFFFF15),
+        ControlState::Pressed => winui_brush(cx, 0xF9F9F94D, 0xFFFFFF08),
+        ControlState::Disabled => winui_brush(cx, 0xF9F9F94D, 0xFFFFFF0B),
+    }
+}
+
+/// `ControlAltFillColor{Secondary,Tertiary,Quarternary,Disabled}`: the box
+/// of an unchecked CheckBox and the ring of an unselected RadioButton.
+pub fn control_alt_fill(state: ControlState, cx: &App) -> Hsla {
+    match state {
+        ControlState::Rest => winui_brush(cx, 0x00000006, 0x00000019),
+        ControlState::Hover => winui_brush(cx, 0x0000000F, 0xFFFFFF0B),
+        ControlState::Pressed => winui_brush(cx, 0x00000018, 0xFFFFFF12),
+        ControlState::Disabled => winui_brush(cx, 0xFFFFFF00, 0xFFFFFF00),
+    }
+}
+
+/// `AccentFillColor{Default,Secondary,Tertiary}` are the accent at 100 %,
+/// 90 % and 80 % opacity; `AccentFillColorDisabled` is #37000000 / #28FFFFFF.
+pub fn accent_fill(state: ControlState, cx: &App) -> Hsla {
+    let accent = Theme::global(cx).primary;
+    match state {
+        ControlState::Rest => accent,
+        ControlState::Hover => accent.opacity(0.9),
+        ControlState::Pressed => accent.opacity(0.8),
+        ControlState::Disabled => winui_brush(cx, 0x00000037, 0xFFFFFF28),
+    }
+}
+
+/// `ControlStrongStrokeColorDisabled` (#37000000 / #28FFFFFF).
+pub fn control_strong_stroke_disabled(cx: &App) -> Hsla {
+    winui_brush(cx, 0x00000037, 0xFFFFFF28)
+}
+
+/// `ControlStrongFillColor{Default,Disabled}`: the Slider track.
+pub fn control_strong_fill(disabled: bool, cx: &App) -> Hsla {
+    if disabled {
+        winui_brush(cx, 0x00000051, 0xFFFFFF3F)
+    } else {
+        winui_brush(cx, 0x00000072, 0xFFFFFF8B)
+    }
+}
+
+/// `ControlSolidFillColorDefault` (#FFFFFF / #454545): the Slider's outer thumb.
+pub fn control_solid_fill(cx: &App) -> Hsla {
+    winui_brush(cx, 0xFFFFFFFF, 0x454545FF)
+}
+
+/// `CardBackgroundFillColorSecondary` (#80F6F6F6 / #08FFFFFF): expander content.
+pub fn card_fill_secondary(cx: &App) -> Hsla {
+    winui_brush(cx, 0xF6F6F680, 0xFFFFFF08)
+}
+
+/// `TextFillColorSecondary` (#9E000000 / #C5FFFFFF): descriptions.
+pub fn text_secondary(cx: &App) -> Hsla {
+    winui_brush(cx, 0x0000009E, 0xFFFFFFC5)
+}
+
+/// `TextFillColorDisabled` (#5C000000 / #5DFFFFFF).
+pub fn text_disabled(cx: &App) -> Hsla {
+    winui_brush(cx, 0x0000005C, 0xFFFFFF5D)
+}
+
+/// `TextOnAccentFillColorPrimary` (#FFFFFF / #000000): glyphs on accent.
+pub fn text_on_accent(cx: &App) -> Hsla {
+    winui_brush(cx, 0xFFFFFFFF, 0x000000FF)
+}
+
+/// `AcrylicInAppFillColorDefaultBrush` fallback colour (#F9F9F9 / #2C2C2C):
+/// flyouts, menus and the ComboBox drop-down. Acrylic blur is not drawn.
+pub fn flyout_fill(cx: &App) -> Hsla {
+    winui_brush(cx, 0xF9F9F9FF, 0x2C2C2CFF)
+}
+
+/// `SurfaceStrokeColorFlyout` (#0F000000 / #33000000).
+pub fn flyout_stroke(cx: &App) -> Hsla {
+    winui_brush(cx, 0x0000000F, 0x00000033)
+}
+
 /// Attach to the Kit-owned root after `gpui_kit::open_window` has created it.
 /// The look follows the actual window appearance (including Linux's system
 /// appearance) and survives window recreation from the tray.
@@ -658,6 +751,58 @@ mod tests {
             ratio >= 4.5,
             "{label}: {ratio:.2}:1 is below AA (text {text:?}, background {background:?})"
         );
+    }
+
+    #[gpui_kit::test]
+    fn winui_control_text_pairs_meet_aa_in_both_modes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_palette(cx);
+            for appearance in [WindowAppearance::Light, WindowAppearance::Dark] {
+                apply_theme(appearance, cx);
+                let t = Theme::global(cx);
+                let layer = content_layer(cx).to_rgb();
+                let card = layer.blend(card_fill(cx).to_rgb());
+                let expander = layer.blend(card_fill_secondary(cx).to_rgb());
+                let flyout = flyout_fill(cx).to_rgb();
+                for (name, surface) in [("card", card), ("expander", expander)] {
+                    assert_readable(name, t.foreground, surface);
+                    assert_readable(
+                        &format!("description on {name}"),
+                        text_secondary(cx),
+                        surface,
+                    );
+                    for state in [
+                        ControlState::Rest,
+                        ControlState::Hover,
+                        ControlState::Pressed,
+                    ] {
+                        assert_readable(
+                            "control text",
+                            t.foreground,
+                            surface.blend(control_fill(state, cx).to_rgb()),
+                        );
+                    }
+                }
+                assert_readable("flyout item", t.foreground, flyout);
+                assert_readable(
+                    "selected flyout item",
+                    t.foreground,
+                    flyout.blend(subtle_fill_secondary(cx).to_rgb()),
+                );
+                // Check marks and radio dots on accent are graphics: WCAG
+                // 1.4.11 asks 3:1 against the fill they sit on.
+                for state in [
+                    ControlState::Rest,
+                    ControlState::Hover,
+                    ControlState::Pressed,
+                ] {
+                    let fill = card.blend(accent_fill(state, cx).to_rgb());
+                    let ratio = contrast(rgb24(text_on_accent(cx).to_rgb()), rgb24(fill));
+                    assert!(ratio >= 3.0, "glyph on accent {state:?}: {ratio:.2}:1");
+                }
+            }
+        });
     }
 
     #[gpui_kit::test]

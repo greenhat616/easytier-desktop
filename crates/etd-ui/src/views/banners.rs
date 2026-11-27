@@ -32,7 +32,6 @@ pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
     let sec_bg = cx.theme().secondary;
     let sec_fg = cx.theme().secondary_foreground;
     let warn = cx.theme().warning;
-    let border = cx.theme().border;
     let title_bar = crate::theme::chrome_fill(cx, cx.theme().title_bar);
 
     let (link_label, tray_available) = {
@@ -163,8 +162,6 @@ pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
         .justify_between()
         .px_4()
         .py_2()
-        .border_b_1()
-        .border_color(border)
         .bg(title_bar)
         .child(left)
         .child(right)

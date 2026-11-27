@@ -10,7 +10,7 @@ use etd_contract::{Desired, InstanceId, NetworkSpec, capability};
 use gpui_kit::{
     AnyElement, Context, InteractiveElement as _, IntoElement, ParentElement as _, Render,
     SharedString, Styled as _, TestSupportExt as _, Window,
-    base::LogicalStyledExt as _,
+    base::{LayoutDirection, LogicalStyledExt as _},
     component::{ActiveTheme as _, Size, StyledExt as _, button::ButtonVariant, sidebar::Sidebar},
     div, px,
 };
@@ -169,6 +169,7 @@ fn render_sidebar(
         .h_full()
         .bg(sidebar)
         .border_color(border)
+        .border_0()
         .collapsed(collapsed)
         .header(header)
         .child(instances)
@@ -191,7 +192,7 @@ fn render_section_content(
         Section::Reclaim => reclaim::render_reclaim_view(view, cx),
         Section::Editor => render_editor(view, cx),
     };
-    div()
+    let page = div()
         .id("page-content")
         .test_support()
         .flex_1()
@@ -201,10 +202,15 @@ fn render_section_content(
         .flex_col()
         .overflow_hidden()
         .bg(cx.theme().popover)
-        .rounded_tl(px(8.))
+        .border_t_1()
+        .border_color(cx.theme().border)
         .child(banners)
-        .child(div().flex_1().min_h_0().overflow_hidden().child(inner))
-        .into_any_element()
+        .child(div().flex_1().min_h_0().overflow_hidden().child(inner));
+    if LayoutDirection::global(cx).is_rtl() {
+        page.rounded_tr(px(8.)).border_r_1().into_any_element()
+    } else {
+        page.rounded_tl(px(8.)).border_l_1().into_any_element()
+    }
 }
 
 impl Render for MainView {

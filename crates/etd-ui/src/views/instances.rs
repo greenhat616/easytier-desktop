@@ -237,10 +237,10 @@ fn render_instance_card(
         _ => format!("state-badge-{}", id.0),
     };
 
-    let select_btn = action_button(
+    let select_btn = crate::views::ui::list_choice_button(
         SharedString::from(format!("btn-select-instance-{}", id.0)),
         SharedString::from(display_name.clone()),
-        BtnStyle::new(ButtonVariant::Ghost, Size::Small),
+        is_selected,
         cx.listener(move |this, _, _, cx| {
             this.controller.select_instance(Some(id_select.clone()), cx);
         }),
@@ -251,6 +251,7 @@ fn render_instance_card(
         .role(Role::Status)
         .test_support()
         .aria_label(SharedString::from(cond_label))
+        .flex_shrink_0()
         .px_2()
         .py_1()
         .rounded_sm()

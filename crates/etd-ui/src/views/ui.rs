@@ -177,7 +177,8 @@ impl gpui::RenderOnce for FluentButton {
             .h(height)
             .min_h(height)
             .px(px(11.))
-            .py(px(5.))
+            .pt(px(5.))
+            .pb(px(6.))
             .rounded(px(4.))
             .with_variant(style.variant)
             .accessibility_label(if style.selected {
@@ -190,7 +191,9 @@ impl gpui::RenderOnce for FluentButton {
             .focus_ring(false)
             .disabled(style.disabled || style.loading)
             .on_click(move |ev, window, cx| (self.on_click)(ev, window, cx));
-        if style.outline {
+        // WinUI standard buttons already have a subtle 1px stroke; Kit's
+        // Default outline instead uses input-background, making them grey.
+        if style.outline && style.variant != ButtonVariant::Default {
             btn = btn.outline();
         }
         if style.icon_only {
@@ -226,7 +229,7 @@ impl gpui::RenderOnce for FluentButton {
                     .min_w_0()
                     .truncate()
                     .text_size(px(14.))
-                    .line_height(px(20.))
+                    .line_height(px(19.))
                     .group_active(group.clone(), move |s| {
                         s.opacity(if style.disabled || style.loading {
                             1.
@@ -284,7 +287,7 @@ fn button_elevation_line(cx: &App) -> AnyElement {
 
 fn loading_button_colors(style: BtnStyle, cx: &App) -> (Hsla, Hsla) {
     let t = cx.theme();
-    if style.outline {
+    if style.outline && style.variant != ButtonVariant::Default {
         let ink = match style.variant {
             ButtonVariant::Primary => t.primary,
             ButtonVariant::Danger => t.danger,
@@ -389,13 +392,107 @@ fn theme_choice_button(
     choice: crate::preferences::ThemePreference,
     selected: bool,
 ) -> AnyElement {
-    let mut style = BtnStyle::new(ButtonVariant::Ghost, Size::Small).selected(selected);
-    if selected {
-        style = style.icon("fluent/checkmark.svg");
+    FluentAlignedRow {
+        id: id.into(),
+        label: choice.label().into(),
+        selected,
+        appearance_choice: true,
+        on_click: Box::new(move |_, window, cx| crate::theme::set_preference(choice, window, cx)),
     }
-    action_button(id, choice.label(), style, move |_, window, cx| {
-        crate::theme::set_preference(choice, window, cx)
-    })
+    .into_any_element()
+}
+
+/// Start-aligned row button for clickable list entries. The containing card
+/// owns the selection tint/border, so this does not add a second selected fill.
+pub fn list_choice_button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    selected: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    FluentAlignedRow {
+        id: id.into(),
+        label: label.into(),
+        selected,
+        appearance_choice: false,
+        on_click: Box::new(on_click),
+    }
+    .into_any_element()
+}
+
+#[derive(IntoElement)]
+struct FluentAlignedRow {
+    id: ElementId,
+    label: SharedString,
+    selected: bool,
+    appearance_choice: bool,
+    on_click: ClickHandler,
+}
+
+impl RenderOnce for FluentAlignedRow {
+    #[inline(never)]
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let focus = focus_for(&self.id, window, cx);
+        let t = cx.theme();
+        let selected = self.selected;
+        let appearance = self.appearance_choice;
+        let aria_label = if appearance && selected {
+            format!("{} (selected)", self.label).into()
+        } else {
+            self.label.clone()
+        };
+        let label = div()
+            .min_w_0()
+            .truncate()
+            .text_size(px(14.))
+            .child(self.label);
+        let btn = BaseButton::new(self.id)
+            .track_focus(&focus)
+            .selected(selected)
+            .aria_selected(selected)
+            .accessibility_label(aria_label)
+            .w_full()
+            .h(px(32.))
+            .flex_row_dir(cx)
+            .justify_start()
+            .items_center()
+            .gap_2()
+            .px(px(8.))
+            .rounded(px(4.))
+            .text_color(t.foreground)
+            .bg(if appearance && selected {
+                t.secondary.opacity(0.55)
+            } else {
+                t.transparent
+            })
+            .hover(|s| s.bg(t.secondary.opacity(0.55)))
+            .active(|s| s.bg(t.secondary_active))
+            .children(appearance.then(|| {
+                let slot = div().size(px(16.)).flex_shrink_0();
+                if selected {
+                    slot.child(
+                        Icon::default()
+                            .path("fluent/checkmark.svg")
+                            .with_size(Size::Medium),
+                    )
+                } else {
+                    slot
+                }
+            }))
+            .child(if selected {
+                label.font_semibold()
+            } else {
+                label
+            })
+            .on_click(move |e, window, cx| (self.on_click)(e, window, cx));
+        let row = div()
+            .relative()
+            .w_full()
+            .min_w_0()
+            .child(btn)
+            .children(focus_visual(focus.is_focused(window), window, cx));
+        if appearance { row } else { row.flex_1() }
+    }
 }
 
 /// Builds a labeled single-line [`Input`] in its own stack frame.
@@ -760,7 +857,7 @@ impl SidebarItem for FluentNavItem {
         btn = if collapsed {
             btn.justify_center()
         } else {
-            btn.px_3()
+            btn.px_3().justify_start()
         };
         btn = btn.child(
             Icon::default()
@@ -911,6 +1008,7 @@ impl FluentInfoBar {
             .flex_wrap()
             .items_center()
             .gap_x(px(12.))
+            .py(px(9.))
             .children(
                 self.title
                     .map(|title| div().font_semibold().text_size(px(14.)).child(title)),
@@ -928,6 +1026,7 @@ impl FluentInfoBar {
                 .flex_wrap()
                 .items_center()
                 .gap_2()
+                .py(px(3.))
                 .children(self.actions)
         });
         let content = div()
@@ -940,13 +1039,19 @@ impl FluentInfoBar {
             .gap_y(px(8.))
             .child(body.min_w(px(180.)))
             .children(actions);
+        let close_inset = if self.close.is_some() {
+            px(6.)
+        } else {
+            px(16.)
+        };
         div()
             .id(self.id)
             .role(self.role)
             .test_support()
             .aria_label(aria_label)
             .min_h(px(48.))
-            .px(px(16.))
+            .ps(px(16.), cx)
+            .pe(close_inset, cx)
             .py(px(4.))
             .rounded(px(4.))
             .border_1()

@@ -1302,3 +1302,81 @@ fn main_thread_constrained_stack_renders_all_views_banners_and_editor_without_ov
         .join()
         .expect("768 KiB stack thread panicked or overflowed");
 }
+
+/// Offscreen product layout evidence for the gallery report. This reuses
+/// the existing fake bridge, tray and installer; no host/runtime is started.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+#[ignore = "requires a real offscreen renderer and GALLERY_SCREENSHOT_DIR"]
+fn capture_product_layout_screenshots() {
+    use gpui_kit::{
+        HeadlessAppContext,
+        platform::{current_headless_renderer, current_platform},
+    };
+    use std::path::PathBuf;
+    let output =
+        PathBuf::from(std::env::var_os("GALLERY_SCREENSHOT_DIR").expect("GALLERY_SCREENSHOT_DIR"));
+    std::fs::create_dir_all(&output).unwrap();
+    for theme in ["light", "dark"] {
+        let mut cx = HeadlessAppContext::with_platform(
+            current_platform(true).text_system(),
+            Arc::new(etd_ui::assets::FluentAssets),
+            current_headless_renderer,
+        );
+        let (cmd_tx, _cmd_rx) = async_channel::unbounded();
+        let (_state_tx, state_rx) = async_channel::bounded(1);
+        let bridge = AppBridge {
+            commands: cmd_tx,
+            states: state_rx,
+        };
+        let (tray, _, _) = FakeTray::available();
+        let (installer, _) = FakeInstaller::ok();
+        let (handle, _) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            etd_ui::theme::install_palette(cx);
+            let controller = UiController::new_for_window(
+                bridge,
+                None,
+                Box::new(tray),
+                installer,
+                false,
+                std::rc::Rc::new(|_| {}),
+                cx,
+            );
+            controller.apply_store(
+                StateStore {
+                    link: HostLink::NoHost,
+                    ..Default::default()
+                },
+                cx,
+            );
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Default::default(),
+                        size: size(px(1200.), px(900.)),
+                    })),
+                    focus: false,
+                    show: false,
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| MainView::new(controller, window, cx)),
+            )
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click(gpui_kit::SharedString::from(format!("theme-{theme}")), cx);
+            window.click("btn-new-network", cx);
+            window.render_frame(cx);
+            assert!(window.find("banner-no-host").visible());
+            assert!(window.find("network-editor-view").visible());
+        })
+        .unwrap();
+        cx.capture_screenshot(handle)
+            .unwrap()
+            .save(output.join(format!("product-layout-{theme}.png")))
+            .unwrap();
+    }
+}

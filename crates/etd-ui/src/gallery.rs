@@ -7,7 +7,8 @@ use crate::{
     theme,
     views::ui::{
         BtnStyle, FluentInfoBar, FluentNavItem, InfoSeverity, action_button, fluent_switch,
-        list_selection_surface, password_input, progress_ring, text_field, theme_menu,
+        list_choice_button, list_selection_surface, password_input, progress_ring, text_field,
+        theme_menu,
     },
 };
 use gpui_kit::{
@@ -148,6 +149,7 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
         .w(px(220.))
         .h_full()
         .bg(theme::chrome_fill(cx, cx.theme().sidebar))
+        .border_0()
         .collapsed(view.collapsed)
         .header(header)
         .child(first)
@@ -335,10 +337,10 @@ fn gallery_lists(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
     {
         let selected = view.list_selected == ix;
         let (fill, border) = list_selection_surface(selected, cx);
-        let btn = action_button(
+        let btn = list_choice_button(
             SharedString::from(format!("gallery-list-{ix}")),
             title,
-            BtnStyle::new(ButtonVariant::Ghost, Size::Medium),
+            selected,
             cx.listener(move |this, _, _, cx| {
                 this.list_selected = ix;
                 cx.notify();

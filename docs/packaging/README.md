@@ -314,7 +314,15 @@ cache:
 | `smoke-windows` | windows-latest | `tests/tier3/release.py msi_release`: install, upgrade, uninstall, machine compared with before |
 | `smoke-linux` | ubuntu-22.04 | `release.py deb_release`: the same with apt, on the oldest supported Ubuntu |
 | `smoke-rpm` | Fedora 43 container | `.github/scripts/rpm-smoke.sh`: scriptlets parse, root-owned files and modes, upgrade, and erasing leaves the file system as before the install (empty folders included); no systemd, so the hooks only print their notice |
-| `publish` | ubuntu-latest | `SHA256SUMS.txt` over the packages; on a tag, a **draft** GitHub release with the packages, the sums and an unsigned-package notice, which a maintainer reviews and publishes |
+| `checksums` | ubuntu-latest | read-only: the two package artifacts by name, which must hold exactly the four release packages, and `SHA256SUMS.txt` over them |
+| `release` | ubuntu-latest | only on a `v*` tag, and the only job with `contents: write`: a **draft** GitHub release with the packages, the sums and an unsigned-package notice, which a maintainer reviews and publishes |
+
+Every action is pinned by commit SHA and the Fedora image by digest; nfpm, the WiX
+7.0.1 and WixToolset.Util.wixext 7.0.1 packages (installed through a NuGet
+configuration whose only source is the checked folder, and the extracted extension
+compared with the package) and the smoke tests' Python dependencies
+(`.github/scripts/tier3-requirements.txt`, `pip --require-hashes`) are SHA-256 checked.
+A manual run never gets write permission.
 
 The smoke upgrades go to a test-only package of the next patch version (the same
 binaries with bytes appended to `etd-host`), which is never published. The packages

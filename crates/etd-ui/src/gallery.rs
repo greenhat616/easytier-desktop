@@ -831,6 +831,10 @@ mod tests {
             window.click("tip-target", cx);
             window.render_frame(cx);
             assert!(window.find("tip").visible());
+            // The tip opens below its target, its tail in the 12 px gap.
+            assert!(
+                window.find("tip").bounds().top() >= window.find("tip-target").bounds().bottom()
+            );
             // A TeachingTip is not light-dismissed.
             window.click("flyout-open", cx);
             window.render_frame(cx);

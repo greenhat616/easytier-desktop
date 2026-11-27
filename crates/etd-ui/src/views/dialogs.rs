@@ -417,8 +417,9 @@ pub fn teaching_tip(
                 .child(div().child(subtitle)),
         )
         .children(action.map(|a| div().mt(px(12.)).child(a)));
-    deferred(anchored().snap_to_window_with_margin(px(8.)).child(tip))
-        .with_priority(1)
+    // Wrapped like the flyouts so the popup anchors below its target.
+    div()
+        .child(deferred(anchored().snap_to_window_with_margin(px(8.)).child(tip)).with_priority(1))
         .into_any_element()
 }
 

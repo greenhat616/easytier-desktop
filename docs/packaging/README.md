@@ -53,7 +53,20 @@ msiexec /x easytier-desktop-<version>-x86_64.msi /qn
 
 `ETD_ALLOW_USER` (optional) enrolls one more account SID as a service administrator,
 passed to `etd-host install --allow-user`. By default only LocalSystem and the
-Administrators group may use the service.
+Administrators group may use the service. Only a local or domain account SID is accepted
+(`S-1-5-21-<domain>-<RID>`, RID 1000 or above): `etd-host` refuses groups and well-known
+SIDs such as Everyone, Users or Administrators, and the package refuses a value with a
+quote or a space before any change. It is not a Secure property, so set it from an
+elevated prompt; from a non-elevated one Windows Installer drops it, and a standard
+user's elevated (policy) install cannot pass it.
+
+A package installs only where no service exists or as an upgrade of an installed
+product. If the service is already installed without a matching product (installed with
+`etd-host install`, or the product registration was lost), the package refuses before
+any change: uninstall it first (`etd-host uninstall`). Same-version rebuilds upgrade
+(`AllowSameVersionUpgrades`), so a rebuilt package replaces the installed product instead
+of installing beside it; ICE61 flags this by design, and `wix build` runs no ICE
+validation.
 
 `etd-ctl.exe` is registered under App Paths
 (`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\etd-ctl.exe`), which serves
@@ -72,10 +85,17 @@ a path is incomplete (see the `etd-sysfx-os` README). Each command's output goes
 
 | Action | When | Runs | Scheduled |
 | --- | --- | --- | --- |
-| `InstallHostService` | first install (`NOT Installed AND NOT WIX_UPGRADE_DETECTED`) | `etd-host install [--allow-user <SID>]` | last, before `InstallFinalize` |
-| `RollbackHostInstall` | rollback of a first install | `etd-host uninstall` (failure ignored) | before `InstallHostService` |
-| `UpgradeHostService` | major upgrade (`WIX_UPGRADE_DETECTED`) | `etd-host upgrade` | last, before `InstallFinalize` |
+| `InstallHostService` | no service yet (`NOT Installed AND NOT ETD_SERVICE_PRESENT`): a first install, or an upgrade after the service was removed | `etd-host install --owner [ProductCode] [--allow-user <SID>]` | last, before `InstallFinalize` |
+| `RollbackHostInstall` | rollback of that install | `etd-host uninstall --only-owner [ProductCode]` (failure ignored) | before `InstallHostService` |
+| `UpgradeHostService` | major upgrade over a service (`WIX_UPGRADE_DETECTED AND ETD_SERVICE_PRESENT`) | `etd-host upgrade` | last, before `InstallFinalize` |
 | `UninstallHostService` | full removal (`REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE`) | `etd-host uninstall` | before `RemoveFiles` |
+
+`ETD_SERVICE_PRESENT` comes from a registry search for the service's key
+(`HKLM\SYSTEM\CurrentControlSet\Services\easytier-desk-host`), whoever installed it; a
+launch condition refuses a first install while it is set. `--owner` records the
+package's ProductCode in `etd-host`'s journal, and the rollback removes only an
+installation recorded with that ProductCode: it can never remove a service this package
+did not install.
 
 `MajorUpgrade` removes the old product inside the new one's transaction
 (`afterInstallInitialize`). That removal sets `UPGRADINGPRODUCTCODE`, so it never runs
@@ -93,9 +113,10 @@ App Paths, product registration). What happens to the service:
 - **First install fails** (`etd-host install` exits non-zero, for example because
   `C:\Program Files\EasyTierDesk` already exists and is not ours, or the service does
   not report ready in time): `etd-host install` rolls back what it created, using its
-  journal, before it exits; `RollbackHostInstall` then runs `etd-host uninstall`, which
-  finds nothing to remove and never touches what it did not create (its failure, as
-  with a foreign folder, is ignored).
+  journal, before it exits; `RollbackHostInstall` then runs
+  `etd-host uninstall --only-owner [ProductCode]`, which removes only an installation
+  this package recorded and otherwise does nothing (its failure is ignored). A service
+  that existed before never reaches this point: the launch condition refuses first.
   The machine is as before, except `C:\ProgramData\EasyTierDesk.maintenance\` and its
   `host.lock`, which are kept by design. A foreign `EasyTierDesk` folder is left
   untouched; remove it, then install again.
@@ -114,13 +135,22 @@ App Paths, product registration). What happens to the service:
   for the service to stop): the product, payload and service registration stay; the
   service may be left disabled with its data, as `etd-host uninstall` reports. Run the
   uninstall again; `etd-host uninstall` resumes from its journal.
+- **Uninstall is rolled back after `etd-host uninstall` succeeded** (a later MSI action
+  fails, or the user cancels): `UninstallHostService` has no rollback, so Windows
+  Installer restores the product and payload but the service and its data are gone. A
+  repair runs no custom action and does not bring the service back. Install the next
+  version (or any upgrade package): with no service present it runs `etd-host install`
+  instead of `upgrade`. Or uninstall the product and install it again.
 
 ## Tests
 
 The privileged workflow's `msi` suite (`etd-testkit --test tier3`, `tests/tier3/package.py`)
-builds three test MSIs with `cargo xtask dist` and runs them on a fresh Windows runner: a
-refused first install leaves nothing, a first install with `ETD_ALLOW_USER`, a major
-upgrade keeping install id, install key and ledger settings, an upgrade whose new host
-never serves (rolled back by `etd-host` and by Windows Installer), and an uninstall
-compared with the machine before install. Those test packages carry the CI upgrade fault
-(`ci-test-fixtures`); release packages must not (PK5 checks the release artifacts).
+builds four test MSIs with `cargo xtask dist --allow-test-fixtures` and runs them on a
+fresh Windows runner: a refused first install leaves nothing; a package over a
+CLI-installed service is refused before any change and the service keeps serving; a
+first install with `ETD_ALLOW_USER`, recorded as owned by its ProductCode; a same-version
+rebuild and a major upgrade, both keeping install id, install key and ledger settings;
+an upgrade whose new host never serves (rolled back by `etd-host` and by Windows
+Installer); and an uninstall compared with the machine before install. Those test
+packages carry the CI upgrade fault (`ci-test-fixtures`) and a debug `etd-ui`; without
+`--allow-test-fixtures`, `dist` refuses both (PK5 also checks the release artifacts).

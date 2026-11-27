@@ -1,15 +1,20 @@
 """The Windows MSI on a disposable runner (PK3, doc#16).
 
-privileged.yml builds three MSIs with `cargo xtask dist` from this build:
-ETD_MSI_A (0.1.0), ETD_MSI_B (0.1.1) and ETD_MSI_C (0.1.2), each with a
+privileged.yml builds four MSIs with `cargo xtask dist
+--allow-test-fixtures` from this build: ETD_MSI_A (0.1.0), ETD_MSI_A2 (a
+rebuild of 0.1.0), ETD_MSI_B (0.1.1) and ETD_MSI_C (0.1.2), each with a
 distinct etd-host image. Their etd-host carries ci-test-fixtures, so a CI
-fault can make an upgrade fail; release packages never do.
+fault can make an upgrade fail; dist refuses that in release packages.
 
 The case walks one machine through:
 1. a first install that fails (a foreign Program Files\\EasyTierDesk):
-   Windows Installer and etd-host leave nothing behind;
+   Windows Installer and etd-host leave nothing behind; then a service
+   installed with the CLI: the MSI refuses to install over it before any
+   change, and the service keeps running untouched;
 2. a first install (A) with ETD_ALLOW_USER: payload, Start menu shortcut,
-   App Paths, and a serving service whose image is the payload's;
+   App Paths, and a serving service whose image is the payload's, recorded
+   as owned by A's ProductCode; then a rebuild of the same version (A2)
+   upgrades it in place, keeping install id, install key and settings;
 3. a major upgrade (B): the service runs B's image and keeps its install
    id, install key, ledger settings (allow list) and state;
 4. an upgrade (C) whose new host never serves: etd-host rolls the service
@@ -154,7 +159,7 @@ def probe_loaded_driver_paths(service):
               f"SeDebugPrivilege removed={report['debug_privilege_removed']}, "
               f"enable refused={report['debug_privilege_enable_refused']}; "
               f"EnumDeviceDrivers {report['enum_count']} entries, {report['enum_null_bases']} with hidden bases; "
-              f"SystemModuleInformation {report['module_count']} entries, problems={report['problems']}; "
+              f"SystemModuleInformation {report['module_count']} entries, path forms {report['shapes']}, problems={report['problems']}; "
               f"WinDivert: {found}", flush=True)
         assert report["debug_privilege_removed"] and report["debug_privilege_enable_refused"], report
         assert not report["problems"], report["problems"]
@@ -192,12 +197,41 @@ def failed_first_install(service, msi):
           "the foreign directory untouched", flush=True)
 
 
+def refused_over_cli_install(service, msi):
+    """A service installed with the CLI: the MSI's launch condition refuses
+    before any change, so its rollback cannot remove that service."""
+    host = payload_image(msi)  # staged next to its kernel bundle, as installed
+    command(host, "install", timeout=300)
+    try:
+        serving(service, "CLI-installed service")
+        before = journal()
+        assert "owner" not in before, before
+        key = digest(service.state / "repair-index.json")
+        kept = settings(service)
+        result = msiexec("/i", msi, "install-over-cli")
+        assert result.returncode == 1603, f"msiexec exited {result.returncode}"
+        assert not products(), products()
+        assert not PAYLOAD.exists(), f"a refused install left {PAYLOAD}"
+        assert not MENU.exists() and app_path() is None
+        serving(service, "CLI-installed service after the refused MSI")
+        assert journal() == before, "the refused MSI changed the installation"
+        assert digest(service.state / "repair-index.json") == key
+        assert settings(service) == kept
+    finally:
+        command(host, "uninstall", timeout=300)
+    assert not service_registered(), "the CLI uninstall left the service"
+    print("MSI over a CLI-installed service: refused (1603) before any change; the service "
+          "kept serving with its install id, key and settings", flush=True)
+
+
 def msi_lifecycle():
     service = Service()
-    a, b, c = (Path(os.environ[name]) for name in ("ETD_MSI_A", "ETD_MSI_B", "ETD_MSI_C"))
-    images = {msi: digest(payload_image(msi)) for msi in (a, b, c)}
-    assert len(set(images.values())) == 3, "the three packages must carry distinct images"
+    a, a2, b, c = (Path(os.environ[name])
+                   for name in ("ETD_MSI_A", "ETD_MSI_A2", "ETD_MSI_B", "ETD_MSI_C"))
+    images = {msi: digest(payload_image(msi)) for msi in (a, a2, b, c)}
+    assert len(set(images.values())) == 4, "the packages must carry distinct images"
     failed_first_install(service, a)
+    refused_over_cli_install(service, a)
 
     def install():
         result = msiexec("/i", a, "install", f"ETD_ALLOW_USER={ALLOWED}")
@@ -225,11 +259,28 @@ def msi_lifecycle():
         assert app_path() == (str(PAYLOAD / "etd-ctl.exe"), str(PAYLOAD) + "\\"), app_path()
         assert digest(service.host) == images[a], "the service image is not the payload's"
         assert ALLOWED.encode() in settings(service), "ETD_ALLOW_USER did not reach the allow list"
-        install_id = journal()["install_id"]
+        record = journal()
+        assert record.get("owner") == code_a, record
+        install_id = record["install_id"]
         key = digest(service.state / "repair-index.json")
         kept = settings(service)
         print(f"installed 0.1.0 ({code_a}): service serving from the payload image, "
-              f"{ALLOWED} enrolled", flush=True)
+              f"owned by its ProductCode, {ALLOWED} enrolled", flush=True)
+
+        # 2b. A rebuild of the same version upgrades in place.
+        result = msiexec("/i", a2, "same-version")
+        assert result.returncode == 0, f"msiexec exited {result.returncode}"
+        [(code_a2, version)] = products()
+        assert version == "0.1.0" and code_a2 != code_a, products()
+        serving(service, "service after the same-version rebuild")
+        assert digest(service.host) == digest(PAYLOAD / "etd-host.exe") == images[a2]
+        record = journal()
+        assert record["install_id"] == install_id and "upgrade" not in record, record
+        assert digest(service.state / "repair-index.json") == key, "the install key changed"
+        assert settings(service) == kept, "the ledger settings (allow list) changed"
+        no_backups(service)
+        print(f"same-version rebuild 0.1.0 ({code_a2}) replaced {code_a}: one product; install "
+              f"id, install key and settings kept; the service runs the rebuild", flush=True)
 
         # 3. Major upgrade.
         result = msiexec("/i", b, "upgrade")

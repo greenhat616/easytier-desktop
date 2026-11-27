@@ -295,6 +295,43 @@ fn make_entry(
 }
 
 #[gpui_kit::test]
+fn pane_and_page_header_share_top_edge_and_banners_are_in_content(cx: &mut TestAppContext) {
+    let (tray, _, _) = FakeTray::available();
+    let (installer, _) = FakeInstaller::ok();
+    let harness = TestHarness::new(cx, Box::new(tray), installer, false);
+    harness.push_store(
+        StateStore {
+            link: HostLink::NoHost,
+            ..Default::default()
+        },
+        cx,
+    );
+    cx.update_window(harness.window, |_, window, _cx| {
+        let pane = window.find("pane-title").bounds();
+        let header = window.find("app-header").bounds();
+        let content = window.find("page-content").bounds();
+        let notification = window.find("banner-no-host").bounds();
+        assert!(pane.origin.x < header.origin.x);
+        // The pane's toggle is inset in the top row; it must no longer start
+        // beneath the header or the notification band.
+        assert!(pane.origin.y < header.bottom());
+        assert!(notification.origin.x >= content.origin.x + px(24.));
+        assert!(notification.origin.y >= content.origin.y);
+        assert!(notification.right() <= content.right());
+        for id in [
+            "btn-connect-service",
+            "btn-connect-user",
+            "btn-refresh",
+            "btn-app-exit",
+            "btn-nohost-install-service",
+        ] {
+            assert_eq!(window.find(id).bounds().size.height, px(32.), "{id}");
+        }
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn navigation_selection_and_collapse_are_live(cx: &mut TestAppContext) {
     let (tray, _, _) = FakeTray::available();
     let (installer, _) = FakeInstaller::ok();

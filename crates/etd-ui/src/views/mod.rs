@@ -11,11 +11,7 @@ use gpui_kit::{
     AnyElement, Context, InteractiveElement as _, IntoElement, ParentElement as _, Render,
     SharedString, Styled as _, TestSupportExt as _, Window,
     base::LogicalStyledExt as _,
-    component::{
-        ActiveTheme as _, Size,
-        button::ButtonVariant,
-        sidebar::{Sidebar, SidebarToggleButton},
-    },
+    component::{ActiveTheme as _, Size, StyledExt as _, button::ButtonVariant, sidebar::Sidebar},
     div, px,
 };
 
@@ -132,27 +128,44 @@ fn render_sidebar(
         active_section == Section::Reclaim,
         cx.listener(|this, _, _, cx| this.controller.select_section(Section::Reclaim, cx)),
     );
+    let toggle = action_button(
+        "collapse",
+        if collapsed {
+            "Expand navigation"
+        } else {
+            "Collapse navigation"
+        },
+        BtnStyle::new(ButtonVariant::Ghost, Size::Medium)
+            .icon("fluent/navigation.svg")
+            .icon_only(),
+        cx.listener(|this, _, _, cx| {
+            this.sidebar_collapsed = !this.sidebar_collapsed;
+            cx.notify();
+        }),
+    );
+    let title_row = div()
+        .id("pane-title")
+        .test_support()
+        .flex_row_dir(cx)
+        .h(px(40.))
+        .items_center()
+        .gap_2()
+        .child(toggle)
+        .children((!collapsed).then(|| {
+            div()
+                .text_size(px(14.))
+                .font_semibold()
+                .child("EasyTier Desktop")
+        }));
     let header = div()
         .flex()
         .flex_col()
         .w_full()
         .gap_2()
-        .child(
-            SidebarToggleButton::new()
-                .collapsed(collapsed)
-                .accessibility_label(if collapsed {
-                    "Expand navigation"
-                } else {
-                    "Collapse navigation"
-                })
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.sidebar_collapsed = !this.sidebar_collapsed;
-                    cx.notify();
-                })),
-        )
+        .child(title_row)
         .children((!collapsed).then_some(new_btn));
     let mut sidebar = Sidebar::new("sidebar-nav")
-        .w(px(210.))
+        .w(px(240.))
         .h_full()
         .bg(sidebar)
         .border_color(border)
@@ -170,6 +183,7 @@ fn render_sidebar(
 fn render_section_content(
     view: &MainView,
     section: Section,
+    banners: AnyElement,
     cx: &mut Context<MainView>,
 ) -> AnyElement {
     let inner = match section {
@@ -178,12 +192,18 @@ fn render_section_content(
         Section::Editor => render_editor(view, cx),
     };
     div()
+        .id("page-content")
+        .test_support()
         .flex_1()
-        .h_full()
+        .min_h_0()
+        .min_w_0()
+        .flex()
+        .flex_col()
         .overflow_hidden()
         .bg(cx.theme().popover)
         .rounded_tl(px(8.))
-        .child(inner)
+        .child(banners)
+        .child(div().flex_1().min_h_0().overflow_hidden().child(inner))
         .into_any_element()
 }
 
@@ -209,26 +229,25 @@ impl Render for MainView {
             self.sidebar_collapsed,
             cx,
         );
-        let content = render_section_content(self, active_section, cx);
+        let content = render_section_content(self, active_section, banners, cx);
 
         div()
             .id("etd-main-root")
             .test_support()
-            .flex()
-            .flex_col()
+            .flex_row_dir(cx)
             .size_full()
             .bg(background)
             .text_color(foreground)
-            .child(header)
-            .child(banners)
+            .overflow_hidden()
+            .child(nav)
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
+                    .min_h_0()
                     .flex()
-                    .flex_row_dir(cx)
-                    .min_h(px(0.))
-                    .overflow_hidden()
-                    .child(nav)
+                    .flex_col()
+                    .child(header)
                     .child(content),
             )
     }

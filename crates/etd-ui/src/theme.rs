@@ -88,6 +88,17 @@ pub fn init(cx: &mut App) {
     windows::init(cx);
 }
 
+/// The standalone component gallery follows the same appearance machinery,
+/// but never opens or mutates the product's UI preference file.
+pub(crate) fn init_gallery(preference: ThemePreference, cx: &mut App) {
+    install_palette(cx);
+    cx.global_mut::<FluentChrome>().preference = preference;
+    set_native_preference(preference, cx);
+    apply_theme(cx.window_appearance(), cx);
+    #[cfg(target_os = "windows")]
+    windows::init(cx);
+}
+
 pub(crate) fn preference(cx: &App) -> ThemePreference {
     cx.try_global::<FluentChrome>()
         .map(|chrome| chrome.preference)

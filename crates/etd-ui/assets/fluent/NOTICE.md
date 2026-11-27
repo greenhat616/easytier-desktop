@@ -50,3 +50,5 @@ Copyright (c) 2020 Microsoft Corporation; MIT license in `LICENSE.txt`. The file
 - `checkmark-circle-filled.svg` — `assets/Checkmark Circle/SVG/ic_fluent_checkmark_circle_24_filled.svg`
 - `warning-filled.svg` — `assets/Warning/SVG/ic_fluent_warning_24_filled.svg`
 - `error-circle-filled.svg` — `assets/Error Circle/SVG/ic_fluent_error_circle_24_filled.svg`
+
+- `navigation.svg` — `assets/Navigation/SVG/ic_fluent_navigation_24_regular.svg`

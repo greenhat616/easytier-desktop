@@ -35,6 +35,7 @@ pub struct BtnStyle {
     pub loading: bool,
     pub icon: Option<&'static str>,
     selected: bool,
+    icon_only: bool,
 }
 
 impl BtnStyle {
@@ -47,11 +48,18 @@ impl BtnStyle {
             loading: false,
             icon: None,
             selected: false,
+            icon_only: false,
         }
     }
 
     pub const fn icon(mut self, asset: &'static str) -> Self {
         self.icon = Some(asset);
+        self
+    }
+
+    /// Icon-only controls retain their full accessible label.
+    pub const fn icon_only(mut self) -> Self {
+        self.icon_only = true;
         self
     }
 
@@ -161,8 +169,16 @@ impl gpui::RenderOnce for FluentButton {
         let style = self.style;
         let focus = focus_for(&id, window, cx);
         let group = SharedString::from(format!("fluent-button:{id:?}"));
+        // WinUI standard control metrics in effective pixels, independent
+        // of Kit's XSmall/Small density. Larger explicit sizes remain valid.
+        let height = button_height(style.size);
         let mut btn = Button::new(id.clone())
-            .with_size(style.size)
+            .with_size(Size::Medium)
+            .h(height)
+            .min_h(height)
+            .px(px(11.))
+            .py(px(5.))
+            .rounded(px(4.))
             .with_variant(style.variant)
             .accessibility_label(if style.selected {
                 format!("{} (selected)", self.label).into()
@@ -176,6 +192,12 @@ impl gpui::RenderOnce for FluentButton {
             .on_click(move |ev, window, cx| (self.on_click)(ev, window, cx));
         if style.outline {
             btn = btn.outline();
+        }
+        if style.icon_only {
+            btn = btn.w(height).min_w(height).px_0().py_0();
+        }
+        if style.selected && style.variant == ButtonVariant::Ghost {
+            btn = btn.bg(cx.theme().secondary.opacity(0.55));
         }
         if style.loading {
             let (fill, ink) = loading_button_colors(style, cx);
@@ -197,20 +219,24 @@ impl gpui::RenderOnce for FluentButton {
         // The content fades slightly during a pointer press; the toolkit's
         // own active color remains the background feedback. Don't scale
         // layout or make disabled targets respond.
-        btn = btn.child(
-            div()
-                .id("fluent-button-label")
-                .min_w_0()
-                .truncate()
-                .group_active(group.clone(), move |s| {
-                    s.opacity(if style.disabled || style.loading {
-                        1.
-                    } else {
-                        0.86
+        if !style.icon_only {
+            btn = btn.child(
+                div()
+                    .id("fluent-button-label")
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(14.))
+                    .line_height(px(20.))
+                    .group_active(group.clone(), move |s| {
+                        s.opacity(if style.disabled || style.loading {
+                            1.
+                        } else {
+                            0.86
+                        })
                     })
-                })
-                .child(self.label),
-        );
+                    .child(self.label),
+            );
+        }
         let elevate = !style.disabled
             && !style.loading
             && !matches!(
@@ -223,6 +249,14 @@ impl gpui::RenderOnce for FluentButton {
             .child(btn)
             .children(elevate.then(|| button_elevation_line(cx)))
             .children(focus_visual(focus.is_focused(window), window, cx))
+    }
+}
+
+fn button_height(size: Size) -> gpui_kit::Pixels {
+    match size {
+        Size::Size(value) => value.max(px(32.)),
+        Size::Large => px(36.),
+        _ => px(32.),
     }
 }
 
@@ -758,6 +792,16 @@ impl SidebarItem for FluentNavItem {
     }
 }
 
+/// The product's instance-card selection surface, also used in the gallery.
+pub fn list_selection_surface(selected: bool, cx: &App) -> (Hsla, Hsla) {
+    let t = cx.theme();
+    if selected {
+        (t.primary.opacity(0.08), t.primary)
+    } else {
+        (t.secondary.opacity(0.25), t.border)
+    }
+}
+
 /// Semantic InfoBar presentation, with neutral text on an opaque composited
 /// tint. The badge's icon matches severity without relying on color alone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -768,20 +812,31 @@ pub enum InfoSeverity {
     Error,
 }
 
-fn info_colors(severity: InfoSeverity, cx: &App) -> (Hsla, Hsla) {
+fn info_colors(severity: InfoSeverity, cx: &App) -> (Hsla, Hsla, Hsla) {
     let t = cx.theme();
-    let color = match severity {
-        InfoSeverity::Informational => t.info,
-        InfoSeverity::Success => t.success,
-        InfoSeverity::Warning => t.warning,
-        InfoSeverity::Error => t.danger,
+    // WinUI Common_themeresources_any.xaml SystemFill colors. Resolve
+    // translucent informational surfaces over our opaque content layer.
+    let (background, icon) = match (t.is_dark(), severity) {
+        (false, InfoSeverity::Informational) => (0xF7F7F7, t.info),
+        (true, InfoSeverity::Informational) => (0x2E2E2E, t.info),
+        (false, InfoSeverity::Success) => (0xDFF6DD, rgb(0x0F7B0F).into()),
+        (true, InfoSeverity::Success) => (0x393D1B, rgb(0x6CCB5F).into()),
+        (false, InfoSeverity::Warning) => (0xFFF4CE, rgb(0x9D5D00).into()),
+        (true, InfoSeverity::Warning) => (0x433519, rgb(0xFCE100).into()),
+        (false, InfoSeverity::Error) => (0xFDE7E9, rgb(0xC42B1C).into()),
+        (true, InfoSeverity::Error) => (0x442726, rgb(0xFF99A4).into()),
     };
-    let bg = Hsla::from(t.popover.to_rgb().blend(color.opacity(0.10).to_rgb()));
-    (bg, color)
+    let bg: Hsla = rgb(background).into();
+    // WinUI's single CardStrokeColorDefault brush composites differently
+    // on each severity fill (light 0x0F000000, dark 0x19000000).
+    let stroke = Hsla::from(rgb(0)).opacity(if t.is_dark() { 25. / 255. } else { 15. / 255. });
+    let border = Hsla::from(bg.to_rgb().blend(stroke.to_rgb()));
+    (bg, icon, border)
 }
 
 pub struct FluentInfoBar {
     id: ElementId,
+    title: Option<SharedString>,
     message: SharedString,
     severity: InfoSeverity,
     role: Role,
@@ -797,12 +852,17 @@ impl FluentInfoBar {
     ) -> Self {
         Self {
             id: id.into(),
+            title: None,
             message: message.into(),
             severity,
             role: Role::Alert,
             actions: Vec::new(),
             close: None,
         }
+    }
+    pub fn title(mut self, title: impl Into<SharedString>) -> Self {
+        self.title = Some(title.into());
+        self
     }
     pub fn status(mut self) -> Self {
         self.role = Role::Status;
@@ -819,7 +879,7 @@ impl FluentInfoBar {
 
     #[inline(never)]
     pub fn render(self, cx: &App) -> AnyElement {
-        let (bg, semantic) = info_colors(self.severity, cx);
+        let (bg, semantic, border) = info_colors(self.severity, cx);
         let icon = match self.severity {
             InfoSeverity::Informational => "fluent/info-filled.svg",
             InfoSeverity::Success => "fluent/checkmark-circle-filled.svg",
@@ -829,7 +889,7 @@ impl FluentInfoBar {
         let badge = div()
             .id("infobar-severity")
             .test_support()
-            .size(px(20.))
+            .size(px(16.))
             .flex_shrink_0()
             .flex()
             .items_center()
@@ -837,38 +897,69 @@ impl FluentInfoBar {
             .child(
                 Icon::default()
                     .path(icon)
-                    .with_size(Size::Large)
+                    .with_size(Size::Medium)
                     .text_color(semantic),
+            );
+        let aria_label: SharedString = match &self.title {
+            Some(title) => format!("{title} — {}", self.message).into(),
+            None => self.message.clone(),
+        };
+        let body = div()
+            .min_w_0()
+            .flex_1()
+            .flex_row_dir(cx)
+            .flex_wrap()
+            .items_center()
+            .gap_x(px(12.))
+            .children(
+                self.title
+                    .map(|title| div().font_semibold().text_size(px(14.)).child(title)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(14.))
+                    .child(self.message),
             );
         let actions = (!self.actions.is_empty()).then(|| {
             div()
                 .flex_row_dir(cx)
-                .flex_shrink_0()
+                .flex_wrap()
+                .items_center()
                 .gap_2()
                 .children(self.actions)
         });
-
+        let content = div()
+            .flex_1()
+            .min_w_0()
+            .flex_row_dir(cx)
+            .flex_wrap()
+            .items_center()
+            .gap_x(px(16.))
+            .gap_y(px(8.))
+            .child(body.min_w(px(180.)))
+            .children(actions);
         div()
             .id(self.id)
             .role(self.role)
             .test_support()
-            .aria_label(self.message.clone())
-            .mx_3()
-            .my_0p5()
-            .px_3()
-            .py_1()
+            .aria_label(aria_label)
+            .min_h(px(48.))
+            .px(px(16.))
+            .py(px(4.))
             .rounded(px(4.))
             .border_1()
-            .border_color(cx.theme().border)
+            .border_color(border)
             .bg(bg)
-            .text_sm()
             .text_color(cx.theme().foreground)
+            .text_size(px(14.))
+            .line_height(px(20.))
             .flex_row_dir(cx)
             .items_center()
-            .gap_3()
+            .gap(px(14.))
             .child(badge)
-            .child(div().min_w_0().flex_1().child(self.message))
-            .children(actions)
+            .child(content)
             .children(self.close)
             .into_any_element()
     }
@@ -1052,7 +1143,8 @@ mod tests {
                     InfoSeverity::Warning,
                     InfoSeverity::Error,
                 ] {
-                    let (bg, badge) = info_colors(severity, cx);
+                    let (bg, badge, border) = info_colors(severity, cx);
+                    assert_ne!(bg, border);
                     assert!(
                         contrast(t.foreground, bg) >= 4.5,
                         "InfoBar body {mode:?} {severity:?}"

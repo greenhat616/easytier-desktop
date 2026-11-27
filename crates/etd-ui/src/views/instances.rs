@@ -204,8 +204,7 @@ fn render_instance_card(
     is_selected: bool,
     cx: &mut Context<MainView>,
 ) -> AnyElement {
-    let primary = cx.theme().primary;
-    let border = cx.theme().border;
+    let (card_bg, card_border) = crate::views::ui::list_selection_surface(is_selected, cx);
     let secondary = cx.theme().secondary;
     let secondary_fg = cx.theme().secondary_foreground;
     let success = cx.theme().success;
@@ -271,12 +270,8 @@ fn render_instance_card(
         .p_3()
         .rounded_md()
         .border_1()
-        .border_color(if is_selected { primary } else { border })
-        .bg(if is_selected {
-            primary.opacity(0.08)
-        } else {
-            secondary.opacity(0.25)
-        })
+        .border_color(card_border)
+        .bg(card_bg)
         .child(
             div()
                 .flex()

@@ -1620,7 +1620,7 @@ mod tests {
                 .unwrap();
             cx.run_until_parked();
             let popout = cx
-                .windows()
+                .update(|cx| cx.windows())
                 .into_iter()
                 .find(|w| *w != handle)
                 .expect("pop-out opened");

@@ -365,48 +365,84 @@ def own_low_connect(port, directory):
 
 SECOND_ACCOUNT = r"""
 $ErrorActionPreference = 'Stop'
-$secure = ConvertTo-SecureString $env:ES5_PROBE_SECRET -AsPlainText -Force
-$cred = [pscredential]::new("$env:COMPUTERNAME\__NAME__", $secure)
-try {
-  $p = Start-Process -FilePath '__EXE__' -Credential $cred -WorkingDirectory '__DIR__' -RedirectStandardOutput '__OUT__' -PassThru -Wait -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand','__SCRIPT__'
-  "exit $($p.ExitCode)"
-} catch { "launch failed: $($_.Exception.GetType().FullName): $($_.Exception.Message)" }
+Add-Type -TypeDefinition @'
+using System;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+using Microsoft.Win32.SafeHandles;
+public static class Es5Probe {
+  [DllImport("advapi32", SetLastError = true, CharSet = CharSet.Unicode)]
+  static extern bool LogonUserW(string user, string domain, string password, int type, int provider, out IntPtr token);
+  [DllImport("advapi32", SetLastError = true)]
+  static extern bool DuplicateTokenEx(IntPtr token, uint access, IntPtr attributes, int level, int type, out IntPtr copy);
+  [DllImport("advapi32", SetLastError = true, CharSet = CharSet.Unicode)]
+  static extern bool ConvertStringSidToSidW(string text, out IntPtr sid);
+  [DllImport("advapi32")]
+  static extern int GetLengthSid(IntPtr sid);
+  [DllImport("advapi32", SetLastError = true)]
+  static extern bool SetTokenInformation(IntPtr token, int kind, ref Label label, int length);
+  [DllImport("kernel32")]
+  static extern bool CloseHandle(IntPtr handle);
+  [StructLayout(LayoutKind.Sequential)]
+  public struct Label { public IntPtr Sid; public uint Attributes; }
+  public static string Connect(string user, string password, int port, bool low) {
+    IntPtr logon;
+    // Interactive, else network logon: either gives the account's own token.
+    if (!LogonUserW(user, ".", password, 2, 0, out logon) && !LogonUserW(user, ".", password, 3, 0, out logon))
+      return "logon failed " + Marshal.GetLastWin32Error();
+    IntPtr copy;
+    bool duplicated = DuplicateTokenEx(logon, 0x02000000, IntPtr.Zero, 2, 2, out copy);
+    CloseHandle(logon);
+    if (!duplicated) return "duplicate failed " + Marshal.GetLastWin32Error();
+    string level = "Medium";
+    if (low) {
+      IntPtr sid;
+      ConvertStringSidToSidW("S-1-16-4096", out sid);
+      var label = new Label { Sid = sid, Attributes = 0x20 };
+      if (!SetTokenInformation(copy, 25, ref label, Marshal.SizeOf(label) + GetLengthSid(sid)))
+        return "label failed " + Marshal.GetLastWin32Error();
+      level = "Low";
+    }
+    using (var handle = new SafeAccessTokenHandle(copy)) {
+      return WindowsIdentity.RunImpersonated(handle, () => {
+        string name = WindowsIdentity.GetCurrent(true).Name;
+        using (var s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)) {
+          try { s.Connect("127.0.0.1", port); return name + " | " + level + " | connected"; }
+          catch (SocketException e) { return name + " | " + level + " | error " + e.NativeErrorCode + " " + e.SocketErrorCode; }
+        }
+      });
+    }
+  }
+}
+'@
+foreach ($low in $false, $true) { [Es5Probe]::Connect('__NAME__', $env:ES5_PROBE_SECRET, __PORT__, $low) }
 """
 
 
 def second_account_connects(port):
     """A temporary standard account (random password, never printed)
-    connects through the secondary logon at Medium and, from a Low-labelled
-    copy, at Low integrity; the account is removed afterwards."""
+    connects from a thread impersonating its own logon token, at Medium and
+    lowered to Low integrity; the account is removed afterwards. (A child
+    process of another account cannot initialise on the runner's window
+    station, and the host's own fence probe impersonates the same way.)"""
     name = "es5probe"
     # At most 14 characters: net user asks for confirmation beyond that.
     password = uuid.uuid4().hex[:10] + "Aa1!"
-    exchange = Path("C:/es5-probe")
-    exchange.mkdir(exist_ok=True)
-    command("icacls", exchange, "/grant", "*S-1-1-0:(OI)(CI)F")
-    images = {"Medium": Path(os.environ["SystemRoot"]) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe",
-              "Low": low_copy(exchange)}
     command("net", "user", name, password, "/add")
-    verdicts = {}
     try:
-        for level, image in images.items():
-            out = exchange / f"connect-{level}.txt"
-            out.unlink(missing_ok=True)
-            launcher = (SECOND_ACCOUNT.replace("__NAME__", name).replace("__EXE__", str(image))
-                        .replace("__DIR__", str(exchange)).replace("__OUT__", str(out))
-                        .replace("__SCRIPT__", encoded(CONNECT.replace("__PORT__", str(port)))))
-            # Windows PowerShell with its own module path, not pwsh 7's
-            # (inherited from the runner), so its cmdlets load.
-            env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
-            result = command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
-                             encoded(launcher), check=False, env=dict(env, ES5_PROBE_SECRET=password))
-            if not out.exists():
-                raise AssertionError(f"second account probe ({level}) did not run: {result.stdout} {result.stderr}")
-            verdicts[level] = out.read_text(encoding="utf-8", errors="replace").strip()
+        script = SECOND_ACCOUNT.replace("__NAME__", name).replace("__PORT__", str(port))
+        # Windows PowerShell with its own module path, not pwsh 7's
+        # (inherited from the runner), so its cmdlets load.
+        env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
+        result = command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                         encoded(script), check=False, env=dict(env, ES5_PROBE_SECRET=password))
     finally:
         command("net", "user", name, "/delete", check=False)
-        shutil.rmtree(exchange, ignore_errors=True)
-    return verdicts
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) != 2:
+        raise AssertionError(f"second account probe: {result.stdout} {result.stderr}")
+    return {"Medium": lines[0], "Low": lines[1]}
 
 
 def identities():
@@ -433,7 +469,7 @@ def identities():
         others = second_account_connects(port)
         for level, verdict in others.items():
             print(f"second account at {level}: {verdict}", flush=True)
-            assert f"{level} Mandatory Level" in verdict, verdict
+            assert f"es5probe | {level} | " in verdict, verdict
             assert verdict.endswith("error 10013 AccessDenied"), verdict
         # Reported, not judged: a Low copy of the elevated token keeps
         # Administrators enabled, and the fence admits elevated

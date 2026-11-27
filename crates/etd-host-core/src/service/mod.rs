@@ -70,11 +70,37 @@ impl Inner {
         // Stop authorization before an external ACL change, including on
         // already-open HTTP/2 connections. Re-enable only once both agree.
         self.authorizer.invalidate();
-        if self.mode == HostMode::Service {
+        if self.has_allow_list() {
             self.allow_list_sink.apply(&entries)?;
         }
         self.authorizer.replace(entries);
         Ok(())
+    }
+
+    /// Only the service keeps an allow list (and its listener ACL).
+    fn has_allow_list(&self) -> bool {
+        match self.mode {
+            HostMode::Service => true,
+            HostMode::User | HostMode::ElevatedSession | HostMode::Unspecified => false,
+        }
+    }
+
+    /// The UI's lease keeps the user and elevated session hosts alive; the
+    /// service runs regardless of clients.
+    fn has_lease(&self) -> bool {
+        match self.mode {
+            HostMode::User | HostMode::ElevatedSession => true,
+            HostMode::Service | HostMode::Unspecified => false,
+        }
+    }
+
+    /// Hosts that grant Admin only to an elevated peer, so a Control peer
+    /// refused an Admin method is told to elevate.
+    fn has_admin_elevation(&self) -> bool {
+        match self.mode {
+            HostMode::Service | HostMode::ElevatedSession => true,
+            HostMode::User | HostMode::Unspecified => false,
+        }
     }
 
     async fn reload_authorization(&self) -> Result<(), ()> {
@@ -172,12 +198,6 @@ impl ContractService {
     }
     fn guard<T>(&self, request: &Request<T>, method: &str) -> Result<(PeerIdentity, Role), Status> {
         check_version(request)?;
-        if self.inner.mode == HostMode::ElevatedSession {
-            return Err(rejection(
-                ErrorCode::FeatureRejected,
-                "elevated session mode is not available in this version",
-            ));
-        }
         let peer = request
             .extensions()
             .get::<PeerIdentity>()
@@ -192,7 +212,7 @@ impl ContractService {
         if !role_allows(role, need) {
             let code = if need == Role::Admin
                 && role == Role::Control
-                && self.inner.mode == HostMode::Service
+                && self.inner.has_admin_elevation()
                 && !peer.elevated
             {
                 ErrorCode::ElevationRequired
@@ -267,10 +287,10 @@ impl ContractService {
         record: RequestRecord,
         mutation: Mutation,
     ) -> Result<Receipt, Status> {
-        if self.inner.mode == HostMode::User && matches!(mutation, Mutation::AllowList(_)) {
+        if !self.inner.has_allow_list() && matches!(mutation, Mutation::AllowList(_)) {
             return Err(rejection(
                 ErrorCode::FeatureRejected,
-                "User host has no allow list",
+                "This host has no allow list",
             ));
         }
         let known = self.inner.ledger.request_status(&record).await;
@@ -836,16 +856,13 @@ impl HostService for ContractService {
             .inner
             .capabilities
             .iter()
-            .filter(|c| {
-                if self.inner.mode == HostMode::User
-                    && matches!(c.as_str(), capability::TUN | capability::ADMIN_ALLOW_LIST)
-                {
-                    return false;
+            .filter(|c| match self.inner.mode {
+                HostMode::User => {
+                    !matches!(c.as_str(), capability::TUN | capability::ADMIN_ALLOW_LIST)
                 }
-                if self.inner.mode == HostMode::Service && c.as_str() == capability::LEASE {
-                    return false;
-                }
-                true
+                HostMode::Service => c.as_str() != capability::LEASE,
+                HostMode::ElevatedSession => c.as_str() != capability::ADMIN_ALLOW_LIST,
+                HostMode::Unspecified => false,
             })
             .cloned()
             .collect();
@@ -1082,7 +1099,7 @@ impl HostService for ContractService {
         request: Request<ReleaseLeaseRequest>,
     ) -> Result<Response<ReleaseLeaseResponse>, Status> {
         self.guard(&request, "ReleaseLease")?;
-        if self.inner.mode == HostMode::Service {
+        if !self.inner.has_lease() {
             return Ok(Response::new(ReleaseLeaseResponse {
                 host_exiting: false,
             }));
@@ -1104,10 +1121,10 @@ impl HostService for ContractService {
     ) -> Result<Response<GetAllowListResponse>, Status> {
         let _lock = self.inner.mutations.lock().await;
         self.guard(&request, "GetAllowList")?;
-        if self.inner.mode == HostMode::User {
+        if !self.inner.has_allow_list() {
             return Err(rejection(
                 ErrorCode::FeatureRejected,
-                "User host has no allow list",
+                "This host has no allow list",
             ));
         }
         let (revision, _) = self.inner.ledger.desired().await.map_err(ledger_error)?;

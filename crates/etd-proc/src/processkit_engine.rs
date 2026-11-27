@@ -23,6 +23,8 @@ use tokio::{
 #[derive(Default, Clone)]
 pub struct ProcessKitEngine {
     console_helper: Option<PathBuf>,
+    /// Appended to every launch's own environment (see [`Self::with_env`]).
+    extra_env: Vec<(OsString, OsString)>,
 }
 
 impl ProcessKitEngine {
@@ -35,7 +37,16 @@ impl ProcessKitEngine {
     pub fn with_console_helper(executable: PathBuf) -> Self {
         Self {
             console_helper: Some(executable),
+            extra_env: Vec::new(),
         }
+    }
+
+    /// Variables the composition root adds to every kernel launch (the
+    /// elevated session host's profile variables). They join the launch's
+    /// own extra environment; engine-owned variables still win.
+    pub fn with_env(mut self, env: Vec<(OsString, OsString)>) -> Self {
+        self.extra_env = env;
+        self
     }
 }
 
@@ -920,7 +931,8 @@ fn kill_orphan(
 }
 #[async_trait]
 impl ProcessEngine for ProcessKitEngine {
-    async fn spawn(&self, cmd: Command) -> Result<Box<dyn ProcessHandle>, ProcessError> {
+    async fn spawn(&self, mut cmd: Command) -> Result<Box<dyn ProcessHandle>, ProcessError> {
+        cmd.env.extend(self.extra_env.iter().cloned());
         let (ready, receiver) = oneshot::channel();
         let helper = self.console_helper.clone();
         parent_death::worker(move || {

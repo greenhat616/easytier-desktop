@@ -32,16 +32,20 @@ struct Cli {
     command: Option<Action>,
 }
 
-#[derive(Debug, Copy, Clone, ValueEnum)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum Mode {
     User,
     Service,
+    /// The current user's privileged host, started from an elevated
+    /// administrator token (Windows only; no path options).
+    ElevatedSession,
 }
 impl From<Mode> for HostMode {
     fn from(value: Mode) -> Self {
         match value {
             Mode::User => Self::User,
             Mode::Service => Self::Service,
+            Mode::ElevatedSession => Self::ElevatedSession,
         }
     }
 }
@@ -110,6 +114,10 @@ enum Action {
         /// instance configuration. Requires `--all`.
         #[arg(long, requires = "all")]
         purge: bool,
+        /// With --mode elevated-session: every user's elevated session
+        /// state, not only the current user's.
+        #[arg(long)]
+        all_users: bool,
     },
     /// Read-only diagnostic information (no special privileges required).
     Doctor,
@@ -122,11 +130,22 @@ enum Action {
 }
 
 fn main() -> ExitCode {
+    // First thing, for every command: DLLs load from System32 only, never
+    // from the (possibly user-writable) image directory.
+    #[cfg(windows)]
+    if let Err(error) = etd_sysfx_os::service::harden_dll_search() {
+        eprintln!("etd-host: cannot restrict the DLL search path: {error}");
+        return ExitCode::FAILURE;
+    }
     match execute(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("etd-host: {error:#}");
-            ExitCode::FAILURE
+            // The elevated session's refusals have their own exit codes,
+            // so the UI can tell them apart.
+            host::SessionRefusal::find(&error).map_or(ExitCode::FAILURE, |refusal| {
+                ExitCode::from(refusal.exit_code())
+            })
         }
     }
 }
@@ -162,13 +181,19 @@ fn execute(cli: Cli) -> Result<()> {
         .build()?;
     match command {
         Action::Doctor => host::doctor(),
+        Action::Run {
+            mode: Mode::ElevatedSession,
+        } => run_elevated_session(runtime),
         Action::Run { mode } => {
             let (exit, settled) = run_bounded(runtime, host::run(mode.into()));
             exit.finish(settled)
         }
-        Action::Reclaim { mode, all, purge } => {
-            run_bounded(runtime, host::reclaim(mode.into(), all, purge)).0
-        }
+        Action::Reclaim {
+            mode,
+            all,
+            purge,
+            all_users,
+        } => run_bounded(runtime, host::reclaim(mode.into(), all, purge, all_users)).0,
         Action::RemoveCore { mode, version } => {
             run_bounded(runtime, host::remove_core(mode.into(), &version)).0
         }
@@ -200,6 +225,43 @@ fn execute(cli: Cli) -> Result<()> {
         }
         Action::ResumeService => run_bounded(runtime, host::resume_service()).0,
     }
+}
+
+/// `run --mode elevated-session`: Ctrl+C or the end of the Windows session
+/// stops it. The session end is held (shutdown block reason) until the
+/// host has wound down and released its lock, within the stop's worst case.
+#[cfg(windows)]
+fn run_elevated_session(runtime: tokio::runtime::Runtime) -> Result<()> {
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let stop = std::sync::Arc::new(stop);
+    let on_end = {
+        let stop = stop.clone();
+        move || {
+            let _ = stop.send(true);
+        }
+    };
+    let mut session_end =
+        etd_sysfx_os::service::SessionEnd::watch(Box::new(on_end), host::stop_worst_case())
+            .context("cannot watch for the end of the Windows session")?;
+    let (exit, settled) = run_bounded(runtime, async move {
+        let interrupt = tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                let _ = stop.send(true);
+            }
+        });
+        let exit = host::run_until(HostMode::ElevatedSession, Some(stopped)).await;
+        interrupt.abort();
+        exit
+    });
+    let result = exit.finish(settled);
+    session_end.finished();
+    result
+}
+
+#[cfg(not(windows))]
+fn run_elevated_session(runtime: tokio::runtime::Runtime) -> Result<()> {
+    drop(runtime);
+    bail!("the elevated session host is Windows-only")
 }
 
 /// Run `work` on `runtime`, then shut the runtime down within

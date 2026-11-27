@@ -23,7 +23,7 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context as TaskContext, Poll},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -298,10 +298,47 @@ pub(crate) fn valid_sid(sid: &str) -> bool {
         })
 }
 
+/// Binding the host's endpoint failed: another process holds its name, or
+/// it cannot be published. Context of the bind error.
+#[derive(Debug)]
+pub(crate) struct EndpointUnavailable;
+impl std::fmt::Display for EndpointUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the host endpoint cannot be published")
+    }
+}
+
+/// The account a host form serves and, for the elevated session, its own
+/// Windows session (its peers must be in the same one). Without the
+/// session no peer is authorized.
+pub(crate) fn host_owner(mode: HostMode) -> io::Result<(Option<OsUserId>, Option<u32>)> {
+    Ok(match mode {
+        HostMode::User => (Some(platform::current_user()?), None),
+        HostMode::ElevatedSession => {
+            #[cfg(windows)]
+            let session = etd_sysfx_os::service::elevated_session_token()
+                .ok()
+                .map(|token| token.session);
+            #[cfg(unix)]
+            let session = None;
+            (Some(platform::current_user()?), session)
+        }
+        HostMode::Service | HostMode::Unspecified => (None, None),
+    })
+}
+
 pub(crate) fn policy(mode: HostMode, entries: &[AllowEntry]) -> io::Result<ListenerPolicy> {
     let mut policy = ListenerPolicy::default();
-    if mode == HostMode::User {
-        return Ok(policy);
+    match mode {
+        // Owner-only pipes: no allow list.
+        HostMode::User | HostMode::ElevatedSession => return Ok(policy),
+        HostMode::Service => (),
+        HostMode::Unspecified => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsupported host mode",
+            ));
+        }
     }
     for entry in entries {
         let id = entry
@@ -361,10 +398,11 @@ fn capabilities(mode: HostMode) -> Vec<String> {
         capability::QUERY_ROUTES,
         capability::QUERY_TRAFFIC,
     ];
-    if mode == HostMode::Service {
-        values.extend([capability::TUN, capability::ADMIN_ALLOW_LIST]);
-    } else {
-        values.push(capability::LEASE);
+    match mode {
+        HostMode::Service => values.extend([capability::TUN, capability::ADMIN_ALLOW_LIST]),
+        HostMode::ElevatedSession => values.extend([capability::TUN, capability::LEASE]),
+        HostMode::User => values.push(capability::LEASE),
+        HostMode::Unspecified => values.clear(),
     }
     values.into_iter().map(str::to_owned).collect()
 }
@@ -395,15 +433,13 @@ pub(crate) async fn serve_with_deps_and(
     // Load the exact durable settings before publishing the endpoint; no
     // mutation task exists until the new listener is bound with that policy.
     let entries = deps.ledger.settings().await?.allow_list;
-    let owner = if mode == HostMode::User {
-        Some(platform::current_user()?)
-    } else {
-        None
-    };
-    let auth = Arc::new(AllowListAuthorizer::new(mode, owner));
+    let (owner, session) = host_owner(mode)?;
+    let auth = Arc::new(AllowListAuthorizer::new(mode, owner).with_session(session));
     auth.load(deps.ledger.as_ref()).await?;
+    let lease = LeaseRule::of(mode)?;
     let listener =
-        LocalListener::bind_replacing_stale(guard.listener_claim(), &policy(mode, &entries)?)?;
+        LocalListener::bind_replacing_stale(guard.listener_claim(), &policy(mode, &entries)?)
+            .context(EndpointUnavailable)?;
     let sink = Arc::new(AclSink(listener.policy_handle()));
     let mut deps = Arc::into_inner(deps).context("unexpected host dependency sharing")?;
     deps.authorizer = auth.clone();
@@ -449,7 +485,7 @@ pub(crate) async fn serve_with_deps_and(
         sink,
     )
     .with_start_blocker(start_blocker);
-    let incoming = tonic_io::incoming(TrackedListener::new(listener, svc.clone(), mode));
+    let incoming = tonic_io::incoming(TrackedListener::new(listener, svc.clone(), lease));
     let orchestrator = Orchestrator::new(deps, port);
     let budget = orchestrator.shutdown_budget();
     let supervisors = orchestrator.supervisor_tasks();
@@ -545,38 +581,148 @@ async fn shutdown_signal(managed: &mut Option<watch::Receiver<bool>>) -> io::Res
     }
 }
 
+/// Which connections hold the lease that keeps a user or elevated session
+/// host alive.
+enum LeaseRule {
+    /// The service: no lease.
+    None,
+    /// The user host: every connection (all are the owner's).
+    Every,
+    /// The elevated session host: connections whose client process image,
+    /// read from a handle opened on the client pid at accept and kept for
+    /// the connection's life, is the `etd-ui.exe` beside the host image
+    /// (compared canonically, case-insensitively). This does not
+    /// authenticate the UI: any program of the same user at that path
+    /// counts. Protecting that path is the installer's job (accepted risk,
+    /// issue #2). Other clients (the CLI) are connections, not holders.
+    /// Elsewhere (no such host) nothing reads the path.
+    UiImage(#[cfg_attr(not(windows), allow(dead_code))] Option<std::path::PathBuf>),
+}
+
+impl LeaseRule {
+    fn of(mode: HostMode) -> io::Result<Self> {
+        Ok(match mode {
+            HostMode::Service | HostMode::Unspecified => Self::None,
+            HostMode::User => Self::Every,
+            HostMode::ElevatedSession => Self::UiImage(sibling_ui()),
+        })
+    }
+
+    /// Whether the client `peer` holds the lease, and the process pin that
+    /// keeps that answer true while the connection lives. `accepted`: when
+    /// the pipe connection was accepted, so after its client connected.
+    fn holds(&self, peer: &PeerIdentity, accepted: SystemTime) -> (bool, Option<ClientPin>) {
+        match self {
+            Self::None => (false, None),
+            Self::Every => (true, None),
+            #[cfg(windows)]
+            // The pin is taken right after accept and tied to the client
+            // pid by its creation time: a process created after the accept
+            // reused the pid and is not the client. Left open: the client
+            // exiting and its pid being reused, by a process at the UI path,
+            // between the IPC layer reading the pid and this open, before
+            // the accept returned. That miscounts a lease (not an
+            // authorization; issue #2). Both times are wall-clock (process
+            // creation times are): a clock set back by more than the UI's
+            // age makes the UI look newer than the accept, so it holds no
+            // lease and the host stops after the grace; fail-safe, rare.
+            Self::UiImage(Some(ui)) => match etd_sysfx_os::service::ProcessPin::open(peer.pid) {
+                Ok(pin) => {
+                    let holds = pin.created() <= accepted
+                        && pin.alive().unwrap_or(false)
+                        && pin
+                            .image()
+                            .and_then(std::fs::canonicalize)
+                            .is_ok_and(|image| same_path(&image, ui));
+                    (holds, Some(pin))
+                }
+                Err(error) => {
+                    tracing::warn!(pid = peer.pid, %error, "client process not inspectable; not a lease holder");
+                    (false, None)
+                }
+            },
+            // No elevated session host on Unix.
+            #[cfg(unix)]
+            Self::UiImage(_) => {
+                let _ = (peer, accepted);
+                (false, None)
+            }
+            #[cfg(windows)]
+            Self::UiImage(None) => (false, None),
+        }
+    }
+}
+
+/// The canonical `etd-ui.exe` beside this host's image, if there is one.
+fn sibling_ui() -> Option<std::path::PathBuf> {
+    let host = std::env::current_exe().ok()?.canonicalize().ok()?;
+    let ui = host
+        .parent()?
+        .join(format!("etd-ui{}", std::env::consts::EXE_SUFFIX));
+    match ui.canonicalize() {
+        Ok(ui) => Some(ui),
+        Err(error) => {
+            tracing::warn!(path = %ui.display(), %error, "no desktop UI beside the host; no connection holds the lease");
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+fn same_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a.as_os_str()
+        .to_string_lossy()
+        .to_lowercase()
+        .eq(&b.as_os_str().to_string_lossy().to_lowercase())
+}
+
+/// Keeps the client process object (and so its pid) alive.
+#[cfg(windows)]
+type ClientPin = etd_sysfx_os::service::ProcessPin;
+#[cfg(unix)]
+type ClientPin = std::convert::Infallible;
+
+#[derive(Default)]
+struct Counts {
+    connections: usize,
+    holders: usize,
+}
 struct Presence {
-    count: Mutex<usize>,
+    counts: Mutex<Counts>,
     service: ContractService,
-    user: bool,
 }
 impl Presence {
-    fn change(&self, add: bool) {
-        let mut count = self
-            .count
+    fn change(&self, add: bool, holder: bool) {
+        let mut counts = self
+            .counts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if add {
-            *count += 1;
+            counts.connections += 1;
+            counts.holders += usize::from(holder);
         } else {
-            *count = count.saturating_sub(1);
+            counts.connections = counts.connections.saturating_sub(1);
+            if holder {
+                counts.holders = counts.holders.saturating_sub(1);
+            }
         }
         self.service
-            .set_connection_presence(*count, if self.user { *count } else { 0 });
+            .set_connection_presence(counts.connections, counts.holders);
     }
 }
 struct TrackedListener {
     listener: LocalListener,
+    lease: LeaseRule,
     presence: Arc<Presence>,
 }
 impl TrackedListener {
-    fn new(listener: LocalListener, service: ContractService, mode: HostMode) -> Self {
+    fn new(listener: LocalListener, service: ContractService, lease: LeaseRule) -> Self {
         Self {
             listener,
+            lease,
             presence: Arc::new(Presence {
-                count: Mutex::new(0),
+                counts: Mutex::new(Counts::default()),
                 service,
-                user: mode == HostMode::User,
             }),
         }
     }
@@ -585,11 +731,14 @@ impl TrackedListener {
 impl Listener for TrackedListener {
     async fn accept(&mut self) -> io::Result<(BoxConn, PeerIdentity)> {
         let (conn, peer) = self.listener.accept().await?;
-        self.presence.change(true);
+        let (holder, pin) = self.lease.holds(&peer, SystemTime::now());
+        self.presence.change(true, holder);
         Ok((
             Box::new(TrackedConnection {
                 conn,
                 presence: self.presence.clone(),
+                holder,
+                _pin: pin,
             }),
             peer,
         ))
@@ -598,10 +747,12 @@ impl Listener for TrackedListener {
 struct TrackedConnection {
     conn: BoxConn,
     presence: Arc<Presence>,
+    holder: bool,
+    _pin: Option<ClientPin>,
 }
 impl Drop for TrackedConnection {
     fn drop(&mut self) {
-        self.presence.change(false);
+        self.presence.change(false, self.holder);
     }
 }
 impl AsyncRead for TrackedConnection {
@@ -626,6 +777,80 @@ impl AsyncWrite for TrackedConnection {
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.conn).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+
+    fn now() -> SystemTime {
+        SystemTime::now()
+    }
+
+    fn peer(pid: u32) -> PeerIdentity {
+        PeerIdentity {
+            user: OsUserId::UnixUid(1),
+            groups: vec![],
+            pid,
+            session: None,
+            elevated: false,
+        }
+    }
+
+    #[test]
+    fn only_the_rule_of_the_form_decides_the_lease() {
+        let me = peer(std::process::id());
+        assert!(
+            !LeaseRule::None.holds(&me, now()).0,
+            "the service has no lease"
+        );
+        assert!(
+            LeaseRule::Every.holds(&me, now()).0,
+            "every user host connection"
+        );
+        assert!(
+            !LeaseRule::UiImage(None).holds(&me, now()).0,
+            "no UI beside the host: no holder"
+        );
+        assert!(matches!(
+            LeaseRule::of(HostMode::Service).unwrap(),
+            LeaseRule::None
+        ));
+        assert!(matches!(
+            LeaseRule::of(HostMode::User).unwrap(),
+            LeaseRule::Every
+        ));
+        assert!(matches!(
+            LeaseRule::of(HostMode::ElevatedSession).unwrap(),
+            LeaseRule::UiImage(_)
+        ));
+    }
+
+    /// The client's image, read from a handle on its pid, must be exactly
+    /// the UI path (here this test process stands in for the UI).
+    #[cfg(windows)]
+    #[test]
+    fn an_elevated_session_lease_needs_the_ui_image() {
+        let me = peer(std::process::id());
+        let image = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let (holds, pin) = LeaseRule::UiImage(Some(image.clone())).holds(&me, now());
+        assert!(holds);
+        assert!(pin.is_some(), "the client process stays pinned");
+        let upper = std::path::PathBuf::from(image.to_string_lossy().to_uppercase());
+        assert!(
+            LeaseRule::UiImage(Some(upper)).holds(&me, now()).0,
+            "case-insensitive"
+        );
+        let other = image.with_file_name("etd-ui.exe");
+        assert!(!LeaseRule::UiImage(Some(other)).holds(&me, now()).0);
+        // A process created after the accept reused the client's pid.
+        let (holds, pin) =
+            LeaseRule::UiImage(Some(image.clone())).holds(&me, SystemTime::UNIX_EPOCH);
+        assert!(!holds, "created after the accept: not the client");
+        assert!(pin.is_some());
+        // A pid that cannot be opened holds nothing.
+        assert!(!LeaseRule::UiImage(Some(image)).holds(&peer(0), now()).0);
     }
 }
 

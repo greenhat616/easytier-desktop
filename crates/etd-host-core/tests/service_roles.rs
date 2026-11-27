@@ -588,43 +588,166 @@ async fn ambiguous_purge_commit_keeps_admin_authorized() {
             .is_ok()
     );
 }
-#[tokio::test]
-async fn elevated_session_explicitly_feature_rejected_including_handshake() {
-    let f = Fixture::new().await;
-    let auth = Arc::new(etd_host_core::auth::allow_list::AllowListAuthorizer::new(
-        HostMode::ElevatedSession,
-        None,
-    ));
-    auth.load(f.ledger.as_ref()).await.unwrap();
+const SESSION_OWNER: &str = "S-1-5-21-1-2-3-1001";
+
+fn session_peer(user: &str, session: Option<u32>, elevated: bool) -> etd_ipc::PeerIdentity {
+    etd_ipc::PeerIdentity {
+        user: etd_ipc::OsUserId::WindowsSid(user.into()),
+        groups: vec![],
+        pid: 1,
+        session,
+        elevated,
+    }
+}
+
+fn session_request<T>(body: T, peer: etd_ipc::PeerIdentity) -> tonic::Request<T> {
+    let mut req = request(body, Role::Viewer);
+    req.extensions_mut().insert(peer);
+    req
+}
+
+async fn session_service(
+    ledger: Arc<MemoryLedger>,
+) -> (
+    ContractService,
+    Arc<etd_host_core::auth::allow_list::AllowListAuthorizer>,
+) {
+    let auth = Arc::new(
+        etd_host_core::auth::allow_list::AllowListAuthorizer::new(
+            HostMode::ElevatedSession,
+            Some(etd_ipc::OsUserId::WindowsSid(SESSION_OWNER.into())),
+        )
+        .with_session(Some(1)),
+    );
+    auth.load(ledger.as_ref()).await.unwrap();
     let (handle, _port) = orchestrator_channel(8, HostView::default());
     let service = ContractService::new(
         HostMode::ElevatedSession,
-        f.ledger,
+        ledger,
         InstallKey([7; 32]),
-        auth,
+        auth.clone(),
         Arc::new(FakeCoreStore::default()),
         handle,
-        vec![],
+        vec![
+            capability::INSTANCES.into(),
+            capability::TUN.into(),
+            capability::LEASE.into(),
+            capability::ADMIN_ALLOW_LIST.into(),
+            capability::ADMIN_PURGE.into(),
+        ],
         8,
     );
+    (service, auth)
+}
+
+#[tokio::test]
+async fn elevated_session_roles_follow_owner_session_and_elevation() {
+    let f = Fixture::new().await;
+    let (_, auth) = session_service(f.ledger).await;
+    let other = "S-1-5-21-1-2-3-1002";
+    for (peer, role) in [
+        (
+            session_peer(SESSION_OWNER, Some(1), false),
+            Some(Role::Control),
+        ),
+        (
+            session_peer(SESSION_OWNER, Some(1), true),
+            Some(Role::Admin),
+        ),
+        (
+            session_peer(&SESSION_OWNER.to_lowercase(), Some(1), false),
+            Some(Role::Control),
+        ),
+        (session_peer(other, Some(1), false), None),
+        (session_peer(other, Some(1), true), None),
+        (session_peer(SESSION_OWNER, Some(2), true), None),
+        (session_peer(SESSION_OWNER, None, true), None),
+        (session_peer("S-1-5-18", Some(1), true), None),
+    ] {
+        assert_eq!(auth.role_of(&peer), role, "{peer:?}");
+    }
+    // Without the host's own session nobody is authorized.
+    let unset = etd_host_core::auth::allow_list::AllowListAuthorizer::new(
+        HostMode::ElevatedSession,
+        Some(etd_ipc::OsUserId::WindowsSid(SESSION_OWNER.into())),
+    );
+    unset.load(&MemoryLedger::default()).await.unwrap();
+    assert_eq!(
+        unset.role_of(&session_peer(SESSION_OWNER, Some(1), true)),
+        None
+    );
+}
+
+#[tokio::test]
+async fn elevated_session_handshake_capabilities_and_elevation_required() {
+    let f = Fixture::new().await;
+    let (service, _) = session_service(f.ledger).await;
     let hello = Hello {
         major: VERSION_MAJOR,
         minor: VERSION_MINOR,
         ..Default::default()
     };
-    let err = service
-        .handshake(request(hello, Role::Admin))
+    let welcome = service
+        .handshake(session_request(
+            hello.clone(),
+            session_peer(SESSION_OWNER, Some(1), false),
+        ))
         .await
-        .unwrap_err();
+        .unwrap()
+        .into_inner();
+    assert_eq!(welcome.role(), Role::Control);
+    assert_eq!(welcome.host_mode(), HostMode::ElevatedSession);
     assert_eq!(
-        err.message(),
-        "elevated session mode is not available in this version"
+        welcome.capabilities,
+        vec![
+            capability::INSTANCES,
+            capability::TUN,
+            capability::LEASE,
+            capability::ADMIN_PURGE
+        ]
     );
-    assert_eq!(code(err), ErrorCode::FeatureRejected);
+    let welcome = service
+        .handshake(session_request(
+            hello.clone(),
+            session_peer(SESSION_OWNER, Some(1), true),
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(welcome.role(), Role::Admin);
     assert_eq!(
         code(
             service
-                .snapshot(request(SnapshotRequest {}, Role::Admin))
+                .handshake(session_request(
+                    hello,
+                    session_peer("S-1-5-21-1-2-3-1002", Some(1), true)
+                ))
+                .await
+                .unwrap_err()
+        ),
+        ErrorCode::PermissionDenied
+    );
+    // An Admin method from the non-elevated owner asks for elevation.
+    assert_eq!(
+        code(
+            service
+                .purge_all_data(session_request(
+                    PurgeAllDataRequest::default(),
+                    session_peer(SESSION_OWNER, Some(1), false)
+                ))
+                .await
+                .unwrap_err()
+        ),
+        ErrorCode::ElevationRequired
+    );
+    // There is no allow list, even for the elevated owner.
+    assert_eq!(
+        code(
+            service
+                .get_allow_list(session_request(
+                    GetAllowListRequest {},
+                    session_peer(SESSION_OWNER, Some(1), true)
+                ))
                 .await
                 .unwrap_err()
         ),

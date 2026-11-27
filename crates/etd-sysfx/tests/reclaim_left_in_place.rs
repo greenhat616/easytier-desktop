@@ -121,6 +121,50 @@ async fn held_by_is_a_conflict_that_closes_once_the_object_is_gone() {
     assert!(w.open().await.is_empty());
 }
 
+/// Once an attempt began, the ledger cannot prove the object unchanged,
+/// whatever the reclaimer observes now (a value changed, then restored by
+/// someone else, looks untouched): HeldBy then counts as a failure.
+#[tokio::test]
+async fn held_by_after_an_earlier_attempt_is_a_failure() {
+    let w = World::new();
+    let e = applied(
+        &w,
+        EffectKind::WinMagicDnsRecovery,
+        magic_dns_key(),
+        Undo::ReplayUpstreamRecovery,
+    )
+    .await;
+    let engine = w.engine();
+    let a = InstanceId::from("a");
+    // An earlier attempt: refused part-way (a crash would leave the same
+    // durable mark, `Reclaiming`, without a failure).
+    w.sys.inject(
+        Fault::on(Step::Reclaim)
+            .kind(EffectKind::WinMagicDnsRecovery)
+            .once()
+            .fail(ReclaimError::Busy("replay interrupted".into())),
+    );
+    engine.reclaim_generation(&a, Epoch(1)).await.unwrap();
+    assert_eq!(record(&w, &e).await.state, EffectState::Reclaiming);
+    w.sys.inject(
+        Fault::on(Step::Reclaim)
+            .kind(EffectKind::WinMagicDnsRecovery)
+            .fail(ReclaimError::HeldBy("easytier-core.exe pid=7".into())),
+    );
+    for _ in 1..QUARANTINE_AFTER {
+        engine.reclaim_generation(&a, Epoch(1)).await.unwrap();
+    }
+    let held = record(&w, &e).await;
+    assert_eq!(held.state, EffectState::Quarantined);
+    assert_eq!(held.failures, QUARANTINE_AFTER);
+    assert!(
+        held.last_error
+            .as_deref()
+            .is_some_and(|m| m.contains("an earlier attempt may have changed it")),
+        "{held:?}"
+    );
+}
+
 #[tokio::test]
 async fn not_deletable_is_a_candidate_never_retried_towards_quarantine() {
     let w = World::new();

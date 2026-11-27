@@ -242,8 +242,13 @@ impl Ctx<'_> {
                 match r.reclaim(e).await {
                     Err(ReclaimError::CredentialMismatch) => self.conflict(e, &found).await,
                     // Left in place without a failure: re-probed by
-                    // `recheck_held` on every run, closed once gone.
-                    Err(ReclaimError::HeldBy(holder)) => {
+                    // `recheck_held` on every run, closed once gone. Only on
+                    // the record's first attempt: `e` is the state read at
+                    // the start of this run, and `reclaiming` above has
+                    // durably marked the attempt before the reclaimer ran,
+                    // so `Reclaiming` here means an earlier run (perhaps one
+                    // that crashed) may have changed the object part-way.
+                    Err(ReclaimError::HeldBy(holder)) if e.state != EffectState::Reclaiming => {
                         self.notes.push(format!(
                             "{} {:?}: held by {holder}; left in place",
                             e.kind,
@@ -258,6 +263,15 @@ impl Ctx<'_> {
                             report::lookup_key(e)
                         ));
                         self.candidate(e, &found).await
+                    }
+                    Err(ReclaimError::HeldBy(holder)) => {
+                        self.fail(
+                            e,
+                            &format!(
+                                "held by {holder}, but an earlier attempt may have changed it; retrying"
+                            ),
+                        )
+                        .await
                     }
                     Err(err) => self.fail(e, &err.to_string()).await,
                     Ok(done) => self.verify(e, r.as_ref(), done).await,

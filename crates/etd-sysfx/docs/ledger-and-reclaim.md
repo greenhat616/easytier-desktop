@@ -166,7 +166,10 @@ Per record: move to `Reclaiming`, probe, decide, act, verify.
 
 After a delete the object must probe absent, otherwise it is a failure. A reclaimer's
 `CredentialMismatch` becomes a conflict, and so does `HeldBy(holder)`: a positive proof
-that another owner holds the object now, named in a report note. `NotDeletable(reason)`
+that another owner holds the object now, named in a report note. `HeldBy` counts only on
+the record's first attempt: the engine marks a record `Reclaiming` durably before calling
+its reclaimer, so a record already `Reclaiming` when the run starts may have been changed
+part-way by an earlier run (one that crashed included), and `HeldBy` is then a failure. `NotDeletable(reason)`
 (ours, but that reclaimer never deletes it, such as a live wintun adapter) makes the record
 a candidate; an administrator's DELETE meets the same answer and leaves it a candidate
 with a note. Neither counts as a failure; both are re-probed on every run and close once

@@ -57,6 +57,8 @@ outside the store, the first gate (before any change) answers `HeldBy` with that
 process's name and image, but only while the system still holds every entry the record
 lists (each NRPT rule present, each saved `SearchList` different from its original): an
 earlier replay interrupted part-way leaves the system short of that, so it must finish.
+The engine adds the durable half: it honours `HeldBy` only on the record's first attempt
+(an observation alone cannot tell a value changed and then restored by someone else).
 The record then becomes a conflict, left in place, and closes once the key is gone (the
 other EasyTier's own clean-up removes it). A candidate that cannot be read or placed, a
 failed enumeration, a changed record, a record whose entries are not all in place or

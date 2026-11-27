@@ -87,7 +87,7 @@ jobs:
           Write-Host "[$Name] captured events: $($rows.Count)"
           $ours = @($rows | Where-Object { $_.'Process Name' -match $Processes })
           $ours | Group-Object 'Process Name' | ForEach-Object { Write-Host "[$Name] $($_.Name): $($_.Count) events" }
-          $classes = @($ours | Where-Object { $_.Operation -like 'Reg*' -and $_.Path -match '^(HKCR|HKCU\Software\Classes|HKU\[^\]+_Classes)' })
+          $classes = @($ours | Where-Object { $_.Operation -like 'Reg*' -and $_.Path -match '^(HKCR|HKCU.Software.Classes|HKU.[^_]+_Classes)' })
           Write-Host "[$Name] HKCR/HKCU classes registry events by our processes: $($classes.Count)"
           $classes | Group-Object 'Process Name', Operation, Path, Result | Sort-Object Count -Descending | ForEach-Object { Write-Host ("  {0,5}  {1}" -f $_.Count, $_.Name) }
           $classes | Export-Csv "C:\pm\$Name-classes.csv" -NoTypeInformation
@@ -123,8 +123,8 @@ jobs:
             Write-Host "exit (natives): $LASTEXITCODE"
             if ($LASTEXITCODE -ne 0) { $code = 1 }
           } finally {
-            & C:\pm\analyze.ps1 -Name native -Processes '^es2n-native-spike\.exe$'
             & C:\pm\plant.ps1 -Remove
+            & C:\pm\analyze.ps1 -Name native -Processes '^es2n-native-spike\.exe$'
           }
           Write-Host "PowerShell view afterwards:"
           foreach ($id in $a, $b) {
@@ -157,11 +157,17 @@ jobs:
       - name: Today's session-form worker under the same plants (evidence, expected to fail)
         if: always()
         shell: pwsh
+        env:
+          CI: 'true'
+          ETD_HOST_CI_INSTALL: '1'
         run: |
+          & C:\pm\plant.ps1 -Remove
           & C:\pm\plant.ps1
           try {
             cargo nextest run --locked --profile privileged -p etd-sysfx-os --run-ignored only --test windows_fence -E 'test(session_fence)' --success-output never --failure-output immediate
             Write-Host "session_fence exit under plants: $LASTEXITCODE"
+            cargo nextest run --locked --profile privileged -p etd-host --run-ignored only --test install_roundtrip -E 'test(install_connect_uninstall)' --success-output never --failure-output immediate
+            Write-Host "install_connect_uninstall exit under plants: $LASTEXITCODE"
           } finally {
             & C:\pm\plant.ps1 -Remove
           }

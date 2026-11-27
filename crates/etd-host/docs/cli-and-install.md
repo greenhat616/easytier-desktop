@@ -122,9 +122,10 @@ blocks; its self-check reclaims it.
      a `Conflict` one (another program's) is ignored;
   2. kernel-binary `WinProgramFirewallRule` records in our firewall group whose
      program path lies inside that root's own `<SID>\cores`.
-  For a program rule that was observed, the read-back key and the credential's
-  actual program must name such a path too; evidence that exists but cannot be read
-  blocks.
+  Only a program rule never observed rests on its planned name. An observed one needs
+  readable evidence of the actual program (the read-back key, the credential's
+  program, or a conflict's found detail): every piece present must be readable and
+  inside, and at least one must be present; otherwise it blocks.
 - Paths count as inside a store only if both are plain local-drive paths (no `..`,
   `.`, doubled separators, streams, device or UNC forms) and, canonicalised (case,
   short names), the store is an ancestor by components and by file identity.

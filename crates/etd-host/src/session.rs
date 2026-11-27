@@ -176,12 +176,13 @@ fn shared_driver_elsewhere(effect: &Effect, stores: &[PathBuf]) -> bool {
     }
 }
 
-/// Reviewed class 2 of [`blocks`]. The planned name, and where the record
-/// was observed the observed key and the credential's actual program, must
-/// all name a program inside that root's own kernel store. Evidence that
-/// exists but cannot be read (another key form, another credential form,
-/// no program in it) blocks; only a record never observed rests on its
-/// name alone.
+/// Reviewed class 2 of [`blocks`]. The planned name must name a program
+/// inside that root's own kernel store. Only a record never observed rests
+/// on that name alone. An observed one needs readable evidence of the
+/// actual program, positively inside the store: the observed key, the
+/// credential's program, or (on a `Conflict`) the program in the found
+/// detail. Every such piece present must be readable and inside, and at
+/// least one must be present; anything else blocks.
 fn program_rule_of(effect: &Effect, cores: &Path) -> bool {
     let inside = |path: &Path| path_inside(path, cores);
     if effect.kind != EffectKind::WinProgramFirewallRule || !our_program_rule(&effect.key, inside) {
@@ -190,22 +191,34 @@ fn program_rule_of(effect: &Effect, cores: &Path) -> bool {
     let Some(observation) = &effect.observation else {
         return true;
     };
-    if let Some(key) = &observation.key
-        && !our_program_rule(key, inside)
-    {
-        return false;
+    let program_in = |value: &str| {
+        serde_json::from_str::<serde_json::Value>(value).is_ok_and(|evidence| {
+            evidence["program"]
+                .as_str()
+                .is_some_and(|program| inside(Path::new(program)))
+        })
+    };
+    let mut evidence = 0;
+    if let Some(key) = &observation.key {
+        if !our_program_rule(key, inside) {
+            return false;
+        }
+        evidence += 1;
     }
     match &observation.credential {
-        None => true,
-        Some(etd_sysfx::Credential::Opaque { value }) => {
-            serde_json::from_str::<serde_json::Value>(value).is_ok_and(|credential| {
-                credential["program"]
-                    .as_str()
-                    .is_some_and(|program| inside(Path::new(program)))
-            })
-        }
-        Some(_) => false,
+        None => (),
+        Some(etd_sysfx::Credential::Opaque { value }) if program_in(value) => evidence += 1,
+        Some(_) => return false,
     }
+    if effect.state == EffectState::Conflict
+        && let Some(detail) = &observation.detail
+    {
+        if !program_in(detail) {
+            return false;
+        }
+        evidence += 1;
+    }
+    evidence > 0
 }
 
 /// A rule key in our firewall group named `EasyTier <program> (Inbound |
@@ -672,7 +685,20 @@ mod tests {
             Some(lower.clone()),
             program(kernel)
         )));
-        assert!(ours(&read_back(rule(kernel, Some("EasyTier")), None, None)));
+        assert!(
+            !ours(&read_back(rule(kernel, Some("EasyTier")), None, None)),
+            "observed without any readable evidence"
+        );
+        assert!(ours(&read_back(
+            rule(kernel, Some("EasyTier")),
+            Some(lower.clone()),
+            None
+        )));
+        assert!(ours(&read_back(
+            rule(kernel, Some("EasyTier")),
+            None,
+            program(kernel)
+        )));
         assert!(!ours(&read_back(
             rule(kernel, Some("EasyTier")),
             Some(lower.clone()),
@@ -710,6 +736,24 @@ mod tests {
             Some(elsewhere),
             None
         )));
+        // A Conflict's found detail is evidence too: it must be readable
+        // and inside.
+        let conflict = |detail: Option<serde_json::Value>| Effect {
+            state: EffectState::Conflict,
+            observation: Some(etd_sysfx::Observation {
+                credential: None,
+                key: None,
+                observed_at: "1970-01-01T00:00:00Z".parse().unwrap(),
+                detail: detail.map(|detail| detail.to_string()),
+            }),
+            ..rule(kernel, Some("EasyTier"))
+        };
+        let found =
+            |path: &Path| Some(serde_json::json!({ "program": path.display().to_string() }));
+        assert!(ours(&conflict(found(kernel))));
+        assert!(!ours(&conflict(found(&fixture.spoof.join("x.exe")))));
+        assert!(!ours(&conflict(Some(serde_json::json!({ "name": "x" })))));
+        assert!(!ours(&conflict(None)), "no readable evidence");
     }
 
     #[test]

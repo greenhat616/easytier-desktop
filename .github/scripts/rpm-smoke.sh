@@ -21,7 +21,8 @@ done
 # snapshot below sees only what the package itself adds.
 mapfile -t requires < <(rpm -qp --requires "$release" | grep -v '^rpmlib(' | awk '{print $1}' | sort -u)
 echo "requires: ${requires[*]}"
-dnf install -y -q --setopt=install_weak_deps=False "${requires[@]}"
+# diffutils: diff for the leftover check below (not in the base image).
+dnf install -y -q --setopt=install_weak_deps=False "${requires[@]}" diffutils
 echo "recommends: $(rpm -qp --recommends "$release" | tr '\n' ' ')"
 
 snapshot() {

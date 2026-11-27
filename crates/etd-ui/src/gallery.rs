@@ -1230,8 +1230,10 @@ mod tests {
                 .unwrap()
                 .save(output.join(format!("gallery-dialogs-{name}-dialog.png")))
                 .unwrap();
-            // Layout page.
+            // Layout page, once the dialog above is closed.
             cx.update_window(handle, |_, window, cx| {
+                window.press("escape", cx);
+                window.render_frame(cx);
                 window.click("gallery-nav-layout", cx);
                 window.render_frame(cx);
                 assert!(window.find("layout-grid").visible());
@@ -1244,8 +1246,6 @@ mod tests {
                 .unwrap();
             // Navigation page.
             cx.update_window(handle, |_, window, cx| {
-                window.press("escape", cx);
-                window.render_frame(cx);
                 window.click("gallery-nav-navigation", cx);
                 window.render_frame(cx);
                 window.click("nav-item-3", cx);

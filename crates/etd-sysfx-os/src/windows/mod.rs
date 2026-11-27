@@ -53,9 +53,7 @@ impl WinError {
         }
     }
     fn reclaim(self) -> ReclaimError {
-        if let Some(holder) = self.message.strip_prefix(HELD_BY) {
-            ReclaimError::HeldBy(holder.to_owned())
-        } else if self.message.contains("BUSY:") {
+        if self.message.contains("BUSY:") {
             ReclaimError::Busy(self.message)
         } else {
             ReclaimError::Os {
@@ -71,8 +69,6 @@ impl WinError {
         }
     }
 }
-/// Message prefix of a [`WinError`] that is a proven foreign holder.
-const HELD_BY: &str = "HELD_BY: ";
 fn observation(credential: Option<Credential>, key: ObjectKey, detail: String) -> Observation {
     Observation {
         credential,
@@ -460,7 +456,7 @@ impl Reclaimer for WindowsReclaimer {
             }
             EffectKind::WinMagicDnsRecovery => {
                 if e.undo != Undo::ReplayUpstreamRecovery { return Err(ReclaimError::CredentialMismatch); }
-                let root=self.1.clone();return blocking(move||magic::replay(&root)).await.map_err(WinError::reclaim);
+                let root=self.1.clone();return blocking(move||Ok(magic::replay(&root))).await.map_err(WinError::reclaim)?.map_err(magic::ReplayError::reclaim);
             }
             EffectKind::WinFirewallRule | EffectKind::WinProgramFirewallRule | EffectKind::WinNrptRule | EffectKind::WinNetworkProfile => {
                 if e.undo != Undo::EnsureAbsent { return Err(ReclaimError::CredentialMismatch); }

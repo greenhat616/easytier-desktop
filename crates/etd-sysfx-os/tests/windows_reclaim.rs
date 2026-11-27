@@ -681,9 +681,10 @@ async fn real_wintun_after_kill() {
         scope.clone(),
     );
     let reclaimer = |kind| os.reclaimers.iter().find(|r| r.kind() == kind).unwrap();
+    // Live and ours: never uninstalled, listed as a candidate instead.
     assert!(matches!(
         reclaimer(adapter.kind).reclaim(&adapter).await,
-        Err(ReclaimError::Busy(_))
+        Err(ReclaimError::NotDeletable(_))
     ));
     let mut effects = Vec::new();
     for protocol in ["TCP", "UDP", "ICMP", "ALL"] {

@@ -54,10 +54,14 @@ checks that no other EasyTier process runs; the kernel processes of this product
 recognised by the identity of their opened image file inside the protected kernel
 store, not by a path prefix. If every running candidate was read and placed, and one is
 outside the store, the first gate (before any change) answers `HeldBy` with that
-process's name and image: the record becomes a conflict, left in place, and closes once
-the key is gone (the other EasyTier's own clean-up removes it). A candidate that cannot be
-read or placed, a failed enumeration, a changed record, or a holder that appears once the
-replay has changed something is `Busy`, and the engine retries towards quarantine. A
+process's name and image, but only while the system still holds every entry the record
+lists (each NRPT rule present, each saved `SearchList` different from its original): an
+earlier replay interrupted part-way leaves the system short of that, so it must finish.
+The record then becomes a conflict, left in place, and closes once the key is gone (the
+other EasyTier's own clean-up removes it). A candidate that cannot be read or placed, a
+failed enumeration, a changed record, a record whose entries are not all in place or
+cannot be read, or a holder that appears once this replay has changed something is
+`Busy`, and the engine retries towards quarantine. A
 conflict is never replayed: if the other EasyTier never used Magic DNS and exits, our
 state stays in the key until the next EasyTier that enables Magic DNS cleans it (our next
 start included) or an administrator keeps the record.

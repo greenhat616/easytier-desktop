@@ -16,9 +16,10 @@
 
 mod cores;
 mod sign;
+mod windows;
 
 use crate::fetch_cores::{self, LOCK, PIN};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -139,26 +140,6 @@ fn stage(bins: &Path, bundle: &Path, core_version: &str, windows: bool, dir: &Pa
     Ok(())
 }
 
-/// The target's packager. None is wired in yet: only a dry run succeeds.
-fn package(_root: &Path, payload: &Payload, dry_run: bool) -> Result<Option<PathBuf>> {
-    ensure!(
-        dry_run,
-        "no packager for {} yet (Windows: PK3; Linux: PK4; macOS: not this release)",
-        payload.triple
-    );
-    println!(
-        "{} {} payload with the {} kernel ({} files) in {}; package output {}",
-        payload.triple,
-        payload.version,
-        payload.core_version,
-        payload.core_files.len(),
-        payload.dir.display(),
-        payload.out.display()
-    );
-    let _ = payload.is_windows();
-    Ok(None)
-}
-
 pub fn run(root: &Path, args: Args) -> Result<()> {
     let pin = fetch_cores::parse_pin(&fs::read_to_string(root.join(PIN)).context(PIN)?)?;
     let triple = if args.target == "host" {
@@ -228,7 +209,14 @@ pub fn run(root: &Path, args: Args) -> Result<()> {
         dir,
         out,
     };
-    let package = package(root, &payload, args.dry_run)?;
+    let package = if payload.is_windows() {
+        windows::package(root, &payload, args.dry_run)?
+    } else {
+        bail!(
+            "no packager for {} yet (Linux: PK4; macOS: not this release)",
+            payload.triple
+        );
+    };
     match package {
         Some(package) => {
             sign::run(args.sign_hook, &package)?;

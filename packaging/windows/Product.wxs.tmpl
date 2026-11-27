@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  EasyTier Desktop per-machine MSI (PK3, doc#16 v2). `cargo xtask dist`
+  renders this file into <out>/<triple>/Product.wxs: it fills in the
+  at-sign placeholders (version, payload folder, kernel version) and
+  generates one component per file of the kernel bundle it verified
+  against crates/etd-host/cores.lock.
+
+  The package owns only its payload folder (Program Files\EasyTier Desktop).
+  The service, its protected folder (Program Files\EasyTierDesk) and its
+  state belong to etd-host: custom actions run the payload's etd-host as
+  LocalSystem, without a window, at these points:
+
+  - first install: `etd-host install`, last before InstallFinalize, with a
+    rollback action that runs `etd-host uninstall` (etd-host install also
+    rolls itself back);
+  - major upgrade: `etd-host upgrade`, last before InstallFinalize, so no
+    MSI action after it can fail. A failed upgrade restores and restarts
+    the previous service itself; a committed one is never rolled back;
+  - full uninstall (not the removal of the old product during an upgrade):
+    `etd-host uninstall` before RemoveFiles.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="EasyTier Desktop" Manufacturer="EasyTier Desktop" Version="@VERSION@"
+           UpgradeCode="89AB7D73-819C-4BB3-BA52-DCB90C01C4ED" Scope="perMachine" Language="1033">
+    <MajorUpgrade Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="A newer version of EasyTier Desktop is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <!-- Optional: one more account (SID) allowed to use the service, passed
+         to the allow-user option of `etd-host install`. Default: LocalSystem and
+         Administrators. -->
+    <Property Id="ETD_ALLOW_USER" Secure="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="EasyTier Desktop">
+        <Directory Id="CoresFolder" Name="cores">
+          <Directory Id="CoreVersionFolder" Name="@CORE_VERSION@" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ProgramMenuDir" Name="EasyTier Desktop" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="Payload" Directory="INSTALLFOLDER">
+      <Component Id="EtdUi">
+        <File Id="EtdUi" Source="@PAYLOAD@\etd-ui.exe" KeyPath="yes" />
+        <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuDir" Name="EasyTier Desktop"
+                  Target="[#EtdUi]" WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="RemoveProgramMenuDir" Directory="ProgramMenuDir" On="uninstall" />
+      </Component>
+      <Component Id="EtdHost">
+        <File Id="EtdHost" Source="@PAYLOAD@\etd-host.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="EtdCtl">
+        <File Id="EtdCtl" Source="@PAYLOAD@\etd-ctl.exe" KeyPath="yes" />
+        <!-- App Paths serves the Run dialog and ShellExecute only; cmd and
+             PowerShell do not search it, and PATH is left alone. -->
+        <RegistryKey Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\etd-ctl.exe">
+          <RegistryValue Type="string" Value="[#EtdCtl]" />
+          <RegistryValue Name="Path" Type="string" Value="[INSTALLFOLDER]" />
+        </RegistryKey>
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="Kernel" Directory="CoreVersionFolder">
+@CORE_COMPONENTS@
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="EasyTier Desktop">
+      <ComponentGroupRef Id="Payload" />
+      <ComponentGroupRef Id="Kernel" />
+    </Feature>
+
+    <!-- Deferred actions read their command line from the property of the
+         same name. [INSTALLFOLDER] ends with a backslash. -->
+    <SetProperty Id="InstallHostService" Action="SetInstallHostService" Sequence="execute"
+                 Before="InstallHostService" Condition="NOT ETD_ALLOW_USER"
+                 Value="&quot;[INSTALLFOLDER]etd-host.exe&quot; install" />
+    <SetProperty Id="InstallHostService" Action="SetInstallHostServiceAllowUser" Sequence="execute"
+                 Before="InstallHostService" Condition="ETD_ALLOW_USER"
+                 Value="&quot;[INSTALLFOLDER]etd-host.exe&quot; install --allow-user &quot;[ETD_ALLOW_USER]&quot;" />
+    <SetProperty Id="RollbackHostInstall" Sequence="execute" Before="RollbackHostInstall"
+                 Value="&quot;[INSTALLFOLDER]etd-host.exe&quot; uninstall" />
+    <SetProperty Id="UpgradeHostService" Sequence="execute" Before="UpgradeHostService"
+                 Value="&quot;[INSTALLFOLDER]etd-host.exe&quot; upgrade" />
+    <SetProperty Id="UninstallHostService" Sequence="execute" Before="UninstallHostService"
+                 Value="&quot;[INSTALLFOLDER]etd-host.exe&quot; uninstall" />
+
+    <CustomAction Id="RollbackHostInstall" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec" Execute="rollback" Impersonate="no" Return="ignore" />
+    <CustomAction Id="InstallHostService" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="UpgradeHostService" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="UninstallHostService" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="check" />
+
+    <InstallExecuteSequence>
+      <Custom Action="RollbackHostInstall" Before="InstallHostService"
+              Condition="NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
+      <Custom Action="InstallHostService" Before="InstallFinalize"
+              Condition="NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
+      <Custom Action="UpgradeHostService" Before="InstallFinalize"
+              Condition="WIX_UPGRADE_DETECTED AND NOT (REMOVE~=&quot;ALL&quot;)" />
+      <Custom Action="UninstallHostService" Before="RemoveFiles"
+              Condition="(REMOVE~=&quot;ALL&quot;) AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

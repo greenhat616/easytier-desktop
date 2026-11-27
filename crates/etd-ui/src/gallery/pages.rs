@@ -1208,6 +1208,18 @@ fn index_handler(
 /// (StackPanelPage.xaml, GridPage.xaml: Red, Blue, Green, Yellow).
 const SAMPLE_FILLS: [u32; 4] = [0xFF0000, 0x0000FF, 0x008000, 0xFFFF00];
 
+/// A WinUI Slider with its Header above it: 14/20 text, 4 px below
+/// (SliderHeaderThemeMargin 0,0,0,4, Slider_themeresources.xaml).
+fn headed(header: &'static str, slider: AnyElement) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .child(div().text_size(px(14.)).line_height(px(20.)).child(header))
+        .child(slider)
+        .into_any_element()
+}
+
 fn spacing_slider(value: f32, cx: &mut Context<Gallery>) -> Entity<SliderState> {
     // WinUI Gallery's spacing sliders: 0–16 in steps of 1, starting at 8.
     let state = cx.new(|_| {
@@ -1310,7 +1322,7 @@ pub(super) fn layout_page(
                 .gap(px(12.))
                 .w(px(240.))
                 .child(orientation)
-                .child(stack_slider)
+                .child(headed("Spacing", stack_slider))
                 .child(SharedString::from(format!("Spacing: {stack_spacing:.0}"))),
         )
         .into_any_element();
@@ -1371,8 +1383,8 @@ pub(super) fn layout_page(
                 .flex_col()
                 .gap(px(12.))
                 .w(px(240.))
-                .child(col_slider)
-                .child(row_slider),
+                .child(headed("ColumnSpacing", col_slider))
+                .child(headed("RowSpacing", row_slider)),
         )
         .into_any_element();
 

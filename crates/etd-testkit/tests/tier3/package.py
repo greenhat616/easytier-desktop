@@ -69,6 +69,16 @@ def products():
     return sorted(found)
 
 
+def display_icon(code):
+    """The Add/Remove Programs icon Windows Installer registered (ARPPRODUCTICON)."""
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, rf"{UNINSTALL}\{code}", 0,
+                        winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
+        try:
+            return winreg.QueryValueEx(key, "DisplayIcon")[0]
+        except FileNotFoundError:
+            return None
+
+
 def app_path():
     try:
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, APP_PATHS, 0,
@@ -257,6 +267,8 @@ def msi_lifecycle():
             assert (PAYLOAD / name).is_file(), f"payload misses {name}"
         assert (MENU / "EasyTier Desktop.lnk").is_file(), "no Start menu shortcut"
         assert app_path() == (str(PAYLOAD / "etd-ctl.exe"), str(PAYLOAD) + "\\"), app_path()
+        icon = display_icon(code_a)
+        assert icon and Path(icon).is_file() and Path(icon).read_bytes()[:4] == b"\0\0\1\0", icon
         assert digest(service.host) == images[a], "the service image is not the payload's"
         assert ALLOWED.encode() in settings(service), "ETD_ALLOW_USER did not reach the allow list"
         record = journal()

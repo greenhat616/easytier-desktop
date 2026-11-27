@@ -37,6 +37,10 @@
     <MediaTemplate EmbedCab="yes" />
 
     <Property Id="ARPNOMODIFY" Value="1" />
+    <!-- Add/Remove Programs icon: packaging/assets/icons/app.ico, the one
+         etd-ui.exe embeds (its Start menu shortcut takes it from there). -->
+    <Icon Id="ProductIcon" SourceFile="@ICON@" />
+    <Property Id="ARPPRODUCTICON" Value="ProductIcon" />
     <!-- Set when the host service is registered, whoever installed it. -->
     <Property Id="ETD_SERVICE_PRESENT">
       <RegistrySearch Root="HKLM" Key="SYSTEM\CurrentControlSet\Services\easytier-desk-host"

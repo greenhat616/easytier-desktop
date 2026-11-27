@@ -110,7 +110,8 @@ cargo xtask dist --bin-dir target/debug --cores target/debug/cores/2.7.1 --out o
    `--allow-test-fixtures` lifts the last two checks for CI test packages.
 3. Runs the target's packager: on Windows (`dist/windows.rs`) it renders
    `packaging/windows/Product.wxs.tmpl` into `<out>/<triple>/Product.wxs` (MSI version,
-   payload paths, one component per kernel file) and, unless `--dry-run`, runs
+   payload paths, one component per kernel file, `packaging/assets/icons/app.ico` as the
+   Add/Remove Programs icon) and, unless `--dry-run`, runs
    `wix build -acceptEula wix7 -arch x64 -ext WixToolset.Util.wixext` (WiX 7.0.1 required,
    `CREATE_NO_WINDOW`) into `easytier-desktop-<version>-<arch>.msi`. Linux comes with PK4
    (`dist/linux.rs`); other targets fail.

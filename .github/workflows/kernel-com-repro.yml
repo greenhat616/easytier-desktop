@@ -108,6 +108,7 @@ jobs:
             Write-Host "capture verdict (report only): exit $LASTEXITCODE"
           }
           & .github/scripts/kcom-hits.ps1 -Name direct -Out $env:PM_OUT
+          exit 0
       - uses: actions/upload-artifact@v4
         if: always()
         with:

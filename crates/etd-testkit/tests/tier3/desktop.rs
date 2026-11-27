@@ -63,9 +63,23 @@ async fn peer() -> anyhow::Result<()> {
         ),
     };
     let connector = Arc::new(LocalConnector { expectation });
-    let channel = tonic::transport::Endpoint::from_static("http://localhost")
-        .connect_with_connector(ClientIo::new(connector, endpoint))
-        .await?;
+    // A session host started just before this peer publishes its pipe only
+    // after its start-up checks: keep trying for a minute, like the UI.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let channel = loop {
+        let attempt = tonic::transport::Endpoint::from_static("http://localhost")
+            .connect_with_connector(ClientIo::new(connector.clone(), endpoint.clone()))
+            .await;
+        match attempt {
+            Ok(channel) => break channel,
+            Err(error)
+                if mode != HostMode::ElevatedSession || std::time::Instant::now() >= deadline =>
+            {
+                return Err(error.into());
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+        }
+    };
     let mut client = HostServiceClient::new(channel);
     let hello = client
         .handshake(request(Hello {

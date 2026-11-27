@@ -291,7 +291,136 @@ def exclusion():
         assert not delta, f"session start to uninstall differences: {sorted(delta)}"
 
 
-CASES = {"session_recovery": recovery, "session_exclusion": exclusion}
+# Copies of system DLLs etd-host imports that are not KnownDLLs, planted
+# beside the portable host: none may be loaded from there.
+PLANTED = ("iphlpapi.dll", "fwpuclnt.dll", "pdh.dll", "powrprof.dll", "cfgmgr32.dll", "version.dll",
+           "dbghelp.dll", "winhttp.dll", "userenv.dll", "wtsapi32.dll")
+
+CONNECT = r"""
+$ErrorActionPreference = 'Continue'
+$label = ((whoami /groups) -match 'Mandatory Label') -replace '\s+', ' '
+$s = [Net.Sockets.Socket]::new([Net.Sockets.AddressFamily]::InterNetwork, [Net.Sockets.SocketType]::Stream, [Net.Sockets.ProtocolType]::Tcp)
+try { $s.Connect('127.0.0.1', __PORT__); $verdict = 'connected' }
+catch { $e = $_.Exception; while ($e.InnerException) { $e = $e.InnerException }; $verdict = "error $($e.NativeErrorCode) $($e.SocketErrorCode)" }
+finally { $s.Dispose() }
+"$(whoami) | $label | $verdict"
+"""
+
+
+def encoded(script):
+    import base64
+    return base64.b64encode(script.encode("utf-16-le")).decode()
+
+
+def kernel_port(session):
+    [kernel] = session.kernels()
+    argv = kernel.cmdline()
+    address = argv[argv.index("--rpc-portal") + 1]
+    host, port = address.rsplit(":", 1)
+    assert host == "127.0.0.1", address
+    return int(port)
+
+
+def low_integrity_connect(port, directory):
+    powershell = Path(os.environ["SystemRoot"]) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    low = directory / "low"
+    low.mkdir()
+    copy = low / "powershell.exe"
+    shutil.copy2(powershell, copy)
+    command("icacls", copy, "/setintegritylevel", "low")
+    result = command(copy, "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                     encoded(CONNECT.replace("__PORT__", str(port))), check=False)
+    return result.stdout.strip() or result.stderr.strip()
+
+
+SECOND_ACCOUNT = r"""
+$ErrorActionPreference = 'Stop'
+$secure = ConvertTo-SecureString $env:ES5_PROBE_SECRET -AsPlainText -Force
+$cred = [pscredential]::new("$env:COMPUTERNAME\__NAME__", $secure)
+$exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$p = Start-Process -FilePath $exe -Credential $cred -WorkingDirectory '__DIR__' -RedirectStandardOutput '__OUT__' -PassThru -Wait -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand','__SCRIPT__'
+"exit $($p.ExitCode)"
+"""
+
+
+def second_account_connect(port):
+    """A temporary standard account (random password, never printed)
+    connects through the secondary logon; removed afterwards."""
+    name = "es5probe"
+    password = uuid.uuid4().hex + "Aa1!"
+    exchange = Path("C:/es5-probe")
+    exchange.mkdir(exist_ok=True)
+    command("icacls", exchange, "/grant", "*S-1-1-0:(OI)(CI)F")
+    out = exchange / "connect.txt"
+    out.unlink(missing_ok=True)
+    command("net", "user", name, password, "/add")
+    try:
+        launcher = (SECOND_ACCOUNT.replace("__NAME__", name).replace("__DIR__", str(exchange))
+                    .replace("__OUT__", str(out))
+                    .replace("__SCRIPT__", encoded(CONNECT.replace("__PORT__", str(port)))))
+        result = command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                         encoded(launcher), check=False, env=dict(os.environ, ES5_PROBE_SECRET=password))
+        if not out.exists():
+            raise AssertionError(f"second account probe did not run: {result.stdout} {result.stderr}")
+        return out.read_text(encoding="utf-8", errors="replace").strip()
+    finally:
+        command("net", "user", name, "/delete", check=False)
+        shutil.rmtree(exchange, ignore_errors=True)
+
+
+def identities():
+    """The real kernel's management port under the session fence refuses a
+    Low-integrity copy of the user's own token and a second account, while
+    the elevated user connects; DLLs planted beside the portable host are
+    not loaded, and the kernel loads only from its store and Windows
+    (doc#13#wbs ES5)."""
+    import psutil
+    import socket
+    with ExitStack() as stack:
+        session = Session(stack)
+        system32 = Path(os.environ["SystemRoot"]) / "System32"
+        for name in PLANTED:
+            shutil.copy2(system32 / name, session.dir / name)
+        status = session.start()
+        instance, request = str(uuid.uuid4()), str(uuid.uuid4())
+        session.apply(spec(), instance, request, str(status["revision"]))
+        session.ready(instance)
+        port = kernel_port(session)
+        with socket.create_connection(("127.0.0.1", port), timeout=5):
+            print(f"elevated user: connected to the kernel port {port}", flush=True)
+        low = low_integrity_connect(port, session.dir)
+        print(f"Low integrity copy: {low}", flush=True)
+        other = second_account_connect(port)
+        print(f"second account: {other}", flush=True)
+        assert "Low Mandatory Level" in low and low.endswith("error 10013 AccessDenied"), low
+        assert other.endswith("error 10013 AccessDenied"), other
+
+        portable = session.dir.resolve()
+        planted = {name.lower() for name in PLANTED}
+        host_modules = [m.path for m in psutil.Process(session.process.pid).memory_maps(grouped=True)
+                        if m.path and Path(m.path).resolve().parent == portable
+                        and Path(m.path).name.lower() in planted]
+        assert not host_modules, f"etd-host loaded planted modules: {host_modules}"
+        [kernel] = session.kernels()
+        store = Path(kernel.info["exe"]).resolve().parent
+        windows = Path(os.environ["SystemRoot"]).resolve()
+        foreign = [m.path for m in kernel.memory_maps(grouped=True)
+                   if m.path and m.path.lower().endswith(".dll")
+                   and Path(m.path).resolve().parent != store
+                   and not Path(m.path).resolve().is_relative_to(windows)]
+        assert not foreign, f"the kernel loaded modules from outside its store and Windows: {foreign}"
+        print(f"etd-host loaded none of the {len(PLANTED)} planted modules; "
+              f"the kernel loads only from its store and Windows", flush=True)
+
+        session.ctl("stop", instance)
+        eventually("stopped instance", lambda: session.view(instance),
+                   lambda body: body.get("state") == "stopped", timeout=240)
+        session.release()
+        purge = session.run("reclaim", "--mode", "elevated-session", "--all", "--purge")
+        assert purge.returncode == 0, f"purge exited {purge.returncode}: {purge.stderr}"
+
+
+CASES = {"session_recovery": recovery, "session_exclusion": exclusion, "session_identities": identities}
 
 if __name__ == "__main__":
     CASES[sys.argv[1]]()

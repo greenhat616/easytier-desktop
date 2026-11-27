@@ -326,10 +326,53 @@ def exclusion():
         assert not delta, f"session start to uninstall differences: {sorted(delta)}"
 
 
-# Copies of system DLLs etd-host imports that are not KnownDLLs, planted
-# beside the portable host: none may be loaded from there.
-PLANTED = ("iphlpapi.dll", "fwpuclnt.dll", "pdh.dll", "powrprof.dll", "cfgmgr32.dll", "version.dll",
-           "dbghelp.dll", "winhttp.dll", "userenv.dll", "wtsapi32.dll")
+def pe_imports(path):
+    """The DLL names in a PE32+ image's import table: what the loader
+    resolves at start. Delay-loaded and LoadLibrary DLLs are not in it."""
+    import struct
+    data = Path(path).read_bytes()
+    pe = struct.unpack_from("<I", data, 0x3C)[0]
+    assert data[pe:pe + 4] == b"PE\0\0", path
+    count, = struct.unpack_from("<H", data, pe + 6)
+    optional_size, = struct.unpack_from("<H", data, pe + 20)
+    optional = pe + 24
+    assert struct.unpack_from("<H", data, optional)[0] == 0x20B, f"{path} is not PE32+"
+    import_rva, _ = struct.unpack_from("<II", data, optional + 112 + 8)
+    sections = [struct.unpack_from("<IIII", data, optional + optional_size + 40 * i + 8) for i in range(count)]
+
+    def offset(rva):
+        for size, address, raw_size, raw in sections:
+            if address <= rva < address + max(size, raw_size):
+                return rva - address + raw
+        raise AssertionError(f"{path}: RVA {rva:#x} outside every section")
+
+    names, at = [], offset(import_rva)
+    while any(descriptor := struct.unpack_from("<IIIII", data, at)):
+        start = offset(descriptor[3])
+        names.append(data[start:data.index(b"\0", start)].decode("ascii").lower())
+        at += 20
+    return names
+
+
+def known_dlls():
+    import winreg
+    names = set()
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                        r"SYSTEM\CurrentControlSet\Control\Session Manager\KnownDLLs") as key:
+        for index in range(winreg.QueryInfoKey(key)[1]):
+            _, value, kind = winreg.EnumValue(key, index)
+            if kind == winreg.REG_SZ:
+                names.add(value.lower())
+    return names
+
+
+def plantable(image, known):
+    """`image`'s imported DLLs a search could take from its own folder: not
+    KnownDLLs, not API sets, and present in System32 to copy."""
+    system32 = Path(os.environ["SystemRoot"]) / "System32"
+    return sorted(name for name in pe_imports(image)
+                  if name not in known and not name.startswith(("api-ms-", "ext-ms-"))
+                  and (system32 / name).is_file())
 
 CONNECT = r"""
 $ErrorActionPreference = 'Continue'
@@ -396,6 +439,12 @@ public static class Es5Probe {
   [DllImport("kernel32")]
   static extern IntPtr GetCurrentProcess();
   [DllImport("advapi32", SetLastError = true)]
+  static extern bool GetTokenInformation(IntPtr token, int kind, IntPtr buffer, int length, out int needed);
+  [DllImport("advapi32")]
+  static extern IntPtr GetSidSubAuthorityCount(IntPtr sid);
+  [DllImport("advapi32")]
+  static extern IntPtr GetSidSubAuthority(IntPtr sid, uint index);
+  [DllImport("advapi32", SetLastError = true)]
   static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
   [DllImport("advapi32", SetLastError = true)]
   static extern bool CreateRestrictedToken(IntPtr token, uint flags, uint disableCount, Label[] disable,
@@ -404,7 +453,31 @@ public static class Es5Probe {
   public struct Label { public IntPtr Sid; public uint Attributes; }
   // The user's own token with Administrators deny-only and the fewest
   // privileges, at Medium: what a non-elevated process of the user has.
-  public static string Own(int port) {
+  static string Try(int port) {
+    using (var s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)) {
+      try { s.Connect("127.0.0.1", port); return "connected"; }
+      catch (SocketException e) { return "error " + e.NativeErrorCode + " " + e.SocketErrorCode; }
+    }
+  }
+  // The integrity RID of the token the calling thread impersonates.
+  static string ThreadIntegrity() {
+    using (var identity = WindowsIdentity.GetCurrent(true)) {
+      if (identity == null) return "not impersonating";
+      int needed;
+      GetTokenInformation(identity.Token, 25, IntPtr.Zero, 0, out needed);
+      IntPtr buffer = Marshal.AllocHGlobal(needed);
+      try {
+        if (!GetTokenInformation(identity.Token, 25, buffer, needed, out needed))
+          return "integrity failed " + Marshal.GetLastWin32Error();
+        IntPtr sid = Marshal.ReadIntPtr(buffer);
+        uint last = (uint)Marshal.ReadByte(GetSidSubAuthorityCount(sid)) - 1;
+        return "0x" + ((uint)Marshal.ReadInt32(GetSidSubAuthority(sid, last))).ToString("X");
+      } finally { Marshal.FreeHGlobal(buffer); }
+    }
+  }
+  // Same process, no impersonation: the elevated token connects.
+  public static string Plain(int port) { return "plain | kernel=" + Try(port); }
+  public static string Own(int port, int control) {
     IntPtr own;
     if (!OpenProcessToken(GetCurrentProcess(), 0xF01FF, out own)) return "open failed " + Marshal.GetLastWin32Error();
     IntPtr admins;
@@ -414,18 +487,20 @@ public static class Es5Probe {
       out restricted);
     CloseHandle(own);
     if (!made) return "restrict failed " + Marshal.GetLastWin32Error();
-    return Probe(restricted, "S-1-16-8192", "Medium", port);
+    return Probe(restricted, "S-1-16-8192", port, control);
   }
-  public static string Connect(string user, string password, int port, bool low) {
+  public static string Connect(string user, string password, int port, int control, bool low) {
     IntPtr logon;
     // Interactive, else network logon: either gives the account's own token.
     if (!LogonUserW(user, ".", password, 2, 0, out logon) && !LogonUserW(user, ".", password, 3, 0, out logon))
       return "logon failed " + Marshal.GetLastWin32Error();
-    return low ? Probe(logon, "S-1-16-4096", "Low", port) : Probe(logon, null, "Medium", port);
+    return Probe(logon, low ? "S-1-16-4096" : null, port, control);
   }
   // Impersonate a copy of `token` (closed here), lowered to `labelSid` if
-  // given, and connect once from that thread.
-  static string Probe(IntPtr token, string labelSid, string level, int port) {
+  // given; from that one thread read the token's integrity back, connect to
+  // the control listener (expected to connect: loopback itself is allowed)
+  // and then to the kernel port.
+  static string Probe(IntPtr token, string labelSid, int port, int control) {
     IntPtr copy;
     bool duplicated = DuplicateTokenEx(token, 0x02000000, IntPtr.Zero, 2, 2, out copy);
     CloseHandle(token);
@@ -440,21 +515,19 @@ public static class Es5Probe {
     using (var handle = new SafeAccessTokenHandle(copy)) {
       return WindowsIdentity.RunImpersonated(handle, () => {
         string name = WindowsIdentity.GetCurrent(true).Name;
-        using (var s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)) {
-          try { s.Connect("127.0.0.1", port); return name + " | " + level + " | connected"; }
-          catch (SocketException e) { return name + " | " + level + " | error " + e.NativeErrorCode + " " + e.SocketErrorCode; }
-        }
+        return name + " | rid=" + ThreadIntegrity() + " | control=" + Try(control) + " | kernel=" + Try(port);
       });
     }
   }
 }
 '@
-[Es5Probe]::Own(__PORT__)
-foreach ($low in $false, $true) { [Es5Probe]::Connect('__NAME__', $env:ES5_PROBE_SECRET, __PORT__, $low) }
+[Es5Probe]::Plain(__PORT__)
+[Es5Probe]::Own(__PORT__, __CONTROL__)
+foreach ($low in $false, $true) { [Es5Probe]::Connect('__NAME__', $env:ES5_PROBE_SECRET, __PORT__, __CONTROL__, $low) }
 """
 
 
-def second_account_connects(port):
+def second_account_connects(port, control):
     """A temporary standard account (random password, never printed)
     connects from a thread impersonating its own logon token, at Medium and
     lowered to Low integrity; the account is removed afterwards. (A child
@@ -465,7 +538,8 @@ def second_account_connects(port):
     password = uuid.uuid4().hex[:10] + "Aa1!"
     command("net", "user", name, password, "/add")
     try:
-        script = SECOND_ACCOUNT.replace("__NAME__", name).replace("__PORT__", str(port))
+        script = (SECOND_ACCOUNT.replace("__NAME__", name).replace("__PORT__", str(port))
+                  .replace("__CONTROL__", str(control)))
         # Windows PowerShell with its own module path, not pwsh 7's
         # (inherited from the runner), so its cmdlets load.
         env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
@@ -474,7 +548,7 @@ def second_account_connects(port):
     finally:
         command("net", "user", name, "/delete", check=False)
     lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    if len(lines) != 3:
+    if len(lines) != 4:
         raise AssertionError(f"identity probes: {result.stdout} {result.stderr}")
     return lines
 
@@ -499,7 +573,10 @@ def identities():
     """The real kernel's management port under the session fence refuses a
     non-elevated copy of the user's own token and a second standard account
     at Medium and at Low integrity, while the elevated user connects
-    (doc#13#wbs ES5)."""
+    (doc#13#wbs ES5). Attribution (audit msg#2224): the probing process
+    connects to the kernel port without impersonation; each impersonated
+    thread reads its token's integrity back and connects to a second
+    loopback listener, so a refusal is the kernel port's own."""
     import socket
     with ExitStack() as stack:
         session = Session(stack)
@@ -507,14 +584,18 @@ def identities():
         port = kernel_port(session)
         with socket.create_connection(("127.0.0.1", port), timeout=5):
             print(f"elevated user: connected to the kernel port {port}", flush=True)
-        own, medium, low = second_account_connects(port)
+        listener = stack.enter_context(socket.create_server(("127.0.0.1", 0), backlog=16))
+        control = listener.getsockname()[1]
+        plain, own, medium, low = second_account_connects(port, control)
+        print(f"same probe process, not impersonating: {plain}", flush=True)
         print(f"own token, not elevated: {own}", flush=True)
         print(f"second account at Medium: {medium}", flush=True)
         print(f"second account at Low: {low}", flush=True)
-        for verdict, who, level in ((own, os.environ["USERNAME"].lower(), "Medium"),
-                                    (medium, "es5probe", "Medium"), (low, "es5probe", "Low")):
-            assert f"\\{who} | {level} | ".lower() in verdict.lower(), verdict
-            assert verdict.endswith("error 10013 AccessDenied"), verdict
+        assert plain == "plain | kernel=connected", plain
+        for verdict, who, rid in ((own, os.environ["USERNAME"], "0x2000"),
+                                  (medium, "es5probe", "0x2000"), (low, "es5probe", "0x1000")):
+            expected = f"\\{who} | rid={rid} | control=connected | kernel=error 10013 AccessDenied"
+            assert verdict.lower().endswith(expected.lower()), verdict
         # Reported, not judged: a Low copy of the elevated token keeps
         # Administrators enabled, and the fence admits elevated
         # administrators by group (only an elevated parent can make one).
@@ -530,18 +611,33 @@ PLANTED_PS_MODULE = Path(os.environ.get("USERPROFILE", "C:/")) / "Documents" / "
 
 def planted_modules():
     """Defensive acceptance on a disposable runner (doc#13#wbs ES5, ruling
-    msg#2205): DLLs planted beside the portable host and a same-name
-    NetSecurity module in the user's own module path are never loaded; the
-    host and the kernel start no PowerShell; and a read-only list of every
-    module loaded shows nothing from the program directory but etd-host.exe,
-    and the kernel only its own store and Windows. (The PowerShell analysis
-    cache and HKCU .NET settings no longer apply: no host runs PowerShell or
-    .NET since ES2N.)"""
+    msg#2205, audit msg#2224). Beside the portable host go System32 copies
+    of every DLL in etd-host.exe's import table that is not a KnownDLL or
+    an API set (read from the image, printed), plus those of the test
+    image running beside it as etd-ui.exe, and a same-name NetSecurity
+    module goes in the user's own PowerShell module path. Then:
+    - etd-host has each of its own imports loaded from System32, so an
+      import never loaded fails rather than passing;
+    - etd-host maps nothing from its folder (or below) but etd-host.exe;
+    - positive control: the unhardened test image in the same folder loads
+      plants from that folder, so the plants work and the check sees them;
+    - neither host nor kernel starts PowerShell, the planted module never
+      runs, and the kernel maps DLLs only from its store, System32 and
+      WinSxS.
+    Out of scope: DLLs loaded at run time (LoadLibrary, delay load), which
+    SetDefaultDllDirectories(SYSTEM32) covers, and the PowerShell analysis
+    cache and HKCU .NET settings, which no host has used since ES2N."""
     import psutil
     with ExitStack() as stack:
         session = Session(stack)
+        known = known_dlls()
+        own = plantable(session.host, known)
+        peer = plantable(session.ui, known)
+        assert own, "etd-host.exe imports nothing outside KnownDLLs: nothing to plant"
+        print(f"planted for etd-host.exe ({len(own)}): {', '.join(own)}", flush=True)
+        print(f"planted for the test image ({len(peer)}): {', '.join(peer)}", flush=True)
         system32 = Path(os.environ["SystemRoot"]) / "System32"
-        for name in PLANTED:
+        for name in sorted(set(own) | set(peer)):
             shutil.copy2(system32 / name, session.dir / name)
         assert not PLANTED_PS_MODULE.exists(), "the runner already has a user NetSecurity module"
         PLANTED_PS_MODULE.mkdir(parents=True)
@@ -552,27 +648,47 @@ def planted_modules():
         marker.unlink(missing_ok=True)
 
         instance = running_network(session)
-        host = psutil.Process(session.process.pid)
-        [kernel] = session.kernels()
-        windows = Path(os.environ["SystemRoot"]).resolve()
         portable = session.dir.resolve()
-        host_dir = [m.path for m in host.memory_maps(grouped=True)
-                    if m.path and Path(m.path).resolve().parent == portable
-                    and Path(m.path).resolve() != session.host.resolve()]
-        assert not host_dir, f"etd-host loaded modules from its program directory: {host_dir}"
+
+        def mapped(process):
+            return {Path(m.path).resolve() for m in process.memory_maps(grouped=True) if m.path}
+
+        host = psutil.Process(session.process.pid)
+        host_maps = mapped(host)
+        by_name = {}
+        for path in host_maps:
+            by_name.setdefault(path.name.lower(), []).append(path)
+        windows32 = system32.resolve()
+        # System32, or WinSxS for side-by-side DLLs such as comctl32.
+        allowed = (windows32, (Path(os.environ["SystemRoot"]) / "WinSxS").resolve())
+        wrong = {name: [str(path) for path in by_name.get(name, [])] for name in own
+                 if not by_name.get(name)
+                 or not all(any(path.is_relative_to(root) for root in allowed) for path in by_name[name])}
+        assert not wrong, f"etd-host imports not loaded, or not from System32/WinSxS: {wrong}"
+        own_folder = sorted(str(path) for path in host_maps
+                            if path.is_relative_to(portable) and path != session.host.resolve())
+        assert not own_folder, f"etd-host loaded modules from its program folder: {own_folder}"
+        print(f"etd-host loaded all {len(own)} imports from System32/WinSxS and nothing from its folder but itself",
+              flush=True)
+
+        control = sorted(path.name for path in mapped(psutil.Process(session.lease.pid))
+                         if path.parent == portable and path.name.lower() in set(own) | set(peer))
+        print(f"positive control: the test image beside it loaded from the folder: {', '.join(control)}",
+              flush=True)
+        assert control, "the unhardened test image loaded no plant: the check cannot see a planted load"
+
+        [kernel] = session.kernels()
         store = Path(kernel.info["exe"]).resolve().parent
-        foreign = [m.path for m in kernel.memory_maps(grouped=True)
-                   if m.path and m.path.lower().endswith(".dll")
-                   and Path(m.path).resolve().parent != store
-                   and not Path(m.path).resolve().is_relative_to(windows)]
-        assert not foreign, f"the kernel loaded modules from outside its store and Windows: {foreign}"
+        foreign = sorted(str(path) for path in mapped(kernel)
+                         if path.suffix.lower() == ".dll" and path.parent != store
+                         and not any(path.is_relative_to(root) for root in allowed))
+        assert not foreign, f"the kernel loaded modules from outside its store, System32 and WinSxS: {foreign}"
         shells = [p.name() for p in host.children(recursive=True)
                   if p.name().lower() in ("powershell.exe", "pwsh.exe")]
         assert not shells, f"the session host started PowerShell: {shells}"
         assert not marker.exists(), "the planted NetSecurity module was loaded"
-        print(f"etd-host loaded none of the {len(PLANTED)} planted DLLs and nothing else from its directory; "
-              f"no PowerShell, the planted NetSecurity module unused; the kernel loads only from its store "
-              f"and Windows", flush=True)
+        print("no PowerShell, the planted NetSecurity module unused; the kernel loads only from its store, "
+              "System32 and WinSxS", flush=True)
         wind_down(session, instance)
 
 

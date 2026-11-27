@@ -40,6 +40,13 @@ def main():
             print(f'  etd-host frames: {len(ours)} of {len(frames)}')
             for i, frame in enumerate(frames):
                 print(f'  {i:3} {frame}')
+            # Version, PE timestamp and image size: the symbol server key of
+            # each module, to resolve the offsets against public symbols.
+            named = {f.split('+')[0].lower() for f in frames}
+            for m in proc.modules:
+                name = m.path.rsplit('\\', 1)[-1]
+                if name.lower() in named and not name.lower().startswith('etd-host'):
+                    print(f'  module {name} {m.version} timestamp {m.timestamp:08X} size {m.size:X}')
 
 
 if __name__ == '__main__':

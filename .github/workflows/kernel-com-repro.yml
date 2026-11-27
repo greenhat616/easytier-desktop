@@ -1,12 +1,14 @@
-# Kernel COM investigation (topic#51 msg#2114): does the elevated session
-# form's kernel (easytier-core, started by the session host with the user's
-# elevated token) activate COM classes from the user's own HKCU when it sets
-# up TUN firewall rules? A marker DLL registered for NetFwPolicy2/NetFwRule
-# records every process that loads it, then refuses to load. Report only.
-name: Kernel COM investigation
+# Kernel COM regression record (topic#51 msg#2114, accepted risk msg#2182):
+# does the elevated session form's kernel (easytier-core, started by the
+# session host with the user's elevated token) still activate COM classes
+# from the user's own HKCU when it sets up TUN firewall rules? A marker DLL
+# registered for NetFwPolicy2/NetFwRule records every process that loads it,
+# then refuses to load. Manual only; it records the result and passes either
+# way (it fails only if the session run itself cannot be driven). See
+# crates/etd-host/docs/cli-and-install.md, "Accepted risk: the kernel's own COM
+# activation".
+name: Kernel COM regression record
 on:
-  push:
-    branches: [wbs/ES-kcom]
   workflow_dispatch:
 
 permissions:

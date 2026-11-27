@@ -311,8 +311,9 @@ fn loading_button_colors(style: BtnStyle, cx: &App) -> (Hsla, Hsla) {
         ButtonVariant::Success => (t.button_success, t.button_success_foreground),
         ButtonVariant::Info => (t.button_info, t.button_info_foreground),
         ButtonVariant::Default => (t.button, t.button_foreground),
-        ButtonVariant::Link => (t.popover, t.link),
-        _ => (t.popover, t.foreground),
+        // Hyperlink and subtle buttons rest on SubtleFillColorTransparent.
+        ButtonVariant::Link => (t.transparent, t.link),
+        _ => (t.transparent, t.foreground),
     }
 }
 

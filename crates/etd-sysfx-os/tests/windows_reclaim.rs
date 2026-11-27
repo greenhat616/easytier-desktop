@@ -14,23 +14,50 @@ use std::{process::Command, sync::Arc};
 /// session host, its management workers get the protected profile directory
 /// next to the state directory, which the composition root creates.
 /// The session tree's protected profile directory, as the composition root
-/// makes it: SYSTEM and Administrators only, nothing inherited.
+/// makes it: SYSTEM and Administrators only, the whole DACL replaced (an
+/// elevated creator's default DACL can add an explicit entry for the user).
 fn protected_profile(path: &std::path::Path) {
-    use std::os::windows::process::CommandExt;
+    use ::windows::{
+        Win32::{
+            Foundation::{HLOCAL, LocalFree},
+            Security::{
+                Authorization::{
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+                    SE_FILE_OBJECT, SetNamedSecurityInfoW,
+                },
+                DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
+                PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+            },
+        },
+        core::HSTRING,
+    };
     std::fs::create_dir(path).unwrap();
-    let status = std::process::Command::new("icacls.exe")
-        .arg(path)
-        .args([
-            "/inheritance:r",
-            "/grant:r",
-            "*S-1-5-18:(OI)(CI)F",
-            "*S-1-5-32-544:(OI)(CI)F",
-            "/q",
-        ])
-        .creation_flags(0x0800_0000)
-        .status()
+    unsafe {
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            &HSTRING::from("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"),
+            SDDL_REVISION_1,
+            &mut sd,
+            None,
+        )
         .unwrap();
-    assert!(status.success(), "icacls {}", path.display());
+        let mut present = false.into();
+        let mut defaulted = false.into();
+        let mut dacl = std::ptr::null_mut();
+        GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted).unwrap();
+        SetNamedSecurityInfoW(
+            &HSTRING::from(path.as_os_str()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl),
+            None,
+        )
+        .ok()
+        .unwrap();
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+    }
 }
 
 fn session_state(dir: &std::path::Path) -> std::path::PathBuf {

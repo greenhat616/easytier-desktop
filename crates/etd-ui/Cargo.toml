@@ -17,7 +17,7 @@ async-channel = { workspace = true }
 async-trait = { workspace = true }
 directories = { workspace = true }
 gpui-kit = { workspace = true, features = ["component", "assets", "x11", "gpui-fast"] }
-image = { version = "0.25.10", default-features = false, features = ["png"] }
+image = { workspace = true, features = ["png"] }
 jiff = { workspace = true, features = ["std"] }
 serde = { workspace = true, features = ["std", "derive"] }
 serde_json = { workspace = true }
@@ -31,7 +31,7 @@ tray-icon = { workspace = true }
 raw-window-handle = "0.6.2"
 
 [target.'cfg(windows)'.build-dependencies]
-embed-resource = "3.0.12"
+embed-resource = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tray-icon = { workspace = true, features = ["ksni"] }

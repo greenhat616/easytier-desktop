@@ -395,8 +395,11 @@ def second_account_connects(port):
             launcher = (SECOND_ACCOUNT.replace("__NAME__", name).replace("__EXE__", str(image))
                         .replace("__DIR__", str(exchange)).replace("__OUT__", str(out))
                         .replace("__SCRIPT__", encoded(CONNECT.replace("__PORT__", str(port)))))
+            # Windows PowerShell with its own module path, not pwsh 7's
+            # (inherited from the runner), so its cmdlets load.
+            env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
             result = command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
-                             encoded(launcher), check=False, env=dict(os.environ, ES5_PROBE_SECRET=password))
+                             encoded(launcher), check=False, env=dict(env, ES5_PROBE_SECRET=password))
             if not out.exists():
                 raise AssertionError(f"second account probe ({level}) did not run: {result.stdout} {result.stderr}")
             verdicts[level] = out.read_text(encoding="utf-8", errors="replace").strip()

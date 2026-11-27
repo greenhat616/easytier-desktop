@@ -8,12 +8,13 @@
 //! [`super::ui`], each builder is `#[inline(never)]` and returns an
 //! [`AnyElement`] so debug stack frames stay small.
 
-use std::rc::Rc;
+use std::{cell::Cell, rc::Rc};
 
 use gpui_kit::{
-    AnyElement, App, BoxShadow, ClickEvent, ElementId, Entity, Hsla, InteractiveElement,
-    IntoElement, KeyDownEvent, ParentElement as _, RenderOnce, Role, SharedString,
-    StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Toggled, Window, anchored,
+    AnyElement, App, BoxShadow, ClickEvent, ElementId, Entity, FocusHandle, Hsla,
+    InteractiveElement, IntoElement, KeyDownEvent, ParentElement as _, RenderOnce, Role,
+    SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Toggled,
+    Window, anchored,
     base::{
         Checkbox as BaseCheckbox, CheckboxState, LogicalStyledExt as _, Radio as BaseRadio,
         RadioGroup, Slider as BaseSlider, SliderIndicator, SliderThumb, SliderTrack,
@@ -675,23 +676,39 @@ pub(crate) fn flyout_keys<E: InteractiveElement>(element: E, on_dismiss: Dismiss
     })
 }
 
-/// WinUI gives focus back to the control that opened a flyout when the
-/// flyout closes, so Tab carries on from there. Rendered inside an open
-/// popup, this remembers the element focused when the popup first appears
-/// and refocuses it once the popup is gone.
-pub(crate) fn focus_return(key: impl Into<ElementId>) -> AnyElement {
-    FocusReturn { key: key.into() }.into_any_element()
+/// Focus for an open popup, as WinUI's flyouts and dialogs handle it: the
+/// popup takes focus when it opens, so Up, Down, Escape and Enter reach it
+/// and Down moves to its first item. When it closes with focus still
+/// inside, focus goes back to the control that opened it, so Tab carries
+/// on from there. `build` attaches the handle to the popup's container
+/// (`track_focus`, or `focus_trap` for a dialog).
+pub(crate) fn popup_focus(
+    key: impl Into<ElementId>,
+    build: impl FnOnce(&FocusHandle) -> AnyElement + 'static,
+) -> AnyElement {
+    PopupFocus {
+        key: key.into(),
+        build: Box::new(build),
+    }
+    .into_any_element()
 }
+
+type PopupBuilder = Box<dyn FnOnce(&FocusHandle) -> AnyElement>;
 
 #[derive(IntoElement)]
-struct FocusReturn {
+struct PopupFocus {
     key: ElementId,
+    build: PopupBuilder,
 }
 
-impl RenderOnce for FocusReturn {
+/// Lives exactly as long as the popup renders; its release is the popup
+/// closing.
+struct PopupFocusState {
+    inside: Rc<Cell<bool>>,
+}
+
+impl RenderOnce for PopupFocus {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        // A popup takes focus when it opens, as WinUI's flyouts do, so Up,
-        // Down and Escape reach it; Down then moves to the first item.
         let focus = window
             .use_keyed_state((self.key.clone(), "fluent-popup-focus"), cx, |_, cx| {
                 cx.focus_handle()
@@ -699,14 +716,19 @@ impl RenderOnce for FocusReturn {
             .read(cx)
             .clone();
         let take = focus.clone();
-        // The keyed state lives only while the popup renders; its release
-        // is the popup closing.
-        window.use_keyed_state((self.key, "fluent-focus-return"), cx, |window, cx| {
+        let state = window.use_keyed_state((self.key, "fluent-focus-return"), cx, |window, cx| {
             let opener = window.focused(cx);
             let handle = window.window_handle();
-            window.defer(cx, move |window, cx| window.focus(&take, cx));
-            cx.on_release(move |_, app| {
-                if let Some(opener) = opener {
+            let open = cx.entity().downgrade();
+            window.defer(cx, move |window, cx| {
+                // Skip if the popup closed again before this ran.
+                if open.upgrade().is_some() {
+                    window.focus(&take, cx);
+                }
+            });
+            cx.on_release(move |this: &mut PopupFocusState, app| {
+                // A press elsewhere that moved focus keeps it there.
+                if let (true, Some(opener)) = (this.inside.get(), opener) {
                     app.defer(move |app| {
                         handle
                             .update(app, |_, window, cx| window.focus(&opener, cx))
@@ -715,8 +737,13 @@ impl RenderOnce for FocusReturn {
                 }
             })
             .detach();
+            PopupFocusState {
+                inside: Rc::new(Cell::new(true)),
+            }
         });
-        div().id("fluent-popup-focus").track_focus(&focus)
+        let inside = focus.contains_focused(window, cx);
+        state.read(cx).inside.set(inside);
+        (self.build)(&focus)
     }
 }
 
@@ -759,8 +786,8 @@ pub fn flyout(
     let on_dismiss: DismissHandler = Rc::new(on_dismiss);
     let layer_dismiss = on_dismiss.clone();
     let id = id.into();
+    let key = id.clone();
     let surface = flyout_surface(cx)
-        .child(focus_return(id.clone()))
         .id(id)
         .test_support()
         .role(Role::Menu)
@@ -779,7 +806,9 @@ pub fn flyout(
             deferred(
                 anchored()
                     .snap_to_window_with_margin(px(8.))
-                    .child(flyout_keys(surface, on_dismiss)),
+                    .child(popup_focus(key, move |focus| {
+                        flyout_keys(surface.track_focus(focus), on_dismiss).into_any_element()
+                    })),
             )
             .with_priority(2),
         )

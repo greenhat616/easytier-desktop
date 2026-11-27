@@ -74,6 +74,7 @@ enum Page {
     Settings,
     BasicInput,
     Menus,
+    Dialogs,
 }
 
 struct Gallery {
@@ -190,6 +191,14 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
         "fluent/more-horizontal.svg",
         cx,
     );
+    let dialogs = nav(
+        Page::Dialogs,
+        "gallery-nav-dialogs",
+        "Dialogs & flyouts",
+        "fluent/chat.svg",
+        "fluent/chat.svg",
+        cx,
+    );
     let mut sidebar = Sidebar::new("gallery-sidebar")
         .w(px(220.))
         .h_full()
@@ -200,6 +209,7 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
         .child(first)
         .child(basic)
         .child(menus)
+        .child(dialogs)
         .child(settings);
     if !view.collapsed {
         sidebar = sidebar.footer(div().w_full().child(theme_menu(cx)));
@@ -547,6 +557,7 @@ impl Render for Gallery {
             Page::Settings => ("Settings", pages::settings_page(self, cx)),
             Page::BasicInput => ("Basic input", pages::basic_input_page(self, window, cx)),
             Page::Menus => ("Menus & toolbars", pages::menus_page(self, cx)),
+            Page::Dialogs => ("Dialogs & flyouts", pages::dialogs_page(self, cx)),
         };
         div()
             .id("gallery-root")
@@ -800,6 +811,77 @@ mod tests {
             window.press("up", cx);
             window.render_frame(cx);
             assert_eq!(view.read(cx).demo_number(cx).as_ref(), "14");
+
+            // Dialogs & flyouts.
+            window.click("gallery-nav-dialogs", cx);
+            window.render_frame(cx);
+            window.click("dialog-open", cx);
+            window.render_frame(cx);
+            assert!(window.find("dialog").visible());
+            assert!(window.find("dialog").bounds().size.width >= px(320.));
+            assert!(window.find("dialog").bounds().size.width <= px(548.));
+            // The smoke layer takes presses outside the dialog.
+            window.click("gallery-nav-controls", cx);
+            window.render_frame(cx);
+            assert!(window.find("dialog").visible());
+            window.click("dialog-secondary", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("dialog").is_none());
+            assert_eq!(view.read(cx).demo_dialog_result().as_ref(), "Don't save");
+            window.click("tip-target", cx);
+            window.render_frame(cx);
+            assert!(window.find("tip").visible());
+            // A TeachingTip is not light-dismissed.
+            window.click("flyout-open", cx);
+            window.render_frame(cx);
+            assert!(window.find("tip").visible());
+            assert!(window.find("flyout").visible());
+            window.click("flyout-confirm", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("flyout").is_none());
+            window.click("tip-close", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("tip").is_none());
+            window.click("dialog-open", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        // The open dialog takes focus: Enter answers the default button.
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.press("enter", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("dialog").is_none());
+            assert_eq!(view.read(cx).demo_dialog_result().as_ref(), "Save");
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            tab_to(window, "dialog-open", cx);
+            window.press("enter", cx);
+            window.render_frame(cx);
+            assert!(window.find("dialog").visible());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            // Tab stays inside the dialog.
+            for _ in 0..8 {
+                window.press("tab", cx);
+                window.render_frame(cx);
+                assert_ne!(window.find("dialog-open").focused(), Some(true));
+            }
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("dialog").is_none());
+            assert_eq!(view.read(cx).demo_dialog_result().as_ref(), "Cancel");
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("dialog-open").focused(), Some(true));
         })
         .unwrap();
     }
@@ -986,6 +1068,39 @@ mod tests {
             cx.capture_screenshot(handle)
                 .unwrap()
                 .save(output.join(format!("gallery-settings-{name}-focus.png")))
+                .unwrap();
+            // Dialogs page: a TeachingTip and a Flyout open together, then
+            // the ContentDialog over its smoke layer.
+            cx.update_window(handle, |_, window, cx| {
+                window.click("gallery-nav-dialogs", cx);
+                window.render_frame(cx);
+                window.click("tip-target", cx);
+                window.render_frame(cx);
+                window.click("flyout-open", cx);
+                window.render_frame(cx);
+                assert!(window.find("tip").visible());
+                assert!(window.find("flyout").visible());
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(format!("gallery-dialogs-{name}.png")))
+                .unwrap();
+            cx.update_window(handle, |_, window, cx| {
+                window.press("escape", cx);
+                window.render_frame(cx);
+                window.click("tip-close", cx);
+                window.render_frame(cx);
+                window.click("dialog-open", cx);
+                window.render_frame(cx);
+                assert!(window.find("dialog").visible());
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(format!("gallery-dialogs-{name}-dialog.png")))
                 .unwrap();
         }
     }

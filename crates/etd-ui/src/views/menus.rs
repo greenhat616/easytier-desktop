@@ -17,7 +17,7 @@ use gpui_kit::{
 
 use crate::theme::{self, ControlState};
 use crate::views::controls::{
-    DismissHandler, flyout_keys, flyout_surface, focus_return, light_dismiss_layer,
+    DismissHandler, flyout_keys, flyout_surface, light_dismiss_layer, popup_focus,
 };
 use crate::views::ui::keyboard_focus;
 
@@ -335,13 +335,17 @@ pub fn menu_flyout(
         .id("menu-surface")
         .occlude()
         .mt(px(4.))
-        .child(focus_return(id))
         .child(menu_content(id, entries, 160., cx));
     div()
         .child(light_dismiss_layer(move |window, cx| {
             layer_dismiss(window, cx)
         }))
-        .child(deferred(anchor.child(flyout_keys(surface, on_dismiss))).with_priority(2))
+        .child(
+            deferred(anchor.child(popup_focus(id, move |focus| {
+                flyout_keys(surface.track_focus(focus), on_dismiss).into_any_element()
+            })))
+            .with_priority(2),
+        )
         .into_any_element()
 }
 

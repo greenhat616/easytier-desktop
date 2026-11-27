@@ -36,6 +36,7 @@ pub struct BtnStyle {
     pub icon: Option<&'static str>,
     selected: bool,
     icon_only: bool,
+    full_width: bool,
 }
 
 impl BtnStyle {
@@ -49,7 +50,15 @@ impl BtnStyle {
             icon: None,
             selected: false,
             icon_only: false,
+            full_width: false,
         }
+    }
+
+    /// Stretches the button across its container, as ContentDialog's
+    /// equal-width buttons are.
+    pub const fn full_width(mut self) -> Self {
+        self.full_width = true;
+        self
     }
 
     pub const fn icon(mut self, asset: &'static str) -> Self {
@@ -240,6 +249,9 @@ impl gpui::RenderOnce for FluentButton {
         if style.icon_only {
             btn = btn.w(height).min_w(height).px_0().py_0();
         }
+        if style.full_width {
+            btn = btn.w_full();
+        }
         // WinUI AccentButtonBackgroundDisabled is AccentFillColorDisabled
         // (#37000000 / #28FFFFFF) with TextOnAccentFillColorDisabled, a
         // neutral fill, not the Kit's 15 % tint of the accent.
@@ -303,8 +315,11 @@ impl gpui::RenderOnce for FluentButton {
                 style.variant,
                 ButtonVariant::Ghost | ButtonVariant::Link | ButtonVariant::Text
             );
-        div()
-            .relative()
+        let mut frame = div().relative();
+        if style.full_width {
+            frame = frame.w_full();
+        }
+        frame
             .group(group)
             .child(btn)
             .children(elevate.then(|| button_elevation_line(cx)))

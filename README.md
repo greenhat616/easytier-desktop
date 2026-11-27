@@ -144,11 +144,15 @@ text boxes, navigation items, InfoBars, selected cards, progress rings, and
 appearance choices. Its state is in-memory: it does not open a host connection,
 tray, profile library, or production UI preferences.
 
-The gallery's Basic input and Settings pages show controls that the product
-does not use yet (CheckBox, RadioButtons, ToggleButton, DropDownButton,
-SplitButton, ComboBox, Slider, NumberBox, SettingsCard and SettingsExpander).
-They live in `etd-ui`'s `views::controls` and take their values from the
-WinUI theme resources and the Windows Community Toolkit SettingsControls.
+The gallery's Basic input, Settings, Menus & toolbars and Dialogs & flyouts
+pages show controls that the product does not use yet (CheckBox,
+RadioButtons, ToggleButton, DropDownButton, SplitButton, ComboBox, Slider,
+NumberBox, SettingsCard, SettingsExpander, MenuFlyout, CommandBar,
+ContentDialog, Flyout and TeachingTip). They live in `etd-ui`'s
+`views::controls`, `views::menus` and `views::dialogs` and take their values
+from the WinUI theme resources and the Windows Community Toolkit
+SettingsControls. Each is a Tab stop with the WinUI focus visual; open
+flyouts take Up, Down and Escape and give focus back when they close.
 
 The control geometry follows Microsoft's [Button template](https://github.com/microsoft/microsoft-ui-xaml/blob/main/controls/dev/CommonStyles/Button_themeresources.xaml)
 (32 epx standard height, 14 epx text, 11/5/11/6 padding, 4 epx radius),

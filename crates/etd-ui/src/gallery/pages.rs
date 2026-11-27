@@ -24,6 +24,7 @@ use crate::views::{
         flyout_item, number_box, settings_card, settings_expander, settings_expander_item,
         split_button, toggle_button,
     },
+    dialogs::{DialogButtons, DialogResult, content_dialog, flyout_panel, teaching_tip},
     menus::{BarCommand, MenuCheck, MenuEntry, MenuHandler, MenuItem, command_bar, menu_flyout},
     ui::{BtnStyle, action_button, settings_switch},
 };
@@ -39,6 +40,7 @@ pub(super) enum Popup {
     Menu,
     Context,
     Overflow,
+    Flyout,
 }
 
 pub(super) struct DemoState {
@@ -62,6 +64,9 @@ pub(super) struct DemoState {
     show_hidden: bool,
     sort: usize,
     preview: bool,
+    dialog_open: bool,
+    dialog_result: SharedString,
+    tip_open: bool,
 }
 
 impl DemoState {
@@ -103,6 +108,9 @@ impl DemoState {
             show_hidden: true,
             sort: 0,
             preview: false,
+            dialog_open: false,
+            dialog_result: "None".into(),
+            tip_open: false,
         }
     }
 }
@@ -117,6 +125,9 @@ impl Gallery {
     }
     pub(super) fn demo_last(&self) -> SharedString {
         self.demo.last.clone()
+    }
+    pub(super) fn demo_dialog_result(&self) -> SharedString {
+        self.demo.dialog_result.clone()
     }
 }
 
@@ -838,5 +849,154 @@ pub(super) fn menus_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<AnyEl
         section("MenuFlyout", [menu_button, note], cx),
         section("Context menu", std::iter::once(target).chain(context), cx),
         section("CommandBar", [bar], cx),
+    ]
+}
+
+#[inline(never)]
+pub(super) fn dialogs_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<AnyElement> {
+    let demo = &view.demo;
+    let note = |text: SharedString, cx: &App| {
+        div()
+            .text_size(px(12.))
+            .line_height(px(16.))
+            .text_color(crate::theme::text_secondary(cx))
+            .child(text)
+            .into_any_element()
+    };
+
+    // ContentDialog: Save is the default button.
+    let dialog = demo.dialog_open.then(|| {
+        let view = cx.entity().downgrade();
+        content_dialog(
+            "dialog",
+            "Save your work?",
+            div()
+                .child("You have unsaved changes to this profile. Save them before closing?")
+                .into_any_element(),
+            DialogButtons {
+                primary: Some("Save"),
+                secondary: Some("Don't save"),
+                close: "Cancel",
+                default: DialogResult::Primary,
+            },
+            Rc::new(move |result, _, cx| {
+                view.update(cx, |this, cx| {
+                    this.demo.dialog_open = false;
+                    this.demo.dialog_result = SharedString::from(match result {
+                        DialogResult::Primary => "Save",
+                        DialogResult::Secondary => "Don't save",
+                        DialogResult::None => "Cancel",
+                    });
+                    cx.notify();
+                })
+                .ok();
+            }),
+        )
+    });
+    let open_dialog = action_button(
+        "dialog-open",
+        "Show dialog",
+        BtnStyle::new(ButtonVariant::Default, Size::Medium),
+        cx.listener(|this, _: &gpui_kit::ClickEvent, _, cx| {
+            this.demo.dialog_open = true;
+            cx.notify();
+        }),
+    );
+    let dialog_note = note(
+        SharedString::from(format!("Dialog result: {}", demo.dialog_result)),
+        cx,
+    );
+
+    // Flyout: arbitrary content in a light-dismiss popup.
+    let flyout = (demo.popup == Some(Popup::Flyout)).then(|| {
+        let confirm = cx.listener(|this, _: &gpui_kit::ClickEvent, _, cx| {
+            this.demo.popup = None;
+            this.demo.last = "Cleared recents".into();
+            cx.notify();
+        });
+        flyout_panel(
+            "flyout",
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .child("Recent samples will be removed. Continue?")
+                .child(action_button(
+                    "flyout-confirm",
+                    "Clear recents",
+                    BtnStyle::new(ButtonVariant::Default, Size::Medium),
+                    confirm,
+                ))
+                .into_any_element(),
+            dismiss(cx),
+            cx,
+        )
+    });
+    let flyout_button = div()
+        .flex()
+        .flex_col()
+        .items_start()
+        .child(action_button(
+            "flyout-open",
+            "Clear recents…",
+            BtnStyle::new(ButtonVariant::Default, Size::Medium),
+            popup_toggle(Popup::Flyout, cx),
+        ))
+        .children(flyout)
+        .into_any_element();
+
+    // TeachingTip below its target; it stays open until closed.
+    let tip = demo.tip_open.then(|| {
+        let view = cx.entity().downgrade();
+        let got_it = cx.listener(|this, _: &gpui_kit::ClickEvent, _, cx| {
+            this.demo.tip_open = false;
+            cx.notify();
+        });
+        teaching_tip(
+            "tip",
+            "Pin your favorite samples",
+            "Pinned samples appear first on the home page.",
+            Some(action_button(
+                "tip-action",
+                "Got it",
+                BtnStyle::new(ButtonVariant::Primary, Size::Medium),
+                got_it,
+            )),
+            move |_, cx| {
+                view.update(cx, |this, cx| {
+                    this.demo.tip_open = false;
+                    cx.notify();
+                })
+                .ok();
+            },
+            cx,
+        )
+    });
+    let tip_target = div()
+        .flex()
+        .flex_col()
+        .items_start()
+        .child(action_button(
+            "tip-target",
+            "Show tip",
+            BtnStyle::new(ButtonVariant::Default, Size::Medium),
+            cx.listener(|this, _: &gpui_kit::ClickEvent, _, cx| {
+                this.demo.tip_open = !this.demo.tip_open;
+                cx.notify();
+            }),
+        ))
+        .children(tip)
+        .into_any_element();
+
+    vec![
+        section(
+            "ContentDialog",
+            std::iter::once(open_dialog)
+                .chain(std::iter::once(dialog_note))
+                .chain(dialog),
+            cx,
+        ),
+        section("Flyout", [flyout_button], cx),
+        section("TeachingTip", [tip_target], cx),
     ]
 }

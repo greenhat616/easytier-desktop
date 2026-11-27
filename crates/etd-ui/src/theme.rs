@@ -255,7 +255,7 @@ pub(crate) fn chrome_fill(cx: &App, fallback: Hsla) -> Hsla {
 /// WinUI surface brushes from `Common_themeresources_any.xaml`, as
 /// `0xRRGGBBAA` for (light, dark). Translucent values are painted as-is so
 /// they composite over whatever layer is really below them, as in XAML.
-fn winui_brush(cx: &App, light: u32, dark: u32) -> Hsla {
+pub(crate) fn winui_brush(cx: &App, light: u32, dark: u32) -> Hsla {
     rgba(if Theme::global(cx).is_dark() {
         dark
     } else {

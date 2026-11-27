@@ -207,6 +207,320 @@ async fn install_bundles(
     Ok(())
 }
 
+/// What an upgrade changed in the kernel store.
+pub struct CoreMerge {
+    /// SHA directories this upgrade created; removed again on rollback.
+    pub published: Vec<PathBuf>,
+    /// Versions dropped from the manifest because this build no longer
+    /// trusts them. Their directories stay: live records may name them.
+    pub dropped: Vec<String>,
+}
+
+/// `etd-host upgrade`: merge this build's release table into an existing
+/// service kernel store. Kept entries must still match the embedded table;
+/// rows already present are verified in place, missing ones are staged from
+/// `<bundle_root>/cores/<version>/`. No SHA directory is ever deleted here.
+/// The previous manifest is saved to `backup` before the new one is
+/// committed, so [`restore_manifest`] can undo the commit.
+pub async fn upgrade_bundled_cores(
+    bundle_root: &Path,
+    target: &Path,
+    backup: &Path,
+) -> Result<CoreMerge> {
+    merge_bundles(
+        bundle_root,
+        target,
+        backup,
+        TRUSTED_CORES,
+        &etd_core_easytier::EasyTierDriver,
+        etd_sysfx_os::driver_bundle_reference,
+    )
+    .await
+}
+
+fn read_manifest(target: &Path) -> Result<etd_host_core::core_store::manifest::Manifest> {
+    use etd_host_core::core_store::manifest::MANIFEST_FILE;
+    let file = fs::File::open(target.join(MANIFEST_FILE))
+        .context("kernel inventory missing; reinstall the service")?;
+    serde_json::from_reader(file).context("invalid kernel inventory")
+}
+
+/// The manifest an upgrade with `table` commits, or `None` if a row must
+/// first be staged. Untrusted entries are dropped; the default becomes the
+/// table's first version.
+fn merged_manifest(
+    old: &etd_host_core::core_store::manifest::Manifest,
+    table: &[TrustedCoreRow],
+) -> (etd_host_core::core_store::manifest::Manifest, Vec<String>) {
+    use etd_host_core::core_store::manifest::Manifest;
+    let trusted = |version: &str, sha: &str| {
+        table
+            .iter()
+            .any(|&(row, expected, _)| row == version && expected == sha)
+    };
+    let (cores, dropped): (Vec<_>, Vec<_>) = old
+        .cores
+        .iter()
+        .cloned()
+        .partition(|entry| trusted(&entry.version, &entry.sha256));
+    let default_version = table
+        .first()
+        .map(|&(version, _, _)| version.to_owned())
+        .or_else(|| {
+            old.default_version
+                .clone()
+                .filter(|version| cores.iter().any(|entry| &entry.version == version))
+        });
+    (
+        Manifest {
+            default_version,
+            cores,
+        },
+        dropped.into_iter().map(|entry| entry.version).collect(),
+    )
+}
+
+/// The store already holds exactly this build's release table, verified.
+pub fn cores_current(target: &Path) -> Result<bool> {
+    current_with(target, TRUSTED_CORES)
+}
+
+fn current_with(target: &Path, table: &[TrustedCoreRow]) -> Result<bool> {
+    let old = read_manifest(target)?;
+    let (merged, dropped) = merged_manifest(&old, table);
+    let present = |&(version, expected, _): &TrustedCoreRow| {
+        merged
+            .cores
+            .iter()
+            .any(|entry| entry.version == version && entry.sha256 == expected)
+    };
+    if !dropped.is_empty()
+        || merged.default_version != old.default_version
+        || !table.iter().all(present)
+    {
+        return Ok(false);
+    }
+    for &(_, expected, files) in table {
+        if verify_directory(&target.join(expected), &trusted_bundle(expected, files)).is_err() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn merge_bundles(
+    bundle_root: &Path,
+    target: &Path,
+    backup: &Path,
+    table: &[TrustedCoreRow],
+    driver: &dyn etd_core_api::CoreDriver,
+    driver_ref: impl Fn(&Path) -> Result<Option<String>, etd_sysfx_os::OsError>,
+) -> Result<CoreMerge> {
+    use etd_host_core::core_store::manifest::{MANIFEST_FILE, ManifestEntry};
+    let old = read_manifest(target)?;
+    let (mut manifest, dropped) = merged_manifest(&old, table);
+    let mut published = Vec::new();
+    let result = async {
+        for &(version, expected, files) in table {
+            let bundle = trusted_bundle(expected, files);
+            if manifest
+                .cores
+                .iter()
+                .any(|entry| entry.version == version && entry.sha256 == expected)
+            {
+                verify_directory(&target.join(expected), &bundle)
+                    .with_context(|| format!("installed core {version}"))?;
+                continue;
+            }
+            let source = bundle_root.join("cores").join(version);
+            let (staged, created) = stage_bundle_core(&source, target, &bundle)
+                .with_context(|| format!("bundled core {version}"))?;
+            if created {
+                published.push(target.join(expected));
+            }
+            let descriptor = driver.identify(&staged).await?;
+            if descriptor.version != version {
+                bail!("bundled kernel version differs from embedded release table");
+            }
+            verify_directory(staged.parent().context("missing SHA directory")?, &bundle)?;
+            manifest.cores.retain(|entry| entry.version != version);
+            manifest.cores.push(ManifestEntry {
+                version: version.into(),
+                proto_revision: descriptor.proto_revision,
+                sha256: expected.into(),
+            });
+        }
+        if serde_json::to_value(&manifest)? != serde_json::to_value(&old)? {
+            atomic_json(backup, &old)?;
+            atomic_json(&target.join(MANIFEST_FILE), &manifest)?;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        // The manifest is the last write; a failure before it leaves the
+        // previous inventory in place, a failure during it is undone here.
+        restore_manifest(target, backup)
+            .with_context(|| format!("upgrade failed: {error:#}; could not restore manifest"))?;
+        remove_published(&published, &driver_ref)
+            .with_context(|| format!("upgrade failed: {error:#}"))?;
+        return Err(error);
+    }
+    Ok(CoreMerge { published, dropped })
+}
+
+/// Put back the manifest saved by an upgrade, if any, and drop the backup.
+pub fn restore_manifest(target: &Path, backup: &Path) -> Result<bool> {
+    use etd_host_core::core_store::manifest::{MANIFEST_FILE, Manifest};
+    let file = match fs::File::open(backup) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let manifest: Manifest =
+        serde_json::from_reader(file).context("invalid saved kernel inventory")?;
+    atomic_json(&target.join(MANIFEST_FILE), &manifest)?;
+    discard_manifest_backup(backup)?;
+    Ok(true)
+}
+
+pub fn discard_manifest_backup(backup: &Path) -> Result<()> {
+    match fs::remove_file(backup) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
+    }
+}
+
+/// What tells whether a host wrote, and so possibly migrated, the ledger:
+/// `user_version` is the schema version; a non-empty write-ahead log (its
+/// size and modification time) means the main file's header may not be
+/// current yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LedgerHeader {
+    pub user_version: u32,
+    pub wal: Option<(u64, std::time::SystemTime)>,
+}
+
+impl LedgerHeader {
+    /// Whether a host may have migrated the ledger between `self` and
+    /// `after`: the schema version changed, or the write-ahead log did.
+    pub fn maybe_migrated(&self, after: &LedgerHeader) -> bool {
+        after.user_version != self.user_version || (after.wal.is_some() && after.wal != self.wal)
+    }
+}
+
+/// Read without opening the database, so no migration can run. `None` if
+/// there is no readable SQLite ledger.
+pub fn ledger_header(state: &Path) -> Option<LedgerHeader> {
+    use std::io::Read;
+    let path = state.join("ledger.sqlite3");
+    let mut header = [0u8; 64];
+    fs::File::open(&path).ok()?.read_exact(&mut header).ok()?;
+    if &header[..16] != b"SQLite format 3\0" {
+        return None;
+    }
+    let user_version = u32::from_be_bytes([header[60], header[61], header[62], header[63]]);
+    let wal = fs::metadata(state.join("ledger.sqlite3-wal"))
+        .ok()
+        .filter(|m| m.len() > 0)
+        .and_then(|m| Some((m.len(), m.modified().ok()?)));
+    Some(LedgerHeader { user_version, wal })
+}
+
+/// What an upgrade that dropped `dropped` kernels must tell the user about
+/// the host's kernel selection. Reads the ledger read-only (never migrates
+/// it); if that is not possible the notice names no instances.
+pub async fn kernel_selection_notice(state: &Path, dropped: &[String]) -> Option<String> {
+    use etd_sysfx::{
+        BootId, Ledger,
+        sqlite::{OpenOptions, SqliteLedger},
+    };
+    if dropped.is_empty() {
+        return None;
+    }
+    let generic = format!(
+        "if the selected kernel was {}, instances will not start until another kernel is selected",
+        dropped.join(" or ")
+    );
+    if !ledger_exists(state).unwrap_or(false) {
+        return None;
+    }
+    let Ok(ledger) = SqliteLedger::open_with_options(
+        state.join("ledger.sqlite3"),
+        BootId("upgrade-diagnosis".into()),
+        OpenOptions {
+            read_only: true,
+            ..Default::default()
+        },
+    )
+    .await
+    else {
+        return Some(generic);
+    };
+    let read = async {
+        let settings = ledger.settings().await?;
+        let (_, desired) = ledger.desired().await?;
+        Ok::<_, LedgerError>((settings.selected_core, desired))
+    }
+    .await;
+    let _ = ledger.close().await;
+    let Ok((selected, desired)) = read else {
+        return Some(generic);
+    };
+    let selected = selected.filter(|version| dropped.contains(version))?;
+    let running: Vec<String> = desired
+        .iter()
+        .filter(|instance| instance.desired == etd_contract::v1::Desired::Running as i32)
+        .map(|instance| {
+            let name = instance
+                .spec
+                .as_ref()
+                .map(|spec| spec.display_name.as_str())
+                .unwrap_or_default();
+            if name.is_empty() {
+                instance.instance_id.clone()
+            } else {
+                format!("{name} ({})", instance.instance_id)
+            }
+        })
+        .collect();
+    Some(if running.is_empty() {
+        format!(
+            "the selected kernel {selected} is no longer trusted; select another kernel before starting an instance"
+        )
+    } else {
+        format!(
+            "the selected kernel {selected} is no longer trusted; these instances will not start until another kernel is selected: {}",
+            running.join(", ")
+        )
+    })
+}
+
+/// Remove SHA directories an upgrade created, newest first. A directory the
+/// OS cannot rule out as a driver image source is kept and reported.
+pub fn remove_published(
+    published: &[PathBuf],
+    driver_ref: &impl Fn(&Path) -> Result<Option<String>, etd_sysfx_os::OsError>,
+) -> Result<()> {
+    for dir in published.iter().rev() {
+        if !dir.try_exists()? {
+            continue;
+        }
+        if let Some(reference) = driver_ref(dir)
+            .with_context(|| format!("cannot determine driver references of {}", dir.display()))?
+        {
+            bail!("kernel bundle {} retained: {reference}", dir.display());
+        }
+        fs::remove_dir_all(dir).with_context(|| format!("could not remove {}", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// [`remove_published`] with the native driver reference query.
+pub fn remove_published_bundles(published: &[PathBuf]) -> Result<()> {
+    remove_published(published, &etd_sysfx_os::driver_bundle_reference)
+}
+
 fn is_hash_name(name: &str) -> bool {
     name.len() == 64
         && name
@@ -555,6 +869,118 @@ mod tests {
         assert!(manifest_exists(&target).unwrap());
     }
 
+    const CORE_SHA: &str = "f9adb7d924ed98c558040c910600d7363d749e7d20e8d355626edd53b4fb929f";
+    const COMPANION_SHA: &str = "5a76891725f3b6a5325dc17f0cef622fffb0b38794e1b0c7d9f2537ff73ad1fb";
+    const OLD_SHA: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    /// An installed store with one old entry and a payload carrying 9.9.9.
+    fn upgrade_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        use etd_host_core::core_store::manifest::{MANIFEST_FILE, Manifest, ManifestEntry};
+        let root = tempfile::tempdir().unwrap();
+        let bundle_root = root.path().join("payload");
+        let source = bundle_root.join("cores").join("9.9.9");
+        let target = root.path().join("cores");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(target.join(OLD_SHA)).unwrap();
+        fs::write(target.join(OLD_SHA).join(CORE_FILE), b"old kernel").unwrap();
+        fs::write(source.join(CORE_FILE), b"verified fixture").unwrap();
+        fs::write(source.join("runtime.dll"), b"verified companion").unwrap();
+        atomic_json(
+            &target.join(MANIFEST_FILE),
+            &Manifest {
+                default_version: Some("1.0.0".into()),
+                cores: vec![ManifestEntry {
+                    version: "1.0.0".into(),
+                    proto_revision: "0000000".into(),
+                    sha256: OLD_SHA.into(),
+                }],
+            },
+        )
+        .unwrap();
+        let backup = root
+            .path()
+            .join("maintenance")
+            .join("upgrade-manifest.json");
+        fs::create_dir(backup.parent().unwrap()).unwrap();
+        (root, bundle_root, target, backup)
+    }
+
+    fn manifest_text(target: &Path) -> String {
+        fs::read_to_string(target.join(etd_host_core::core_store::manifest::MANIFEST_FILE)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn upgrade_merges_new_kernels_and_keeps_old_directories() {
+        const TABLE: &[TrustedCoreRow] = &[("9.9.9", CORE_SHA, &[("runtime.dll", COMPANION_SHA)])];
+        let (_root, bundle_root, target, backup) = upgrade_fixture();
+        let before = manifest_text(&target);
+        assert!(!current_with(&target, TABLE).unwrap());
+        let driver = etd_testkit::fakes::core::FakeCoreDriver::new();
+        let merge = merge_bundles(&bundle_root, &target, &backup, TABLE, &driver, |_| Ok(None))
+            .await
+            .unwrap();
+        assert_eq!(merge.published, [target.join(CORE_SHA)]);
+        assert_eq!(merge.dropped, ["1.0.0"]);
+        let manifest = read_manifest(&target).unwrap();
+        assert_eq!(manifest.default_version.as_deref(), Some("9.9.9"));
+        assert_eq!(manifest.cores.len(), 1);
+        assert_eq!(manifest.cores[0].sha256, CORE_SHA);
+        // The untrusted old bundle is no longer listed but never deleted.
+        assert!(target.join(OLD_SHA).join(CORE_FILE).is_file());
+        assert!(current_with(&target, TABLE).unwrap());
+        // A second merge changes nothing and saves no new backup.
+        fs::remove_file(&backup).unwrap();
+        let again = merge_bundles(&bundle_root, &target, &backup, TABLE, &driver, |_| Ok(None))
+            .await
+            .unwrap();
+        assert!(again.published.is_empty() && again.dropped.is_empty());
+        assert!(!backup.exists());
+        // Restoring brings back the pre-upgrade manifest exactly once.
+        atomic_json(
+            &backup,
+            &serde_json::from_str::<serde_json::Value>(&before).unwrap(),
+        )
+        .unwrap();
+        assert!(restore_manifest(&target, &backup).unwrap());
+        assert_eq!(read_manifest(&target).unwrap().cores[0].sha256, OLD_SHA);
+        assert!(!backup.exists());
+        assert!(!restore_manifest(&target, &backup).unwrap());
+        remove_published(&merge.published, &|_| Ok(None)).unwrap();
+        assert!(!target.join(CORE_SHA).exists());
+    }
+
+    #[tokio::test]
+    async fn failed_upgrade_merge_leaves_the_store_as_it_was() {
+        // The second row has no bundle in the payload.
+        const TABLE: &[TrustedCoreRow] = &[
+            ("9.9.9", CORE_SHA, &[("runtime.dll", COMPANION_SHA)]),
+            (
+                "another",
+                "5a2fb8a8a81676b585a828720640469131e1bef8750f45304506f2615d9389ad",
+                &[],
+            ),
+        ];
+        let (_root, bundle_root, target, backup) = upgrade_fixture();
+        let before = manifest_text(&target);
+        let driver = etd_testkit::fakes::core::FakeCoreDriver::new();
+        assert!(
+            merge_bundles(&bundle_root, &target, &backup, TABLE, &driver, |_| Ok(None))
+                .await
+                .is_err()
+        );
+        assert_eq!(manifest_text(&target), before);
+        assert!(!target.join(CORE_SHA).exists());
+        assert!(!backup.exists());
+        // A bundle the OS may still reference as a driver source is kept.
+        let referenced = target.join(OLD_SHA);
+        let error = remove_published(std::slice::from_ref(&referenced), &|_| {
+            Ok(Some("driver fixture".into()))
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("driver fixture"));
+        assert!(referenced.exists());
+    }
+
     #[test]
     fn bundle_copy_requires_the_embedded_hash() {
         let root = tempfile::tempdir().unwrap();
@@ -577,5 +1003,35 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         assert!(!super::native_history(state.path(), false, false).unwrap());
         assert!(!super::native_history(state.path(), false, true).unwrap());
+    }
+
+    #[test]
+    fn the_ledger_header_shows_a_migration_without_opening_the_database() {
+        let state = tempfile::tempdir().unwrap();
+        assert_eq!(super::ledger_header(state.path()), None);
+        let mut page = b"SQLite format 3\0".to_vec();
+        page.resize(100, 0);
+        page[60..64].copy_from_slice(&7u32.to_be_bytes());
+        std::fs::write(state.path().join("ledger.sqlite3"), &page).unwrap();
+        let header = super::ledger_header(state.path()).unwrap();
+        assert_eq!(header.user_version, 7);
+        assert_eq!(header.wal, None);
+        std::fs::write(state.path().join("ledger.sqlite3-wal"), b"").unwrap();
+        assert_eq!(super::ledger_header(state.path()).unwrap().wal, None);
+        // A log left by the previous host that nobody touched is no sign.
+        std::fs::write(state.path().join("ledger.sqlite3-wal"), b"frames").unwrap();
+        let left = super::ledger_header(state.path()).unwrap();
+        assert!(left.wal.is_some());
+        assert!(!left.maybe_migrated(&super::ledger_header(state.path()).unwrap()));
+        assert!(!header.maybe_migrated(&header));
+        // A log that grew, or a new schema version, is.
+        std::fs::write(state.path().join("ledger.sqlite3-wal"), b"more frames").unwrap();
+        assert!(left.maybe_migrated(&super::ledger_header(state.path()).unwrap()));
+        assert!(header.maybe_migrated(&super::LedgerHeader {
+            user_version: 8,
+            wal: None
+        }));
+        std::fs::write(state.path().join("ledger.sqlite3"), b"not a database").unwrap();
+        assert_eq!(super::ledger_header(state.path()), None);
     }
 }

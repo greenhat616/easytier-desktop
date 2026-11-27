@@ -47,6 +47,8 @@ jobs:
             suite: clean
           - os: windows-latest
             suite: stop
+          - os: windows-latest
+            suite: upgrade
           - os: ubuntu-latest
             suite: takeover
           - os: macos-latest
@@ -130,6 +132,9 @@ jobs:
       - name: Service STOP with a running network (administrator)
         if: matrix.suite == 'stop'
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=service_stop_with_a_running_network_is_bounded)' --success-output immediate
+      - name: Upgrade with a running network (administrator)
+        if: matrix.suite == 'upgrade'
+        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=installed_network_survives_upgrade)' --success-output immediate
       - name: Pre-existing shared drivers (fresh administrator runner)
         if: matrix.suite == 'preflight'
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=preexisting_shared_drivers_are_conflicts) | test(=preexisting_shared_drivers_survive_uninstall)' --success-output immediate

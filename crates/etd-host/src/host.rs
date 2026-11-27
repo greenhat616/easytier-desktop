@@ -33,7 +33,7 @@ use etd_sysfx_os::{
     OsConfig, OsError,
     service::{
         DeferredOutcome, HostFilesystem, HostLayout, LifecycleJournal, MaintenanceLock,
-        NativeHostFilesystem, NativeServiceManager, Phase, Resource, ServiceManager,
+        NativeHostFilesystem, NativeServiceManager, Phase, Resource, ServiceManager, UpgradeStage,
     },
 };
 #[cfg(windows)]
@@ -46,7 +46,9 @@ mod serving;
 use serving::policy;
 #[cfg(windows)]
 use serving::valid_sid;
-pub(crate) use serving::{LayoutLock, serve_with_deps};
+pub(crate) use serving::{LayoutLock, serve_with_deps_and};
+#[path = "upgrade.rs"]
+pub(crate) mod upgrade;
 /// See [`serving::RUNTIME_SHUTDOWN`].
 pub(crate) const RUNTIME_SHUTDOWN: std::time::Duration = serving::RUNTIME_SHUTDOWN;
 const LEDGER: &str = "ledger.sqlite3";
@@ -350,12 +352,32 @@ async fn serve_until(
         endpoint(mode, &layout)?,
         form,
     );
+    let mut on_serving: Option<Box<dyn FnOnce() + Send>> = None;
     if mode == HostMode::Service {
-        ensure!(
-            LifecycleJournal::open(&layout)?
-                .is_some_and(|journal| journal.phase() == Phase::Installed),
-            "service installation is incomplete or disabled for uninstall; retry maintenance"
-        );
+        let journal = LifecycleJournal::open(&layout)?
+            .filter(|journal| journal.phase() == Phase::Installed)
+            .context(
+                "service installation is incomplete or disabled for uninstall; retry maintenance",
+            )?;
+        match journal.upgrade_stage() {
+            // `Disabling` changed nothing yet: this is still the old host.
+            None | Some(UpgradeStage::Disabling) => {}
+            Some(UpgradeStage::Replacing | UpgradeStage::RollingBack) => bail!(
+                "an upgrade of this service is incomplete; run etd-host upgrade from the new payload again, or etd-host uninstall"
+            ),
+            Some(UpgradeStage::Starting) => {
+                ensure!(
+                    !etd_sysfx_os::service::ci_upgrade_fault(&layout, "new-host-unready"),
+                    "CI fault: the new host does not become ready"
+                );
+                // This is the new host: serving commits the upgrade.
+                let layout = layout.clone();
+                let install_id = journal.install_id().to_owned();
+                on_serving = Some(Box::new(move || {
+                    upgrade::commit_by_new_host(&layout, &install_id)
+                }));
+            }
+        }
     }
     let logging = logging(&layout)?;
     let Dependencies {
@@ -363,7 +385,7 @@ async fn serve_until(
         missing,
         sqlite,
     } = dependencies(mode, &layout).await?;
-    let stopped = serve_with_deps(mode, guard, host, managed_stop, missing).await?;
+    let stopped = serve_with_deps_and(mode, guard, host, managed_stop, missing, on_serving).await?;
     // The ledger's writer thread is joined before the lock can go: no
     // queued transition lands after another process owns the ledger.
     let closed = tokio::time::timeout(serving::LEDGER_CLOSE, async {
@@ -953,11 +975,7 @@ fn print_report(report: &ReclaimReport) {
 
 pub async fn reclaim(mode: HostMode, _all: bool, purge: bool) -> Result<()> {
     let layout = layout(mode)?;
-    let _command = if mode == HostMode::Service {
-        Some(NativeHostFilesystem.lock_maintenance(&layout)?)
-    } else {
-        None
-    };
+    let _command = service_maintenance(mode, &layout)?;
     prepare(mode, &layout)?;
     let _guard = NativeHostFilesystem.lock(&layout)?;
     let deps = dependencies(mode, &layout).await?;
@@ -997,7 +1015,7 @@ async fn lock_after_stop<T>(
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if tokio::time::Instant::now() >= until {
                     bail!(
-                        "the service reported STOPPED but its process is still exiting and holds the host lock; retry etd-host uninstall in a moment"
+                        "the service reported STOPPED but its process is still exiting and holds the host lock; retry in a moment"
                     );
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1045,6 +1063,10 @@ async fn uninstall_locked(layout: &HostLayout, expected_id: Option<&str>) -> Res
     );
     if journal.phase() == Phase::Installing {
         return rollback_install(layout, &guard, journal);
+    }
+    if journal.upgrade_stage().is_some() {
+        upgrade::roll_back_for_uninstall(layout, &mut journal)
+            .context("cannot restore an interrupted upgrade before uninstall")?;
     }
     journal.step(Phase::Disabled, || {
         NativeServiceManager.stop_and_disable(layout)
@@ -1169,6 +1191,7 @@ pub async fn resume_service() -> Result<()> {
     let guard = NativeHostFilesystem.lock(&layout)?;
     NativeHostFilesystem.validate_service(&layout)?;
     let mut journal = LifecycleJournal::open(&layout)?.context("no service installation")?;
+    upgrade::ensure_no_upgrade(&journal)?;
     let install_id = journal.install_id().to_owned();
     journal.resume_service()?;
     drop(guard);
@@ -1205,13 +1228,22 @@ pub fn uninstall_status() -> Result<()> {
     Ok(())
 }
 
+/// The maintenance lock for a service-mode `reclaim` / `remove-core`,
+/// refused while an upgrade is uncommitted.
+fn service_maintenance(mode: HostMode, layout: &HostLayout) -> Result<Option<MaintenanceLock>> {
+    if mode != HostMode::Service {
+        return Ok(None);
+    }
+    let command = NativeHostFilesystem.lock_maintenance(layout)?;
+    if let Some(journal) = LifecycleJournal::open(layout)? {
+        upgrade::ensure_no_upgrade(&journal)?;
+    }
+    Ok(Some(command))
+}
+
 pub async fn remove_core(mode: HostMode, version: &str) -> Result<()> {
     let layout = layout(mode)?;
-    let _command = if mode == HostMode::Service {
-        Some(NativeHostFilesystem.lock_maintenance(&layout)?)
-    } else {
-        None
-    };
+    let _command = service_maintenance(mode, &layout)?;
     prepare(mode, &layout)?;
     let _guard = NativeHostFilesystem.lock(&layout)?;
     let resources = dependencies(mode, &layout).await?;
@@ -1918,10 +1950,7 @@ mod lock_after_stop_tests {
             .unwrap_err();
         assert!(started.elapsed() >= Duration::from_secs(10));
         assert!(started.elapsed() < Duration::from_secs(11));
-        assert!(
-            error.to_string().contains("retry etd-host uninstall"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("retry in a moment"), "{error}");
     }
 
     #[tokio::test(start_paused = true)]

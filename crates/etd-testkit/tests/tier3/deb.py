@@ -10,6 +10,10 @@ dependencies first, so apt adds nothing else to the machine.
 The case walks one machine through:
 1. a service installed with the CLI: the package's preinst refuses before
    anything is unpacked, and the service keeps running untouched;
+1b. a first install whose configure is retried (`dpkg --unpack`, then
+   `dpkg --configure`): over a CLI-installed service the postinst fails and
+   the service is untouched; over the package's own service, registered by
+   an interrupted configure and left stopped, the retry starts it; purge;
 2. a first install (A): payload, /usr/bin links, desktop entry, icons, and a
    serving service whose image is the payload's, recorded as owned by the
    package;
@@ -18,7 +22,9 @@ The case walks one machine through:
 4. an upgrade (C) whose new host never serves: etd-host rolls the service
    back and B keeps serving; dpkg leaves C unpacked but half-configured
    (postinst failed) and does not restore B's files. Once the fault is gone,
-   `dpkg --configure -a` reruns the postinst and completes the upgrade;
+   `dpkg --configure -a` reruns the postinst and completes the upgrade. This
+   is the same build with a fault, not an older release: what an upgrade
+   failure leaves across real versions is described in docs/packaging;
 5. `apt-get purge`: Service.installed compares the machine with before
    step 2, and no payload, link, desktop entry, icon or package remains.
 """
@@ -27,6 +33,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import sys
 
 from service import Service, command, eventually, require_runner
@@ -106,9 +113,20 @@ def no_backups(service):
         assert not leftover.exists(), f"upgrade left {leftover}"
 
 
+def owned_by_root(path, mode):
+    info = path.lstat()
+    assert (info.st_uid, info.st_gid) == (0, 0), f"{path} is owned by {info.st_uid}:{info.st_gid}"
+    assert stat.S_IMODE(info.st_mode) == mode, f"{path} has mode {stat.S_IMODE(info.st_mode):o}"
+
+
 def package_files_present():
     for name in ("etd-ui", "etd-host", "etd-ctl", "cores/2.7.1/easytier-core"):
         assert (PAYLOAD / name).is_file(), f"payload misses {name}"
+        owned_by_root(PAYLOAD / name, 0o755)
+    for folder in (PAYLOAD, PAYLOAD / "cores", PAYLOAD / "cores/2.7.1"):
+        owned_by_root(folder, 0o755)
+    for data in (DESKTOP, *ICONS):
+        owned_by_root(data, 0o644)
     for link, target in LINKS.items():
         assert link.is_symlink() and link.resolve() == target, f"{link} -> {os.readlink(link)}"
     assert DESKTOP.is_file(), "no desktop entry"
@@ -145,12 +163,52 @@ def refused_over_cli_install(service, deb):
           "the service kept serving with its install id and settings", flush=True)
 
 
+def first_install_retries(service, deb):
+    """dpkg --configure retrying a first install converges only for the
+    package's own service."""
+    result = run("dpkg", "--unpack", deb, name="unpack")
+    assert result.returncode == 0 and status() == "iU", (result.returncode, status())
+    host = PAYLOAD / "etd-host"
+    # Another installer's service appeared before configuring: never adopted.
+    command(host, "install", timeout=300)
+    try:
+        before = journal()
+        assert "owner" not in before, before
+        kept = settings(service)
+        result = run("dpkg", "--configure", PACKAGE, name="configure-over-cli")
+        assert result.returncode != 0, "the postinst took over a CLI-installed service"
+        assert status() == "iF", status()
+        serving(service, "CLI-installed service after the failed configure")
+        assert journal() == before and settings(service) == kept
+    finally:
+        command(host, "uninstall", timeout=300)
+    # The package's own install registered the service, then configure
+    # stopped before the service started.
+    command(host, "install", "--owner", OWNER, timeout=300)
+    install_id = journal()["install_id"]
+    command("systemctl", "stop", "easytier-desk-host.service")
+    result = run("dpkg", "--configure", "-a", name="configure-retry")
+    assert result.returncode == 0, f"dpkg --configure exited {result.returncode}"
+    assert f"already installed for {OWNER}" in result.stdout, result.stdout
+    assert status() == "ii", status()
+    serving(service, "service started by the retried configure")
+    record = journal()
+    assert record["install_id"] == install_id and record.get("owner") == OWNER, record
+    result = run("apt-get", "purge", "-y", PACKAGE, name="purge-retry")
+    assert result.returncode == 0, f"apt-get purge exited {result.returncode}"
+    assert not_installed() and not UNIT.exists(), status()
+    package_files_absent()
+    print("retried first install: refused over a CLI-installed service (dpkg iF, service "
+          "untouched); resumed and started the package's own registered service", flush=True)
+
+
 def deb_lifecycle():
     service = Service()
     a, b, c = (Path(os.environ[name]) for name in ("ETD_DEB_A", "ETD_DEB_B", "ETD_DEB_C"))
     images = {deb: digest(payload_image(deb)) for deb in (a, b, c)}
     assert len(set(images.values())) == 3, "the packages must carry distinct images"
     refused_over_cli_install(service, a)
+    first_install_retries(service, a)
 
     def install():
         result = apt_install(a, "install")

@@ -227,14 +227,26 @@ jobs:
           deb="$RUNNER_TEMP/deb-A/x86_64-unknown-linux-gnu/easytier-desktop_0.1.0-1_amd64.deb"
           dpkg-deb --info "$deb"
           dpkg-deb --contents "$deb"
+          out="$RUNNER_TEMP/deb-A/x86_64-unknown-linux-gnu"
+          arch="$out/easytier-desktop-0.1.0-1-x86_64.pkg.tar.zst"
+          # Every packaged path is root's, and every folder is 0755 (the
+          # installed modes are checked by the deb suite).
+          check_listing() {
+            awk -v what="$1" '
+              $2 != "root/root" && $2 != "0/0" { print what ": not root-owned: " $0; bad = 1 }
+              /^d/ && $1 != "drwxr-xr-x" { print what ": folder mode: " $0; bad = 1 }
+              END { exit bad }'
+          }
+          dpkg-deb --contents "$deb" | check_listing deb
+          tar --zstd -tvf "$arch" | check_listing arch
           # Every Debian dependency must resolve; install them now so the
           # package's own install adds nothing else to the machine.
-          depends=$(dpkg-deb -f "$deb" Depends | tr -d ' ' | tr ',' ' ')
+          depends=$(dpkg-deb -f "$deb" Depends | sed -E 's/\([^)]*\)//g' | tr -d ' ' | tr ',' ' ')
           bash .github/scripts/install-ubuntu-packages.sh $depends
           # The other formats build and carry the expected hooks.
-          out="$RUNNER_TEMP/deb-A/x86_64-unknown-linux-gnu"
           ls -l "$out"
-          tar --zstd -xOf "$out/easytier-desktop-0.1.0-1-x86_64.pkg.tar.zst" .INSTALL
+          tar --zstd -xOf "$arch" .INSTALL
+          tar --zstd -xOf "$arch" .PKGINFO
       - name: Compile runner as the build user
         run: cargo nextest list --locked --profile privileged --run-ignored only -p etd-testkit --test tier3
       - name: Installed service tests (administrator)

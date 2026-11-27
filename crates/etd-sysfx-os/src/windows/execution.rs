@@ -167,6 +167,19 @@ impl Environment {
     }
 }
 
+/// The management script as it is sent: without whole-line comments,
+/// indentation and blank lines, none of which PowerShell needs (the script
+/// has no here-strings or line continuations). The encoded command line is
+/// limited to 32767 characters.
+fn script() -> String {
+    include_str!("system.ps1")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn io_error(e: std::io::Error) -> WinError {
     WinError::new(e.raw_os_error().unwrap_or(-1) as i64, e.to_string())
 }
@@ -381,7 +394,7 @@ impl Worker {
             "-NoProfile",
             "-NonInteractive",
             "-EncodedCommand",
-            &encoded_command(include_str!("system.ps1")),
+            &encoded_command(&script()),
         ])
         .env("ETD_OS_SERVE", "1")
         .stdin(Stdio::piped())
@@ -999,6 +1012,18 @@ mod tests {
             .map(|(name, _)| name.to_ascii_uppercase())
             .collect();
         assert!(names.is_sorted(), "{names:?}");
+    }
+
+    #[test]
+    fn the_encoded_script_fits_a_command_line() {
+        let raw = include_str!("system.ps1");
+        // Trimming lines is only safe without here-strings and continuations.
+        assert!(!raw.contains("@\"") && !raw.contains("@'"));
+        assert!(raw.lines().all(|line| !line.trim_end().ends_with('`')));
+        // 32767 characters, less the executable path and the other arguments.
+        let encoded = encoded_command(&script()).len();
+        assert!(encoded < 30_000, "{encoded}");
+        assert!(script().starts_with("$PSModuleAutoLoadingPreference = 'None'"));
     }
 
     #[test]

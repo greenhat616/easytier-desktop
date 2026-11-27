@@ -82,6 +82,7 @@ impl fmt::Display for SessionRefusal {
 impl std::error::Error for SessionRefusal {}
 
 /// `\\.\pipe\easytier-desk-session-<SID>`.
+#[cfg(windows)]
 pub(super) fn endpoint_name(sid: &str) -> String {
     format!(r"\\.\pipe\easytier-desk-session-{sid}")
 }
@@ -373,6 +374,7 @@ mod tests {
         assert_eq!(SessionRefusal::find(&anyhow::anyhow!("other")), None);
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_session_pipe_is_named_after_the_owner() {
         assert_eq!(

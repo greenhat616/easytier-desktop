@@ -595,7 +595,8 @@ enum LeaseRule {
     /// authenticate the UI: any program of the same user at that path
     /// counts. Protecting that path is the installer's job (accepted risk,
     /// issue #2). Other clients (the CLI) are connections, not holders.
-    UiImage(Option<std::path::PathBuf>),
+    /// Elsewhere (no such host) nothing reads the path.
+    UiImage(#[cfg_attr(not(windows), allow(dead_code))] Option<std::path::PathBuf>),
 }
 
 impl LeaseRule {

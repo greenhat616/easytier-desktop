@@ -155,11 +155,12 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          # unix_service's macOS case binds below /private/var/run, which is
-          # group-writable there, so the listener refuses it: not run on macOS.
+          # macOS: /private/var/run is group-writable, so the service listener
+          # refuses directories below it. unix_service's macOS case binds there
+          # and is not run; the tier 2 service host uses /private/var/db.
           ipc_tests="--test unix_service --test stale_endpoint"
           runtime=/run/etd-g1
-          if [ "$RUNNER_OS" = macOS ]; then ipc_tests="--test stale_endpoint"; runtime=/private/var/run/etd-g1; fi
+          if [ "$RUNNER_OS" = macOS ]; then ipc_tests="--test stale_endpoint"; runtime=/private/var/db/etd-g1; fi
           cargo nextest list --locked --profile privileged -p etd-ipc --run-ignored only $ipc_tests
           cargo nextest list --locked --profile privileged -p etd-testkit --run-ignored only --test tier2
           sudo install -d -m 0700 -o root "$runtime"

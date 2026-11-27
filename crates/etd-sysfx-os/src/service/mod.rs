@@ -303,6 +303,15 @@ pub(super) fn is_image(current: &Path, executable: &Path) -> io::Result<bool> {
     }
 }
 
+/// Whether `current` (canonical) is the installed image: `executable`, or
+/// the new image an upgrade rollback moved aside to `.failed` while it was
+/// running (Windows keeps a running image mapped under its new name).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn runs_installed_image(current: &Path, executable: &Path) -> io::Result<bool> {
+    Ok(is_image(current, executable)?
+        || is_image(current, &image::ImagePaths::of(executable).failed)?)
+}
+
 pub fn current_exe() -> io::Result<PathBuf> {
     std::env::current_exe()?.canonicalize()
 }

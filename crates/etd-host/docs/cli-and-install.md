@@ -179,9 +179,11 @@ and maintenance directories are never touched; the ledger is never rolled back.
   `upgrade` or `uninstall`.
 - **Windows, uninstall after a crash at `Replacing`:** run from the installed image,
   which is then the new one, `uninstall` restores the previous image and parks the
-  running one as `etd-host.failed`; removing the install directory then fails once,
-  because that file is still mapped. Running `uninstall` again (from the restored
-  image) completes. Installer front ends must offer that retry.
+  running one as `etd-host.failed`, which stays mapped until the process exits. It
+  counts that image as the installed one, so, as for any uninstall run from the
+  installed image, a helper copied from it removes the install directory after the
+  process exits (`uninstall --status` reports it). The MSI runs `uninstall` from its
+  payload copy, which is never the installed image.
 
 If the upgrade drops the selected kernel version, it says so and names the instances
 set to run. Planning then fails with "selected kernel ... is not in this host's

@@ -458,10 +458,15 @@ fn native_absolute(path: &str) -> bool {
         Some(tail)
     } else if let Some(rest) = strip_prefix_ci(path, r"\??\") {
         drive(rest)
-            .or_else(|| strip_prefix_ci(rest, r"UNC\"))
+            .or_else(|| {
+                // UNC\<server>\<share>\<file...>: server and share are checked
+                // as components below; a file must follow them.
+                strip_prefix_ci(rest, r"UNC\").filter(|unc| unc.split('\\').count() >= 3)
+            })
             .or_else(|| {
                 strip_prefix_ci(rest, "Volume{")
                     .and_then(|volume| volume.split_once("}\\"))
+                    .filter(|(guid, _)| volume_guid(guid))
                     .map(|(_, tail)| tail)
             })
     } else {
@@ -473,6 +478,16 @@ fn native_absolute(path: &str) -> bool {
                 .split('\\')
                 .all(|part| !part.is_empty() && part != "." && part != "..")
     })
+}
+
+/// `8-4-4-4-12` hexadecimal digits, the GUID of a `Volume{...}` name.
+fn volume_guid(text: &str) -> bool {
+    let groups: Vec<&str> = text.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(group, len)| group.len() == len && group.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// The paths in a `SystemModuleInformation` buffer. Any entry whose path is
@@ -1246,6 +1261,26 @@ mod tests {
                 "not a complete absolute path",
             ),
             (modules(&[br"\SystemRoot\"]), "inconsistent"),
+            (
+                modules(&[br"\??\UNC\server\x.sys"]),
+                "not a complete absolute path",
+            ),
+            (
+                modules(&[br"\??\UNC\\share\x.sys"]),
+                "not a complete absolute path",
+            ),
+            (
+                modules(&[br"\??\Volume{01234567-89ab-cdef-0123}\x.sys"]),
+                "not a complete absolute path",
+            ),
+            (
+                modules(&[br"\??\Volume{0123456g-89ab-cdef-0123-456789abcdef}\x.sys"]),
+                "not a complete absolute path",
+            ),
+            (
+                modules(&[br"\??\Volume{}\x.sys"]),
+                "not a complete absolute path",
+            ),
             (
                 offset_at(br"\SystemRoot\System32\drivers\x.sys", 0),
                 "inconsistent",

@@ -57,3 +57,4 @@ Copyright (c) 2020 Microsoft Corporation; MIT license in `LICENSE.txt`. The file
 - `panel-left.svg` — `assets/Panel Left/SVG/ic_fluent_panel_left_24_regular.svg`
 - `speaker-2.svg` — `assets/Speaker 2/SVG/ic_fluent_speaker_2_24_regular.svg`
 - `grid.svg` — `assets/Grid/SVG/ic_fluent_grid_24_regular.svg`
+- `chat.svg` — `assets/Chat/SVG/ic_fluent_chat_24_regular.svg`

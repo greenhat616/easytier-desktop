@@ -564,7 +564,15 @@ fn logging(layout: &HostLayout) -> Result<tracing_appender::non_blocking::Worker
 pub fn doctor() -> Result<()> {
     println!("EasyTier Desktop host {}", env!("CARGO_PKG_VERSION"));
     for mode in [HostMode::User, HostMode::Service] {
-        let layout = layout(mode)?;
+        // An elevated doctor gets no user layout: the user folder is never
+        // resolved for an elevated token.
+        let layout = match layout(mode) {
+            Ok(layout) => layout,
+            Err(error) => {
+                println!("{mode:?}: unavailable: {error:#}");
+                continue;
+            }
+        };
         println!(
             "{mode:?}: state={}, core store={}",
             layout.state.display(),

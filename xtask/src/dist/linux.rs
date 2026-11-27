@@ -147,7 +147,11 @@ fn script(source: &str, format: &str, hook: &str) -> Result<String> {
         source.matches("@FORMAT@").count() == 1 && source.matches("@HOOK@").count() == 1,
         "{SCRIPT} must hold @FORMAT@ and @HOOK@ once each"
     );
-    let text = source.replace("@FORMAT@", format).replace("@HOOK@", hook);
+    // A package script must have LF line endings whatever the checkout has.
+    let text = source
+        .replace("\r\n", "\n")
+        .replace("@FORMAT@", format)
+        .replace("@HOOK@", hook);
     ensure!(!text.contains("@FORMAT@") && !text.contains("@HOOK@"));
     Ok(text)
 }
@@ -274,7 +278,9 @@ pub(super) fn package(root: &Path, payload: &Payload, dry_run: bool) -> Result<V
             .join("apps/easytier-desktop.png");
         ensure!(icon.is_file(), "missing icon {}", icon.display());
     }
-    let template = fs::read_to_string(root.join(TEMPLATE)).context(TEMPLATE)?;
+    let template = fs::read_to_string(root.join(TEMPLATE))
+        .context(TEMPLATE)?
+        .replace("\r\n", "\n");
     let config = payload.out.join("nfpm.yaml");
     fs::write(
         &config,
@@ -323,6 +329,7 @@ mod tests {
             "packaging/linux/nfpm.yaml.tmpl"
         ))
         .unwrap()
+        .replace("\r\n", "\n")
     }
 
     fn maintainer() -> String {
@@ -332,6 +339,7 @@ mod tests {
             "packaging/linux/scripts/maintainer.sh"
         ))
         .unwrap()
+        .replace("\r\n", "\n")
     }
 
     fn payload() -> Payload {
@@ -435,6 +443,7 @@ mod hook_tests {
             "packaging/linux/scripts/maintainer.sh"
         ))
         .unwrap()
+        .replace("\r\n", "\n")
     }
 
     struct Machine {
@@ -588,6 +597,8 @@ mod hook_tests {
     fn arch_hooks_take_versions_and_leave_a_foreign_service_alone() {
         let fresh = Machine::new(0);
         ok(&fresh.run_arch("postinstall", "post_install", &["0.1.0-1"]));
+        // The stub installs nothing: the service exists from here on.
+        let fresh = fresh.with_service();
         ok(&fresh.run_arch("postupgrade", "post_upgrade", &["0.2.0-1", "0.1.0-1"]));
         // pacman passes the old version to pre_remove: still a removal.
         ok(&fresh.run_arch("preremove", "pre_remove", &["0.2.0-1"]));

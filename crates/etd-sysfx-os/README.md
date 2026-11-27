@@ -26,16 +26,17 @@ reclaimed, privileged tests) are in [docs/platforms.md](docs/platforms.md).
 | `appearance::{AppearanceSnapshot, AccentRamp, AppearanceWatch, mica_backdrop_accepted, set_window_dark_mode}` | Desktop appearance for the UI; inert stubs outside Windows |
 | `windows`, `linux`, `macos` | Platform modules (compiled only on their OS); internals are private |
 
-Feature `ci-test-fixtures` compiles the Windows identity fixture `service::ci_fixture`.
-Only `etd-host`'s dev-dependency enables it, for the privileged install test on
-disposable CI runners.
+Feature `ci-test-fixtures` compiles the Windows identity fixture `service::ci_fixture`
+and `windows::worker_diagnostics`. Only `etd-host`'s dev-dependency and the privileged
+`windows_session_inputs` run enable it, on disposable CI runners; without it the worker
+refuses the script's `diagnostics` request.
 
 ## What each platform provides
 
 | | Windows | Linux | macOS |
 | --- | --- | --- | --- |
 | Reclaimers | `win.*` kinds, `route`, `driver` | `linux.tun`, `linux.resolved_link`, `route`, `linux.fence_rule` | `macos.utun`, `route`, `macos.fence_rule` |
-| Fence | WFP (permit SYSTEM only) | nftables (uid 0 only) | PF anchor (user 0 only), root hosts only |
+| Fence | WFP (service: permit SYSTEM; elevated session: SYSTEM and elevated administrators) | nftables (uid 0 only) | PF anchor (user 0 only), root hosts only |
 | Boot id | volatile registry marker | kernel `boot_id` | `kern.bootsessionuuid` |
 | Service | SCM, LocalSystem | systemd unit | launchd |
 
@@ -68,9 +69,9 @@ Default host directories (`service`):
 | --- | --- |
 | `lib.rs` | `OsConfig`, `OsAdapters`, dispatch to the platform module |
 | `windows/mod.rs` | Reclaimers, observer, sweeper, fence wiring |
-| `windows/wfp.rs`, `probe.rs` | Persistent WFP fence; LocalService connection probe |
+| `windows/wfp.rs`, `probe.rs`, `token.rs` | WFP fence of the host's form (persistent for the service, non-persistent for the elevated session); LocalService probe (service) or a host thread impersonating a restricted Medium token (session); host form from the process token |
 | `windows/interfaces.rs`, `registry.rs`, `magic.rs` | wintun identity, registry and boot marker, Magic DNS recovery replay |
-| `windows/execution.rs`, `system.ps1` | Constant PowerShell script for firewall, NRPT, profiles, registry and listener queries |
+| `windows/execution.rs`, `system.ps1` | Constant PowerShell script for firewall, NRPT, profiles, registry and listener queries; no module autoloading, absolute imports, explicit environment (under an elevated host that is not SYSTEM: profile variables in the session tree, and the CLR profiler off as defence in depth against HKCU runtime settings) |
 | `windows/driver_refs.rs`, `appearance.rs` | Driver references into the kernel store; DWM / appearance |
 | `linux/mod.rs`, `network.rs`, `observe.rs` | Reclaimers, sweeper, links / routes / listeners, runtime directories |
 | `linux/fence.rs`, `resolved.rs` | nftables fence; resolve1 per-link DNS |

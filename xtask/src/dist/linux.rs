@@ -231,7 +231,10 @@ fn render(
     glibc: &str,
 ) -> Result<String> {
     let arch = arch(&payload.triple)?;
-    let mut cores = String::new();
+    let mut cores = format!(
+        "  - dst: \"{}\"\n    type: dir\n    file_info:\n      mode: 0755\n",
+        quoted(&format!("{LIB}/cores/{}", payload.core_version))
+    );
     for (index, name) in payload.core_files.iter().enumerate() {
         // The kernel executable comes first (cores::verify).
         let mode = if index == 0 { "0755" } else { "0644" };
@@ -444,6 +447,19 @@ mod tests {
             "src: \"/b \\\"q\\\"/payload/cores/2.7.1/easytier-core\"\n    dst: \"/usr/lib/easytier-desktop/cores/2.7.1/easytier-core\"\n    file_info:\n      mode: 0755"
         ));
         assert!(text.contains("dst: /usr/bin/easytier-desktop\n    type: symlink"));
+        // Every folder of the package's own is listed, so rpm removes it.
+        for dir in [
+            "/usr/lib/easytier-desktop\n",
+            "/usr/lib/easytier-desktop/cores\n",
+            "\"/usr/lib/easytier-desktop/cores/2.7.1\"\n",
+        ] {
+            assert!(
+                text.contains(&format!(
+                    "  - dst: {dir}    type: dir\n    file_info:\n      mode: 0755"
+                )),
+                "{dir}"
+            );
+        }
         assert!(text.contains("dst: /usr/bin/etd-ctl\n    type: symlink"));
         assert!(text.contains("dst: /usr/share/applications/easytier-desktop.desktop"));
         for size in ICON_SIZES {

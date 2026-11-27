@@ -30,16 +30,39 @@ async fn peer() -> anyhow::Result<()> {
         return Ok(());
     };
     super::require_runner();
-    let connector = Arc::new(LocalConnector {
-        expectation: ServerExpectation {
-            exe_dir: etd_sysfx_os::service::installed_host_dir()?,
-            requirement: ServerRequirement::Service,
-        },
-    });
-    #[cfg(windows)]
-    let endpoint = Endpoint::NamedPipe(etd_ipc::SERVICE_PIPE_NAME.into());
-    #[cfg(unix)]
-    let endpoint = Endpoint::UnixSocket(etd_ipc::SERVICE_SOCKET_PATH.into());
+    // ETD_G2_SESSION_DIR: talk to the elevated session host run from that
+    // directory (this image copied there as etd-ui.exe holds its lease).
+    let session = env::var_os("ETD_G2_SESSION_DIR").map(PathBuf::from);
+    let (expectation, endpoint, mode) = match session {
+        #[cfg(windows)]
+        Some(dir) => {
+            let etd_ipc::OsUserId::WindowsSid(sid) = etd_ipc::platform::current_user()? else {
+                anyhow::bail!("unexpected kind of user id");
+            };
+            (
+                ServerExpectation {
+                    exe_dir: dir,
+                    requirement: ServerRequirement::CurrentUserElevated,
+                },
+                Endpoint::NamedPipe(format!(r"\\.\pipe\easytier-desk-session-{sid}")),
+                HostMode::ElevatedSession,
+            )
+        }
+        #[cfg(unix)]
+        Some(_) => anyhow::bail!("the elevated session host is Windows-only"),
+        None => (
+            ServerExpectation {
+                exe_dir: etd_sysfx_os::service::installed_host_dir()?,
+                requirement: ServerRequirement::Service,
+            },
+            #[cfg(windows)]
+            Endpoint::NamedPipe(etd_ipc::SERVICE_PIPE_NAME.into()),
+            #[cfg(unix)]
+            Endpoint::UnixSocket(etd_ipc::SERVICE_SOCKET_PATH.into()),
+            HostMode::Service,
+        ),
+    };
+    let connector = Arc::new(LocalConnector { expectation });
     let channel = tonic::transport::Endpoint::from_static("http://localhost")
         .connect_with_connector(ClientIo::new(connector, endpoint))
         .await?;
@@ -53,7 +76,7 @@ async fn peer() -> anyhow::Result<()> {
         }))
         .await?
         .into_inner();
-    assert_eq!(hello.host_mode(), HostMode::Service);
+    assert_eq!(hello.host_mode(), mode);
     let instance = env::var("ETD_G2_INSTANCE")?;
     let tag = env::var("ETD_G2_REQUEST")?;
     let reply = PathBuf::from(env::var_os("ETD_G2_REPLY").unwrap());

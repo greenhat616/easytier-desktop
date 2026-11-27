@@ -745,3 +745,26 @@ pub(super) fn defer_install_removal(_: &HostLayout, _: &str) -> io::Result<Optio
 pub(super) fn deferred_worker_alive(_: u32) -> io::Result<bool> {
     Ok(false)
 }
+
+#[cfg(test)]
+mod unit_content_tests {
+    /// A change to the registration this build installs must keep earlier
+    /// installs upgradable: move the old content into
+    /// `PREVIOUS_UNIT_CONTENTS`, then update this digest.
+    #[test]
+    fn the_registration_content_is_pinned() {
+        use sha2::{Digest, Sha256};
+        #[cfg(target_os = "linux")]
+        let pinned = "08cb35a7a5a19ce365271ce1cdcae40a9f6d60ec61f8bcb0c35bbf7d8345974e";
+        #[cfg(target_os = "macos")]
+        let pinned = "1f5da3476166fa1bfed1341e292a7e9a5e9b2a8f5f2a1dcec14feee139a396ba";
+        let actual: String = Sha256::digest(super::UNIT_CONTENT.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            actual, pinned,
+            "UNIT_CONTENT changed: add the previous content to PREVIOUS_UNIT_CONTENTS so installed services stay upgradable, then pin the new digest"
+        );
+    }
+}

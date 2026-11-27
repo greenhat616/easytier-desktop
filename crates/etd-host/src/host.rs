@@ -1066,7 +1066,7 @@ async fn uninstall_locked(layout: &HostLayout, expected_id: Option<&str>) -> Res
         return rollback_install(layout, &guard, journal);
     }
     if journal.upgrade_stage().is_some() {
-        upgrade::roll_back(layout, &mut journal, &[])
+        upgrade::roll_back_for_uninstall(layout, &mut journal)
             .context("cannot restore an interrupted upgrade before uninstall")?;
     }
     journal.step(Phase::Disabled, || {

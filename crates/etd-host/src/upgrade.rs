@@ -45,6 +45,24 @@ pub(super) fn roll_back(
     journal: &mut LifecycleJournal,
     published: &[PathBuf],
 ) -> Result<()> {
+    restore(layout, journal, published, true)
+}
+
+/// [`roll_back`] before an uninstall, which removes the registration
+/// anyway: a registration backup that cannot be restored is only reported.
+pub(super) fn roll_back_for_uninstall(
+    layout: &HostLayout,
+    journal: &mut LifecycleJournal,
+) -> Result<()> {
+    restore(layout, journal, &[], false)
+}
+
+fn restore(
+    layout: &HostLayout,
+    journal: &mut LifecycleJournal,
+    published: &[PathBuf],
+    strict_registration: bool,
+) -> Result<()> {
     journal.set_upgrade_stage(Some(UpgradeStage::RollingBack))?;
     NativeServiceManager
         .restore_host_image(layout)
@@ -55,9 +73,15 @@ pub(super) fn roll_back(
     }
     storage::restore_manifest(&layout.cores, &manifest_backup(layout))
         .context("cannot restore the previous kernel inventory")?;
-    NativeServiceManager
-        .restore_registration(layout, journal)
-        .context("cannot restore the previous service registration")?;
+    if let Err(error) = NativeServiceManager.restore_registration(layout, journal) {
+        if strict_registration {
+            return Err(anyhow::Error::from(error)
+                .context("cannot restore the previous service registration"));
+        }
+        eprintln!(
+            "warning: the previous service registration was not restored ({error}); uninstall removes it anyway"
+        );
+    }
     storage::remove_published_bundles(published)?;
     NativeServiceManager.discard_host_backup(layout)?;
     journal.set_upgrade_stage(None)?;

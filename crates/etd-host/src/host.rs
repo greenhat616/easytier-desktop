@@ -651,6 +651,21 @@ pub async fn install(users: &[String], owner: Option<String>) -> Result<()> {
     );
     let command = lock_install_command(&layout).await?;
     if let Some(journal) = LifecycleJournal::open(&layout)? {
+        if let Some(owner) = resumes_owned(journal.phase(), journal.owner(), owner.as_deref()) {
+            // A package hook retried after its install registered the
+            // service (dpkg --configure after an interrupted configure):
+            // converge by starting it; the allow list stays as recorded.
+            let install_id = journal.install_id().to_owned();
+            drop(journal);
+            start_and_verify(&layout, &install_id)
+                .await
+                .with_context(|| {
+                    format!("already installed for {owner}; the service did not start")
+                })?;
+            drop(command);
+            println!("already installed for {owner}; the service is running");
+            return Ok(());
+        }
         ensure!(
             journal.phase() == Phase::Installing,
             "service already installed or uninstall incomplete; run uninstall --status or retry uninstall first"
@@ -723,6 +738,18 @@ pub async fn install(users: &[String], owner: Option<String>) -> Result<()> {
     .await?;
     println!("installed; allow list: {}", enrolled.join(", "));
     Ok(())
+}
+
+/// The owner when `install --owner <owner>` meets a completed installation
+/// recorded with that same owner: the retry resumes it instead of failing.
+/// Without an owner, or with another one, an existing installation is
+/// never taken over.
+fn resumes_owned<'a>(
+    phase: Phase,
+    recorded: Option<&str>,
+    owner: Option<&'a str>,
+) -> Option<&'a str> {
+    owner.filter(|owner| phase == Phase::Installed && recorded == Some(*owner))
 }
 
 /// One allow-list entry for the installer's report, e.g. `admin user S-1-5-18`.
@@ -1439,6 +1466,36 @@ pub async fn remove_core(mode: HostMode, version: &str) -> Result<()> {
     }
     deps.core_store.remove(version).await?;
     resources.close().await
+}
+
+#[cfg(test)]
+mod resume_owned_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_same_owner_resumes_a_completed_installation() {
+        let pkg = "easytier-desktop-package";
+        assert_eq!(
+            resumes_owned(Phase::Installed, Some(pkg), Some(pkg)),
+            Some(pkg)
+        );
+        // Another owner, an ownerless (CLI) installation, or no owner asked.
+        assert_eq!(
+            resumes_owned(Phase::Installed, Some("other"), Some(pkg)),
+            None
+        );
+        assert_eq!(resumes_owned(Phase::Installed, None, Some(pkg)), None);
+        assert_eq!(resumes_owned(Phase::Installed, Some(pkg), None), None);
+        assert_eq!(resumes_owned(Phase::Installed, None, None), None);
+        // An install or uninstall still in progress is not complete.
+        for phase in [Phase::Installing, Phase::Disabled, Phase::Unregistered] {
+            assert_eq!(
+                resumes_owned(phase, Some(pkg), Some(pkg)),
+                None,
+                "{phase:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

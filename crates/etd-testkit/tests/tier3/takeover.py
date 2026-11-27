@@ -311,6 +311,12 @@ def management_port():
         # Recovery once the impostor has gone.
         if result["state"] == "gave_up":
             service.ctl("start", instance, "--retry")
+            # The receipt means the retry is committed; the supervisor acts
+            # on it afterwards, so the view can still show the generation
+            # that gave up.
+            eventually("the retry taking effect", lambda: service.view(instance),
+                       lambda view: not (view.get("state") == "gave_up" and view.get("epoch") == epoch),
+                       timeout=TIMEOUT)
         recovered = full_ready(service, instance, after=epoch) if result["state"] == "gave_up" else result
         verify(service, baseline, instance, recovered, differences)
         recovered_port = fence_port(service, instance, recovered["epoch"])

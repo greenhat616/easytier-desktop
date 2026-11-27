@@ -15,7 +15,7 @@ use etd_contract::{HostMode, HostPhase, InstanceId};
 use gpui_kit::{
     AnyElement, App, Context, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Role,
     SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _,
-    component::{ActiveTheme as _, Size, StyledExt as _, button::ButtonVariant},
+    component::{ActiveTheme as _, Size, button::ButtonVariant},
     div,
 };
 

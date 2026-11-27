@@ -65,7 +65,9 @@ jobs:
           Expand-Archive C:\pm\pm.zip -DestinationPath C:\pm
           $sig = Get-AuthenticodeSignature C:\pm\Procmon64.exe
           if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') { throw "Procmon signature: $($sig.Status) $($sig.SignerCertificate.Subject)" }
-      - name: A TUN network in the session form under the HKCU plant, captured
+      - name: A TUN network in the session form under the HKCU plant
+        # Not under Process Monitor: it breaks the host's pipe handshake (the
+        # ES2N gate sees the same with the service form). The marker decides.
         shell: pwsh
         env:
           CI: 'true'
@@ -76,24 +78,36 @@ jobs:
           # Control: an elevated process of the same user activating the
           # class by ProgID gets the planted server.
           try { New-Object -ComObject HNetCfg.FwPolicy2 | Out-Null; Write-Host 'control: activation succeeded' } catch { Write-Host "control: activation failed: $($_.Exception.Message)" }
-          Start-Process C:\pm\Procmon64.exe -ArgumentList '/AcceptEula','/Quiet','/Minimized','/BackingFile','C:\pm\kcom.pml'
-          Start-Sleep -Seconds 10
+          & .github/scripts/kcom-hits.ps1 -Name control -Out $env:PM_OUT
           try {
             cargo nextest run --locked --profile privileged -p etd-host --run-ignored only --test session_e2e -E 'test(elevated_session_kernel_with_tun)' --success-output immediate --failure-output immediate
             $code = $LASTEXITCODE
           } finally {
             & .github/scripts/kcom-plant.ps1 -Remove
-            & .github/scripts/es2n-capture.ps1 -Name kcom -Processes '^(etd-host|easytier-core)\.exe$' -Product '^easytier-core\.exe$' -Allowed $env:GITHUB_WORKSPACE, "$env:ProgramData\EasyTierDesk.session" -Out $env:PM_OUT
+          }
+          & .github/scripts/kcom-hits.ps1 -Name session -Out $env:PM_OUT
+          Write-Host "session test: exit $code"
+          exit $code
+      - name: The same kernel run directly with TUN under the plant, captured (report only)
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $core = (Get-ChildItem target\debug\cores -Recurse -Filter easytier-core.exe | Select-Object -First 1).FullName
+          Write-Host "kernel: $core"
+          & .github/scripts/kcom-plant.ps1
+          Start-Process C:\pm\Procmon64.exe -ArgumentList '/AcceptEula','/Quiet','/Minimized','/BackingFile','C:\pm\kcom.pml'
+          Start-Sleep -Seconds 10
+          try {
+            $p = Start-Process $core -ArgumentList '--network-name','etd-kcom-direct','--ipv4','10.144.234.1/24','--no-listener' -RedirectStandardOutput "$env:PM_OUT\direct-kernel.log" -RedirectStandardError "$env:PM_OUT\direct-kernel.err" -WindowStyle Hidden -PassThru
+            Start-Sleep -Seconds 30
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+          } finally {
+            & .github/scripts/kcom-plant.ps1 -Remove
+            & .github/scripts/es2n-capture.ps1 -Name kcom -Processes '^easytier-core\.exe$' -Product '^easytier-core\.exe$' -Allowed (Split-Path $core) -Out $env:PM_OUT
             Write-Host "capture verdict (report only): exit $LASTEXITCODE"
           }
-          Write-Host "session test: exit $code"
-          Write-Host '--- marker hits (process that loaded the planted DLL) ---'
-          $hits = @(Get-ChildItem C:\etd-kcom\hit-*.txt -ErrorAction SilentlyContinue)
-          foreach ($h in $hits) { Write-Host "== $($h.Name)"; Get-Content $h | Write-Host }
-          $kernel = @($hits | Where-Object { (Get-Content $_ -Raw) -match 'easytier-core\.exe' })
-          "kernel hits: $($kernel.Count); all hits: $($hits.Count); session test exit: $code" | Tee-Object "$env:PM_OUT\kcom-summary.txt"
-          Copy-Item C:\etd-kcom\hit-*.txt $env:PM_OUT -ErrorAction SilentlyContinue
-          exit $code
+          & .github/scripts/kcom-hits.ps1 -Name direct -Out $env:PM_OUT
       - uses: actions/upload-artifact@v4
         if: always()
         with:

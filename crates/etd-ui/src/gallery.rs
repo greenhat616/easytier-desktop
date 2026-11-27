@@ -737,6 +737,24 @@ mod tests {
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
             assert_eq!(window.find("menu-button").focused(), Some(true));
+            // Escape also closes a menu whose submenu is open.
+            window.click("menu-button", cx);
+            window.render_frame(cx);
+            window.click("menu-sort", cx);
+            window.render_frame(cx);
+            assert!(window.find("menu-sort-submenu").visible());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("menu-flyout").is_none());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
             tab_to(window, "bar-add", cx);
             window.press("space", cx);
             window.render_frame(cx);
@@ -942,15 +960,17 @@ mod tests {
                 .unwrap()
                 .save(output.join(format!("gallery-menus-{name}.png")))
                 .unwrap();
-            // Keyboard focus on the Settings page: Escape closes the menu,
+            // Keyboard focus on the Settings page: the first press outside
+            // the open menu only light-dismisses it, the second navigates;
             // then Tab reaches the Sound expander header.
-            cx.update_window(handle, |_, window, cx| {
-                window.press("escape", cx);
-                window.render_frame(cx);
-                window.click("gallery-nav-settings", cx);
-                window.render_frame(cx);
-            })
-            .unwrap();
+            for _ in 0..2 {
+                cx.update_window(handle, |_, window, cx| {
+                    window.click("gallery-nav-settings", cx);
+                    window.render_frame(cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+            }
             cx.run_until_parked();
             cx.update_window(handle, |_, window, cx| {
                 for _ in 0..60 {

@@ -614,16 +614,17 @@ async fn killed_host_reclaims_previous_generation_on_restart() {
     f.host = Fixture::spawn(f.root.path(), false);
     let mut client = f.connect().await;
     super::gone(&engine, &old).await;
-    let ledger = read_ledger(f.root.path()).await;
-    let open = ledger.open_effects(&ScopeFilter::default()).await.unwrap();
-    assert!(
-        previous
-            .iter()
-            .all(|old| !open.iter().any(|new| new.id == old.id)),
-        "old generation still open after self-check"
-    );
+    wait_open(
+        f.root.path(),
+        "old generation still open after self-check",
+        |open| {
+            previous
+                .iter()
+                .all(|old| !open.iter().any(|new| new.id == old.id))
+        },
+    )
+    .await;
     assert_runtime_dirs_gone(&previous);
-    ledger.close().await.unwrap();
     finish_user(&mut f, &mut client).await;
 }
 
@@ -1091,16 +1092,36 @@ async fn host_death_mid_reclaim_replays_completed_undo() {
     std::fs::remove_file(f.root.path().join("block-reclaim")).unwrap();
     f.host = Fixture::spawn(f.root.path(), false);
     let mut client = f.connect().await;
-    let db = read_ledger(f.root.path()).await;
-    assert!(
-        db.open_effects(&ScopeFilter::default())
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    wait_open(
+        f.root.path(),
+        "the interrupted undo was not replayed",
+        <[etd_sysfx::Effect]>::is_empty,
+    )
+    .await;
     assert_runtime_dirs_gone(&records);
-    db.close().await.unwrap();
     finish_user(&mut f, &mut client).await;
+}
+
+/// Wait, bounded, until the ledger's open records satisfy `done`. Serving
+/// does not mean reclaimed: a self-check whose machine-wide kernel sweep
+/// cannot account for every process (parallel tests start and end many)
+/// holds the reclaim, fail closed, and the host re-sweeps and reclaims
+/// `reclaim_retry` later.
+async fn wait_open(root: &Path, what: &str, done: impl Fn(&[etd_sysfx::Effect]) -> bool) {
+    let mut last = Vec::new();
+    let settled = timeout(LIMIT, async {
+        loop {
+            let db = read_ledger(root).await;
+            last = db.open_effects(&ScopeFilter::default()).await.unwrap();
+            db.close().await.unwrap();
+            if done(&last) {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(settled.is_ok(), "{what}; open records: {last:#?}");
 }
 
 async fn wait_ready(client: &mut Client) {

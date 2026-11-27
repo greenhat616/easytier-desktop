@@ -66,8 +66,11 @@ the service form only.
 
 ## `install`
 
-Administrator only. `--allow-user` takes numeric SIDs (Windows) or UIDs (Unix); each
-becomes an admin allow-list entry.
+Administrator only. `--allow-user` takes account SIDs on Windows (`S-1-5-21-<domain>-<RID>`
+with RID 1000 or above; groups and well-known SIDs are refused) or UIDs on Unix; each
+becomes an admin allow-list entry. `--owner <tag>` (1 to 64 letters, digits, braces,
+hyphens, underscores or dots) records who installed in the journal, with its first
+write; the MSI passes its ProductCode (see `uninstall --only-owner`).
 
 1. Take the maintenance lock. An existing journal must be in phase `Installing` (an
    interrupted install, which is rolled back first); anything else refuses.
@@ -235,6 +238,11 @@ Administrator only, under the maintenance lock. The journal advances through
    references a kernel bundle in `cores`, or when that cannot be determined.
 
 Without a journal, `uninstall` succeeds only if preflight finds no product resources.
+
+`uninstall --only-owner <tag>` uninstalls only an installation whose journal records
+that owner (and the same install id throughout); with no journal or another owner it
+removes nothing and succeeds. An installer's rollback uses it so that it never removes
+an installation it did not make.
 
 ## `reclaim` and `remove-core`
 

@@ -481,12 +481,27 @@ fn entry(id: Id, role: Role) -> AllowEntry {
     }
 }
 
+/// A local or domain account SID: `S-1-5-21-<three domain parts>-<RID>`
+/// with RID 1000 or above. Well-known accounts, built-in groups, Everyone
+/// and other authorities are not accounts that can be enrolled here.
+#[cfg(windows)]
+fn account_sid(sid: &str) -> bool {
+    let parts: Vec<&str> = sid.split('-').collect();
+    valid_sid(sid)
+        && parts.len() == 8
+        && parts[..4] == ["S", "1", "5", "21"]
+        && parts[7].parse::<u32>().is_ok_and(|rid| rid >= 1000)
+}
+
 fn enrolled_users(users: &[String]) -> Result<Vec<AllowEntry>> {
     let mut entries = Vec::new();
     for user in users {
         #[cfg(windows)]
         let id = {
-            ensure!(valid_sid(user), "expected a numeric SID");
+            ensure!(
+                account_sid(user),
+                "expected an account SID (S-1-5-21-..., RID 1000 or above), not a group or well-known SID"
+            );
             Id::WindowsUserSid(user.clone())
         };
         #[cfg(unix)]
@@ -543,7 +558,7 @@ async fn maintenance_change(ledger: &dyn Ledger, change: Change) -> Result<v1::R
         .await?)
 }
 
-pub async fn install(users: &[String]) -> Result<()> {
+pub async fn install(users: &[String], owner: Option<String>) -> Result<()> {
     let users = enrolled_users(users)?;
     let mode = HostMode::Service;
     let layout = layout(mode)?;
@@ -571,7 +586,7 @@ pub async fn install(users: &[String]) -> Result<()> {
         rollback_install(&layout, &guard, journal)?;
     }
     NativeServiceManager.preflight_install(&layout)?;
-    let mut journal = LifecycleJournal::begin(&layout)?;
+    let mut journal = LifecycleJournal::begin_owned(&layout, owner)?;
     let result: Result<()> = async {
         NativeServiceManager.prepare_install(&layout, &mut journal)?;
         journal.plan(Resource::Data)?;
@@ -983,7 +998,10 @@ pub async fn reclaim(mode: HostMode, _all: bool, purge: bool) -> Result<()> {
     deps.close().await
 }
 
-pub async fn uninstall() -> Result<()> {
+/// `only_owner`: remove only an installation recorded with that owner and
+/// otherwise succeed without touching anything, so an installer's rollback
+/// never removes an installation it did not make.
+pub async fn uninstall(only_owner: Option<&str>) -> Result<()> {
     let mode = HostMode::Service;
     let layout = layout(mode)?;
     ensure!(
@@ -991,7 +1009,21 @@ pub async fn uninstall() -> Result<()> {
         "administrator privileges required"
     );
     let _command = NativeHostFilesystem.lock_maintenance(&layout)?;
-    uninstall_locked(&layout, None).await
+    let Some(owner) = only_owner else {
+        return uninstall_locked(&layout, None).await;
+    };
+    // The maintenance-command lock keeps the journal from changing until
+    // uninstall_locked checks the same transaction again.
+    match LifecycleJournal::open(&layout)? {
+        Some(journal) if journal.owner() == Some(owner) => {
+            let id = journal.install_id().to_owned();
+            uninstall_locked(&layout, Some(&id)).await
+        }
+        _ => {
+            println!("no installation owned by {owner}; nothing removed");
+            Ok(())
+        }
+    }
 }
 
 /// Caller holds the maintenance-command mutex until this returns, including
@@ -1964,5 +1996,38 @@ mod lock_after_stop_tests {
         .unwrap_err();
         assert_eq!(tries, 1);
         assert!(error.to_string().contains("denied"));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod account_sid_tests {
+    use super::account_sid;
+
+    #[test]
+    fn only_local_or_domain_account_sids_are_enrolled() {
+        for sid in [
+            "S-1-5-21-1111111111-2222222222-3333333333-1001",
+            "S-1-5-21-1-2-3-1000",
+        ] {
+            assert!(account_sid(sid), "{sid}");
+        }
+        for sid in [
+            "S-1-1-0",                                       // Everyone
+            "S-1-5-11",                                      // Authenticated Users
+            "S-1-5-18",                                      // LocalSystem
+            "S-1-5-32-544",                                  // Administrators
+            "S-1-5-32-545",                                  // Users
+            "S-1-5-21-1111111111-2222222222-3333333333-500", // built-in Administrator
+            "S-1-5-21-1111111111-2222222222-3333333333-513", // Domain Users
+            "S-1-5-21-1111111111-2222222222-3333333333-999",
+            "S-1-5-21-1-2-1000",
+            "S-1-5-21-1-2-3-4-1000",
+            "S-1-12-1-1-2-3-4",
+            "S-1-5-21-1-2-3-01000",
+            "S-1-5-21-1-2-3-1000\" --allow-user \"S-1-1-0",
+            "",
+        ] {
+            assert!(!account_sid(sid), "{sid}");
+        }
     }
 }

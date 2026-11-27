@@ -865,25 +865,17 @@ fn referenced(dir: &Path) -> Result<Option<String>, WinError> {
     Ok(None)
 }
 
-/// Read-only driver reference check. Never deletes/stops a driver. Any
-/// incomplete enumeration or ambiguous image path fails closed.
 /// Whether a driver service image path (as SCM reports it) lies in the
-/// system's driver directory or inside one of `dirs`, compared as the
-/// reference check compares them. Unparsable or ambiguous paths are not.
+/// system's driver directory or inside one of `dirs`, by [`path_within`].
+/// Unparsable or ambiguous paths are not.
 pub(crate) fn driver_image_within(raw: &str, dirs: &[&Path]) -> Result<bool, OsError> {
     let check = || -> Result<bool, WinError> {
         let root = windows_dir()?;
-        let image = normalized(&image_path(raw, &root)?)?;
-        let drivers = normalized(&root.join("System32").join("drivers"))?;
-        if inside(&image, &drivers) {
-            return Ok(true);
-        }
-        for dir in dirs {
-            if inside(&image, &normalized(dir)?) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        let image = image_path(raw, &root)?;
+        let drivers = root.join("System32").join("drivers");
+        Ok(std::iter::once(drivers.as_path())
+            .chain(dirs.iter().copied())
+            .any(|dir| path_within(&image, dir)))
     };
     check().map_err(|e| OsError::Os {
         code: e.code,
@@ -891,15 +883,103 @@ pub(crate) fn driver_image_within(raw: &str, dirs: &[&Path]) -> Result<bool, OsE
     })
 }
 
-/// Whether the absolute `path` lies inside `dir`, compared as the
-/// reference check compares paths (prefix-free, case-insensitive).
+/// Whether the absolute `path` lies strictly below the existing directory
+/// `dir`. Both must be plain local-drive paths (a drive letter, optionally
+/// `\\?\`, then non-empty components: no `.` or `..`, no doubled or
+/// trailing separator, no stream or device syntax, no component ending in a
+/// dot or space). Both are then canonicalised (case, short names, links;
+/// for a missing `path` its closest existing ancestor), compared component
+/// by component without regard to case, and the ancestor of `path` at
+/// `dir`'s depth must be the same file as `dir` (volume serial and file
+/// id). Anything ambiguous or unreadable is not inside.
 pub(crate) fn path_within(path: &Path, dir: &Path) -> bool {
-    match (normalized(path), normalized(dir)) {
-        (Ok(path), Ok(dir)) => path != dir && inside(&path, &dir),
-        _ => false,
-    }
+    let check = || -> Result<bool, WinError> {
+        if !plain_local(path) || !plain_local(dir) {
+            return Ok(false);
+        }
+        let Some(path) = canonical_even_missing(path, false)? else {
+            return Ok(false);
+        };
+        let dir = fs::canonicalize(dir).map_err(io_error)?;
+        let (Some(inner), Some(outer)) = (components(&path), components(&dir)) else {
+            return Ok(false);
+        };
+        if inner.len() <= outer.len() || inner[..outer.len()] != outer[..] {
+            return Ok(false);
+        }
+        let ancestor = path
+            .ancestors()
+            .nth(inner.len() - outer.len())
+            .ok_or_else(|| error("missing ancestor"))?;
+        Ok(directory_identity(ancestor)? == directory_identity(&dir)?)
+    };
+    check().unwrap_or(false)
 }
 
+fn plain_local(path: &Path) -> bool {
+    let Some(text) = path.to_str() else {
+        return false;
+    };
+    let body = strip_prefix_ci(text, r"\\?\").unwrap_or(text);
+    let bytes = body.as_bytes();
+    let drive =
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\';
+    if !drive || body.contains('/') || body.ends_with('\\') {
+        return false;
+    }
+    body[3..].split('\\').all(|part| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && !part.ends_with('.')
+            && !part.ends_with(' ')
+            && !part.contains([':', '*', '?', '"', '<', '>', '|'])
+    })
+}
+
+/// Drive letter and components, upper-cased, of a canonical local path.
+fn components(path: &Path) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => match prefix.kind() {
+                Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+                    out.push(format!("{}:", char::from(letter).to_ascii_uppercase()))
+                }
+                _ => return None,
+            },
+            Component::RootDir => (),
+            Component::Normal(part) => out.push(part.to_str()?.to_uppercase()),
+            Component::CurDir | Component::ParentDir => return None,
+        }
+    }
+    Some(out)
+}
+
+fn directory_identity(path: &Path) -> Result<FileIdentity, WinError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_FLAG_BACKUP_SEMANTICS opens a directory.
+    let file = fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES.0)
+        .custom_flags(0x0200_0000)
+        .open(path)
+        .map_err(io_error)?;
+    let mut info = FILE_ID_INFO::default();
+    // SAFETY: file owns the live handle and info is writable.
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(file.as_raw_handle()),
+            FileIdInfo,
+            (&mut info as *mut FILE_ID_INFO).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    }
+    .map_err(WinError::windows)?;
+    Ok((info.VolumeSerialNumber, info.FileId.Identifier))
+}
+
+/// Read-only driver reference check. Never deletes/stops a driver. Any
+/// incomplete enumeration or ambiguous image path fails closed.
 pub fn driver_bundle_referenced(dir: &Path) -> Result<bool, OsError> {
     driver_bundle_reference(dir).map(|reference| reference.is_some())
 }
@@ -932,6 +1012,54 @@ pub fn ci_short_path(path: &Path) -> Result<PathBuf, OsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Containment is canonical: spoofed prefixes, `..`, doubled or
+    /// trailing separators, device and UNC forms are refused; case and
+    /// short names resolve to the same directory.
+    #[test]
+    fn path_within_compares_canonical_components_and_file_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let cores = dir.path().join("cores");
+        let spoof = dir.path().join("cores2");
+        fs::create_dir_all(cores.join("0a")).unwrap();
+        fs::create_dir_all(&spoof).unwrap();
+        let kernel = cores.join("0a").join("easytier-core.exe");
+        fs::write(&kernel, b"fixture").unwrap();
+        let text = |path: &Path| path.to_str().unwrap().to_owned();
+        let inside = |path: &str| path_within(Path::new(path), &cores);
+
+        assert!(inside(&text(&kernel)));
+        assert!(inside(&text(&cores.join("0a").join("missing.sys"))));
+        assert!(inside(&text(&kernel).to_uppercase()));
+        assert!(inside(&format!(r"\\?\{}", text(&kernel))));
+        assert!(!inside(&text(&cores)), "the directory itself");
+        assert!(!inside(&text(&spoof.join("easytier-core.exe"))));
+        assert!(!inside(&format!(r"{}\..\cores2\x.exe", text(&cores))));
+        assert!(!inside(&format!(r"{}\0a\..\..\cores2\x.exe", text(&cores))));
+        assert!(!inside(&format!(r"{}\.\0a\x.exe", text(&cores))));
+        assert!(!inside(&format!(r"{}\\0a\x.exe", text(&cores))));
+        assert!(!inside(&format!(r"{}\0a\", text(&cores))));
+        assert!(!inside(&format!(r"{}\0a\x.exe.", text(&cores))));
+        assert!(!inside(&format!(r"{}\0a\x.exe:stream", text(&cores))));
+        assert!(!inside(&text(&kernel).replace('\\', "/")));
+        assert!(!inside(r"0a\easytier-core.exe"));
+        assert!(!inside(r"\\server\share\cores\0a\x.exe"));
+        assert!(!inside(&format!(r"\\.\{}", text(&kernel))));
+
+        let mut short = vec![0u16; 32768];
+        // SAFETY: a NUL-terminated path and a writable buffer.
+        let n = unsafe {
+            ::windows::Win32::Storage::FileSystem::GetShortPathNameW(
+                &::windows::core::HSTRING::from(kernel.as_os_str()),
+                Some(&mut short),
+            )
+        } as usize;
+        if n > 0 && n < short.len() {
+            use std::os::windows::ffi::OsStringExt;
+            let short = PathBuf::from(std::ffi::OsString::from_wide(&short[..n]));
+            assert!(path_within(&short, &cores), "{}", short.display());
+        }
+    }
 
     #[test]
     fn registered_missing_volume_is_absent_but_loaded_volume_is_unknown() {

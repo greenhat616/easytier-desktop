@@ -177,7 +177,10 @@ class Session:
     def purge(self):
         """Purge the session root. A root a shared driver's registration
         still references is retained, and the command says so."""
-        result = self.run("reclaim", "--mode", "elevated-session", "--all", "--purge")
+        # Only --all-users removes the roots (cli-and-install.md, reclaim);
+        # an elevated administrator may run it.
+        result = self.run("reclaim", "--mode", "elevated-session", "--all-users", "--all", "--purge")
+        print(f"purge: exit {result.returncode}: {result.stdout.strip()} {result.stderr.strip()}", flush=True)
         assert result.returncode == 0, f"purge exited {result.returncode}: {result.stderr}"
         if self.root.exists():
             remaining = sorted(str(p.relative_to(self.root)) for p in self.root.rglob("*"))
@@ -364,8 +367,10 @@ SECOND_ACCOUNT = r"""
 $ErrorActionPreference = 'Stop'
 $secure = ConvertTo-SecureString $env:ES5_PROBE_SECRET -AsPlainText -Force
 $cred = [pscredential]::new("$env:COMPUTERNAME\__NAME__", $secure)
-$p = Start-Process -FilePath '__EXE__' -Credential $cred -WorkingDirectory '__DIR__' -RedirectStandardOutput '__OUT__' -PassThru -Wait -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand','__SCRIPT__'
-"exit $($p.ExitCode)"
+try {
+  $p = Start-Process -FilePath '__EXE__' -Credential $cred -WorkingDirectory '__DIR__' -RedirectStandardOutput '__OUT__' -PassThru -Wait -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand','__SCRIPT__'
+  "exit $($p.ExitCode)"
+} catch { "launch failed: $($_.Exception.GetType().FullName): $($_.Exception.Message)" }
 """
 
 

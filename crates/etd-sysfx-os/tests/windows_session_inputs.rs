@@ -261,6 +261,8 @@ async fn user_inputs_do_not_reach_the_elevated_workers() {
         "HOMEPATH",
         "LOCALAPPDATA",
         "PATH",
+        // Set by powershell.exe itself at startup when it is missing.
+        "PATHEXT",
         "PSMODULEANALYSISCACHEPATH",
         "PSMODULEPATH",
         "SYSTEMROOT",

@@ -1,4 +1,5 @@
-# HKCU accesses etd-host may make (lead ruling, topic#51 msg#2039): exact
+# HKCU accesses etd-host may make (lead rulings, topic#51 msg#2039 and
+# msg#2045; call stacks in the gate's hosts-stacks.txt): exact
 # operation and path (case-insensitive), nothing below them. Every other
 # HKCU access by etd-host fails the Windows native gate. Columns: group,
 # operations (comma-separated), path, reason. Mirrored in doc#17 v3.
@@ -15,3 +16,5 @@ startup	RegOpenKey	HKCU\Software\Policies\Microsoft\Windows\Control Panel\Deskto
 startup	RegOpenKey,RegCloseKey	HKCU\Software\Microsoft\Windows NT\CurrentVersion	opened on the way to AppCompatFlags (CreateProcess) and by start-up
 createprocess	RegOpenKey	HKCU\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers	compatibility layers checked by CreateProcess for each child (ES4 hardening item)
 createprocess	RegOpenKey	HKCU\Software\Policies\Microsoft\Windows\Safer\CodeIdentifiers	software restriction policy checked by CreateProcess for each child (ES4 hardening item)
+createprocess	RegOpenKey,RegCloseKey	HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders	known-folder paths for the compatibility check: kernel32 under CreateProcess for each child, apphelp at the uninstall helper copy's start-up (ES4 hardening item)
+createprocess	RegQueryValue	HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders\Cache	the same compatibility check's known-folder cache (ES4 hardening item)

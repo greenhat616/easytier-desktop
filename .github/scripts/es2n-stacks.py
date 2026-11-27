@@ -1,6 +1,6 @@
 """ES2N gate (doc#17): the call stack of the first matching registry access
-per process in a Process Monitor log, each frame named by its module
-(no symbols). Used to attribute HKCU reads of etd-host to Windows or to
+per process in a Process Monitor log, each frame named by its module and
+the offset into it (no symbols). Used to attribute HKCU reads of etd-host to Windows or to
 our code (topic#51 msg#2045).
 
 usage: es2n-stacks.py <log.pml> <process name> <path substring> [more substrings]
@@ -14,8 +14,9 @@ def module_of(address, modules):
     for m in modules:
         base = m.base_address
         if base <= address < base + m.size:
-            return m.path.rsplit('\\', 1)[-1]
-    return 'kernel' if address >= 0xFFFF800000000000 else '?'
+            name = m.path.rsplit('\\', 1)[-1]
+            return f'{name}+0x{address - base:x}'
+    return 'kernel' if address >= 0xFFFF800000000000 else f'?+0x{address:x}'
 
 
 def main():
@@ -34,7 +35,7 @@ def main():
                 continue
             seen.add(key)
             frames = [module_of(a, proc.modules) for a in (event.stacktrace or [])]
-            ours = [f for f in frames if f.lower().startswith('etd-host')]
+            ours = [f for f in frames if f.lower().startswith('etd-host.exe+')]
             print(f'pid {proc.pid} {proc.image_path} ({proc.user}, {proc.integrity}): {event.operation} {event.path}')
             print(f'  etd-host frames: {len(ours)} of {len(frames)}')
             for i, frame in enumerate(frames):

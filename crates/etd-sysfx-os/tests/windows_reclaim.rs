@@ -10,6 +10,16 @@ use etd_testkit::{
 };
 use std::{process::Command, sync::Arc};
 
+/// The runner is an elevated administrator, not SYSTEM: like the elevated
+/// session host, its management workers get the protected profile directory
+/// next to the state directory, which the composition root creates.
+fn session_state(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir(dir.join("profile")).unwrap();
+    let state = dir.join("state");
+    std::fs::create_dir(&state).unwrap();
+    state
+}
+
 fn ps(script: &str) -> String {
     let output = Command::new("powershell.exe")
         .no_window()
@@ -59,7 +69,7 @@ fn boot_marker_stable_and_volatile() {
     assert_eq!(std::env::var("CI").as_deref(), Ok("true"));
     let dir = tempfile::tempdir().unwrap();
     let config = OsConfig {
-        state_dir: dir.path().into(),
+        state_dir: session_state(dir.path()),
         run_dir: dir.path().join("run"),
         core_store_dir: dir.path().join("core"),
     };
@@ -111,7 +121,7 @@ async fn profile_signature_cleanup() {
     assert_eq!(std::env::var("CI").as_deref(), Ok("true"));
     let dir = tempfile::tempdir().unwrap();
     let os = adapters(&OsConfig {
-        state_dir: dir.path().into(),
+        state_dir: session_state(dir.path()),
         run_dir: dir.path().join("run"),
         core_store_dir: dir.path().join("core"),
     })
@@ -190,7 +200,7 @@ async fn registry_and_magic_dns() {
     let core_store = dir.path().join("core");
     std::fs::create_dir(&core_store).unwrap();
     let os = adapters(&OsConfig {
-        state_dir: dir.path().into(),
+        state_dir: session_state(dir.path()),
         run_dir: dir.path().join("run"),
         core_store_dir: core_store.clone(),
     })
@@ -416,7 +426,7 @@ async fn reclaim_and_conflict() {
     assert_eq!(std::env::var("CI").as_deref(), Ok("true"));
     let dir = tempfile::tempdir().unwrap();
     let os = adapters(&OsConfig {
-        state_dir: dir.path().into(),
+        state_dir: session_state(dir.path()),
         run_dir: dir.path().join("run"),
         core_store_dir: dir.path().join("core"),
     })
@@ -571,7 +581,7 @@ async fn real_wintun_after_kill() {
     let exe = std::path::PathBuf::from(std::env::var_os("ETD_O1_CORE").expect("S2-pinned CI core"));
     let dir = tempfile::tempdir().unwrap();
     let os = adapters(&OsConfig {
-        state_dir: dir.path().into(),
+        state_dir: session_state(dir.path()),
         run_dir: dir.path().join("run"),
         core_store_dir: exe.parent().unwrap().into(),
     })
@@ -869,7 +879,7 @@ async fn a_disabled_driver_service_without_a_file_is_observed() {
     assert_eq!(std::env::var("CI").as_deref(), Ok("true"));
     let dir = tempfile::tempdir().unwrap();
     let os = adapters(&OsConfig {
-        state_dir: dir.path().into(),
+        state_dir: session_state(dir.path()),
         run_dir: dir.path().join("run"),
         core_store_dir: dir.path().join("core"),
     })
@@ -969,7 +979,7 @@ async fn a_foreign_program_rule_is_observed_not_an_error() {
     assert_eq!(std::env::var("CI").as_deref(), Ok("true"));
     let dir = tempfile::tempdir().unwrap();
     let os = adapters(&OsConfig {
-        state_dir: dir.path().into(),
+        state_dir: session_state(dir.path()),
         run_dir: dir.path().join("run"),
         core_store_dir: dir.path().join("core"),
     })
@@ -1034,7 +1044,7 @@ fn uninstall_removes_only_the_service_boot_marker() {
     assert_eq!(std::env::var("CI").as_deref(), Ok("true"));
     let dir = tempfile::tempdir().unwrap();
     let config = OsConfig {
-        state_dir: dir.path().into(),
+        state_dir: session_state(dir.path()),
         run_dir: dir.path().join("run"),
         core_store_dir: dir.path().join("core"),
     };

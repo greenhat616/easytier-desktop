@@ -1,6 +1,13 @@
-//! Persistent WFP fences. Each logical rule is four filters, all in our
-//! protected provider/sublayer. Transactions ensure no half-installed fence.
-use super::{WinError, observation};
+//! WFP fences. Each logical rule is four filters, all in our protected
+//! provider/sublayer. Transactions ensure no half-installed fence.
+//!
+//! The host form decides two things ([`FenceForm`]): who the permit filters
+//! let through, and whether filters and container are persistent. The
+//! system service's fence is persistent and permits SYSTEM; the elevated
+//! session's is non-persistent (gone at the next BFE start, so at reboot)
+//! and permits SYSTEM and enabled Administrators. An existing fence is read
+//! back as one of exactly these two shapes, whichever host installed it.
+use super::{FenceForm, WinError, observation};
 use ::windows::{
     Win32::{
         Foundation::{
@@ -27,6 +34,46 @@ use uuid::Uuid;
 const PROVIDER: GUID = GUID::from_u128(0x51e7d001_7bc3_43b9_a795_7b80c196382f);
 const SUBLAYER: GUID = GUID::from_u128(0x51e7d002_7bc3_43b9_a795_7b80c196382f);
 pub const CONTAINER: &str = "51e7d002-7bc3-43b9-a795-7b80c196382f";
+
+/// The ALE_USER_ID condition of the permit filters. The condition is an
+/// access check of the connecting token against this DACL.
+///
+/// Session: an allow ACE for BUILTIN\Administrators matches only a token in
+/// which that group is ENABLED, that is an elevated token. In a filtered
+/// (non-elevated) token the group is deny-only, and a deny-only group never
+/// matches an allow ACE. So the permitted set is SYSTEM and elevated
+/// administrator processes, which can already do anything the kernel port
+/// allows. Never add the user's SID or any group a non-elevated token has
+/// enabled (Users, Authenticated Users, INTERACTIVE, ...): a non-elevated
+/// process of the same user would reach an unauthenticated kernel running
+/// as administrator.
+fn permit_sddl(form: FenceForm) -> &'static str {
+    match form {
+        FenceForm::Service => "D:P(A;;0x1;;;SY)",
+        FenceForm::Session => "D:P(A;;0x1;;;SY)(A;;0x1;;;BA)",
+    }
+}
+/// The descriptor of our provider, sublayer and filters. Only SYSTEM can
+/// name SYSTEM as owner; an elevated session host names Administrators.
+fn protected_sddl(form: FenceForm) -> &'static str {
+    match form {
+        FenceForm::Service => "O:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)",
+        FenceForm::Session => "O:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)",
+    }
+}
+/// Whether a form's filters and container are persistent. Session objects
+/// are added in a non-dynamic engine session, so they outlive the host
+/// process (and with it a kernel that might still run) until BFE stops.
+fn persistent(form: FenceForm) -> bool {
+    form == FenceForm::Service
+}
+fn form_of(persistent: bool) -> FenceForm {
+    if persistent {
+        FenceForm::Service
+    } else {
+        FenceForm::Session
+    }
+}
 
 fn check(code: u32, operation: &str) -> Result<(), WinError> {
     if code == 0 {
@@ -154,22 +201,28 @@ unsafe fn display_name(ptr: PWSTR) -> String {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Principal {
+    System,
+    Administrators,
+}
+
 // BFE owns and validates the security descriptors returned by its APIs.
-// Never treat a container as exclusive if its ACL admits an ordinary user.
-pub(super) unsafe fn trusted_acl(dacl: *const ACL, system_only: bool) -> Result<bool, WinError> {
+/// The DACL's entries when every one is a well-formed ACCESS_ALLOWED ACE
+/// for SYSTEM or BUILTIN\Administrators, in order; `None` for anything else.
+unsafe fn allowed_aces(dacl: *const ACL) -> Result<Option<Vec<(Principal, u32)>>, WinError> {
     if dacl.is_null() {
-        return Ok(false);
+        return Ok(None);
     }
-    let mut system = false;
-    let mut admin = false;
     let start = dacl as usize;
     let size = unsafe { (*dacl).AclSize } as usize;
     if size < size_of::<ACL>() {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(end) = start.checked_add(size) else {
-        return Ok(false);
+        return Ok(None);
     };
+    let mut aces = Vec::new();
     for index in 0..unsafe { (*dacl).AceCount } as u32 {
         let mut ptr = null_mut();
         unsafe {
@@ -182,7 +235,7 @@ pub(super) unsafe fn trusted_acl(dacl: *const ACL, system_only: bool) -> Result<
                 .checked_add(size_of::<ACE_HEADER>())
                 .is_none_or(|p| p > end)
         {
-            return Ok(false);
+            return Ok(None);
         }
         // Inspect only the generic header before interpreting the ACE body.
         let header = unsafe { ptr.cast::<ACE_HEADER>().read_unaligned() };
@@ -192,32 +245,47 @@ pub(super) unsafe fn trusted_acl(dacl: *const ACL, system_only: bool) -> Result<
             || ace_size < sid_offset + 8
             || ace_start.checked_add(ace_size).is_none_or(|p| p > end)
         {
-            return Ok(false);
+            return Ok(None);
         }
         let sid_ptr = unsafe { ptr.cast::<u8>().add(sid_offset) };
         let count = unsafe { *sid_ptr.add(1) } as usize;
         if sid_offset + 8 + count * 4 > ace_size {
-            return Ok(false);
+            return Ok(None);
         }
         let sid = PSID(sid_ptr.cast());
         if !unsafe { IsValidSid(sid).as_bool() } {
-            return Ok(false);
+            return Ok(None);
         }
         let ace = unsafe { ptr.cast::<ACCESS_ALLOWED_ACE>().read_unaligned() };
-        if unsafe { IsWellKnownSid(sid, WinLocalSystemSid).as_bool() } {
-            if system_only && ace.Mask != 1 {
-                return Ok(false);
-            }
-            system = true;
-        } else if !system_only
-            && unsafe { IsWellKnownSid(sid, WinBuiltinAdministratorsSid).as_bool() }
-        {
-            admin = true;
+        let principal = if unsafe { IsWellKnownSid(sid, WinLocalSystemSid).as_bool() } {
+            Principal::System
+        } else if unsafe { IsWellKnownSid(sid, WinBuiltinAdministratorsSid).as_bool() } {
+            Principal::Administrators
         } else {
-            return Ok(false);
-        }
+            return Ok(None);
+        };
+        aces.push((principal, ace.Mask));
     }
-    Ok(system && (system_only || admin))
+    Ok(Some(aces))
+}
+
+/// Never treat a container as exclusive if its ACL admits an ordinary user:
+/// only SYSTEM and Administrators entries, and both present.
+pub(super) unsafe fn trusted_acl(dacl: *const ACL) -> Result<bool, WinError> {
+    let Some(aces) = (unsafe { allowed_aces(dacl) })? else {
+        return Ok(false);
+    };
+    Ok(aces.iter().any(|(p, _)| *p == Principal::System)
+        && aces.iter().any(|(p, _)| *p == Principal::Administrators))
+}
+
+/// The form whose permit condition is exactly this ACE list.
+fn permit_form(aces: &[(Principal, u32)]) -> Option<FenceForm> {
+    match aces {
+        [(Principal::System, 1)] => Some(FenceForm::Service),
+        [(Principal::System, 1), (Principal::Administrators, 1)] => Some(FenceForm::Session),
+        _ => None,
+    }
 }
 
 fn check_acl(e: &Engine, key: GUID, kind: &str) -> Result<(), WinError> {
@@ -243,7 +311,7 @@ fn check_acl(e: &Engine, key: GUID, kind: &str) -> Result<(), WinError> {
             ),
             "read WFP security descriptor",
         )?;
-        let trusted = trusted_acl(dacl, false);
+        let trusted = trusted_acl(dacl);
         let trusted_owner = !owner.0.is_null()
             && (IsWellKnownSid(owner, WinLocalSystemSid).as_bool()
                 || IsWellKnownSid(owner, WinBuiltinAdministratorsSid).as_bool());
@@ -255,7 +323,13 @@ fn check_acl(e: &Engine, key: GUID, kind: &str) -> Result<(), WinError> {
     Ok(())
 }
 
-unsafe fn exact_conditions(filter: &FWPM_FILTER0, i: u8, port: u16) -> Result<bool, WinError> {
+/// Whether `filter` is exactly filter `i` of a `form` fence on `port`.
+unsafe fn exact_conditions(
+    filter: &FWPM_FILTER0,
+    i: u8,
+    port: u16,
+    form: FenceForm,
+) -> Result<bool, WinError> {
     let v6 = i >= 2;
     let permit = i % 2 == 1;
     if filter.layerKey
@@ -335,7 +409,9 @@ unsafe fn exact_conditions(filter: &FWPM_FILTER0, i: u8, port: u16) -> Result<bo
                     &mut defaulted,
                 )
                 .map_err(WinError::windows)?;
-                if !present.as_bool() || !trusted_acl(dacl, true)? {
+                if !present.as_bool()
+                    || permit_form(&allowed_aces(dacl)?.unwrap_or_default()) != Some(form)
+                {
                     return Ok(false);
                 }
                 identity = true;
@@ -353,6 +429,13 @@ struct Filter {
     label: String,
     persistent: bool,
     owned: bool,
+}
+impl Filter {
+    /// The form a filter with this persistence belongs to; its conditions
+    /// must then be that form's ([`exact_conditions`]).
+    fn form(&self) -> FenceForm {
+        form_of(self.persistent)
+    }
 }
 
 fn filters(e: &Engine) -> Result<Vec<Filter>, WinError> {
@@ -422,12 +505,15 @@ fn matching(e: &Engine, id: Uuid, port: u16) -> Result<Vec<Filter>, WinError> {
                     && !value.providerKey.is_null()
                     && *value.providerKey == PROVIDER,
             };
-            let valid_conditions = exact_conditions(value, i, port);
+            let valid_conditions = exact_conditions(value, i, port, found.form());
             FwpmFreeMemory0((&mut f as *mut *mut FWPM_FILTER0).cast());
+            // All four filters of one fence have the same form.
             if !found.owned
-                || !found.persistent
                 || found.label != label(id, port)
                 || !valid_conditions?
+                || out
+                    .first()
+                    .is_some_and(|first: &Filter| first.persistent != found.persistent)
             {
                 return Err(WinError::invalid("WFP filter identity mismatch"));
             }
@@ -442,7 +528,9 @@ fn matching(e: &Engine, id: Uuid, port: u16) -> Result<Vec<Filter>, WinError> {
     Ok(out)
 }
 
-fn ensure_container(e: &Engine, sd: &Sd) -> Result<(), WinError> {
+/// Add our provider and sublayer for `form` if absent; an existing one must
+/// have our identity and the form's persistence.
+fn ensure_container(e: &Engine, form: FenceForm, sd: &Sd) -> Result<(), WinError> {
     unsafe {
         let mut p = null_mut();
         let rc = FwpmProviderGetByKey0(e.0, &PROVIDER, &mut p);
@@ -454,13 +542,17 @@ fn ensure_container(e: &Engine, sd: &Sd) -> Result<(), WinError> {
                     name: PWSTR(name.as_mut_ptr()),
                     ..Default::default()
                 },
-                flags: FWPM_PROVIDER_FLAG_PERSISTENT,
+                flags: if persistent(form) {
+                    FWPM_PROVIDER_FLAG_PERSISTENT
+                } else {
+                    0
+                },
                 ..Default::default()
             };
             check(FwpmProviderAdd0(e.0, &p, Some(sd.0)), "add WFP provider")?;
         } else {
             check(rc, "lookup WFP provider")?;
-            let valid = (*p).flags & FWPM_PROVIDER_FLAG_PERSISTENT != 0
+            let valid = ((*p).flags & FWPM_PROVIDER_FLAG_PERSISTENT != 0) == persistent(form)
                 && display_name((*p).displayData.name) == "EasyTier Desktop fence provider";
             FwpmFreeMemory0((&mut p as *mut *mut FWPM_PROVIDER0).cast());
             if !valid {
@@ -479,7 +571,11 @@ fn ensure_container(e: &Engine, sd: &Sd) -> Result<(), WinError> {
                     name: PWSTR(name.as_mut_ptr()),
                     ..Default::default()
                 },
-                flags: FWPM_SUBLAYER_FLAG_PERSISTENT,
+                flags: if persistent(form) {
+                    FWPM_SUBLAYER_FLAG_PERSISTENT
+                } else {
+                    0
+                },
                 providerKey: &mut provider,
                 weight: 0xffff,
                 ..Default::default()
@@ -487,7 +583,7 @@ fn ensure_container(e: &Engine, sd: &Sd) -> Result<(), WinError> {
             check(FwpmSubLayerAdd0(e.0, &s, Some(sd.0)), "add WFP sublayer")?;
         } else {
             check(rc, "lookup WFP sublayer")?;
-            let valid = (*s).flags & FWPM_SUBLAYER_FLAG_PERSISTENT != 0
+            let valid = ((*s).flags & FWPM_SUBLAYER_FLAG_PERSISTENT != 0) == persistent(form)
                 && !(*s).providerKey.is_null()
                 && *(*s).providerKey == PROVIDER
                 && display_name((*s).displayData.name) == "EasyTier Desktop fence sublayer";
@@ -516,13 +612,13 @@ fn condition(
     }
 }
 
-pub fn install(key: &ObjectKey) -> Result<Observation, WinError> {
+pub fn install(key: &ObjectKey, form: FenceForm) -> Result<Observation, WinError> {
     let (id, port) = parts(key)?;
     let e = Engine::open()?;
-    let match_system = Sd::new("D:P(A;;0x1;;;SY)")?;
-    let protected = Sd::new("O:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)")?;
+    let permit = Sd::new(permit_sddl(form))?;
+    let protected = Sd::new(protected_sddl(form))?;
     e.transaction(|| {
-        ensure_container(&e, &protected)?;
+        ensure_container(&e, form, &protected)?;
         let existing = matching(&e, id, port)?;
         if !existing.is_empty() {
             return Err(WinError::invalid("fence already exists"));
@@ -534,8 +630,8 @@ pub fn install(key: &ObjectKey) -> Result<Observation, WinError> {
             return Err(WinError::invalid("port already fenced"));
         }
         let mut blob = FWP_BYTE_BLOB {
-            size: match_system.1,
-            data: match_system.0.0.cast(),
+            size: permit.1,
+            data: permit.0.0.cast(),
         };
         let mut provider = PROVIDER;
         for v6 in [false, true] {
@@ -586,12 +682,15 @@ pub fn install(key: &ObjectKey) -> Result<Observation, WinError> {
                         name: PWSTR(name.as_mut_ptr()),
                         ..Default::default()
                     },
-                    flags: FWPM_FILTER_FLAG_PERSISTENT
-                        | if permit {
-                            FWPM_FILTER_FLAGS(0)
-                        } else {
-                            FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT
-                        },
+                    flags: if persistent(form) {
+                        FWPM_FILTER_FLAG_PERSISTENT
+                    } else {
+                        FWPM_FILTER_FLAGS(0)
+                    } | if permit {
+                        FWPM_FILTER_FLAGS(0)
+                    } else {
+                        FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT
+                    },
                     providerKey: &mut provider,
                     subLayerKey: SUBLAYER,
                     layerKey: if v6 {
@@ -620,7 +719,7 @@ pub fn install(key: &ObjectKey) -> Result<Observation, WinError> {
                 unsafe {
                     check(
                         FwpmFilterAdd0(e.0, &filter, Some(protected.0), None),
-                        "add persistent WFP filter",
+                        "add WFP filter",
                     )?;
                 }
             }
@@ -639,12 +738,17 @@ fn observe_on(e: &Engine, key: &ObjectKey) -> Result<Option<Observation>, WinErr
     if matching.is_empty() {
         return Ok(None);
     }
+    let persistence = if matching[0].persistent {
+        "persistent"
+    } else {
+        "non-persistent"
+    };
     Ok(Some(observation(
         Some(Credential::ExclusiveContainer {
             container: CONTAINER.into(),
         }),
         key.clone(),
-        format!("{} persistent WFP filters", matching.len()),
+        format!("{} {persistence} WFP filters", matching.len()),
     )))
 }
 
@@ -661,9 +765,11 @@ pub fn remove(key: &ObjectKey) -> Result<Reclaimed, WinError> {
         if found.is_empty() {
             return Ok(Reclaimed::AlreadyAbsent);
         }
-        // Confirm parent identities as well as each filter's membership.
-        let protected = Sd::new("O:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)")?;
-        ensure_container(&e, &protected)?;
+        // Confirm parent identities as well as each filter's membership,
+        // for the form the found filters have, whoever removes them.
+        let form = found[0].form();
+        let protected = Sd::new(protected_sddl(form))?;
+        ensure_container(&e, form, &protected)?;
         // Only delete the shared container when this is its entire filter
         // population; enumerate before removing because BFE can snapshot an
         // enumeration at transaction start.
@@ -713,7 +819,7 @@ fn filter_key(f: &Filter) -> Result<ObjectKey, WinError> {
     let (Ok(id), Ok(port)) = (Uuid::parse_str(id), port.parse::<u16>()) else {
         return Err(WinError::invalid("unrecognized WFP fence identifier"));
     };
-    if !f.owned || !f.persistent || !(0..4).any(|i| child(id, i) == f.key) {
+    if !f.owned || !(0..4).any(|i| child(id, i) == f.key) {
         return Err(WinError::invalid("unrecognized WFP filter identity"));
     }
     Ok(ObjectKey::Fence {
@@ -780,4 +886,78 @@ fn enumerate_impl(tolerant: bool) -> Result<Vec<(ObjectKey, Observation)>, WinEr
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn aces(sddl: &str) -> Option<Vec<(Principal, u32)>> {
+        let sd = Sd::new(sddl).unwrap();
+        let mut present = BOOL(0);
+        let mut defaulted = BOOL(0);
+        let mut dacl = null_mut();
+        unsafe {
+            GetSecurityDescriptorDacl(sd.0, &mut present, &mut dacl, &mut defaulted).unwrap();
+            assert!(present.as_bool(), "{sddl}");
+            allowed_aces(dacl).unwrap()
+        }
+    }
+
+    #[test]
+    fn each_form_reads_back_only_its_own_permit() {
+        for form in [FenceForm::Service, FenceForm::Session] {
+            assert_eq!(permit_form(&aces(permit_sddl(form)).unwrap()), Some(form));
+        }
+        for sddl in [
+            // Groups a non-elevated token has enabled, and a user SID.
+            "D:P(A;;0x1;;;SY)(A;;0x1;;;BU)",
+            "D:P(A;;0x1;;;SY)(A;;0x1;;;AU)",
+            "D:P(A;;0x1;;;SY)(A;;0x1;;;IU)",
+            "D:P(A;;0x1;;;SY)(A;;0x1;;;WD)",
+            "D:P(A;;0x1;;;SY)(A;;0x1;;;S-1-5-21-1-2-3-1001)",
+            "D:P(A;;0x1;;;SY)(A;;0x1;;;BA)(A;;0x1;;;S-1-5-21-1-2-3-1001)",
+            // Not exactly one of the two shapes.
+            "D:P(A;;0x1;;;BA)(A;;0x1;;;SY)",
+            "D:P(A;;0x1;;;BA)",
+            "D:P(A;;0x3;;;SY)",
+            "D:P(A;;0x1;;;SY)(A;;0x3;;;BA)",
+            "D:P(A;;0x1;;;SY)(A;;0x1;;;BA)(A;;0x1;;;BA)",
+            "D:P(D;;0x1;;;BU)(A;;0x1;;;SY)",
+            "D:P",
+        ] {
+            assert_eq!(aces(sddl).and_then(|a| permit_form(&a)), None, "{sddl}");
+        }
+    }
+
+    #[test]
+    fn a_container_acl_admits_only_system_and_administrators() {
+        let trusted = |sddl: &str| {
+            let sd = Sd::new(sddl).unwrap();
+            let mut present = BOOL(0);
+            let mut defaulted = BOOL(0);
+            let mut dacl = null_mut();
+            unsafe {
+                GetSecurityDescriptorDacl(sd.0, &mut present, &mut dacl, &mut defaulted).unwrap();
+                trusted_acl(dacl).unwrap()
+            }
+        };
+        for form in [FenceForm::Service, FenceForm::Session] {
+            assert!(trusted(protected_sddl(form)), "{form:?}");
+        }
+        assert!(!trusted("D:P(A;;GA;;;SY)"));
+        assert!(!trusted("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;BU)"));
+        assert!(!trusted(
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;S-1-5-21-1-2-3-1001)"
+        ));
+    }
+
+    #[test]
+    fn persistence_decides_the_form_a_filter_is_read_as() {
+        for form in [FenceForm::Service, FenceForm::Session] {
+            assert_eq!(form_of(persistent(form)), form);
+        }
+        assert!(persistent(FenceForm::Service));
+        assert!(!persistent(FenceForm::Session));
+    }
 }

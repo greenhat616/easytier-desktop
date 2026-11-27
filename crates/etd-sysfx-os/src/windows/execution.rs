@@ -1,6 +1,15 @@
 //! One protected PowerShell execution environment. The management script is
 //! constant; only JSON requests reach it, one per line on its standard input.
-use super::{WinError, encoded_command};
+//!
+//! The environment is explicit, never inherited. Under an elevated host that
+//! is not SYSTEM (the elevated session) every user profile, HKCU and
+//! environment input is untrusted (doc#13#untrusted): the profile variables
+//! point at the protected, empty profile directory of the session tree,
+//! and the script imports its modules by absolute path with autoloading off.
+use super::{
+    WinError, encoded_command,
+    token::{self, HostToken},
+};
 use serde_json::Value;
 use std::os::windows::io::AsRawHandle;
 use std::{
@@ -10,10 +19,76 @@ use std::{
         ffi::{OsStrExt, OsStringExt},
         process::CommandExt,
     },
-    path::PathBuf,
+    path::{Component, Path, PathBuf, Prefix},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
+
+/// The protected directory the children of an elevated non-SYSTEM host get
+/// as their profile; set by `adapters()`.
+static WORKER_PROFILE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+pub(super) fn set_worker_profile(profile: Option<PathBuf>) {
+    *WORKER_PROFILE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = profile;
+}
+
+/// FILE_ATTRIBUTE_REPARSE_POINT.
+const REPARSE_POINT: u32 = 0x400;
+
+/// The profile variables pointing at `profile`, which must be an existing
+/// plain directory (not a reparse point) on an absolute drive path. It is
+/// neither created nor repaired here; the composition root made and
+/// verified it. The module analysis cache is turned off (an invalid path,
+/// as documented in about_Environment_Variables) rather than redirected.
+fn profile_vars(profile: &Path) -> Result<Vec<(OsString, OsString)>, WinError> {
+    use std::os::windows::fs::MetadataExt;
+    let refused = |why: &str| {
+        WinError::invalid(format!(
+            "worker profile directory {}: {why}",
+            profile.display()
+        ))
+    };
+    let mut components = profile.components();
+    let drive = match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+                format!("{}:", char::from(letter))
+            }
+            _ => return Err(refused("not on a drive path")),
+        },
+        _ => return Err(refused("not absolute")),
+    };
+    if components.next() != Some(Component::RootDir) {
+        return Err(refused("not absolute"));
+    }
+    let mut rest = PathBuf::new();
+    for component in components {
+        match component {
+            Component::Normal(name) => rest.push(name),
+            _ => return Err(refused("not a normalised path")),
+        }
+    }
+    if rest.as_os_str().is_empty() {
+        return Err(refused("a drive root"));
+    }
+    let metadata = std::fs::symlink_metadata(profile).map_err(|e| refused(&e.to_string()))?;
+    if !metadata.is_dir() || metadata.file_attributes() & REPARSE_POINT != 0 {
+        return Err(refused("not a plain directory"));
+    }
+    let full = PathBuf::from(format!("{drive}\\")).join(&rest);
+    let mut home = OsString::from("\\");
+    home.push(rest.as_os_str());
+    Ok(vec![
+        ("APPDATA".into(), full.clone().into_os_string()),
+        ("HOMEDRIVE".into(), drive.into()),
+        ("HOMEPATH".into(), home),
+        ("LOCALAPPDATA".into(), full.clone().into_os_string()),
+        ("PSModuleAnalysisCachePath".into(), "NUL".into()),
+        ("USERPROFILE".into(), full.into_os_string()),
+    ])
+}
 
 pub(super) struct Environment {
     pub exe: PathBuf,
@@ -22,6 +97,9 @@ pub(super) struct Environment {
 }
 impl Environment {
     pub fn new() -> Result<Self, WinError> {
+        Self::for_host(token::host_token()?)
+    }
+    fn for_host(host: HostToken) -> Result<Self, WinError> {
         let mut buf = [0u16; 32768];
         let n = unsafe {
             ::windows::Win32::System::SystemInformation::GetSystemDirectoryW(Some(&mut buf))
@@ -36,7 +114,7 @@ impl Environment {
         let ps = cwd.join("WindowsPowerShell/v1.0");
         let path =
             std::env::join_paths([&cwd, &ps]).map_err(|e| WinError::invalid(e.to_string()))?;
-        let vars = vec![
+        let mut vars: Vec<(OsString, OsString)> = vec![
             ("ComSpec".into(), cwd.join("cmd.exe").into_os_string()),
             ("Path".into(), path),
             ("PSModulePath".into(), ps.join("Modules").into_os_string()),
@@ -45,6 +123,21 @@ impl Environment {
             ("TMP".into(), root.join("Temp").into_os_string()),
             ("windir".into(), root.as_os_str().to_owned()),
         ];
+        if host == HostToken::Elevated {
+            // Fail closed: never the user's own profile.
+            let profile = WORKER_PROFILE
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .ok_or_else(|| {
+                    WinError::invalid(
+                        "an elevated host that is not SYSTEM has no protected worker profile directory",
+                    )
+                })?;
+            vars.extend(profile_vars(&profile)?);
+        }
+        // The block for CreateProcessAsUserW must be sorted.
+        vars.sort_by_key(|(name, _)| name.to_ascii_uppercase());
         Ok(Self {
             exe: ps.join("powershell.exe"),
             cwd,
@@ -688,7 +781,16 @@ fn settle(deadline: Instant) -> Result<(), WinError> {
 mod tests {
     use super::*;
 
+    /// Workers of an elevated test process (the CI runner) need a profile
+    /// directory, as under the elevated session host.
+    fn test_profile() {
+        static PROFILE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let dir = PROFILE.get_or_init(|| tempfile::tempdir().unwrap());
+        set_worker_profile(Some(dir.path().to_owned()));
+    }
+
     fn fresh() -> Worker {
+        test_profile();
         let job = Job::new().unwrap();
         let worker = Worker::spawn(&job, u64::MAX).unwrap();
         // The test keeps the job alive by leaking it with the worker.
@@ -765,6 +867,7 @@ mod tests {
     // closes it for good.
     #[test]
     fn shutdown_ends_every_worker_and_admits_no_more() {
+        test_profile();
         assert_eq!(run(serde_json::json!({"op":"magic"})).unwrap().len(), 1);
         let job = pool().job.clone().expect("a job for the first worker");
         assert!(job.active().unwrap() > 0, "the idle worker runs in the job");
@@ -837,6 +940,65 @@ mod tests {
         ));
         assert!(started.elapsed() < DEADLINE);
         worker.end();
+    }
+
+    fn value<'a>(vars: &'a [(OsString, OsString)], name: &str) -> Option<&'a OsString> {
+        vars.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+    }
+
+    #[test]
+    fn profile_variables_point_at_the_profile_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let vars = profile_vars(dir.path()).unwrap();
+        for name in ["USERPROFILE", "APPDATA", "LOCALAPPDATA"] {
+            assert_eq!(Path::new(value(&vars, name).unwrap()), dir.path(), "{name}");
+        }
+        let mut home = value(&vars, "HOMEDRIVE").unwrap().clone();
+        home.push(value(&vars, "HOMEPATH").unwrap());
+        assert_eq!(Path::new(&home), dir.path());
+        assert_eq!(value(&vars, "PSModuleAnalysisCachePath").unwrap(), "NUL");
+        assert_eq!(vars.len(), 6);
+    }
+
+    #[test]
+    fn a_profile_that_is_not_a_plain_absolute_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        for refused in [
+            dir.path().join("missing"),
+            file,
+            dir.path().join("..").join(dir.path().file_name().unwrap()),
+            PathBuf::from(r"relative\profile"),
+            PathBuf::from(r"\profile"),
+            PathBuf::from(r"C:\"),
+            PathBuf::from(r"\\server\share\profile"),
+        ] {
+            assert!(profile_vars(&refused).is_err(), "{}", refused.display());
+        }
+    }
+
+    #[test]
+    fn only_an_elevated_host_that_is_not_system_redirects_and_never_without_a_profile() {
+        set_worker_profile(None);
+        let refused = Environment::for_host(HostToken::Elevated).err().unwrap();
+        assert!(refused.message.contains("profile"), "{}", refused.message);
+        for host in [HostToken::System, HostToken::Standard] {
+            let environment = Environment::for_host(host).unwrap();
+            assert!(
+                value(&environment.vars, "USERPROFILE").is_none(),
+                "{host:?}"
+            );
+        }
+        test_profile();
+        let environment = Environment::for_host(HostToken::Elevated).unwrap();
+        assert!(value(&environment.vars, "USERPROFILE").is_some());
+        let names: Vec<_> = environment
+            .vars
+            .iter()
+            .map(|(name, _)| name.to_ascii_uppercase())
+            .collect();
+        assert!(names.is_sorted(), "{names:?}");
     }
 
     #[test]

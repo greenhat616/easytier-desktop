@@ -80,6 +80,9 @@ enum Page {
     Layout,
     Feedback,
     Transitions,
+    ThemeTransitions,
+    Implicit,
+    Parallax,
     Easing,
 }
 
@@ -241,6 +244,30 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
         "fluent/arrow-right.svg",
         cx,
     );
+    let theme_transitions = nav(
+        Page::ThemeTransitions,
+        "gallery-nav-theme-transitions",
+        "Theme transitions",
+        "fluent/arrow-sync.svg",
+        "fluent/arrow-sync.svg",
+        cx,
+    );
+    let implicit = nav(
+        Page::Implicit,
+        "gallery-nav-implicit",
+        "Implicit transitions",
+        "fluent/arrow-clockwise.svg",
+        "fluent/arrow-clockwise.svg",
+        cx,
+    );
+    let parallax = nav(
+        Page::Parallax,
+        "gallery-nav-parallax",
+        "ParallaxView",
+        "fluent/grid.svg",
+        "fluent/grid.svg",
+        cx,
+    );
     let easing = nav(
         Page::Easing,
         "gallery-nav-easing",
@@ -264,6 +291,9 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
         .child(layout)
         .child(feedback)
         .child(page_transitions)
+        .child(theme_transitions)
+        .child(implicit)
+        .child(parallax)
         .child(easing)
         .child(settings);
     if !view.collapsed {
@@ -630,6 +660,15 @@ impl Render for Gallery {
                 "Page transitions",
                 motion_pages::page_transitions_page(self, cx),
             ),
+            Page::ThemeTransitions => (
+                "Theme transitions",
+                motion_pages::theme_transitions_page(self, window, cx),
+            ),
+            Page::Implicit => (
+                "Implicit transitions",
+                motion_pages::implicit_transitions_page(self, window, cx),
+            ),
+            Page::Parallax => ("ParallaxView", motion_pages::parallax_page(window, cx)),
             Page::Easing => (
                 "Easing functions",
                 motion_pages::easing_page(self, window, cx),
@@ -886,6 +925,138 @@ mod tests {
     /// timings: a MenuFlyout fades for 83 ms, a ContentDialog for 83 ms and
     /// an Expander's content slides up for 167 ms. An Expander that is open
     /// when it first appears does not slide in.
+    /// Theme and implicit transitions and ParallaxView follow WinUI's
+    /// timing: the measured theme storyboards, the source's offsets and
+    /// delays, and the implicit transitions' 300 ms.
+    #[gpui_kit::test]
+    fn gallery_theme_transitions_follow_winui_timing(cx: &mut TestAppContext) {
+        use std::time::Duration;
+        let (handle, _view) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            theme::install_palette(cx);
+            cx.set_reduce_motion(false);
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Default::default(),
+                        size: size(px(1440.), px(2400.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| Gallery::new(window, cx)),
+            )
+            .unwrap()
+        });
+        let step = |cx: &mut TestAppContext, ms: u64| {
+            for _ in 0..(ms / 50) {
+                cx.executor().advance_clock(Duration::from_millis(50));
+                cx.run_until_parked();
+                cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                    .unwrap();
+            }
+        };
+        let top = |cx: &mut TestAppContext, id: &'static str| {
+            cx.update_window(handle, |_, window, _| window.find(id).bounds().top())
+                .unwrap()
+        };
+        let left = |cx: &mut TestAppContext, id: &'static str| {
+            cx.update_window(handle, |_, window, _| window.find(id).bounds().left())
+                .unwrap()
+        };
+        // Entrance, five at once: the fifth waits 5 x 35 ms, 28 px down.
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("gallery-nav-theme-transitions", cx);
+            window.render_frame(cx);
+            window.click("entrance-add-five", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 150);
+        let waiting = top(cx, "entrance-item-104");
+        step(cx, 1000);
+        assert_eq!(waiting - top(cx, "entrance-item-104"), px(28.));
+
+        // Reposition: hiding green moves blue 85 px left over 367 ms.
+        let before = left(cx, "reposition-blue");
+        cx.update_window(handle, |_, window, cx| {
+            window.click("reposition-toggle", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 100);
+        let moving = left(cx, "reposition-blue");
+        assert!(
+            moving < before && moving > before - px(85.),
+            "sliding: {moving:?} from {before:?}"
+        );
+        step(cx, 400);
+        assert_eq!(left(cx, "reposition-blue"), before - px(85.));
+
+        // Add/Delete: the deleted item fades for 100 ms; the rest close the
+        // gap after 220 ms.
+        let second = top(cx, "add-delete-item-1");
+        cx.update_window(handle, |_, window, cx| {
+            window.click("add-delete-delete", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 50);
+        cx.update_window(handle, |_, window, _| {
+            assert!(window.try_find("add-delete-item-0").is_some(), "fading");
+        })
+        .unwrap();
+        step(cx, 150);
+        cx.update_window(handle, |_, window, _| {
+            assert!(window.try_find("add-delete-item-0").is_none(), "gone");
+        })
+        .unwrap();
+        assert_eq!(top(cx, "add-delete-item-1"), second, "waits 220 ms");
+        step(cx, 500);
+        assert_eq!(top(cx, "add-delete-item-1"), second - px(32.));
+
+        // Implicit translation: 300 ms on (0.8,0,0.2,1).
+        cx.update_window(handle, |_, window, cx| {
+            window.click("gallery-nav-implicit", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let start = left(cx, "implicit-translate");
+        cx.update_window(handle, |_, window, cx| {
+            window.click("implicit-translate-toggle", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 150);
+        let mid = left(cx, "implicit-translate") - start;
+        assert!(mid > px(20.) && mid < px(180.), "halfway: {mid:?}");
+        step(cx, 200);
+        assert_eq!(left(cx, "implicit-translate") - start, px(200.));
+
+        // ParallaxView: scrolling moves the background up.
+        cx.update_window(handle, |_, window, cx| {
+            window.click("gallery-nav-parallax", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let resting = top(cx, "parallax-background");
+        cx.update_window(handle, |_, window, cx| {
+            window.scroll(
+                "parallax-list",
+                gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-300.))),
+                cx,
+            );
+            window.render_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert!(
+            top(cx, "parallax-background") < resting,
+            "background moved up"
+        );
+    }
+
     /// Page transitions and easing functions run on WinUI's timing
     /// (ThemeTransitions.cpp, EasingFunctions.cpp).
     #[gpui_kit::test]
@@ -1791,7 +1962,13 @@ mod tests {
             .unwrap();
             cx.run_until_parked();
             // Motion pages, at rest.
-            for page in ["page-transitions", "easing"] {
+            for page in [
+                "page-transitions",
+                "theme-transitions",
+                "implicit",
+                "parallax",
+                "easing",
+            ] {
                 cx.update_window(handle, |_, window, cx| {
                     window.click(SharedString::from(format!("gallery-nav-{page}")), cx);
                     window.render_frame(cx);
@@ -1834,6 +2011,35 @@ mod tests {
                     cx.advance_clock(Duration::from_millis(200));
                     cx.run_until_parked();
                 }
+                // Theme transitions: five squares arriving staggered, and
+                // the popup coming in.
+                cx.update_window(handle, |_, window, cx| {
+                    window.click("gallery-nav-theme-transitions", cx);
+                    window.render_frame(cx);
+                    window.click("entrance-add-five", cx);
+                    window.click("theme-popup-show", cx);
+                    window.render_frame(cx);
+                })
+                .unwrap();
+                let mut at = 0;
+                for ms in [50, 150, 300, 600] {
+                    cx.advance_clock(Duration::from_millis(ms - at));
+                    at = ms;
+                    cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                        .unwrap();
+                    cx.capture_screenshot(handle)
+                        .unwrap()
+                        .save(output.join(format!("gallery-motion-theme-{ms}ms.png")))
+                        .unwrap();
+                }
+                cx.advance_clock(Duration::from_millis(500));
+                cx.update_window(handle, |_, window, cx| {
+                    window.click("theme-popup-close", cx);
+                    window.render_frame(cx);
+                })
+                .unwrap();
+                cx.advance_clock(Duration::from_millis(200));
+                cx.run_until_parked();
                 cx.update(|cx| cx.set_reduce_motion(true));
             }
             // Navigation page.
@@ -1872,6 +2078,9 @@ mod tests {
                 "layout",
                 "feedback",
                 "page-transitions",
+                "theme-transitions",
+                "implicit",
+                "parallax",
                 "easing",
                 "settings",
             ] {

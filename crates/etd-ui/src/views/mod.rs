@@ -15,6 +15,7 @@ pub mod popout;
 pub mod progress;
 pub mod pseudo;
 pub mod reclaim;
+pub mod theme_transition;
 pub mod ui;
 
 use etd_app::UserCommand;

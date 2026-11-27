@@ -37,12 +37,12 @@ pub enum PopupKind {
     /// to its final bounds; it fades out over 83 ms.
     Menu,
     /// Flyout (FlyoutBase PopupThemeTransition): it comes in from 50 px above
-    /// (FlyoutBase::g_entranceThemeOffset) while fading in, and fades out.
-    /// The transition's timing lives in Windows' animation tables, not the
-    /// WinUI source, so this uses ControlNormalAnimationDuration and
-    /// ControlFastOutSlowInKeySpline in, ControlFasterAnimationDuration
-    /// out.
+    /// (FlyoutBase::g_entranceThemeOffset) and fades out. The timing is
+    /// [`POPUP_IN`]'s.
     Flyout,
+    /// A Popup with PopupThemeTransition at its default 40 px offset
+    /// (DependencyProperty.cpp:687-689), with [`POPUP_IN`]'s timing.
+    Popup,
     /// ContentDialog (ContentDialog_themeresources.xaml DialogShowing /
     /// DialogHidden): LayoutRoot, smoke included, fades in over 83 ms
     /// (ControlFasterAnimationDuration) and out over 83 ms. WinUI also
@@ -50,10 +50,19 @@ pub enum PopupKind {
     Dialog,
 }
 
+/// PopupThemeTransition's timing. WinUI reads it from the Windows
+/// animation tables at run time (ThemeGenerator.cpp:727-750, storyboards
+/// TAS_SHOWPOPUP and TAS_HIDEPOPUP), so it is not in the source; these are
+/// the values Windows 11 26300 returns. Showing, the popup moves into place
+/// over 367 ms on (0.1,0.9,0.2,1) and fades in linearly over 83 ms after an
+/// 83 ms wait; hiding, it fades out linearly over 83 ms.
+pub const POPUP_IN: Duration = Duration::from_millis(367);
+
 impl PopupKind {
     fn duration(self, open: bool) -> Duration {
         match (self, open) {
-            (Self::Menu | Self::Flyout, true) => NORMAL,
+            (Self::Menu, true) => NORMAL,
+            (Self::Flyout | Self::Popup, true) => POPUP_IN,
             (Self::Dialog, true) => FASTER,
             (_, false) => FASTER,
         }
@@ -153,7 +162,7 @@ impl RenderOnce for Animated {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let sample = self.motion.sample(window, cx);
         let kind = self.motion.kind;
-        let entrance = NORMAL.as_secs_f32();
+        let entrance = self.motion.kind.duration(true).as_secs_f32();
         match sample.phase {
             PresencePhase::Present | PresencePhase::Absent => div().id(self.id).child(self.surface),
             PresencePhase::Exiting => div()
@@ -163,8 +172,6 @@ impl RenderOnce for Animated {
             PresencePhase::Entering => {
                 let t = sample.progress;
                 let eased = fast_out_slow_in(t);
-                // An 83 ms fade inside the 250 ms entrance.
-                let fade = (t * entrance / FASTER.as_secs_f32()).min(1.);
                 match kind {
                     PopupKind::Menu => div().id(self.id).relative().overflow_hidden().child(
                         div()
@@ -172,12 +179,18 @@ impl RenderOnce for Animated {
                             .top(relative(-0.5 * (1. - eased)))
                             .child(self.surface),
                     ),
-                    PopupKind::Flyout => div()
-                        .id(self.id)
-                        .relative()
-                        .top(px(-50. * (1. - eased)))
-                        .opacity(fade)
-                        .child(self.surface),
+                    PopupKind::Flyout | PopupKind::Popup => {
+                        let offset = if kind == PopupKind::Flyout { 50. } else { 40. };
+                        let ms = t * entrance * 1000.;
+                        let decel = cubic_bezier(0.1, 0.9, 0.2, 1.)(t);
+                        let fade = ((ms - 83.) / 83.).clamp(0., 1.);
+                        div()
+                            .id(self.id)
+                            .relative()
+                            .top(px(-offset * (1. - decel)))
+                            .opacity(fade)
+                            .child(self.surface)
+                    }
                     // The dialog's whole entrance is the 83 ms fade.
                     PopupKind::Dialog => div().id(self.id).opacity(t).child(self.surface),
                 }

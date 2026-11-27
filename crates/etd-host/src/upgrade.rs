@@ -182,7 +182,10 @@ fn discard_backups(layout: &HostLayout) {
     }
 }
 
-pub async fn upgrade() -> Result<()> {
+/// `only_owner`: upgrade only an installation recorded with that owner and
+/// otherwise succeed without touching anything, so a package's hook never
+/// takes over a service another installer made.
+pub async fn upgrade(only_owner: Option<&str>) -> Result<()> {
     let layout = layout(HostMode::Service)?;
     ensure!(
         NativeServiceManager.entry_is_elevated()?,
@@ -201,8 +204,14 @@ pub async fn upgrade() -> Result<()> {
         .context("missing payload directory")?
         .to_owned();
     let _command = NativeHostFilesystem.lock_maintenance(&layout)?;
-    let mut journal = LifecycleJournal::open(&layout)?
-        .context("no service installation; run etd-host install")?;
+    let journal = LifecycleJournal::open(&layout)?;
+    if let Some(owner) = only_owner
+        && journal.as_ref().and_then(LifecycleJournal::owner) != Some(owner)
+    {
+        println!("no installation owned by {owner}; nothing upgraded");
+        return Ok(());
+    }
+    let mut journal = journal.context("no service installation; run etd-host install")?;
     ensure!(
         journal.phase() == Phase::Installed,
         "service is not installed (phase {:?}); finish uninstall or resume the service first",

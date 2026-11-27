@@ -219,6 +219,10 @@ itself fails the message says to retry `uninstall`.
 
 ## `upgrade`
 
+`upgrade --only-owner <tag>` upgrades only an installation whose journal records that
+owner; with no journal or another owner it changes nothing and succeeds. The Linux
+packages' hooks use it so that they never take over a service another installer made.
+
 Administrator only. Run it from the new installation payload (the new `etd-host`
 with its bundled `cores/` beside it), never from the installed image, which it
 refuses (also when that cannot be determined). The new image is the running image,

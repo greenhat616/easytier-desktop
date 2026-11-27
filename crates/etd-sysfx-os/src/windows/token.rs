@@ -89,7 +89,7 @@ impl TokenUserBuffer {
     }
 }
 
-fn sid_string(sid: PSID) -> Result<String, WinError> {
+pub(super) fn sid_string(sid: PSID) -> Result<String, WinError> {
     let mut text = PWSTR::null();
     // SAFETY: `sid` is a valid SID; the string is freed with LocalFree.
     unsafe {

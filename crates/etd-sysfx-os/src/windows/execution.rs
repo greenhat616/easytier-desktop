@@ -63,9 +63,10 @@ const WRITE_RIGHTS: u32 = 0x0002
 
 /// The protection of `path`: whether its owner is SYSTEM or Administrators
 /// (a non-elevated process cannot arrange that), and whether its DACL lets
-/// only SYSTEM and Administrators write. Any allow entry with a write right
+/// only SYSTEM and Administrators write (else the entry that does not).
+/// Any allow entry with a write right
 /// for another principal, a null DACL or an entry of another type refuses.
-fn protection(path: &Path) -> Result<(bool, bool), WinError> {
+fn protection(path: &Path) -> Result<(bool, Option<String>), WinError> {
     use ::windows::{
         Win32::{
             Foundation::{HLOCAL, LocalFree},
@@ -102,12 +103,12 @@ fn protection(path: &Path) -> Result<(bool, bool), WinError> {
                 || IsWellKnownSid(sid, WinBuiltinAdministratorsSid).as_bool()
         };
         let owner_privileged = !owner.0.is_null() && privileged(owner);
-        let mut admin_writes = !dacl.is_null();
-        if admin_writes {
+        let mut violation = dacl.is_null().then(|| "no DACL".to_owned());
+        if violation.is_none() {
             for index in 0..(*dacl).AceCount as u32 {
                 let mut ace = std::ptr::null_mut();
                 if GetAce(dacl, index, &mut ace).is_err() {
-                    admin_writes = false;
+                    violation = Some(format!("entry {index} unreadable"));
                     break;
                 }
                 let header = ace.cast::<ACE_HEADER>().read_unaligned();
@@ -123,22 +124,29 @@ fn protection(path: &Path) -> Result<(bool, bool), WinError> {
                                 .add(std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart))
                                 .cast(),
                         );
-                        if !IsValidSid(sid).as_bool()
-                            || (allowed.Mask & WRITE_RIGHTS != 0 && !privileged(sid))
-                        {
-                            admin_writes = false;
+                        if !IsValidSid(sid).as_bool() {
+                            violation = Some(format!("entry {index} has an invalid SID"));
+                            break;
+                        }
+                        if allowed.Mask & WRITE_RIGHTS != 0 && !privileged(sid) {
+                            violation = Some(format!(
+                                "entry {index} allows {:#x} to {}",
+                                allowed.Mask,
+                                super::token::sid_string(sid)
+                                    .unwrap_or_else(|_| "an unreadable SID".into())
+                            ));
                             break;
                         }
                     }
-                    _ => {
-                        admin_writes = false;
+                    other => {
+                        violation = Some(format!("entry {index} has type {other}"));
                         break;
                     }
                 }
             }
         }
         let _ = LocalFree(Some(HLOCAL(descriptor.0)));
-        Ok((owner_privileged, admin_writes))
+        Ok((owner_privileged, violation))
     }
 }
 
@@ -187,12 +195,14 @@ fn protected_profile_vars(profile: &Path) -> Result<Vec<(OsString, OsString)>, W
             profile.display()
         ))
     };
-    let (owner, writes) = protection(profile)?;
+    let (owner, violation) = protection(profile)?;
     if !owner {
         return Err(refused("not owned by SYSTEM or Administrators"));
     }
-    if !writes {
-        return Err(refused("writable by others than SYSTEM and Administrators"));
+    if let Some(violation) = violation {
+        return Err(refused(&format!(
+            "writable by others than SYSTEM and Administrators ({violation})"
+        )));
     }
     let resolved = std::fs::canonicalize(profile).map_err(|e| refused(&e.to_string()))?;
     // Short (8.3) names are aliases, not links: compare long forms.
@@ -990,10 +1000,8 @@ mod tests {
         set_worker_profile(Some(path.clone()));
     }
 
-    /// A temporary directory under its final path, with the session tree's
-    /// DACL (SYSTEM and Administrators only) when this process is elevated:
-    /// only then is it owned by Administrators and can keep access.
-    fn protected_dir() -> (tempfile::TempDir, PathBuf) {
+    /// Replace the DACL of `path` with the one in `sddl`, not inherited.
+    fn set_dacl(path: &Path, sddl: &str) {
         use ::windows::{
             Win32::{
                 Foundation::{HLOCAL, LocalFree},
@@ -1008,37 +1016,69 @@ mod tests {
             },
             core::HSTRING,
         };
+        unsafe {
+            let mut sd = PSECURITY_DESCRIPTOR::default();
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                &HSTRING::from(sddl),
+                SDDL_REVISION_1,
+                &mut sd,
+                None,
+            )
+            .unwrap();
+            let mut present = false.into();
+            let mut defaulted = false.into();
+            let mut dacl = std::ptr::null_mut();
+            GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted).unwrap();
+            SetNamedSecurityInfoW(
+                &HSTRING::from(path.as_os_str()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(dacl),
+                None,
+            )
+            .ok()
+            .unwrap();
+            let _ = LocalFree(Some(HLOCAL(sd.0)));
+        }
+    }
+
+    /// A temporary directory under its final path, with the session tree's
+    /// DACL (SYSTEM and Administrators only) when this process is elevated:
+    /// only then is it owned by Administrators and can keep access.
+    fn protected_dir() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = PathBuf::from(plain(&std::fs::canonicalize(dir.path()).unwrap()));
         if privileged_owner(&path).unwrap() {
-            unsafe {
-                let mut sd = PSECURITY_DESCRIPTOR::default();
-                ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                    &HSTRING::from("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"),
-                    SDDL_REVISION_1,
-                    &mut sd,
-                    None,
-                )
-                .unwrap();
-                let mut present = false.into();
-                let mut defaulted = false.into();
-                let mut dacl = std::ptr::null_mut();
-                GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted).unwrap();
-                SetNamedSecurityInfoW(
-                    &HSTRING::from(path.as_os_str()),
-                    SE_FILE_OBJECT,
-                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                    None,
-                    None,
-                    Some(dacl),
-                    None,
-                )
-                .ok()
-                .unwrap();
-                let _ = LocalFree(Some(HLOCAL(sd.0)));
-            }
+            set_dacl(&path, "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
         }
         (dir, path)
+    }
+
+    #[test]
+    fn only_system_and_administrators_may_write_a_protected_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        // The owner keeps READ_CONTROL and WRITE_DAC whatever the DACL.
+        for (sddl, writes) in [
+            ("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", true),
+            (
+                "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)",
+                true,
+            ),
+            ("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(D;OICI;FA;;;WD)", true),
+            ("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)", false),
+            ("D:P(A;OICI;FA;;;SY)(A;OICI;0x2;;;BU)", false),
+            ("D:P(A;OICI;FA;;;SY)(A;OICI;GW;;;AU)", false),
+        ] {
+            set_dacl(dir.path(), sddl);
+            assert_eq!(
+                protection(dir.path()).unwrap().1.is_none(),
+                writes,
+                "{sddl}"
+            );
+        }
+        set_dacl(dir.path(), "D:P(A;OICI;FA;;;OW)");
     }
 
     fn fresh() -> Worker {

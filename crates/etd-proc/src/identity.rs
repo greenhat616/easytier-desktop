@@ -434,6 +434,41 @@ pub(crate) fn bsd_state(pid: u32) -> io::Result<Option<BsdState>> {
     }
 }
 
+/// Linux: what `/proc` says about a process, for diagnostics: its state
+/// letter, whether it is exiting (`PF_EXITING`), its real uid, or that it
+/// has no entry any more.
+#[cfg(target_os = "linux")]
+pub(crate) fn proc_summary(pid: u32) -> String {
+    const PF_EXITING: u64 = 0x4;
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return "no /proc entry (exited)".into();
+        }
+        Err(error) => return format!("/proc/{pid}/stat unreadable: {error}"),
+    };
+    let fields: Vec<&str> = stat
+        .rsplit_once(')')
+        .map_or_else(Vec::new, |(_, rest)| rest.split_whitespace().collect());
+    let state = fields.first().copied().unwrap_or("?");
+    let exiting = fields
+        .get(6)
+        .and_then(|flags| flags.parse::<u64>().ok())
+        .map_or("unknown".into(), |flags| {
+            (flags & PF_EXITING != 0).to_string()
+        });
+    let uid = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Uid:"))
+                .and_then(|ids| ids.split_whitespace().next().map(str::to_owned))
+        })
+        .unwrap_or_else(|| "unknown".into());
+    format!("state {state}, exiting {exiting}, uid {uid}")
+}
+
 #[cfg(unix)]
 pub(crate) fn pid_absent(pid: u32) -> io::Result<bool> {
     let pid = i32::try_from(pid).map_err(io::Error::other)?;

@@ -409,10 +409,12 @@ async fn registry_and_magic_dns() {
         child
     };
     let foreign = fixture(dir.path());
-    assert!(matches!(
-        reclaimer(effect.kind).reclaim(&effect).await,
-        Err(ReclaimError::Busy(_))
-    ));
+    // Proven external and nothing replayed yet: held by it, left in place.
+    let held = reclaimer(effect.kind).reclaim(&effect).await;
+    assert!(
+        matches!(&held, Err(ReclaimError::HeldBy(h)) if h.contains("easytier-gate-fixture")),
+        "{held:?}"
+    );
     assert!(
         os.observer
             .observe(effect.kind, &magic_key)
@@ -427,6 +429,18 @@ async fn registry_and_magic_dns() {
             .unwrap()
             .is_some()
     );
+    // As left by an earlier replay interrupted after restoring the
+    // SearchList: it must finish, so the same holder is only Busy.
+    ps(&format!(
+        "Set-ItemProperty -LiteralPath '{tcpip}' -Name SearchList -Value 'original.invalid'"
+    ));
+    assert!(matches!(
+        reclaimer(effect.kind).reclaim(&effect).await,
+        Err(ReclaimError::Busy(_))
+    ));
+    ps(&format!(
+        "Set-ItemProperty -LiteralPath '{tcpip}' -Name SearchList -Value 'current.invalid'"
+    ));
     drop(foreign);
     let own = fixture(&core_store);
     assert_eq!(
@@ -738,9 +752,10 @@ async fn real_wintun_after_kill() {
         scope.clone(),
     );
     let reclaimer = |kind| os.reclaimers.iter().find(|r| r.kind() == kind).unwrap();
+    // Live and ours: never uninstalled, listed as a candidate instead.
     assert!(matches!(
         reclaimer(adapter.kind).reclaim(&adapter).await,
-        Err(ReclaimError::Busy(_))
+        Err(ReclaimError::NotDeletable(_))
     ));
     let mut effects = Vec::new();
     for protocol in ["TCP", "UDP", "ICMP", "ALL"] {

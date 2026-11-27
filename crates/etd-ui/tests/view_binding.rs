@@ -295,6 +295,53 @@ fn make_entry(
 }
 
 #[gpui_kit::test]
+fn pane_and_page_header_share_top_edge_and_banners_are_in_content(cx: &mut TestAppContext) {
+    let (tray, _, _) = FakeTray::available();
+    let (installer, _) = FakeInstaller::ok();
+    let harness = TestHarness::new(cx, Box::new(tray), installer, false);
+    harness.push_store(
+        StateStore {
+            link: HostLink::NoHost,
+            ..Default::default()
+        },
+        cx,
+    );
+    cx.update_window(harness.window, |_, window, _cx| {
+        let pane = window.find("pane-title").bounds();
+        let header = window.find("app-header").bounds();
+        let content = window.find("page-content").bounds();
+        let notification = window.find("banner-no-host").bounds();
+        assert!(pane.origin.x < header.origin.x);
+        // The pane's toggle is inset in the top row; it must no longer start
+        // beneath the header or the notification band.
+        assert!(pane.origin.y < header.bottom());
+        assert!(notification.origin.x >= content.origin.x + px(24.));
+        assert!(notification.origin.y >= content.origin.y);
+        assert!(notification.right() <= content.right());
+        // Multiple action buttons are WinUI custom content below the message.
+        let body = window
+            .within("banner-no-host")
+            .find("infobar-body")
+            .bounds();
+        let actions = window
+            .within("banner-no-host")
+            .find("infobar-actions")
+            .bounds();
+        assert!(actions.origin.y >= body.bottom());
+        for id in [
+            "btn-connect-service",
+            "btn-connect-user",
+            "btn-refresh",
+            "btn-app-exit",
+            "btn-nohost-install-service",
+        ] {
+            assert_eq!(window.find(id).bounds().size.height, px(32.), "{id}");
+        }
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn navigation_selection_and_collapse_are_live(cx: &mut TestAppContext) {
     let (tray, _, _) = FakeTray::available();
     let (installer, _) = FakeInstaller::ok();
@@ -1245,7 +1292,13 @@ fn main_thread_constrained_stack_renders_all_views_banners_and_editor_without_ov
                 window.input("中文测试net", cx);
                 window.click("editor-network-secret", cx);
                 window.input("secret-123", cx);
-                if !window.find("btn-suggested-listeners").visible() {
+                // The WinUI-style multiline InfoBars can consume different
+                // vertical space depending on text metrics. Scroll like a
+                // user until the later form control is in the viewport.
+                for _ in 0..6 {
+                    if window.find("btn-suggested-listeners").visible() {
+                        break;
+                    }
                     window.scroll(
                         "network-editor-scroll",
                         gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-140.))),
@@ -1264,4 +1317,82 @@ fn main_thread_constrained_stack_renders_all_views_banners_and_editor_without_ov
     handle
         .join()
         .expect("768 KiB stack thread panicked or overflowed");
+}
+
+/// Offscreen product layout evidence for the gallery report. This reuses
+/// the existing fake bridge, tray and installer; no host/runtime is started.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+#[ignore = "requires a real offscreen renderer and GALLERY_SCREENSHOT_DIR"]
+fn capture_product_layout_screenshots() {
+    use gpui_kit::{
+        HeadlessAppContext,
+        platform::{current_headless_renderer, current_platform},
+    };
+    use std::path::PathBuf;
+    let output =
+        PathBuf::from(std::env::var_os("GALLERY_SCREENSHOT_DIR").expect("GALLERY_SCREENSHOT_DIR"));
+    std::fs::create_dir_all(&output).unwrap();
+    for theme in ["light", "dark"] {
+        let mut cx = HeadlessAppContext::with_platform(
+            current_platform(true).text_system(),
+            Arc::new(etd_ui::assets::FluentAssets),
+            current_headless_renderer,
+        );
+        let (cmd_tx, _cmd_rx) = async_channel::unbounded();
+        let (_state_tx, state_rx) = async_channel::bounded(1);
+        let bridge = AppBridge {
+            commands: cmd_tx,
+            states: state_rx,
+        };
+        let (tray, _, _) = FakeTray::available();
+        let (installer, _) = FakeInstaller::ok();
+        let (handle, _) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            etd_ui::theme::install_palette(cx);
+            let controller = UiController::new_for_window(
+                bridge,
+                None,
+                Box::new(tray),
+                installer,
+                false,
+                std::rc::Rc::new(|_| {}),
+                cx,
+            );
+            controller.apply_store(
+                StateStore {
+                    link: HostLink::NoHost,
+                    ..Default::default()
+                },
+                cx,
+            );
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Default::default(),
+                        size: size(px(1200.), px(900.)),
+                    })),
+                    focus: false,
+                    show: false,
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| MainView::new(controller, window, cx)),
+            )
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click(gpui_kit::SharedString::from(format!("theme-{theme}")), cx);
+            window.click("btn-new-network", cx);
+            window.render_frame(cx);
+            assert!(window.find("banner-no-host").visible());
+            assert!(window.find("network-editor-view").visible());
+        })
+        .unwrap();
+        cx.capture_screenshot(handle)
+            .unwrap()
+            .save(output.join(format!("product-layout-{theme}.png")))
+            .unwrap();
+    }
 }

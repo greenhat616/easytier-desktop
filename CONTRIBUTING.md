@@ -14,6 +14,15 @@ to submit a change. The detailed rules live in the
 
 ## 2. Environment
 
+If you use [mise](https://mise.jdx.dev/), review `mise.toml`, run `mise trust`
+and then `mise install --locked` at the repository root. Use `mise exec -- just
+--list` to see the common commands, or activate mise in your shell and run
+`just --list`. Rust still comes from rustup and `rust-toolchain.toml`.
+
+You can also install the tools directly and use the Cargo commands below. Set
+`PROTOC_INCLUDE` to the release's `include` directory containing
+`google/protobuf/descriptor.proto` when configuring protoc by hand.
+
 | Tool | Version | Notes |
 | --- | --- | --- |
 | Rust | 1.100.0 | Install `rustup`; `rust-toolchain.toml` selects the version, rustfmt and Clippy. Use the MSVC toolchain on Windows. |

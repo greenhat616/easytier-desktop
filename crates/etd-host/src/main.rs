@@ -50,6 +50,20 @@ impl From<Mode> for HostMode {
     }
 }
 
+/// An installer tag: 1 to 64 ASCII letters, digits, braces, hyphens,
+/// underscores or dots (an MSI ProductCode fits).
+fn owner_tag(value: &str) -> Result<String, String> {
+    let valid = (1..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'{' | b'}' | b'-' | b'_' | b'.'));
+    if valid {
+        Ok(value.to_owned())
+    } else {
+        Err("expected 1-64 letters, digits, braces, hyphens, underscores or dots".into())
+    }
+}
+
 #[derive(Subcommand)]
 enum Action {
     /// Run a local authenticated host.
@@ -59,8 +73,14 @@ enum Action {
     },
     /// Install the system service (requires administrator privileges).
     Install {
+        /// One more administrator: an account SID (S-1-5-21-..., RID 1000
+        /// or above) on Windows, a UID elsewhere. Repeatable.
         #[arg(long, value_name = "SID_OR_UID")]
         allow_user: Vec<String>,
+        /// Record who installs (an MSI passes its ProductCode); see
+        /// `uninstall --only-owner`.
+        #[arg(long, value_name = "TAG", value_parser = owner_tag)]
+        owner: Option<String>,
     },
     /// Replace the installed service with this build, keeping its state
     /// (requires administrator privileges; run from the new payload).
@@ -74,6 +94,11 @@ enum Action {
         wait_parent: Option<u32>,
         #[arg(long, hide = true, requires = "wait_parent")]
         install_id: Option<String>,
+        /// Uninstall only an installation recorded with this owner; when
+        /// there is none, do nothing and succeed (an installer's rollback).
+        #[arg(long, value_name = "TAG", value_parser = owner_tag,
+              conflicts_with_all = ["status", "wait_parent", "install_id"])]
+        only_owner: Option<String>,
     },
     /// Re-enable a service disabled by an incomplete uninstall (before reclaim finished).
     ResumeService,
@@ -172,12 +197,15 @@ fn execute(cli: Cli) -> Result<()> {
         Action::RemoveCore { mode, version } => {
             run_bounded(runtime, host::remove_core(mode.into(), &version)).0
         }
-        Action::Install { allow_user } => run_bounded(runtime, host::install(&allow_user)).0,
+        Action::Install { allow_user, owner } => {
+            run_bounded(runtime, host::install(&allow_user, owner)).0
+        }
         Action::Upgrade => run_bounded(runtime, host::upgrade::upgrade()).0,
         Action::Uninstall {
             status,
             wait_parent,
             install_id,
+            only_owner,
         } => {
             if status {
                 return host::uninstall_status();
@@ -193,7 +221,7 @@ fn execute(cli: Cli) -> Result<()> {
                     bail!("uninstall worker is Windows-only");
                 }
             }
-            run_bounded(runtime, host::uninstall()).0
+            run_bounded(runtime, host::uninstall(only_owner.as_deref())).0
         }
         Action::ResumeService => run_bounded(runtime, host::resume_service()).0,
     }
@@ -292,5 +320,29 @@ mod run_bounded_tests {
             tokio::task::spawn_blocking(|| ()).await.unwrap();
         });
         assert!(settled);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn owner_tags_take_a_product_code_and_nothing_that_splits_a_command_line() {
+        Cli::command().debug_assert();
+        let code = "{89AB7D73-819C-4BB3-BA52-DCB90C01C4ED}";
+        assert_eq!(owner_tag(code).unwrap(), code);
+        for bad in ["", "a b", "a\"b", "a;b", &"x".repeat(65)] {
+            assert!(owner_tag(bad).is_err(), "{bad}");
+        }
+        let cli = Cli::try_parse_from(["etd-host", "uninstall", "--only-owner", code]).unwrap();
+        assert!(
+            matches!(cli.command, Some(Action::Uninstall { only_owner: Some(ref o), .. }) if o == code)
+        );
+        assert!(
+            Cli::try_parse_from(["etd-host", "uninstall", "--only-owner", code, "--status"])
+                .is_err()
+        );
     }
 }

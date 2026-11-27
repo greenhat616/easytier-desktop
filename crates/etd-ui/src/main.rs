@@ -4,21 +4,23 @@
 //! `GrpcHostClient` + `LocalConnector`, elevation-aware `LocalHostLauncher`,
 //! and `TomlProfileStore`, then runs GPUI with [`QuitMode::Explicit`],
 //! [`etd_ui::assets::FluentAssets`], and [`etd_ui::NativeTrayBackend`]. Every exit
-//! funnels through [`etd_app::ExitGate`] before `cx.quit()`.
+//! funnels through [`etd_app::ExitGate`] before `cx.quit()`. Logs and panics
+//! go to a rotated file first ([`logging`]).
+//!
+//! Release builds use the Windows GUI subsystem, so launching the app opens
+//! no console window.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod logging;
 
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use etd_app::{AppRuntime, BridgeConfig, window_tray::WindowInput};
 use etd_ui::{NativeTrayBackend, PlatformServiceInstaller, UiController, build_local_services};
 use gpui_kit::QuitMode;
-use tracing_subscriber::EnvFilter;
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    logging::init();
 
     let (services, is_elevated) =
         build_local_services().expect("failed to initialize desktop application services");

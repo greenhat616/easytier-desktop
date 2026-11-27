@@ -163,8 +163,11 @@ the service form only.
 
 ## `install`
 
-Administrator only. `--allow-user` takes numeric SIDs (Windows) or UIDs (Unix); each
-becomes an admin allow-list entry.
+Administrator only. `--allow-user` takes account SIDs on Windows (`S-1-5-21-<domain>-<RID>`
+with RID 1000 or above; groups and well-known SIDs are refused) or UIDs on Unix; each
+becomes an admin allow-list entry. `--owner <tag>` (1 to 64 letters, digits, braces,
+hyphens, underscores or dots) records who installed in the journal, with its first
+write; the MSI passes its ProductCode (see `uninstall --only-owner`).
 
 1. Take the maintenance lock. An existing journal must be in phase `Installing` (an
    interrupted install, which is rolled back first); anything else refuses.
@@ -279,9 +282,11 @@ and maintenance directories are never touched; the ledger is never rolled back.
   `upgrade` or `uninstall`.
 - **Windows, uninstall after a crash at `Replacing`:** run from the installed image,
   which is then the new one, `uninstall` restores the previous image and parks the
-  running one as `etd-host.failed`; removing the install directory then fails once,
-  because that file is still mapped. Running `uninstall` again (from the restored
-  image) completes. Installer front ends must offer that retry.
+  running one as `etd-host.failed`, which stays mapped until the process exits. It
+  counts that image as the installed one, so, as for any uninstall run from the
+  installed image, a helper copied from it removes the install directory after the
+  process exits (`uninstall --status` reports it). The MSI runs `uninstall` from its
+  payload copy, which is never the installed image.
 
 If the upgrade drops the selected kernel version, it says so and names the instances
 set to run. Planning then fails with "selected kernel ... is not in this host's
@@ -333,6 +338,11 @@ Administrator only, under the maintenance lock. The journal advances through
    references a kernel bundle in `cores`, or when that cannot be determined.
 
 Without a journal, `uninstall` succeeds only if preflight finds no product resources.
+
+`uninstall --only-owner <tag>` uninstalls only an installation whose journal records
+that owner (and the same install id throughout); with no journal or another owner it
+removes nothing and succeeds. An installer's rollback uses it so that it never removes
+an installation it did not make.
 
 ## `reclaim` and `remove-core`
 

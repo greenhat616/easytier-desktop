@@ -689,8 +689,11 @@ pub(super) fn defer_install_removal(
     use ::windows::core::PCWSTR;
     use sha2::{Digest, Sha256};
     use std::io::{Read, Seek};
+    // Uninstall run from the installed image, including one that just
+    // rolled back an upgrade and so runs as `.failed`, cannot remove its own
+    // executing image: a helper finishes after this process exits.
     if !layout.executable.try_exists()?
-        || super::current_exe()? != layout.executable.canonicalize()?
+        || !super::runs_installed_image(&super::current_exe()?, &layout.executable)?
     {
         return Ok(None);
     }

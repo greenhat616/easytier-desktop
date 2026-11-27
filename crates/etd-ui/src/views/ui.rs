@@ -200,7 +200,7 @@ impl gpui::RenderOnce for FluentButton {
             btn = btn.w(height).min_w(height).px_0().py_0();
         }
         if style.selected && style.variant == ButtonVariant::Ghost {
-            btn = btn.bg(cx.theme().secondary.opacity(0.55));
+            btn = btn.bg(crate::theme::subtle_fill_secondary(cx));
         }
         if style.loading {
             let (fill, ink) = loading_button_colors(style, cx);
@@ -311,8 +311,9 @@ fn loading_button_colors(style: BtnStyle, cx: &App) -> (Hsla, Hsla) {
         ButtonVariant::Success => (t.button_success, t.button_success_foreground),
         ButtonVariant::Info => (t.button_info, t.button_info_foreground),
         ButtonVariant::Default => (t.button, t.button_foreground),
-        ButtonVariant::Link => (t.popover, t.link),
-        _ => (t.popover, t.foreground),
+        // Hyperlink and subtle buttons rest on SubtleFillColorTransparent.
+        ButtonVariant::Link => (t.transparent, t.link),
+        _ => (t.transparent, t.foreground),
     }
 }
 
@@ -438,6 +439,8 @@ impl RenderOnce for FluentAlignedRow {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let focus = focus_for(&self.id, window, cx);
         let t = cx.theme();
+        let subtle = crate::theme::subtle_fill_secondary(cx);
+        let pressed = crate::theme::subtle_fill_tertiary(cx);
         let selected = self.selected;
         let appearance = self.appearance_choice;
         let aria_label = if appearance && selected {
@@ -465,12 +468,12 @@ impl RenderOnce for FluentAlignedRow {
             .rounded(px(4.))
             .text_color(t.foreground)
             .bg(if appearance && selected {
-                t.secondary.opacity(0.55)
+                subtle
             } else {
                 t.transparent
             })
-            .hover(|s| s.bg(t.secondary.opacity(0.55)))
-            .active(|s| s.bg(t.secondary_active))
+            .hover(|s| s.bg(subtle))
+            .active(|s| s.bg(pressed))
             .children(appearance.then(|| {
                 let slot = div().size(px(16.)).flex_shrink_0();
                 if selected {
@@ -558,11 +561,13 @@ impl RenderOnce for FluentInput {
     #[inline(never)]
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let focus = self.state.read(cx).focus_handle(cx);
+        let focused = focus.is_focused(window);
         let mut input = Input::new(&self.state)
             .id(self.id)
             .aria_label(self.aria_label)
             .disabled(self.disabled)
-            .focus_ring(false);
+            .focus_ring(false)
+            .bg(crate::theme::text_control_fill(focused, self.disabled, cx));
         if self.password {
             input = input.content_type(InputContentType::Password).mask_toggle();
         }
@@ -570,7 +575,7 @@ impl RenderOnce for FluentInput {
             .relative()
             .w_full()
             .child(input)
-            .children(focus_visual(focus.is_focused(window), window, cx))
+            .children(focus_visual(focused, window, cx))
     }
 }
 
@@ -818,11 +823,9 @@ impl SidebarItem for FluentNavItem {
         let t = cx.theme();
         let selected = self.selected;
         let collapsed = self.collapsed;
-        let bg = if selected {
-            t.secondary.opacity(0.55)
-        } else {
-            t.transparent
-        };
+        let subtle = crate::theme::subtle_fill_secondary(cx);
+        let pressed = crate::theme::subtle_fill_tertiary(cx);
+        let bg = if selected { subtle } else { t.transparent };
         let icon = if selected {
             self.filled_icon
         } else {
@@ -855,8 +858,8 @@ impl SidebarItem for FluentNavItem {
             .flex_row_dir(cx)
             .items_center()
             .gap_2()
-            .hover(|s| s.bg(t.secondary.opacity(0.65)))
-            .active(|s| s.bg(t.secondary_active))
+            .hover(|s| s.bg(subtle))
+            .active(|s| s.bg(pressed))
             .on_click(move |event, window, cx| handler(event, window, cx));
         btn = if collapsed {
             btn.justify_center()
@@ -897,9 +900,16 @@ impl SidebarItem for FluentNavItem {
 pub fn list_selection_surface(selected: bool, cx: &App) -> (Hsla, Hsla) {
     let t = cx.theme();
     if selected {
-        (t.primary.opacity(0.08), t.primary)
+        // Still a card: the accent tint goes over the card fill, not the layer.
+        let card = crate::theme::content_layer(cx)
+            .to_rgb()
+            .blend(crate::theme::card_fill(cx).to_rgb());
+        (
+            Hsla::from(card.blend(t.primary.opacity(0.08).to_rgb())),
+            t.primary,
+        )
     } else {
-        (t.secondary.opacity(0.25), t.border)
+        (crate::theme::card_fill(cx), crate::theme::card_stroke(cx))
     }
 }
 
@@ -919,7 +929,7 @@ fn info_colors(severity: InfoSeverity, cx: &App) -> (Hsla, Hsla, Hsla) {
     // translucent informational surfaces over our opaque content layer.
     let (background, icon) = match (t.is_dark(), severity) {
         (false, InfoSeverity::Informational) => (0xF7F7F7, t.info),
-        (true, InfoSeverity::Informational) => (0x2E2E2E, t.info),
+        (true, InfoSeverity::Informational) => (0x2F2F2F, t.info),
         (false, InfoSeverity::Success) => (0xDFF6DD, rgb(0x0F7B0F).into()),
         (true, InfoSeverity::Success) => (0x393D1B, rgb(0x6CCB5F).into()),
         (false, InfoSeverity::Warning) => (0xFFF4CE, rgb(0x9D5D00).into()),

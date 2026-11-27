@@ -183,8 +183,8 @@ fn section(
                 .p_3()
                 .rounded(px(8.))
                 .border_1()
-                .border_color(cx.theme().border)
-                .bg(cx.theme().popover)
+                .border_color(theme::card_stroke(cx))
+                .bg(theme::card_fill(cx))
                 .children(children),
         )
         .into_any_element()
@@ -498,7 +498,7 @@ impl Render for Gallery {
                     .child(div().font_semibold().text_size(px(24.)).child("Component gallery"))
                     .child(div().text_sm().text_color(cx.theme().muted_foreground).child(format!("Local actions: {}", self.clicks))))
                 .child(div().id("gallery-scroll").test_support().flex_1().min_h_0().overflow_y_scroll()
-                    .bg(cx.theme().popover).rounded_tl(px(8.)).border_t_1().border_l_1().border_color(cx.theme().border).px(px(24.)).py_4().flex().flex_col().gap_4()
+                    .bg(theme::content_layer(cx)).rounded_tl(px(8.)).border_t_1().border_l_1().border_color(theme::card_stroke(cx)).px(px(24.)).py_4().flex().flex_col().gap_4()
                     .child(div().text_sm().text_color(cx.theme().muted_foreground)
                         .child("Hover or hold an enabled sample, or press Tab then Space/Enter. Appearance is session-only. No host is used."))
                     .child(buttons).child(inputs).child(lists).child(notifications)))
@@ -508,10 +508,7 @@ impl Render for Gallery {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui_kit::{
-        TestAppContext,
-        test::{TestAppContextExt as _, TestWindowExt as _},
-    };
+    use gpui_kit::{TestAppContext, test::TestWindowExt as _};
 
     #[gpui_kit::test]
     fn gallery_exercises_controls_without_host(cx: &mut TestAppContext) {
@@ -566,7 +563,7 @@ mod tests {
         use gpui_kit::{
             HeadlessAppContext,
             platform::{current_headless_renderer, current_platform},
-            test::TestEventExt as _,
+            test::{TestAppContextExt as _, TestEventExt as _},
         };
         use std::{path::PathBuf, sync::Arc, time::Duration};
         let output = PathBuf::from(

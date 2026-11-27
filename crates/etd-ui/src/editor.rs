@@ -450,7 +450,6 @@ fn render_editor_header(
     cx: &mut Context<MainView>,
 ) -> AnyElement {
     let border = cx.theme().border;
-    let bg = cx.theme().background;
     let fg = cx.theme().foreground;
     let save_desired = if is_edit {
         Desired::Unspecified
@@ -492,7 +491,6 @@ fn render_editor_header(
         .py_3()
         .border_b_1()
         .border_color(border)
-        .bg(bg)
         .child(div().text_lg().font_semibold().text_color(fg).child(title))
         .child(
             div()
@@ -533,8 +531,8 @@ fn render_identity_section(
     is_edit: bool,
     cx: &mut Context<MainView>,
 ) -> AnyElement {
-    let border = cx.theme().border;
-    let sec = cx.theme().secondary;
+    let border = crate::theme::card_stroke(cx);
+    let card = crate::theme::card_fill(cx);
 
     let display = text_field(
         "Display Name",
@@ -570,7 +568,7 @@ fn render_identity_section(
         .rounded_md()
         .border_1()
         .border_color(border)
-        .bg(sec.opacity(0.25))
+        .bg(card)
         .child(display)
         .child(net_name)
         .child(secret)
@@ -694,8 +692,8 @@ fn render_addressing_section(
     editor: &NetworkEditorState,
     cx: &mut Context<MainView>,
 ) -> AnyElement {
-    let border = cx.theme().border;
-    let sec = cx.theme().secondary;
+    let border = crate::theme::card_stroke(cx);
+    let card = crate::theme::card_fill(cx);
 
     let dhcp_sw = switch_control(
         "editor-dhcp",
@@ -724,7 +722,7 @@ fn render_addressing_section(
         .rounded_md()
         .border_1()
         .border_color(border)
-        .bg(sec.opacity(0.25))
+        .bg(card)
         .child(dhcp_sw)
         .child(cidr)
         .child(peers)
@@ -733,8 +731,8 @@ fn render_addressing_section(
 
 #[inline(never)]
 fn render_listeners_section(editor: &NetworkEditorState, cx: &mut Context<MainView>) -> AnyElement {
-    let border = cx.theme().border;
-    let sec = cx.theme().secondary;
+    let border = crate::theme::card_stroke(cx);
+    let card = crate::theme::card_fill(cx);
     let muted = cx.theme().muted_foreground;
 
     let listeners_input = text_field(
@@ -787,7 +785,7 @@ fn render_listeners_section(editor: &NetworkEditorState, cx: &mut Context<MainVi
         .rounded_md()
         .border_1()
         .border_color(border)
-        .bg(sec.opacity(0.25))
+        .bg(card)
         .child(listeners_input)
         .child(
             div()
@@ -815,8 +813,8 @@ fn render_options_section(
     tun_available: bool,
     cx: &mut Context<MainView>,
 ) -> AnyElement {
-    let border = cx.theme().border;
-    let sec = cx.theme().secondary;
+    let border = crate::theme::card_stroke(cx);
+    let card = crate::theme::card_fill(cx);
 
     let no_tun_label = if tun_available {
         "No TUN interface (SOCKS5 / port forwarding only)"
@@ -915,7 +913,7 @@ fn render_options_section(
         .rounded_md()
         .border_1()
         .border_color(border)
-        .bg(sec.opacity(0.25))
+        .bg(card)
         .child(proxy)
         .child(exits)
         .child(

@@ -11,7 +11,7 @@ use gpui_kit::{
     App, Global, Hsla, SharedString, Styled as _, Window, WindowAppearance,
     WindowBackgroundAppearance,
     component::{Theme, ThemeConfig, ThemeMode, ThemeSet},
-    transparent_black,
+    rgba, transparent_black,
 };
 
 use crate::{
@@ -249,6 +249,61 @@ pub(crate) fn chrome_fill(cx: &App, fallback: Hsla) -> Hsla {
         transparent_black()
     } else {
         fallback
+    }
+}
+
+/// WinUI surface brushes from `Common_themeresources_any.xaml`, as
+/// `0xRRGGBBAA` for (light, dark). Translucent values are painted as-is so
+/// they composite over whatever layer is really below them, as in XAML.
+fn winui_brush(cx: &App, light: u32, dark: u32) -> Hsla {
+    rgba(if Theme::global(cx).is_dark() {
+        dark
+    } else {
+        light
+    })
+    .into()
+}
+
+/// NavigationView content area: `LayerFillColorDefault` (#80FFFFFF /
+/// #4C3A3A3A) resolved over `SolidBackgroundFillColorBase` (#F3F3F3 /
+/// #202020). Kept opaque so Mica stays limited to the window chrome.
+pub(crate) fn content_layer(cx: &App) -> Hsla {
+    winui_brush(cx, 0xF9F9F9FF, 0x282828FF)
+}
+
+/// `CardBackgroundFillColorDefault` (#B3FFFFFF / #0DFFFFFF): cards and
+/// grouped sections sit slightly above the content layer, never below it.
+pub(crate) fn card_fill(cx: &App) -> Hsla {
+    winui_brush(cx, 0xFFFFFFB3, 0xFFFFFF0D)
+}
+
+/// `CardStrokeColorDefault` (#0F000000 / #19000000), also the
+/// NavigationView content grid border.
+pub(crate) fn card_stroke(cx: &App) -> Hsla {
+    winui_brush(cx, 0x0000000F, 0x00000019)
+}
+
+/// `SubtleFillColorSecondary` (#09000000 / #0FFFFFFF): navigation and list
+/// rows when hovered or selected.
+pub(crate) fn subtle_fill_secondary(cx: &App) -> Hsla {
+    winui_brush(cx, 0x00000009, 0xFFFFFF0F)
+}
+
+/// `SubtleFillColorTertiary` (#06000000 / #0AFFFFFF): the same rows pressed.
+pub(crate) fn subtle_fill_tertiary(cx: &App) -> Hsla {
+    winui_brush(cx, 0x00000006, 0xFFFFFF0A)
+}
+
+/// TextBox fill: `TextControlBackground` = `ControlFillColorDefault`
+/// (#B3FFFFFF / #0FFFFFFF), focused `ControlFillColorInputActive` (#FFFFFF /
+/// #B31E1E1E), disabled `ControlFillColorDisabled` (#4DF9F9F9 / #0BFFFFFF).
+pub(crate) fn text_control_fill(focused: bool, disabled: bool, cx: &App) -> Hsla {
+    if disabled {
+        winui_brush(cx, 0xF9F9F94D, 0xFFFFFF0B)
+    } else if focused {
+        winui_brush(cx, 0xFFFFFFFF, 0x1E1E1EB3)
+    } else {
+        winui_brush(cx, 0xFFFFFFB3, 0xFFFFFF0F)
     }
 }
 
@@ -592,22 +647,20 @@ mod tests {
 
     #[gpui_kit::test]
     fn badge_and_input_text_pairs_meet_aa_in_both_modes(cx: &mut TestAppContext) {
-        use gpui_kit::component::Colorize as _;
         cx.update(|cx| {
             gpui_kit::init(cx);
             install_palette(cx);
             for appearance in [WindowAppearance::Light, WindowAppearance::Dark] {
                 apply_theme(appearance, cx);
                 let t = Theme::global(cx);
-                let surface = t.popover.to_rgb();
-                let normal_card = surface.blend(t.secondary.opacity(0.25).to_rgb());
-                let selected_card = surface.blend(t.primary.opacity(0.08).to_rgb());
+                let surface = content_layer(cx).to_rgb();
+                let normal_card = surface.blend(card_fill(cx).to_rgb());
+                let selected_card = normal_card.blend(t.primary.opacity(0.08).to_rgb());
                 // The selected card may use any readable OS accent. Include
                 // the worst luminance extreme, not just the default blue.
                 let extreme: Hsla = rgb(if t.is_dark() { 0xFFFFFF } else { 0x000000 }).into();
-                let extreme_card = surface.blend(extreme.opacity(0.08).to_rgb());
+                let extreme_card = normal_card.blend(extreme.opacity(0.08).to_rgb());
                 let base = t.background.to_rgb();
-                let editor_card = base.blend(t.secondary.opacity(0.25).to_rgb());
                 let parents = [
                     base,
                     surface,
@@ -615,7 +668,6 @@ mod tests {
                     normal_card,
                     selected_card,
                     extreme_card,
-                    editor_card,
                 ];
                 // Neutral badge and tinted success/error/waiting badges are
                 // the exact pairs in render_instance_card/render_header.
@@ -623,6 +675,12 @@ mod tests {
                     "neutral badge",
                     t.secondary_foreground,
                     t.secondary.to_rgb(),
+                );
+                // The header's no-tray pill is opaque: popover plus 20% warning.
+                assert_readable(
+                    "no-tray badge",
+                    t.warning,
+                    t.popover.to_rgb().blend(t.warning.opacity(0.2).to_rgb()),
                 );
                 for parent in parents {
                     for (name, semantic) in [
@@ -633,14 +691,16 @@ mod tests {
                         assert_readable(
                             name,
                             semantic,
-                            parent.blend(semantic.opacity(0.2).to_rgb()),
+                            parent.blend(semantic.opacity(0.15).to_rgb()),
                         );
                     }
-                    // Match gpui-component 0.11 input::input_style: dark
-                    // enabled uses the input tint at 30%, disabled uses 80%.
-                    let enabled = parent.blend(t.input_background().to_rgb());
-                    let disabled = parent.blend(t.input.mix_oklab(t.transparent, 0.8).to_rgb());
+                    // FluentInput paints the WinUI TextControlBackground
+                    // states over whichever surface holds the field.
+                    let enabled = parent.blend(text_control_fill(false, false, cx).to_rgb());
+                    let focused = parent.blend(text_control_fill(true, false, cx).to_rgb());
+                    let disabled = parent.blend(text_control_fill(false, true, cx).to_rgb());
                     assert_readable("enabled input", t.foreground, enabled);
+                    assert_readable("focused input", t.foreground, focused);
                     assert_readable("input placeholder", t.muted_foreground, enabled);
                     assert_readable("disabled input", t.muted_foreground, disabled);
                     assert_readable(

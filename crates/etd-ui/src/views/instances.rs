@@ -219,13 +219,13 @@ fn render_instance_card(
 
     let (badge_bg, badge_fg) = match condition {
         InstanceCondition::Running | InstanceCondition::RunningBasic => {
-            (success.opacity(0.2), success)
+            (success.opacity(0.15), success)
         }
         InstanceCondition::GaveUp
         | InstanceCondition::Quarantined
-        | InstanceCondition::CutUnconfirmed => (danger.opacity(0.2), danger),
+        | InstanceCondition::CutUnconfirmed => (danger.opacity(0.15), danger),
         InstanceCondition::Waiting | InstanceCondition::Backoff | InstanceCondition::Unknown => {
-            (warning.opacity(0.2), warning)
+            (warning.opacity(0.15), warning)
         }
         _ => (secondary, secondary_fg),
     };
@@ -621,7 +621,6 @@ fn render_detail_tabs(
 
 #[inline(never)]
 fn render_overview(entry: &InstanceEntry, cx: &Context<MainView>) -> AnyElement {
-    let theme = cx.theme();
     let condition = UiModel::condition_label(entry.condition());
     let desired = format!("{:?}", entry.desired_state());
     let epoch = entry.status.as_ref().map_or(0, |s| s.epoch);
@@ -718,8 +717,8 @@ fn render_overview(entry: &InstanceEntry, cx: &Context<MainView>) -> AnyElement 
         .p_4()
         .rounded_md()
         .border_1()
-        .border_color(theme.border)
-        .bg(theme.secondary.opacity(0.2))
+        .border_color(crate::theme::card_stroke(cx))
+        .bg(crate::theme::card_fill(cx))
         .children(rows)
         .into_any_element()
 }
@@ -848,8 +847,8 @@ fn render_nodes_page(
                         .p_3()
                         .rounded_md()
                         .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.secondary.opacity(0.2))
+                        .border_color(crate::theme::card_stroke(cx))
+                        .bg(crate::theme::card_fill(cx))
                         .text_sm()
                         .child(summary),
                 );
@@ -934,8 +933,8 @@ fn render_routes_page(
                         .p_3()
                         .rounded_md()
                         .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.secondary.opacity(0.2))
+                        .border_color(crate::theme::card_stroke(cx))
+                        .bg(crate::theme::card_fill(cx))
                         .text_sm()
                         .child(summary),
                 );
@@ -1004,8 +1003,8 @@ fn render_traffic_page(
                     .p_3()
                     .rounded_md()
                     .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.secondary.opacity(0.25))
+                    .border_color(crate::theme::card_stroke(cx))
+                    .bg(crate::theme::card_fill(cx))
                     .text_sm()
                     .font_medium()
                     .child(totals),

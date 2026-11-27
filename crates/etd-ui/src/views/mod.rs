@@ -201,9 +201,9 @@ fn render_section_content(
         .flex()
         .flex_col()
         .overflow_hidden()
-        .bg(cx.theme().popover)
+        .bg(crate::theme::content_layer(cx))
         .border_t_1()
-        .border_color(cx.theme().border)
+        .border_color(crate::theme::card_stroke(cx))
         .child(banners)
         .child(div().flex_1().min_h_0().overflow_hidden().child(inner));
     if LayoutDirection::global(cx).is_rtl() {

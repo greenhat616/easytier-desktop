@@ -1,0 +1,440 @@
+name: Release packages
+
+# PK5 (doc#16 v2): build the unsigned release packages, check them, smoke
+# test them on fresh runners, and on a v* tag attach them with SHA256SUMS.txt
+# to a draft GitHub release, which a maintainer publishes.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_BUILD_JOBS: '4'
+  # Signing is a placeholder this release (issue #2): dist runs
+  # `--sign-hook none`, and the step below refuses to pretend otherwise.
+  ETD_SIGNING_ENABLED: 'false'
+  NFPM_VERSION: '2.49.0'
+  NFPM_SHA256: '2afaa5ffb5e3493402e31e7c67a5a1fb42133e3f66fc315ca0051934125561c7'
+  # The independent check for the CI test-fixtures marker in the packages.
+  FIXTURE_CHECK: .github/scripts/check-no-fixtures.py
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      next: ${{ steps.version.outputs.next }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The workspace version is the package version; a tag must name it.
+      # `next` is the smoke tests' upgrade target and is never published.
+      - id: version
+        shell: python
+        run: |
+          import os, tomllib
+          with open("Cargo.toml", "rb") as f:
+              version = tomllib.load(f)["workspace"]["package"]["version"]
+          ref = os.environ["GITHUB_REF"]
+          if ref.startswith("refs/tags/") and ref != f"refs/tags/v{version}":
+              raise SystemExit(f"{ref} does not name the workspace version {version}")
+          major, minor, patch = map(int, version.split("."))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"version={version}\nnext={major}.{minor}.{patch + 1}\n")
+          print(f"package {version}; smoke upgrade target {major}.{minor}.{patch + 1}")
+
+  package-windows:
+    needs: version
+    runs-on: windows-latest
+    timeout-minutes: 90
+    outputs:
+      core-sha: ${{ steps.build.outputs.core-sha }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      NEXT: ${{ needs.version.outputs.next }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-tools
+        with:
+          tools: protoc python
+      # No build cache: a release is built from the tree alone.
+      - name: Build the release binaries and the MSI (WiX 7.0.1, OSMF EULA accepted)
+        id: build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo xtask fetch-cores --target x86_64-pc-windows-msvc --github-env ETD_RELEASE_CORE
+          $core = (Get-Content -LiteralPath $env:GITHUB_ENV | Select-String '^ETD_RELEASE_CORE=').Line.Split('=', 2)[1]
+          "core-sha=$((Get-FileHash -LiteralPath $core -Algorithm SHA256).Hash.ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          cargo build --release --locked -p etd-ui -p etd-host -p etd-ctl
+          # WiX and its Util extension from packages whose SHA-256 is checked,
+          # through a NuGet configuration whose only source is that folder.
+          $feed = Join-Path $env:RUNNER_TEMP 'wix-feed'
+          New-Item -ItemType Directory -Force $feed | Out-Null
+          $packages = @{
+            'wix'                    = '25209a1f73b20106621f11abe5e1a4e87c1d9f5c596795d246de7bb64446df17'
+            'wixtoolset.util.wixext' = 'e654f578e0a7d433819fe4cc343f9e37cb14f600fa061a6480857ba51334a075'
+          }
+          foreach ($id in $packages.Keys) {
+            $file = Join-Path $feed "$id.7.0.1.nupkg"
+            Invoke-WebRequest -Uri "https://api.nuget.org/v3-flatcontainer/$id/7.0.1/$id.7.0.1.nupkg" -OutFile $file
+            $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($hash -ne $packages[$id]) { throw "$id 7.0.1 has SHA-256 $hash, expected $($packages[$id])" }
+          }
+          $config = Join-Path $feed 'nuget.config'
+          "<?xml version=`"1.0`" encoding=`"utf-8`"?><configuration><packageSources><clear /><add key=`"verified`" value=`"$feed`" /></packageSources></configuration>" |
+            Set-Content -LiteralPath $config -Encoding utf8
+          dotnet tool install --global wix --version 7.0.1 --configfile $config
+          $env:PATH = "$(Join-Path $env:USERPROFILE '.dotnet/tools');$env:PATH"
+          # Non-commercial open source use of the WiX 7 binaries (msg#1468).
+          wix eula accept wix7
+          Push-Location $feed
+          wix extension add -g WixToolset.Util.wixext/7.0.1
+          Pop-Location
+          # The cached extension must be, byte for byte, the verified package's
+          # wixext7 folder (all that `wix extension add` extracts).
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $cache = Join-Path $env:USERPROFILE '.wix/extensions/WixToolset.Util.wixext/7.0.1'
+          $zip = [IO.Compression.ZipFile]::OpenRead((Join-Path $feed 'wixtoolset.util.wixext.7.0.1.nupkg'))
+          try {
+            $entries = @($zip.Entries | Where-Object { $_.FullName -like 'wixext7/*' -and $_.Name })
+            if ($entries.Count -eq 0) { throw 'the verified package has no wixext7 folder' }
+            foreach ($entry in $entries) {
+              $stream = $entry.Open()
+              try { $expected = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream)) } finally { $stream.Dispose() }
+              $file = Join-Path $cache $entry.FullName
+              if ((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ne $expected) { throw "$file differs from the verified package" }
+            }
+            $cached = @(Get-ChildItem -LiteralPath $cache -Recurse -File)
+            if ($cached.Count -ne $entries.Count) { throw "the extension cache holds $($cached.Count) files, the package $($entries.Count)" }
+          } finally { $zip.Dispose() }
+          Write-Output "WiX 7.0.1 and WixToolset.Util.wixext 7.0.1 installed from SHA-256-checked packages"
+          $out = Join-Path $env:RUNNER_TEMP 'release'
+          cargo xtask dist --target x86_64-pc-windows-msvc --package-version $env:VERSION --out $out --sign-hook none
+          # The smoke upgrade target: the same build as the next patch, with
+          # bytes appended to etd-host so the upgrade replaces the image.
+          $bin = Join-Path $env:RUNNER_TEMP 'next-bin'
+          New-Item -ItemType Directory -Force $bin | Out-Null
+          Copy-Item target/release/etd-ui.exe, target/release/etd-host.exe, target/release/etd-ctl.exe $bin
+          [IO.File]::AppendAllText((Join-Path $bin 'etd-host.exe'), "`0etd-release-smoke-next")
+          cargo xtask dist --target x86_64-pc-windows-msvc --bin-dir $bin --package-version $env:NEXT --out (Join-Path $env:RUNNER_TEMP 'next') --sign-hook none
+      - name: Sign (not implemented, issue #2)
+        if: env.ETD_SIGNING_ENABLED == 'true'
+        run: |
+          echo "release signing is not implemented yet (issue #2)"
+          exit 1
+      - name: Check the MSI carries no CI test fixtures
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = Join-Path $env:RUNNER_TEMP "release/x86_64-pc-windows-msvc/easytier-desktop-$env:VERSION-x86_64.msi"
+          $extract = Join-Path $env:RUNNER_TEMP 'msi-extract'
+          # An administrative image: the MSI's files, nothing installed.
+          $process = Start-Process msiexec.exe -ArgumentList '/a', "`"$msi`"", '/qn', "TARGETDIR=`"$extract`"" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "msiexec /a exited $($process.ExitCode)" }
+          $python = mise which python
+          & $python -I $env:FIXTURE_CHECK $extract
+          if ($LASTEXITCODE -ne 0) { throw 'the MSI carries the CI test-fixtures marker' }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-windows
+          path: ${{ runner.temp }}/release/x86_64-pc-windows-msvc/*.msi
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: smoke-windows
+          path: ${{ runner.temp }}/next/x86_64-pc-windows-msvc/*.msi
+          if-no-files-found: error
+
+  # Ubuntu 22.04: the packages need its glibc (2.35) or newer, not the
+  # newest runner's.
+  package-linux:
+    needs: version
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    outputs:
+      core-sha: ${{ steps.build.outputs.core-sha }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      NEXT: ${{ needs.version.outputs.next }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the build libraries
+        run: |
+          bash .github/scripts/install-ubuntu-packages.sh build-essential clang cmake pkg-config libssl-dev \
+            libfontconfig1-dev libfreetype6-dev libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev libxcb-dri3-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libwayland-dev libvulkan-dev libdbus-1-dev rpm2cpio cpio zstd
+      - uses: ./.github/actions/setup-tools
+        with:
+          tools: protoc python
+      - name: Install nfpm (pinned, checksum verified)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/nfpm.tar.gz" \
+            "https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          echo "$NFPM_SHA256  $RUNNER_TEMP/nfpm.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/nfpm" && tar -xzf "$RUNNER_TEMP/nfpm.tar.gz" -C "$RUNNER_TEMP/nfpm" nfpm
+          echo "$RUNNER_TEMP/nfpm" >> "$GITHUB_PATH"
+      - name: Build the release binaries and the packages
+        id: build
+        run: |
+          set -euo pipefail
+          cargo xtask fetch-cores --target x86_64-unknown-linux-gnu --github-env ETD_RELEASE_CORE
+          core=$(sed -n 's/^ETD_RELEASE_CORE=//p' "$GITHUB_ENV" | tail -n1)
+          echo "core-sha=$(sha256sum "$core" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          cargo build --release --locked -p etd-ui -p etd-host -p etd-ctl
+          cargo xtask dist --target x86_64-unknown-linux-gnu --package-version "$VERSION" \
+            --out "$RUNNER_TEMP/release" --sign-hook none
+          # The smoke upgrade target (see package-windows).
+          bin="$RUNNER_TEMP/next-bin"
+          mkdir -p "$bin"
+          cp target/release/etd-ui target/release/etd-host target/release/etd-ctl "$bin/"
+          printf '\0etd-release-smoke-next' >> "$bin/etd-host"
+          cargo xtask dist --target x86_64-unknown-linux-gnu --bin-dir "$bin" --package-version "$NEXT" \
+            --out "$RUNNER_TEMP/next" --sign-hook none
+      - name: Sign (not implemented, issue #2)
+        if: env.ETD_SIGNING_ENABLED == 'true'
+        run: |
+          echo "release signing is not implemented yet (issue #2)"
+          exit 1
+      - name: Check the packages' C library floor and test fixtures
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/release/x86_64-unknown-linux-gnu"
+          deb="$out/easytier-desktop_${VERSION}-1_amd64.deb"
+          rpm="$out/easytier-desktop-${VERSION}-1.x86_64.rpm"
+          arch="$out/easytier-desktop-${VERSION}-1-x86_64.pkg.tar.zst"
+          ls -l "$out"
+          dpkg-deb --info "$deb"
+          floor=$(dpkg-deb -f "$deb" Depends | sed -nE 's/.*libc6 \(>= ([0-9.]+)\).*/\1/p')
+          [[ -n "$floor" ]] || { echo "the deb has no libc6 lower bound"; exit 1; }
+          echo "the packages need glibc $floor or newer"
+          dpkg --compare-versions "$floor" le 2.35 || { echo "glibc $floor is newer than Ubuntu 22.04's 2.35"; exit 1; }
+          x="$RUNNER_TEMP/extract"
+          mkdir -p "$x/deb" "$x/rpm" "$x/arch"
+          dpkg-deb -x "$deb" "$x/deb"
+          (cd "$x/rpm" && rpm2cpio "$rpm" | cpio -idm --quiet)
+          tar --zstd -xf "$arch" -C "$x/arch"
+          python3 -I "$FIXTURE_CHECK" "$x/deb" "$x/rpm" "$x/arch"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-linux
+          path: |
+            ${{ runner.temp }}/release/x86_64-unknown-linux-gnu/*.deb
+            ${{ runner.temp }}/release/x86_64-unknown-linux-gnu/*.rpm
+            ${{ runner.temp }}/release/x86_64-unknown-linux-gnu/*.pkg.tar.zst
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: smoke-linux
+          path: |
+            ${{ runner.temp }}/next/x86_64-unknown-linux-gnu/*.deb
+            ${{ runner.temp }}/next/x86_64-unknown-linux-gnu/*.rpm
+          if-no-files-found: error
+
+  smoke-windows:
+    needs: [version, package-windows]
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      ETD_G2_CI: '1'
+      ETD_G2_SHA: ${{ needs.package-windows.outputs.core-sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-tools
+        with:
+          tools: python
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-windows
+          path: ${{ runner.temp }}/release
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: smoke-windows
+          path: ${{ runner.temp }}/next
+      - name: Install, upgrade and uninstall the release MSI (administrator)
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          NEXT: ${{ needs.version.outputs.next }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $python = mise which python
+          & $python -m pip install --require-hashes -r .github/scripts/tier3-requirements.txt
+          $env:ETD_RELEASE = Join-Path $env:RUNNER_TEMP "release/easytier-desktop-$env:VERSION-x86_64.msi"
+          $env:ETD_RELEASE_NEXT = Join-Path $env:RUNNER_TEMP "next/easytier-desktop-$env:NEXT-x86_64.msi"
+          # The release payload, extracted (an administrative image, nothing
+          # installed) to a folder the uninstall leaves alone.
+          $extract = Join-Path $env:RUNNER_TEMP 'payload'
+          $process = Start-Process msiexec.exe -ArgumentList '/a', "`"$env:ETD_RELEASE`"", '/qn', "TARGETDIR=`"$extract`"" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "msiexec /a exited $($process.ExitCode)" }
+          $env:ETD_G2_BIN = (Get-ChildItem -LiteralPath $extract -Recurse -Filter etd-host.exe | Select-Object -First 1).DirectoryName
+          Write-Output "release payload: $env:ETD_G2_BIN"
+          & $python -B -u crates/etd-testkit/tests/tier3/release.py msi_release
+      - name: Keep the MSI logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: smoke-windows-msi-logs
+          path: ${{ runner.temp }}/msi-logs
+          if-no-files-found: ignore
+
+  smoke-linux:
+    needs: [version, package-linux]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      ETD_G2_CI: '1'
+      ETD_G2_SHA: ${{ needs.package-linux.outputs.core-sha }}
+      VERSION: ${{ needs.version.outputs.version }}
+      NEXT: ${{ needs.version.outputs.next }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-tools
+        with:
+          tools: python
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-linux
+          path: ${{ runner.temp }}/release
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: smoke-linux
+          path: ${{ runner.temp }}/next
+      - name: Install the packages' dependencies first
+        run: |
+          set -euo pipefail
+          deb="$RUNNER_TEMP/release/easytier-desktop_${VERSION}-1_amd64.deb"
+          depends=$(dpkg-deb -f "$deb" Depends | sed -E 's/\([^)]*\)//g' | tr -d ' ' | tr ',' ' ')
+          bash .github/scripts/install-ubuntu-packages.sh $depends
+          sudo systemctl start systemd-resolved
+      - name: Install, upgrade and purge the release deb (root)
+        run: |
+          set -euo pipefail
+          python=$(mise which python)
+          "$python" -m pip install --require-hashes -r .github/scripts/tier3-requirements.txt
+          # The release payload, extracted to a folder the purge leaves alone.
+          dpkg-deb -x "$RUNNER_TEMP/release/easytier-desktop_${VERSION}-1_amd64.deb" "$RUNNER_TEMP/payload"
+          sudo env "PATH=$PATH" "RUNNER_TEMP=$RUNNER_TEMP" "GITHUB_WORKSPACE=$GITHUB_WORKSPACE" \
+            "GITHUB_ACTIONS=$GITHUB_ACTIONS" "RUNNER_ENVIRONMENT=$RUNNER_ENVIRONMENT" "ETD_G2_CI=$ETD_G2_CI" \
+            "ETD_G2_SHA=$ETD_G2_SHA" "ETD_G2_BIN=$RUNNER_TEMP/payload/usr/lib/easytier-desktop" \
+            "ETD_RELEASE=$RUNNER_TEMP/release/easytier-desktop_${VERSION}-1_amd64.deb" \
+            "ETD_RELEASE_NEXT=$RUNNER_TEMP/next/easytier-desktop_${NEXT}-1_amd64.deb" \
+            "$python" -B -u crates/etd-testkit/tests/tier3/release.py deb_release
+
+  # Fedora has no systemd in a container: this checks the rpm itself
+  # (scriptlets, files, upgrade, and that erasing it leaves nothing).
+  smoke-rpm:
+    needs: [version, package-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      NEXT: ${{ needs.version.outputs.next }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-linux
+          path: ${{ runner.temp }}/pkg/release
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: smoke-linux
+          path: ${{ runner.temp }}/pkg/next
+      # Fedora 43, pinned by the image index digest.
+      - name: Install, upgrade and erase the release rpm in Fedora 43
+        run: |
+          docker run --rm -v "$RUNNER_TEMP/pkg:/pkg:ro" -v "$GITHUB_WORKSPACE/.github/scripts:/scripts:ro" \
+            registry.fedoraproject.org/fedora@sha256:169d84d08158fc0fec43bc161ee3ca66fefdc88a5840fa615ae759c84c2298aa \
+            bash /scripts/rpm-smoke.sh \
+            "/pkg/release/easytier-desktop-${VERSION}-1.x86_64.rpm" "/pkg/next/easytier-desktop-${NEXT}-1.x86_64.rpm"
+
+  # Read-only: gather the four release packages and their checksums. A
+  # dispatch stops here with an artifact; nothing gets write permission.
+  checksums:
+    needs: [version, package-windows, package-linux, smoke-windows, smoke-linux, smoke-rpm]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-windows
+          path: release
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-linux
+          path: release
+      - name: Checksums over exactly the four release packages
+        working-directory: release
+        run: |
+          set -euo pipefail
+          expected=$(printf '%s\n' "easytier-desktop-${VERSION}-x86_64.msi" "easytier-desktop_${VERSION}-1_amd64.deb" \
+            "easytier-desktop-${VERSION}-1.x86_64.rpm" "easytier-desktop-${VERSION}-1-x86_64.pkg.tar.zst" | sort)
+          actual=$(find . -mindepth 1 -printf '%P\n' | sort)
+          if [[ "$actual" != "$expected" ]]; then
+            echo "release files differ from the four expected packages:"; diff <(echo "$expected") <(echo "$actual") || true
+            exit 1
+          fi
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ env.VERSION }}
+          path: release/*
+          if-no-files-found: error
+
+  # Only a v* tag makes a release, and only a draft a maintainer reviews and
+  # publishes. This is the one job with write permission.
+  release:
+    needs: [version, checksums]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-${{ needs.version.outputs.version }}
+          path: release
+      - name: Draft the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          (cd release && sha256sum -c SHA256SUMS.txt)
+          cat > notes.md <<EOF
+          EasyTier Desktop ${VERSION}: Windows MSI and Linux deb, rpm and Arch packages.
+
+          These packages are **unsigned** (issue #2): Windows SmartScreen warns about an
+          unknown publisher. Check downloads against SHA256SUMS.txt.
+          EOF
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "EasyTier Desktop ${VERSION}" \
+            --notes-file notes.md release/*

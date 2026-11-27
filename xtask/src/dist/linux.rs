@@ -37,7 +37,9 @@ const HOOKS: [(&str, &[&str]); 3] = [
 /// deb job, which prints both: the libraries `ldd` shows etd-ui linking
 /// (xcb, xkbcommon, glibc; etd-host and etd-ctl link glibc only), the ones
 /// etd-ui loads at run time (Vulkan, EGL, Wayland; renderdoc is an optional
-/// debugging hook), and the tools etd-host runs (nft, ip).
+/// debugging hook), the tools etd-host runs (nft, ip), and the icon theme
+/// whose folders the icons go into (it owns them; rpm would otherwise leave
+/// them behind empty).
 const DEB_DEPENDS: &[&str] = &[
     "libc6",
     "libgcc-s1",
@@ -51,6 +53,7 @@ const DEB_DEPENDS: &[&str] = &[
     "libwayland-egl1",
     "nftables",
     "iproute2",
+    "hicolor-icon-theme",
 ];
 const RPM_DEPENDS: &[&str] = &[
     "glibc",
@@ -64,6 +67,7 @@ const RPM_DEPENDS: &[&str] = &[
     "libwayland-egl",
     "nftables",
     "iproute",
+    "hicolor-icon-theme",
 ];
 const ARCH_DEPENDS: &[&str] = &[
     "glibc",
@@ -76,6 +80,7 @@ const ARCH_DEPENDS: &[&str] = &[
     "wayland",
     "nftables",
     "iproute2",
+    "hicolor-icon-theme",
 ];
 
 /// nfpm's architecture and each format's file-name architecture.
@@ -231,7 +236,10 @@ fn render(
     glibc: &str,
 ) -> Result<String> {
     let arch = arch(&payload.triple)?;
-    let mut cores = String::new();
+    let mut cores = format!(
+        "  - dst: \"{}\"\n    type: dir\n    file_info:\n      mode: 0755\n",
+        quoted(&format!("{LIB}/cores/{}", payload.core_version))
+    );
     for (index, name) in payload.core_files.iter().enumerate() {
         // The kernel executable comes first (cores::verify).
         let mode = if index == 0 { "0755" } else { "0644" };
@@ -444,6 +452,19 @@ mod tests {
             "src: \"/b \\\"q\\\"/payload/cores/2.7.1/easytier-core\"\n    dst: \"/usr/lib/easytier-desktop/cores/2.7.1/easytier-core\"\n    file_info:\n      mode: 0755"
         ));
         assert!(text.contains("dst: /usr/bin/easytier-desktop\n    type: symlink"));
+        // Every folder of the package's own is listed, so rpm removes it.
+        for dir in [
+            "/usr/lib/easytier-desktop\n",
+            "/usr/lib/easytier-desktop/cores\n",
+            "\"/usr/lib/easytier-desktop/cores/2.7.1\"\n",
+        ] {
+            assert!(
+                text.contains(&format!(
+                    "  - dst: {dir}    type: dir\n    file_info:\n      mode: 0755"
+                )),
+                "{dir}"
+            );
+        }
         assert!(text.contains("dst: /usr/bin/etd-ctl\n    type: symlink"));
         assert!(text.contains("dst: /usr/share/applications/easytier-desktop.desktop"));
         for size in ICON_SIZES {
@@ -470,6 +491,13 @@ mod tests {
         assert!(deb.contains("      - \"libc6 (>= 2.35)\"\n"), "{deb}");
         assert!(rpm.contains("      - \"glibc >= 2.35\"\n"), "{rpm}");
         assert!(arch.contains("      - \"glibc\"\n"), "{arch}");
+        // The icon folders belong to the icon theme every format requires.
+        for format in [deb, rpm, arch] {
+            assert!(
+                format.contains("      - \"hicolor-icon-theme\"\n"),
+                "{format}"
+            );
+        }
         // A Vulkan driver is recommended, not required.
         assert!(
             deb.contains("recommends:\n      - \"mesa-vulkan-drivers | vulkan-icd\""),

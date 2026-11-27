@@ -1,0 +1,7 @@
+# The tier-three smoke tests' Python dependencies, hash-locked
+# (pip install --require-hashes -r). Hashes from PyPI for the Windows and
+# Linux x86_64 wheels.
+psutil==7.0.0 \
+    --hash=sha256:4cf3d4eb1aa9b348dec30105c55cd9b7d4629285735a102beb4441e38db90553 \
+    --hash=sha256:1e744154a6580bc968a0195fd25e80432d3afec619daf145b9e5ba16cc1d688e \
+    --hash=sha256:4b1388a4f6875d7e2aff5c4ca1cc16c545ed41dd8bb596cefea80111db353a34

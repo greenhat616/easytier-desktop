@@ -26,6 +26,16 @@ description: |-
   installs and starts the service; removing it uninstalls the service.
 
 contents:
+  # The package's own folders, listed so that every format owns them: rpm
+  # removes only folders a package lists, and would leave these behind.
+  - dst: /usr/lib/easytier-desktop
+    type: dir
+    file_info:
+      mode: 0755
+  - dst: /usr/lib/easytier-desktop/cores
+    type: dir
+    file_info:
+      mode: 0755
   - src: "@PAYLOAD@/etd-ui"
     dst: /usr/lib/easytier-desktop/etd-ui
     file_info:

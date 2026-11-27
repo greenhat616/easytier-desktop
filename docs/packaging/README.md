@@ -1,8 +1,9 @@
 # Packaging
 
 Release packages are built by `cargo xtask dist` (see [`xtask/README.md`](../../xtask/README.md)).
-This release builds the Windows MSI (PK3) and Linux `.deb`/`.rpm`/Arch packages (PK4); the
-release workflow comes with PK5, and macOS is not packaged this release. The plan is
+This release builds the Windows MSI (PK3) and Linux `.deb`/`.rpm`/Arch packages (PK4),
+and `.github/workflows/release-package.yml` builds, checks and smoke tests them for a
+release (PK5); macOS is not packaged this release. The plan is
 doc#16 v2 in topic#53.
 
 ## Two folders
@@ -236,7 +237,8 @@ record:
 
 **First install fails** (`etd-host install` exits non-zero). `etd-host install` rolls
 back what it created; if its rollback is incomplete it says so, and
-`/usr/lib/easytier-desktop/etd-host uninstall` resumes the cleanup. Fix the cause, then
+`/usr/lib/easytier-desktop/etd-host uninstall --only-owner easytier-desktop-package`
+resumes the cleanup. Fix the cause, then
 `dpkg --configure -a` on deb, or on rpm and Arch run
 `/usr/lib/easytier-desktop/etd-host install --owner easytier-desktop-package`; or remove
 the package.
@@ -249,8 +251,12 @@ the package.
 | --- | --- | --- |
 | `upgrade rolled back` / `upgrade stopped; the previous service was restarted` | the previous version, restored and serving | fix the cause, then rerun the upgrade (below) |
 | `…the ledger was (or may have been) migrated by the new version, so the previous host runs diagnostics-only` (or `whether the new version migrated the ledger is unknown`) | the previous version, diagnostics only: networks do not start | rerun the upgrade (below); the new version opens the migrated ledger |
-| `…the previous service did not restart` | stopped | rerun the upgrade, or `/usr/local/lib/easytier-desk/etd-host resume-service` |
-| `rollback incomplete…; the service stays disabled` or `an interrupted upgrade could not be restored` | disabled | rerun the upgrade, or `etd-host uninstall` and install again |
+| `…the previous service did not restart` | stopped | rerun the upgrade, or `/usr/local/lib/easytier-desk/etd-host resume-service` (see below) |
+| `rollback incomplete…; the service stays disabled` or `an interrupted upgrade could not be restored` | disabled | rerun the upgrade, or `/usr/local/lib/easytier-desk/etd-host uninstall --only-owner easytier-desktop-package` and install again |
+
+`resume-service` only re-enables and starts an installation whose journal records no
+upgrade in progress; it refuses while one is recorded (an incomplete rollback or an
+interrupted upgrade), and then only rerunning the upgrade or uninstalling helps.
 
 Rerunning the upgrade: `dpkg --configure -a` on deb; on rpm and Arch,
 `/usr/lib/easytier-desktop/etd-host upgrade --only-owner easytier-desktop-package`. Until
@@ -263,7 +269,8 @@ service serving, and `dpkg --configure -a` completing the upgrade.
 
 **Removal fails** (`etd-host uninstall` exits non-zero): dpkg and rpm keep the package
 installed; run the removal again, `etd-host uninstall` resumes from its journal. pacman
-removes the files anyway: run `/usr/local/lib/easytier-desk/etd-host uninstall`.
+removes the files anyway: run
+`/usr/local/lib/easytier-desk/etd-host uninstall --only-owner easytier-desktop-package`.
 
 **Downgrades are not supported.** apt, dnf and pacman will install an older package, but
 its postinst runs the older `etd-host upgrade`, which may refuse the ledger the newer
@@ -281,7 +288,8 @@ from `dpkg -S`) and the library names it holds for loading at run time:
 | `etd-ui` | glibc, libgcc, libxcb, libxcb-xkb, libxkbcommon, libxkbcommon-x11 | Vulkan, EGL, Wayland client and EGL (renderdoc is an optional debugging hook, not a dependency) |
 | `etd-host`, `etd-ctl` | glibc, libgcc | nothing more |
 
-`etd-host` also runs `nft` and `ip` (`nftables`, `iproute2`). The deb names are installed
+`etd-host` also runs `nft` and `ip` (`nftables`, `iproute2`), and the icons go into
+`hicolor-icon-theme`'s folders, so every format depends on that package, which owns them. The deb names are installed
 by that job; the rpm and Arch names are their equivalents and are not installed by any
 test yet (PK5).
 
@@ -292,6 +300,35 @@ test yet (PK5).
 - **A Vulkan driver** is recommended, not required (the loader is a dependency):
   deb `Recommends: mesa-vulkan-drivers | vulkan-icd`, rpm `Recommends: mesa-vulkan-drivers`,
   Arch `optdepends` `vulkan-driver`. Without one, `etd-ui` cannot open its window.
+
+## Release workflow
+
+`.github/workflows/release-package.yml` runs on a `v*` tag (which must name the workspace
+version) and by hand (`workflow_dispatch`). It builds from the tree alone, with no build
+cache:
+
+| Job | Runner | What |
+| --- | --- | --- |
+| `package-windows` | windows-latest | release binaries, WiX 7.0.1, `cargo xtask dist` → the MSI; its administrative image (`msiexec /a`) must carry no CI test-fixtures marker |
+| `package-linux` | **ubuntu-22.04** | release binaries, nfpm 2.49.0 (SHA-256 checked) → deb, rpm and Arch; the C library floor must be 2.35 or older, and the extracted deb, rpm and Arch contents must carry no CI test-fixtures marker |
+| `smoke-windows` | windows-latest | `tests/tier3/release.py msi_release`: install, upgrade, uninstall, machine compared with before |
+| `smoke-linux` | ubuntu-22.04 | `release.py deb_release`: the same with apt, on the oldest supported Ubuntu |
+| `smoke-rpm` | Fedora 43 container | `.github/scripts/rpm-smoke.sh`: scriptlets parse, root-owned files and modes, upgrade, and erasing leaves the file system as before the install (empty folders included); no systemd, so the hooks only print their notice |
+| `checksums` | ubuntu-latest | read-only: the two package artifacts by name, which must hold exactly the four release packages, and `SHA256SUMS.txt` over them |
+| `release` | ubuntu-latest | only on a `v*` tag, and the only job with `contents: write`: a **draft** GitHub release with the packages, the sums and an unsigned-package notice, which a maintainer reviews and publishes |
+
+Every action is pinned by commit SHA and the Fedora image by digest; nfpm, the WiX
+7.0.1 and WixToolset.Util.wixext 7.0.1 packages (installed through a NuGet
+configuration whose only source is the checked folder, and the extracted extension
+compared with the package) and the smoke tests' Python dependencies
+(`.github/scripts/tier3-requirements.txt`, `pip --require-hashes`) are SHA-256 checked.
+A manual run never gets write permission.
+
+The smoke upgrades go to a test-only package of the next patch version (the same
+binaries with bytes appended to `etd-host`), which is never published. The packages
+are unsigned (issue #2): `dist` runs `--sign-hook none`, and a placeholder step fails
+if `ETD_SIGNING_ENABLED` is set. The Arch package is built and checked for fixtures but
+not installed by any smoke test.
 
 ## Application icons
 

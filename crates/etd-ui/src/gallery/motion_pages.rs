@@ -394,15 +394,18 @@ fn button(
     cx: &mut Context<Gallery>,
     f: impl Fn(&mut Gallery, &mut Context<Gallery>) + 'static,
 ) -> AnyElement {
-    action_button(
-        id,
-        label,
-        BtnStyle::new(ButtonVariant::Default, Size::Medium),
-        cx.listener(move |this, _: &gpui_kit::ClickEvent, _, cx| {
-            f(this, cx);
-            cx.notify();
-        }),
-    )
+    // In a row of its own, so a lone button keeps its natural width.
+    row()
+        .child(action_button(
+            id,
+            label,
+            BtnStyle::new(ButtonVariant::Default, Size::Medium),
+            cx.listener(move |this, _: &gpui_kit::ClickEvent, _, cx| {
+                f(this, cx);
+                cx.notify();
+            }),
+        ))
+        .into_any_element()
 }
 
 fn row() -> gpui_kit::Div {

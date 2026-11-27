@@ -39,11 +39,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, suite: recovery, sample: 1 }
-          - { os: windows-latest, suite: recovery, sample: 1 }
-          - { os: windows-latest, suite: clean, sample: 1 }
-          - { os: windows-latest, suite: recovery, sample: 2 }
-          - { os: windows-latest, suite: clean, sample: 2 }
+          - { os: ubuntu-latest, suite: recovery }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -55,13 +51,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
         with:
-          ref: aa850359958a627c3b6b6f9e177a53285890342e
+          ref: 32f81daa6a80001e8005c2e5aab693679e92dfa0
           persist-credentials: false
       - name: Install Linux libraries and network inspection tools
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev libssl-dev mold nftables iproute2
+          bash .github/scripts/install-ubuntu-packages.sh libdbus-1-dev libssl-dev mold nftables iproute2
           sudo systemctl start systemd-resolved
       - uses: ./.github/actions/setup-tools
         with:

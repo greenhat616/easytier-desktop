@@ -303,7 +303,9 @@ buf breaking --against ".git#ref=$(git merge-base origin/main HEAD)"
 ```
 
 The `contract` job of `ci.yml` runs the same checks on every push, with `buf`
-1.75.0; on `main` the second comparison is against its previous commit. The
+1.75.0; on `main` the second comparison is against its previous commit. The second
+comparison passes `buf.yaml`'s module and rules inline without `ignore_only`, so a new
+cardinality change in `host.proto` still fails it. The
 descriptor baseline test runs in CI too (through `cargo nextest run --workspace`).
 
 ## Changing the contract

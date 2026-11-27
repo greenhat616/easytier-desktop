@@ -32,7 +32,9 @@ jobs:
       - run: cargo xtask check-boundaries
   # The contract rules of buf.yaml. `buf breaking` compares with the
   # freeze-v1 tag and with where this change starts (main's previous commit
-  # on main, the merge base with main elsewhere).
+  # on main, the merge base with main elsewhere). The second comparison uses
+  # buf.yaml's module and rules without its ignore_only, which exists only
+  # for the freeze-v1 baseline: keep the two in step.
   contract:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -53,7 +55,8 @@ jobs:
           else
             base=$(git merge-base origin/main HEAD)
           fi
-          buf breaking --against ".git#ref=$base"
+          config='{"version":"v2","modules":[{"path":"crates/etd-contract/proto"}],"breaking":{"use":["FILE"]}}'
+          buf breaking --config "$config" --against ".git#ref=$base"
   check:
     strategy:
       fail-fast: false

@@ -129,7 +129,8 @@ How a change is approved:
 - Within `etd.v1` only additive changes are allowed. `buf breaking` against
   `freeze-v1` and against the start of the change must pass. `buf.yaml` exempts
   `host.proto` from `FIELD_SAME_CARDINALITY` for the two `NetworkFlags` fields that
-  `3dcf200` gave explicit presence (wire compatible, approved).
+  `3dcf200` gave explicit presence (wire compatible, approved). The exemption is for
+  the `freeze-v1` baseline only: CI compares with the start of the change without it.
 - The descriptor baseline `crates/etd-contract/tests/baseline/etd.v1.txt` is checked
   by the tests. After an approved additive change, regenerate it with
   `ETD_UPDATE_BASELINE=1 cargo nextest run -p etd-contract` and include the diff in

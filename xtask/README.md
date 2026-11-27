@@ -104,7 +104,8 @@ cargo xtask dist --bin-dir target/debug --cores target/debug/cores/2.7.1 --out o
    `core_lock.rs`: the executable and every companion with its SHA-256, and no other file.
    Only the payload that was checked is packaged. The staged `etd-host` must embed every
    digest of that row (it was built from the same `cores.lock`) and must not carry the CI
-   fault hook (`ci-test-fixtures`, recognised by its `ci-upgrade-fault` file name); on
+   fault hook (`ci-test-fixtures`, recognised by the `ETD-CI-TEST-FIXTURES-BUILD` marker
+   that feature compiles in); on
    Windows `etd-ui.exe` must be a GUI-subsystem (release) build, so it opens no console.
    `--allow-test-fixtures` lifts the last two checks for CI test packages.
 3. Runs the target's packager: on Windows (`dist/windows.rs`) it renders

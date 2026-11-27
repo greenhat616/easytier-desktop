@@ -59,9 +59,9 @@ pub struct Args {
     allow_test_fixtures: bool,
 }
 
-/// Compiled into etd-host only with the ci-test-fixtures feature (the CI
-/// upgrade fault's trigger file name).
-const TEST_FIXTURE_MARKER: &[u8] = b"ci-upgrade-fault";
+/// etd-sysfx-os's `CI_TEST_FIXTURES_MARKER`: in every binary built with the
+/// ci-test-fixtures feature and in no other.
+const TEST_FIXTURE_MARKER: &[u8] = b"ETD-CI-TEST-FIXTURES-BUILD";
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
@@ -331,7 +331,7 @@ mod tests {
         let release = format!("prefix{}middle{}suffix", digests[0], digests[1]).into_bytes();
         check_host(&release, &digests, false).unwrap();
         let mut fixtures = release.clone();
-        fixtures.extend_from_slice(b"maintenance/ci-upgrade-fault");
+        fixtures.extend_from_slice(b"\0ETD-CI-TEST-FIXTURES-BUILD\0");
         let error = check_host(&fixtures, &digests, false).unwrap_err();
         assert!(
             format!("{error:#}").contains("ci-test-fixtures"),

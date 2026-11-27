@@ -143,6 +143,13 @@ jobs:
           # Non-commercial open source use of the WiX 7 binaries (msg#1468).
           wix eula accept wix7
           wix extension add -g WixToolset.Util.wixext/7.0.1
+          # The fixture build carries the marker: dist must refuse it unless allowed.
+          $PSNativeCommandUseErrorActionPreference = $false
+          $refused = cargo xtask dist --dry-run --bin-dir target/debug --cores target/debug/cores/2.7.1 --out (Join-Path $env:RUNNER_TEMP 'msi-refused') 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ($code -eq 0 -or $refused -notmatch 'built with ci-test-fixtures') { throw "dist did not refuse the ci-test-fixtures etd-host (exit $code): $refused" }
+          Write-Output "dist refused the ci-test-fixtures etd-host without --allow-test-fixtures"
           foreach ($package in @(@('A', '0.1.0'), @('A2', '0.1.0'), @('B', '0.1.1'), @('C', '0.1.2'))) {
             $name, $version = $package
             $bin = Join-Path $env:RUNNER_TEMP "msi-bin-$name"

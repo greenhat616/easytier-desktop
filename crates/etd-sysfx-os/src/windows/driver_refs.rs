@@ -441,11 +441,45 @@ const MODULE_NAME: usize = 3 * std::mem::size_of::<usize>() + 16;
 const MODULE_NAME_LEN: usize = 256;
 const MODULE_ENTRY: usize = MODULE_NAME + MODULE_NAME_LEN;
 
+/// Whether `path` is a complete absolute native image path: `\SystemRoot\`,
+/// `\??\` with a drive, `UNC\` or `Volume{...}` root, `\Device\`, or a drive
+/// root, followed by non-empty components (no `.` or `..`). A bare name or a
+/// relative path is not, though the registered-image normalizer would place
+/// it under the Windows directory.
+fn native_absolute(path: &str) -> bool {
+    fn drive(path: &str) -> Option<&str> {
+        let bytes = path.as_bytes();
+        (bytes.len() > 3 && bytes[0].is_ascii_alphabetic() && &bytes[1..3] == b":\\")
+            .then(|| &path[3..])
+    }
+    let tail = if let Some(tail) = strip_prefix_ci(path, r"\SystemRoot\") {
+        Some(tail)
+    } else if let Some(tail) = strip_prefix_ci(path, r"\Device\") {
+        Some(tail)
+    } else if let Some(rest) = strip_prefix_ci(path, r"\??\") {
+        drive(rest)
+            .or_else(|| strip_prefix_ci(rest, r"UNC\"))
+            .or_else(|| {
+                strip_prefix_ci(rest, "Volume{")
+                    .and_then(|volume| volume.split_once("}\\"))
+                    .map(|(_, tail)| tail)
+            })
+    } else {
+        drive(path)
+    };
+    tail.is_some_and(|tail| {
+        !tail.is_empty()
+            && tail
+                .split('\\')
+                .all(|part| !part.is_empty() && part != "." && part != "..")
+    })
+}
+
 /// The paths in a `SystemModuleInformation` buffer. Any entry whose path is
-/// empty, unterminated, possibly truncated (255 bytes fill the field),
-/// inconsistent with its file-name offset, not decodable, or holding a `?`
-/// past a leading `\??\` (a character the kernel could not convert) fails
-/// the whole list.
+/// empty, unterminated, possibly truncated (255 bytes fill the field), not a
+/// complete absolute native path, whose file-name offset is not exactly
+/// past its last separator, not decodable, or holding a `?` past a leading
+/// `\??\` (a character the kernel could not convert) fails the whole list.
 fn parse_modules(
     bytes: &[u8],
     ansi: impl Fn(&[u8]) -> Result<String, WinError>,
@@ -475,7 +509,10 @@ fn parse_modules(
         if len >= MODULE_NAME_LEN - 1 {
             return Err(error("kernel module path may be truncated"));
         }
-        if offset >= len || (offset > 0 && name[offset - 1] != b'\\') {
+        // The file name starts right after the last separator. A DBCS trail
+        // byte equal to '\' in the name fails here, closed.
+        let separator = name[..len].iter().rposition(|byte| *byte == b'\\');
+        if offset == 0 || offset >= len || separator != Some(offset - 1) {
             return Err(error("inconsistent kernel module path"));
         }
         let path = ansi(&name[..len])?;
@@ -485,6 +522,11 @@ fn parse_modules(
         {
             return Err(error(format!(
                 "kernel module path not representable: {path}"
+            )));
+        }
+        if !native_absolute(&path) {
+            return Err(error(format!(
+                "kernel module path is not a complete absolute path: {path}"
             )));
         }
         images.push(path);
@@ -544,7 +586,10 @@ fn module_images() -> Result<Vec<String>, WinError> {
                     status.0
                 )));
             }
-            let written = (written as usize).min(length as usize);
+            if written == 0 || written > length {
+                return Err(error("inconsistent kernel module list size"));
+            }
+            let written = written as usize;
             // SAFETY: the buffer is initialized; read its first `written` bytes.
             let bytes =
                 unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), written) };
@@ -1137,12 +1182,23 @@ mod tests {
         bytes
     }
 
+    /// One module whose file-name offset is `offset`, whatever the path.
+    fn offset_at(path: &[u8], offset: u16) -> Vec<u8> {
+        let mut bytes = modules(&[path]);
+        bytes[MODULES_HEADER + MODULE_NAME - 2..MODULES_HEADER + MODULE_NAME]
+            .copy_from_slice(&offset.to_le_bytes());
+        bytes
+    }
+
     #[test]
     fn the_kernel_module_list_yields_complete_paths_or_fails() {
-        let paths: [&[u8]; 3] = [
+        let paths: [&[u8]; 6] = [
             br"\SystemRoot\system32\ntoskrnl.exe",
             br"\SystemRoot\System32\drivers\wintun.sys",
             br"\??\C:\Program Files\EasyTierDesk\cores\abc\WinDivert64.sys",
+            br"\??\UNC\server\share\x.sys",
+            br"\??\Volume{01234567-89ab-cdef-0123-456789abcdef}\x.sys",
+            br"\Device\HarddiskVolume3\Windows\x.sys",
         ];
         let parsed = parse_modules(&modules(&paths), ansi_path).unwrap();
         assert_eq!(
@@ -1168,6 +1224,40 @@ mod tests {
             (unterminated, "unterminated"),
             (bad_offset, "inconsistent"),
             (modules(&[br"\??\C:\Drivers\caf?.sys"]), "not representable"),
+            (modules(&[b"ntoskrnl.exe"]), "inconsistent"),
+            (
+                modules(&[br"system32\drivers\x.sys"]),
+                "not a complete absolute path",
+            ),
+            (
+                modules(&[br"\Windows\System32\drivers\x.sys"]),
+                "not a complete absolute path",
+            ),
+            (
+                modules(&[br"\??\C:\Drivers\.\x.sys"]),
+                "not a complete absolute path",
+            ),
+            (
+                modules(&[br"\??\C:\Drivers\\x.sys"]),
+                "not a complete absolute path",
+            ),
+            (
+                modules(&[br"\??\Drivers\x.sys"]),
+                "not a complete absolute path",
+            ),
+            (modules(&[br"\SystemRoot\"]), "inconsistent"),
+            (
+                offset_at(br"\SystemRoot\System32\drivers\x.sys", 0),
+                "inconsistent",
+            ),
+            (
+                offset_at(br"\SystemRoot\System32\drivers\x.sys", 12),
+                "inconsistent",
+            ),
+            (
+                offset_at(br"\SystemRoot\System32\drivers\x.sys", 31),
+                "inconsistent",
+            ),
             (short, "count"),
             (none, "count"),
             (vec![1, 0], "short"),

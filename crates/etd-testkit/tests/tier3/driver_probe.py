@@ -97,7 +97,7 @@ def module_list():
         raw = buffer.raw[:written.value]
         break
     count = int.from_bytes(raw[:4], "little")
-    entries, problems = [], []
+    entries, problems, shapes = [], [], {}
     for index in range(count):
         entry = raw[HEADER + index * ENTRY:HEADER + (index + 1) * ENTRY]
         if len(entry) < ENTRY:
@@ -111,14 +111,53 @@ def module_list():
             continue
         if end >= NAME_LEN - 1:
             problems.append(f"entry {index}: path may be truncated")
-        if offset >= end or (offset and name[offset - 1:offset] != b"\\"):
+        # Exactly past the last separator, as driver_refs.rs requires.
+        if offset == 0 or offset >= end or name.rfind(b"\\", 0, end) != offset - 1:
             problems.append(f"entry {index}: file name offset {offset} inconsistent")
         path = name[:end].decode("mbcs", errors="replace")
         rest = path[4:] if path.startswith("\\??\\") else path
         if "?" in rest or "�" in path:
             problems.append(f"entry {index}: not representable: {path}")
+        if not native_absolute(path):
+            problems.append(f"entry {index}: not a complete absolute path: {path}")
+        shapes[shape(path)] = shapes.get(shape(path), 0) + 1
         entries.append(path)
-    return count, entries, problems
+    return count, entries, problems, shapes
+
+
+def shape(path):
+    """The root form of a module path, for the report."""
+    lower = path.lower()
+    for prefix in ("\\systemroot\\", "\\device\\", "\\??\\unc\\", "\\??\\volume{"):
+        if lower.startswith(prefix):
+            return prefix
+    if lower.startswith("\\??\\") and lower[5:7] == ":\\":
+        return "\\??\\<drive>:\\"
+    if lower[1:3] == ":\\":
+        return "<drive>:\\"
+    return "other"
+
+
+def native_absolute(path):
+    """driver_refs.rs native_absolute: a native root, then non-empty
+    components without . or .."""
+    lower = path.lower()
+    def drive(value):
+        return value[3:] if len(value) > 3 and value[0].isascii() and value[0].isalpha() and value[1:3] == ":\\" else None
+    if lower.startswith("\\systemroot\\"):
+        tail = path[len("\\systemroot\\"):]
+    elif lower.startswith("\\device\\"):
+        tail = path[len("\\device\\"):]
+    elif lower.startswith("\\??\\"):
+        rest = path[4:]
+        tail = drive(rest)
+        if tail is None and rest.lower().startswith("unc\\"):
+            tail = rest[4:]
+        if tail is None and rest.lower().startswith("volume{") and "}\\" in rest:
+            tail = rest.split("}\\", 1)[1]
+    else:
+        tail = drive(path)
+    return bool(tail) and all(part not in ("", ".", "..") for part in tail.split("\\"))
 
 
 def build():
@@ -132,14 +171,14 @@ def main():
     removed = set_debug(SE_PRIVILEGE_REMOVED)
     enable = set_debug(SE_PRIVILEGE_ENABLED)
     bases = driver_bases()
-    count, entries, problems = module_list()
+    count, entries, problems, shapes = module_list()
     number, display = build()
     print(json.dumps({
         "build": number, "display_version": display,
         "debug_privilege_removed": removed == 0,
         "debug_privilege_enable_refused": enable == ERROR_NOT_ALL_ASSIGNED,
         "enum_count": len(bases), "enum_null_bases": sum(1 for base in bases if not base),
-        "module_count": count, "modules": entries, "problems": problems,
+        "module_count": count, "modules": entries, "problems": problems, "shapes": shapes,
     }))
 
 

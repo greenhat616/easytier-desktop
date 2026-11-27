@@ -7,7 +7,7 @@
 use std::rc::Rc;
 
 use gpui_kit::{
-    AnyElement, App, ClickEvent, ElementId, InteractiveElement as _, IntoElement,
+    AnyElement, App, ClickEvent, ElementId, InteractiveElement as _, IntoElement, KeyDownEvent,
     ParentElement as _, Pixels, Point, Role, SharedString, StatefulInteractiveElement as _,
     Styled as _, TestSupportExt as _, Toggled, Window, anchored,
     base::LogicalStyledExt as _,
@@ -16,7 +16,10 @@ use gpui_kit::{
 };
 
 use crate::theme::{self, ControlState};
-use crate::views::controls::{flyout_surface, light_dismiss_layer};
+use crate::views::controls::{
+    DismissHandler, flyout_keys, flyout_surface, focus_return, light_dismiss_layer,
+};
+use crate::views::ui::keyboard_focus;
 
 pub type MenuHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
@@ -104,11 +107,16 @@ fn divider(cx: &App) -> gpui_kit::Hsla {
 }
 
 /// MenuFlyoutPresenter content: padding 0,2,0,2 (MenuFlyoutPresenterThemePadding),
-/// items with MenuFlyoutItemMargin 4,2,4,2, MenuFlyoutItemThemePadding
-/// 11,8,11,9 and MenuFlyoutThemeMinHeight 32; `SubtleFillColorSecondary`
+/// items with MenuFlyoutItemMargin 4,2,4,2, MenuFlyoutItemThemePaddingNarrow
+/// 11,4,11,5 (the padding WinUI uses when the menu is opened by mouse, pen
+/// or keyboard: MenuFlyoutItemBase::GetShouldBeNarrow) and
+/// MenuFlyoutThemeMinHeight 32; `SubtleFillColorSecondary`
 /// on hover and `SubtleFillColorTertiary` pressed. When any item has a check
 /// or an icon the labels share a 28 px column (MenuFlyoutItemPlaceholderThemeThickness),
-/// 56 px when items have both (…DoublePlaceholderThemeThickness).
+/// 56 px when the menu has both a checkable item and an item with an icon
+/// (…DoublePlaceholderThemeThickness; MenuFlyoutItem::UpdateVisualState
+/// picks CheckAndIconPlaceholder from the presenter-wide flags). Up and
+/// Down move between items and Escape closes the menu.
 /// Accelerator text is `TextFillColorSecondary`, 24 px after the label, and
 /// a sub-item's chevron sits 24 px after it (MenuFlyoutItemChevronMargin).
 /// Separators are 1 px `DividerStrokeColorDefault` with 1 px above and
@@ -182,8 +190,8 @@ pub fn menu_content(
                 .min_h(px(32.))
                 .ps(px(11. + indent), cx)
                 .pe(px(11.), cx)
-                .pt(px(8.))
-                .pb(px(9.))
+                .pt(px(4.))
+                .pb(px(5.))
                 .rounded(px(4.))
                 .flex()
                 .flex_row()
@@ -247,6 +255,13 @@ pub fn menu_content(
                                     flyout_surface(cx)
                                         .id("menu-submenu-surface")
                                         .occlude()
+                                        .on_key_down(|event: &KeyDownEvent, window, cx| {
+                                            // Left returns to the parent menu.
+                                            if event.keystroke.key == "left" {
+                                                window.focus_prev(cx);
+                                                cx.stop_propagation();
+                                            }
+                                        })
                                         .child(menu_content(sub_id, sub, 160., cx)),
                                 ),
                             )
@@ -255,6 +270,13 @@ pub fn menu_content(
                     );
                 }
             }
+            let row = if item.disabled {
+                row.into_any_element()
+            } else {
+                keyboard_focus(item.id.clone(), move |focus| {
+                    row.track_focus(focus).into_any_element()
+                })
+            };
             wrapper.child(row).into_any_element()
         }
     });
@@ -307,20 +329,19 @@ pub fn menu_flyout(
     if let Some(at) = at {
         anchor = anchor.position(at);
     }
+    let on_dismiss: DismissHandler = Rc::new(on_dismiss);
+    let layer_dismiss = on_dismiss.clone();
+    let surface = flyout_surface(cx)
+        .id("menu-surface")
+        .occlude()
+        .mt(px(4.))
+        .child(focus_return(id))
+        .child(menu_content(id, entries, 160., cx));
     div()
-        .child(light_dismiss_layer(on_dismiss))
-        .child(
-            deferred(
-                anchor.child(
-                    flyout_surface(cx)
-                        .id("menu-surface")
-                        .occlude()
-                        .mt(px(4.))
-                        .child(menu_content(id, entries, 160., cx)),
-                ),
-            )
-            .with_priority(2),
-        )
+        .child(light_dismiss_layer(move |window, cx| {
+            layer_dismiss(window, cx)
+        }))
+        .child(deferred(anchor.child(flyout_keys(surface, on_dismiss))).with_priority(2))
         .into_any_element()
 }
 
@@ -434,13 +455,16 @@ pub fn command_bar(
                 icon,
                 toggled,
                 on_click,
-            } => button(SharedString::from(id), Some(label), icon, toggled, cx)
-                .on_click(move |e, w, cx| on_click(e, w, cx))
-                .into_any_element(),
+            } => {
+                let el = button(SharedString::from(id), Some(label), icon, toggled, cx)
+                    .on_click(move |e, w, cx| on_click(e, w, cx));
+                keyboard_focus(id, move |focus| el.track_focus(focus).into_any_element())
+            }
         });
     }
+    let more_id = SharedString::from(format!("{id}-more"));
     let more = button(
-        SharedString::from(format!("{id}-more")),
+        more_id.clone(),
         None,
         "fluent/more-horizontal.svg",
         None,
@@ -448,6 +472,9 @@ pub fn command_bar(
     )
     .aria_expanded(overflow_open)
     .on_click(on_more);
+    let more = keyboard_focus(more_id, move |focus| {
+        more.track_focus(focus).into_any_element()
+    });
     div()
         .flex()
         .flex_col()

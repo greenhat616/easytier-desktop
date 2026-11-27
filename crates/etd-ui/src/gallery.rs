@@ -609,6 +609,16 @@ mod tests {
 
     #[gpui_kit::test]
     fn gallery_exercises_controls_without_host(cx: &mut TestAppContext) {
+        fn tab_to(window: &mut gpui_kit::Window, id: &'static str, cx: &mut gpui_kit::App) {
+            for _ in 0..60 {
+                window.press("tab", cx);
+                window.render_frame(cx);
+                if window.find(id).focused() == Some(true) {
+                    return;
+                }
+            }
+            panic!("Tab never reached {id}");
+        }
         let (handle, view) = cx.update(|cx| {
             gpui_kit::init(cx);
             theme::install_palette(cx);
@@ -694,6 +704,84 @@ mod tests {
             window.click("bar-refresh", cx);
             window.render_frame(cx);
             assert_eq!(view.read(cx).demo_last().as_ref(), "Refresh");
+        })
+        .unwrap();
+        // Closing the overflow menu gave focus back to its More button.
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("command-bar-more").focused(), Some(true));
+
+            // Keyboard: every control is a Tab stop that Enter or Space
+            // activates, and open flyouts take Up, Down and Escape.
+            tab_to(window, "menu-button", cx);
+            assert!(window.find("fluent-focus-visual").visible());
+            window.press("enter", cx);
+            window.render_frame(cx);
+            assert!(window.find("menu-flyout").visible());
+        })
+        .unwrap();
+        // The open menu took focus; Down reaches its first item, Escape
+        // closes it and focus goes back to the button.
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.press("down", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("menu-open").focused(), Some(true));
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("menu-flyout").is_none());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("menu-button").focused(), Some(true));
+            tab_to(window, "bar-add", cx);
+            window.press("space", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_last().as_ref(), "Add");
+
+            window.click("gallery-nav-settings", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("settings-spatial").is_none());
+            tab_to(window, "settings-sound-header", cx);
+            window.press("enter", cx);
+            window.render_frame(cx);
+            assert!(window.find("settings-spatial").visible());
+            // Pressing a control in the header leaves the expander alone.
+            window.click("settings-sound-switch", cx);
+            window.render_frame(cx);
+            assert!(window.find("settings-spatial").visible());
+
+            window.click("gallery-nav-basic-input", cx);
+            window.render_frame(cx);
+            tab_to(window, "basic-combo", cx);
+            window.press("enter", cx);
+            window.render_frame(cx);
+            assert!(window.find("basic-combo-popup").visible());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("basic-combo-popup").is_none());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("basic-combo").focused(), Some(true));
+            tab_to(window, "basic-check-two", cx);
+            window.press("space", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("basic-check-two").checked(), Some(true));
+            window.click("basic-number", cx);
+            window.render_frame(cx);
+            window.press("up", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_number(cx).as_ref(), "14");
         })
         .unwrap();
     }
@@ -834,11 +922,14 @@ mod tests {
                 .unwrap()
                 .save(output.join(format!("gallery-basic-input-{name}-open.png")))
                 .unwrap();
-            // Menus page: the MenuFlyout with its submenu open.
+            // Menus page: the MenuFlyout with its submenu open, and the
+            // Preview AppBarToggleButton checked.
             cx.update_window(handle, |_, window, cx| {
                 window.click("basic-combo", cx);
                 window.render_frame(cx);
                 window.click("gallery-nav-menus", cx);
+                window.render_frame(cx);
+                window.click("bar-preview", cx);
                 window.render_frame(cx);
                 window.click("menu-button", cx);
                 window.render_frame(cx);
@@ -850,6 +941,31 @@ mod tests {
             cx.capture_screenshot(handle)
                 .unwrap()
                 .save(output.join(format!("gallery-menus-{name}.png")))
+                .unwrap();
+            // Keyboard focus on the Settings page: Escape closes the menu,
+            // then Tab reaches the Sound expander header.
+            cx.update_window(handle, |_, window, cx| {
+                window.press("escape", cx);
+                window.render_frame(cx);
+                window.click("gallery-nav-settings", cx);
+                window.render_frame(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                for _ in 0..60 {
+                    window.press("tab", cx);
+                    window.render_frame(cx);
+                    if window.find("settings-sound-header").focused() == Some(true) {
+                        break;
+                    }
+                }
+                assert!(window.find("fluent-focus-visual").visible());
+            })
+            .unwrap();
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(format!("gallery-settings-{name}-focus.png")))
                 .unwrap();
         }
     }

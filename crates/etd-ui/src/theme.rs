@@ -404,6 +404,12 @@ pub fn text_on_accent(cx: &App) -> Hsla {
     winui_brush(cx, 0xFFFFFFFF, 0x000000FF)
 }
 
+/// `TextOnAccentFillColorDisabled` (#FFFFFF / #87FFFFFF): the label of a
+/// disabled accent button, drawn over `AccentFillColorDisabled`.
+pub fn text_on_accent_disabled(cx: &App) -> Hsla {
+    winui_brush(cx, 0xFFFFFFFF, 0xFFFFFF87)
+}
+
 /// `AcrylicInAppFillColorDefaultBrush` fallback colour (#F9F9F9 / #2C2C2C):
 /// flyouts, menus and the ComboBox drop-down. Acrylic blur is not drawn.
 pub fn flyout_fill(cx: &App) -> Hsla {

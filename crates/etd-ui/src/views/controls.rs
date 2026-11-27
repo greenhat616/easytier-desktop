@@ -11,9 +11,9 @@
 use std::rc::Rc;
 
 use gpui_kit::{
-    AnyElement, App, BoxShadow, ClickEvent, ElementId, Entity, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement as _, Role, SharedString, StatefulInteractiveElement as _,
-    Styled as _, TestSupportExt as _, Toggled, Window, anchored,
+    AnyElement, App, BoxShadow, ClickEvent, ElementId, Entity, Hsla, InteractiveElement,
+    IntoElement, KeyDownEvent, ParentElement as _, RenderOnce, Role, SharedString,
+    StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Toggled, Window, anchored,
     base::{
         Checkbox as BaseCheckbox, CheckboxState, LogicalStyledExt as _, Radio as BaseRadio,
         RadioGroup, Slider as BaseSlider, SliderIndicator, SliderThumb, SliderTrack,
@@ -26,9 +26,10 @@ use gpui_kit::{
 };
 
 use crate::theme::{self, ControlState};
-use crate::views::ui::{BtnStyle, action_button};
+use crate::views::ui::{BtnStyle, action_button, keyboard_focus};
 
 type Handler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+pub(crate) type DismissHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 
 fn icon(path: &'static str, size: f32, color: Hsla) -> Icon {
     Icon::default()
@@ -105,6 +106,8 @@ pub fn settings_card(
     cx: &App,
 ) -> AnyElement {
     let header = header.into();
+    let id = id.into();
+    let key = id.clone();
     let hover = theme::control_fill(ControlState::Hover, cx);
     let pressed = theme::control_fill(ControlState::Pressed, cx);
     let mut card = div()
@@ -128,19 +131,20 @@ pub fn settings_card(
             cx,
         ))
         .children(content.map(|c| div().flex_shrink_0().child(c)));
-    if let Some(handler) = on_click {
-        card = card
-            .role(Role::Button)
-            .hover(move |s| s.bg(hover))
-            .active(move |s| s.bg(pressed))
-            .on_click(move |event, window, cx| handler(event, window, cx))
-            .child(div().flex_shrink_0().ms(px(14.), cx).child(icon(
-                "fluent/chevron-right.svg",
-                13.,
-                cx.theme().foreground,
-            )));
-    }
-    card.into_any_element()
+    let Some(handler) = on_click else {
+        return card.into_any_element();
+    };
+    card = card
+        .role(Role::Button)
+        .hover(move |s| s.bg(hover))
+        .active(move |s| s.bg(pressed))
+        .on_click(move |event, window, cx| handler(event, window, cx))
+        .child(div().flex_shrink_0().ms(px(14.), cx).child(icon(
+            "fluent/chevron-right.svg",
+            13.,
+            cx.theme().foreground,
+        )));
+    keyboard_focus(key, move |focus| card.track_focus(focus).into_any_element())
 }
 
 /// One row inside an open SettingsExpander (SettingsExpander.xaml item
@@ -181,10 +185,13 @@ pub fn settings_expander_item(
 
 /// Community Toolkit SettingsExpander: the header is a SettingsCard with
 /// padding 16,16,4,16 and a 32×32 chevron button (SettingsExpanderHeaderPadding,
-/// SettingsExpanderChevronButtonWidth/Height) whose fill follows
+/// SettingsExpanderChevronButtonWidth/Height) with an 8 px end margin
+/// (SettingsExpander.xaml ExpandCollapseChevronBorder Margin 0,0,8,0). The
+/// whole header is the toggle button; pointing at it fills the chevron with
 /// `ExpanderChevron*Background` (SubtleFill transparent / secondary /
-/// tertiary). Open, the header keeps only its top corners and the items sit
-/// on `ExpanderContentBackground` = `CardBackgroundFillColorSecondary`.
+/// tertiary). Controls in the header keep their own presses. Open, the
+/// header keeps only its top corners and the items sit on
+/// `ExpanderContentBackground` = `CardBackgroundFillColorSecondary`.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 pub fn settings_expander(
@@ -202,26 +209,20 @@ pub fn settings_expander(
     let stroke = theme::card_stroke(cx);
     let subtle = theme::subtle_fill_secondary(cx);
     let subtle_pressed = theme::subtle_fill_tertiary(cx);
+    let group = SharedString::from(format!("settings-expander:{id}"));
     let chevron = div()
         .id(SharedString::from(format!("{id}-chevron")))
         .test_support()
-        .role(Role::Button)
-        .aria_label(SharedString::from(if expanded {
-            format!("Collapse {header}")
-        } else {
-            format!("Expand {header}")
-        }))
-        .aria_expanded(expanded)
         .flex_shrink_0()
         .ms(px(8.), cx)
+        .me(px(8.), cx)
         .size(px(32.))
         .rounded(px(4.))
         .flex()
         .items_center()
         .justify_center()
-        .hover(move |s| s.bg(subtle))
-        .active(move |s| s.bg(subtle_pressed))
-        .on_click(move |event, window, cx| on_toggle(event, window, cx))
+        .group_hover(group.clone(), move |s| s.bg(subtle))
+        .group_active(group.clone(), move |s| s.bg(subtle_pressed))
         .child(icon(
             if expanded {
                 "fluent/chevron-up.svg"
@@ -231,9 +232,19 @@ pub fn settings_expander(
             12.,
             cx.theme().foreground,
         ));
+    let head_id = SharedString::from(format!("{id}-header"));
     let mut head = div()
-        .id(SharedString::from(format!("{id}-header")))
+        .id(head_id.clone())
         .test_support()
+        .role(Role::Button)
+        .aria_label(SharedString::from(if expanded {
+            format!("Collapse {header}")
+        } else {
+            format!("Expand {header}")
+        }))
+        .aria_expanded(expanded)
+        .group(group)
+        .on_click(move |event, window, cx| on_toggle(event, window, cx))
         .w_full()
         .min_h(px(68.))
         .pt(px(16.))
@@ -252,13 +263,23 @@ pub fn settings_expander(
             description.map(SharedString::from),
             cx,
         ))
-        .children(content.map(|c| div().flex_shrink_0().child(c)))
+        .children(content.map(|c| {
+            div()
+                .flex_shrink_0()
+                .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation()
+                })
+                .child(c)
+        }))
         .child(chevron);
     head = if expanded {
         head.rounded_t(px(4.))
     } else {
         head.rounded(px(4.))
     };
+    let head = keyboard_focus(head_id, move |focus| {
+        head.track_focus(focus).into_any_element()
+    });
     div()
         .id(id)
         .test_support()
@@ -343,7 +364,13 @@ pub fn fluent_checkbox(
         CheckboxState::Indeterminate => Some("fluent/subtract.svg"),
         CheckboxState::Unchecked => None,
     };
-    let glyph_color = theme::text_on_accent(cx);
+    // CheckBoxCheckGlyphForeground{Checked,Indeterminate}Disabled is
+    // TextOnAccentFillColorDisabled.
+    let glyph_color = if disabled {
+        theme::text_on_accent_disabled(cx)
+    } else {
+        theme::text_on_accent(cx)
+    };
     let mut boxed = div()
         .id("fluent-checkbox-box")
         .test_support()
@@ -372,7 +399,8 @@ pub fn fluent_checkbox(
                 s.bg(pressed).border_color(pressed_stroke)
             });
     }
-    BaseCheckbox::new(id)
+    let key = id.clone();
+    let checkbox = BaseCheckbox::new(id)
         .state(state)
         .disabled(disabled)
         .accessibility_label(label.clone())
@@ -388,8 +416,10 @@ pub fn fluent_checkbox(
             theme::text_disabled(cx)
         } else {
             cx.theme().foreground
-        }))
-        .into_any_element()
+        }));
+    keyboard_focus(key, move |focus| {
+        checkbox.track_focus(focus).into_any_element()
+    })
 }
 
 /// WinUI RadioButton (RadioButton_themeresources.xaml): a 20 px ring with a
@@ -472,26 +502,28 @@ pub fn fluent_radio_group(
                 });
         }
         let on_select = on_select.clone();
-        group = group.child(
-            BaseRadio::new(SharedString::from(format!("{id}-{ix}")))
-                .checked(checked)
-                .disabled(disabled)
-                .accessibility_label(*option)
-                .set_position(ix + 1, options.len())
-                .on_change(move |_, _, window, cx| on_select(&ix, window, cx))
-                .group(hover_group)
-                .min_h(px(32.))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.))
-                .child(ring)
-                .child(body(*option).text_color(if disabled {
-                    theme::text_disabled(cx)
-                } else {
-                    cx.theme().foreground
-                })),
-        );
+        let radio_id = SharedString::from(format!("{id}-{ix}"));
+        let radio = BaseRadio::new(radio_id.clone())
+            .checked(checked)
+            .disabled(disabled)
+            .accessibility_label(*option)
+            .set_position(ix + 1, options.len())
+            .on_change(move |_, _, window, cx| on_select(&ix, window, cx))
+            .group(hover_group)
+            .min_h(px(32.))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.))
+            .child(ring)
+            .child(body(*option).text_color(if disabled {
+                theme::text_disabled(cx)
+            } else {
+                cx.theme().foreground
+            }));
+        group = group.child(keyboard_focus(radio_id, move |focus| {
+            radio.track_focus(focus).into_any_element()
+        }));
     }
     div()
         .flex()
@@ -593,6 +625,8 @@ pub fn flyout_item(
     let subtle = theme::subtle_fill_secondary(cx);
     let pressed = theme::subtle_fill_tertiary(cx);
     let label = label.into();
+    let id = id.into();
+    let key = id.clone();
     let mut item = div()
         .id(id)
         .test_support()
@@ -623,7 +657,67 @@ pub fn flyout_item(
                 .bg(theme::accent_fill(ControlState::Rest, cx)),
         );
     }
-    item.into_any_element()
+    keyboard_focus(key, move |focus| item.track_focus(focus).into_any_element())
+}
+
+/// Keyboard handling inside an open flyout or menu, as WinUI's
+/// MenuFlyoutPresenter and ComboBox drop-down do: Up and Down move focus
+/// between the items, Escape closes the flyout.
+pub(crate) fn flyout_keys<E: InteractiveElement>(element: E, on_dismiss: DismissHandler) -> E {
+    element.on_key_down(move |event: &KeyDownEvent, window, cx| {
+        match event.keystroke.key.as_str() {
+            "down" => window.focus_next(cx),
+            "up" => window.focus_prev(cx),
+            "escape" => on_dismiss(window, cx),
+            _ => return,
+        }
+        cx.stop_propagation();
+    })
+}
+
+/// WinUI gives focus back to the control that opened a flyout when the
+/// flyout closes, so Tab carries on from there. Rendered inside an open
+/// popup, this remembers the element focused when the popup first appears
+/// and refocuses it once the popup is gone.
+pub(crate) fn focus_return(key: impl Into<ElementId>) -> AnyElement {
+    FocusReturn { key: key.into() }.into_any_element()
+}
+
+#[derive(IntoElement)]
+struct FocusReturn {
+    key: ElementId,
+}
+
+impl RenderOnce for FocusReturn {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        // A popup takes focus when it opens, as WinUI's flyouts do, so Up,
+        // Down and Escape reach it; Down then moves to the first item.
+        let focus = window
+            .use_keyed_state((self.key.clone(), "fluent-popup-focus"), cx, |_, cx| {
+                cx.focus_handle()
+            })
+            .read(cx)
+            .clone();
+        let take = focus.clone();
+        // The keyed state lives only while the popup renders; its release
+        // is the popup closing.
+        window.use_keyed_state((self.key, "fluent-focus-return"), cx, |window, cx| {
+            let opener = window.focused(cx);
+            let handle = window.window_handle();
+            window.defer(cx, move |window, cx| window.focus(&take, cx));
+            cx.on_release(move |_, app| {
+                if let Some(opener) = opener {
+                    app.defer(move |app| {
+                        handle
+                            .update(app, |_, window, cx| window.focus(&opener, cx))
+                            .ok();
+                    });
+                }
+            })
+            .detach();
+        });
+        div().id("fluent-popup-focus").track_focus(&focus)
+    }
 }
 
 /// WinUI's light-dismiss layer: while a flyout is open, a press anywhere
@@ -662,23 +756,30 @@ pub fn flyout(
     on_dismiss: impl Fn(&mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
+    let on_dismiss: DismissHandler = Rc::new(on_dismiss);
+    let layer_dismiss = on_dismiss.clone();
+    let id = id.into();
+    let surface = flyout_surface(cx)
+        .child(focus_return(id.clone()))
+        .id(id)
+        .test_support()
+        .role(Role::Menu)
+        .occlude()
+        .mt(px(4.))
+        .min_w(px(min_width))
+        .py(px(2.))
+        .flex()
+        .flex_col()
+        .children(items);
     div()
-        .child(light_dismiss_layer(on_dismiss))
+        .child(light_dismiss_layer(move |window, cx| {
+            layer_dismiss(window, cx)
+        }))
         .child(
             deferred(
-                anchored().snap_to_window_with_margin(px(8.)).child(
-                    flyout_surface(cx)
-                        .id(id)
-                        .test_support()
-                        .role(Role::Menu)
-                        .occlude()
-                        .mt(px(4.))
-                        .min_w(px(min_width))
-                        .py(px(2.))
-                        .flex()
-                        .flex_col()
-                        .children(items),
-                ),
+                anchored()
+                    .snap_to_window_with_margin(px(8.))
+                    .child(flyout_keys(surface, on_dismiss)),
             )
             .with_priority(2),
         )
@@ -699,34 +800,35 @@ pub fn dropdown_button(
     let fill = theme::control_fill(ControlState::Rest, cx);
     let hover = theme::control_fill(ControlState::Hover, cx);
     let pressed = theme::control_fill(ControlState::Pressed, cx);
+    let button = div()
+        .id(id)
+        .test_support()
+        .role(Role::Button)
+        .aria_label(SharedString::from(label))
+        .aria_expanded(open)
+        .h(px(32.))
+        .ps(px(11.), cx)
+        .pe(px(11.), cx)
+        .rounded(px(4.))
+        .border_1()
+        .border_color(cx.theme().input)
+        .bg(fill)
+        .hover(move |s| s.bg(hover))
+        .active(move |s| s.bg(pressed))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.))
+        .on_click(on_click)
+        .child(body(label).text_color(cx.theme().foreground))
+        .child(chevron(cx));
     div()
         .flex()
         .flex_col()
         .items_start()
-        .child(
-            div()
-                .id(id)
-                .test_support()
-                .role(Role::Button)
-                .aria_label(SharedString::from(label))
-                .aria_expanded(open)
-                .h(px(32.))
-                .ps(px(11.), cx)
-                .pe(px(11.), cx)
-                .rounded(px(4.))
-                .border_1()
-                .border_color(cx.theme().input)
-                .bg(fill)
-                .hover(move |s| s.bg(hover))
-                .active(move |s| s.bg(pressed))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.))
-                .on_click(on_click)
-                .child(body(label).text_color(cx.theme().foreground))
-                .child(chevron(cx)),
-        )
+        .child(keyboard_focus(id, move |focus| {
+            button.track_focus(focus).into_any_element()
+        }))
         .children(menu)
         .into_any_element()
 }
@@ -776,23 +878,30 @@ pub fn split_button(
                 .overflow_hidden()
                 .flex()
                 .flex_row()
-                .child(
-                    part(SharedString::from(id))
+                .child({
+                    let primary = part(SharedString::from(id))
                         .aria_label(SharedString::from(label))
                         .ps(px(11.), cx)
                         .pe(px(11.), cx)
                         .on_click(on_primary)
-                        .child(body(label).text_color(cx.theme().foreground)),
-                )
+                        .child(body(label).text_color(cx.theme().foreground));
+                    keyboard_focus(id, move |focus| {
+                        primary.track_focus(focus).into_any_element()
+                    })
+                })
                 .child(div().w(px(1.)).h_full().bg(theme::control_stroke(cx)))
-                .child(
-                    part(SharedString::from(format!("{id}-more")))
+                .child({
+                    let more_id = SharedString::from(format!("{id}-more"));
+                    let more = part(more_id.clone())
                         .aria_label(SharedString::from(format!("More {label} options")))
                         .aria_expanded(open)
                         .w(px(35.))
                         .on_click(on_secondary)
-                        .child(chevron(cx)),
-                ),
+                        .child(chevron(cx));
+                    keyboard_focus(more_id, move |focus| {
+                        more.track_focus(focus).into_any_element()
+                    })
+                }),
         )
         .children(menu)
         .into_any_element()
@@ -853,8 +962,8 @@ pub fn combo_box(
             div()
                 .flex()
                 .flex_col()
-                .child(
-                    div()
+                .child({
+                    let field = div()
                         .id(id)
                         .test_support()
                         .role(Role::ComboBox)
@@ -880,8 +989,9 @@ pub fn combo_box(
                                 .truncate()
                                 .text_color(cx.theme().foreground),
                         )
-                        .child(div().w(px(38.)).flex().justify_center().child(chevron(cx))),
-                )
+                        .child(div().w(px(38.)).flex().justify_center().child(chevron(cx)));
+                    keyboard_focus(id, move |focus| field.track_focus(focus).into_any_element())
+                })
                 .children(menu),
         )
         .into_any_element()
@@ -902,12 +1012,7 @@ pub fn fluent_slider(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
-    let focus = window
-        .use_keyed_state((ElementId::from(id), "fluent-slider-focus"), cx, |_, cx| {
-            cx.focus_handle()
-        })
-        .read(cx)
-        .clone();
+    let _ = window;
     let pct = state.read(cx).percentage();
     let value_state = |s| {
         if disabled { ControlState::Disabled } else { s }
@@ -946,7 +1051,6 @@ pub fn fluent_slider(
     let slider = BaseSlider::new(state)
         .disabled(disabled)
         .accessibility_label(label)
-        .track_focus(&focus)
         .w(px(240.))
         .h(px(32.))
         .flex()
@@ -977,16 +1081,20 @@ pub fn fluent_slider(
                         .child(thumb),
                 ),
         );
-    div()
+    let frame = div()
         .id(SharedString::from(format!("{id}-frame")))
-        .group(group)
-        .child(slider)
-        .into_any_element()
+        .group(group);
+    keyboard_focus(SharedString::from(id), move |focus| {
+        frame.child(slider.track_focus(focus)).into_any_element()
+    })
 }
 
 /// WinUI NumberBox with inline spin buttons (NumberBox.xaml,
 /// SpinButtonPlacementMode="Inline"): a TextBox (see [`super::ui::text_field`])
-/// with two 32 px subtle buttons for −/+ inside its right edge.
+/// whose text stops before two standard RepeatButtons (NumberBoxSpinButtonStyle:
+/// MinWidth 32, glyph 12 px, IsTabStop False) holding ChevronUp E70E and
+/// ChevronDown E70D, with margins 4 and 0,4,4,4. Up and Down in the box step
+/// the value, as NumberBox does.
 #[inline(never)]
 pub fn number_box(
     id: &'static str,
@@ -996,8 +1104,9 @@ pub fn number_box(
     cx: &App,
 ) -> AnyElement {
     let on_step = Rc::new(on_step);
-    let subtle = theme::subtle_fill_secondary(cx);
-    let pressed = theme::subtle_fill_tertiary(cx);
+    let fill = theme::control_fill(ControlState::Rest, cx);
+    let hover = theme::control_fill(ControlState::Hover, cx);
+    let pressed = theme::control_fill(ControlState::Pressed, cx);
     let spin = |dir: f64, glyph: &'static str, label: &'static str| {
         let on_step = on_step.clone();
         div()
@@ -1005,29 +1114,48 @@ pub fn number_box(
             .test_support()
             .role(Role::Button)
             .aria_label(SharedString::from(label))
-            .size(px(28.))
+            .w(px(32.))
+            .h(px(24.))
             .rounded(px(4.))
+            .border_1()
+            .border_color(cx.theme().input)
+            .bg(fill)
             .flex()
             .items_center()
             .justify_center()
-            .hover(move |s| s.bg(subtle))
+            .hover(move |s| s.bg(hover))
             .active(move |s| s.bg(pressed))
             .on_click(move |_, window, cx| on_step(dir, window, cx))
-            .child(icon(glyph, 12., theme::text_secondary(cx)))
+            .child(icon(glyph, 12., cx.theme().foreground))
     };
+    let spins = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(4.))
+        .child(spin(1., "fluent/chevron-up.svg", "Increase"))
+        .child(spin(-1., "fluent/chevron-down.svg", "Decrease"))
+        .into_any_element();
+    let keys = on_step.clone();
     div()
         .w(px(200.))
-        .relative()
-        .child(super::ui::text_field(header, id, header, state, false, cx))
-        .child(
-            div()
-                .absolute()
-                .bottom(px(2.))
-                .right(px(2.))
-                .flex()
-                .flex_row()
-                .child(spin(-1., "fluent/subtract.svg", "Decrease"))
-                .child(spin(1., "fluent/add.svg", "Increase")),
-        )
+        .capture_key_down(move |event: &KeyDownEvent, window, cx| {
+            let dir = match event.keystroke.key.as_str() {
+                "up" => 1.,
+                "down" => -1.,
+                _ => return,
+            };
+            keys(dir, window, cx);
+            cx.stop_propagation();
+        })
+        .child(super::ui::text_field_with_suffix(
+            header,
+            id,
+            header,
+            state,
+            false,
+            Some(spins),
+            cx,
+        ))
         .into_any_element()
 }

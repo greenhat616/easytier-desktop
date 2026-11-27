@@ -25,7 +25,7 @@ use crate::views::{
         split_button, toggle_button,
     },
     menus::{BarCommand, MenuCheck, MenuEntry, MenuHandler, MenuItem, command_bar, menu_flyout},
-    ui::{BtnStyle, action_button, fluent_switch},
+    ui::{BtnStyle, action_button, settings_switch},
 };
 
 /// Which drop-down is open; WinUI keeps at most one light-dismiss popup.
@@ -208,7 +208,7 @@ pub(super) fn settings_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<An
         dismiss(cx),
         cx,
     );
-    let sound_switch = fluent_switch(
+    let sound_switch = settings_switch(
         "settings-sound-switch",
         if demo.sound { "On" } else { "Off" },
         demo.sound,
@@ -218,7 +218,7 @@ pub(super) fn settings_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<An
             cx.notify();
         }),
     );
-    let spatial_switch = fluent_switch(
+    let spatial_switch = settings_switch(
         "settings-spatial-switch",
         if demo.spatial { "On" } else { "Off" },
         demo.spatial,
@@ -608,7 +608,13 @@ pub(super) fn basic_input_page(
             [
                 row(vec![
                     slider,
-                    note(SharedString::from(format!("{slider_value:.0}")), cx),
+                    // Centred on the 32 px slider row.
+                    div()
+                        .h(px(32.))
+                        .flex()
+                        .items_center()
+                        .child(note(SharedString::from(format!("{slider_value:.0}")), cx))
+                        .into_any_element(),
                 ]),
                 slider_disabled,
             ],

@@ -113,6 +113,47 @@ fn action_button_inner(
     .into_any_element()
 }
 
+type FocusBuilder = Box<dyn FnOnce(&FocusHandle) -> AnyElement>;
+
+/// Gives a control drawn from plain elements WinUI keyboard focus: a Tab
+/// stop that `build` attaches with `track_focus` (Enter and Space then fire
+/// the element's click handlers), and the focus visual around it while it
+/// has keyboard focus. The handle is kept per `key`.
+#[inline(never)]
+pub fn keyboard_focus(
+    key: impl Into<ElementId>,
+    build: impl FnOnce(&FocusHandle) -> AnyElement + 'static,
+) -> AnyElement {
+    KeyboardFocus {
+        key: key.into(),
+        build: Box::new(build),
+    }
+    .into_any_element()
+}
+
+#[derive(IntoElement)]
+struct KeyboardFocus {
+    key: ElementId,
+    build: FocusBuilder,
+}
+
+impl RenderOnce for KeyboardFocus {
+    #[inline(never)]
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let focus = window
+            .use_keyed_state((self.key, "fluent-tab-focus"), cx, |_, cx| {
+                cx.focus_handle().tab_stop(true)
+            })
+            .read(cx)
+            .clone();
+        let focused = focus.is_focused(window);
+        div()
+            .relative()
+            .child((self.build)(&focus))
+            .children(focus_visual(focused, window, cx))
+    }
+}
+
 /// App-owned, keyboard-only WinUI focus treatment. The outer 2px line
 /// contrasts with the surface; the inner 1px reverses its polarity. Both
 /// are overlays, so focus never changes layout or intercepts activation.
@@ -198,6 +239,18 @@ impl gpui::RenderOnce for FluentButton {
         }
         if style.icon_only {
             btn = btn.w(height).min_w(height).px_0().py_0();
+        }
+        // WinUI AccentButtonBackgroundDisabled is AccentFillColorDisabled
+        // (#37000000 / #28FFFFFF) with TextOnAccentFillColorDisabled, a
+        // neutral fill, not the Kit's 15 % tint of the accent.
+        if style.disabled && !style.loading && style.variant == ButtonVariant::Primary {
+            btn = btn
+                .bg(crate::theme::accent_fill(
+                    crate::theme::ControlState::Disabled,
+                    cx,
+                ))
+                .border_color(cx.theme().transparent)
+                .text_color(crate::theme::text_on_accent_disabled(cx));
         }
         if style.selected && style.variant == ButtonVariant::Ghost {
             btn = btn.bg(crate::theme::subtle_fill_secondary(cx));
@@ -515,6 +568,21 @@ pub fn text_field(
     disabled: bool,
     cx: &App,
 ) -> AnyElement {
+    text_field_with_suffix(label, id, aria_label, state, disabled, None, cx)
+}
+
+/// [`text_field`] with `suffix` inside the box after the text; the text
+/// stops before it.
+#[inline(never)]
+pub fn text_field_with_suffix(
+    label: &str,
+    id: &'static str,
+    aria_label: &'static str,
+    state: &Entity<InputState>,
+    disabled: bool,
+    suffix: Option<AnyElement>,
+    cx: &App,
+) -> AnyElement {
     let fg = cx.theme().foreground;
     let input = FluentInput {
         id,
@@ -522,6 +590,7 @@ pub fn text_field(
         state: state.clone(),
         disabled,
         password: false,
+        suffix,
     }
     .into_any_element();
     // TextBoxTopHeaderMargin 0,0,0,8; the header is BodyTextBlock 14/20.
@@ -554,6 +623,7 @@ pub fn password_input(
         state: state.clone(),
         disabled,
         password: true,
+        suffix: None,
     }
     .into_any_element()
 }
@@ -565,6 +635,8 @@ struct FluentInput {
     state: Entity<InputState>,
     disabled: bool,
     password: bool,
+    /// Content inside the box after the text, such as NumberBox's spin buttons.
+    suffix: Option<AnyElement>,
 }
 
 impl RenderOnce for FluentInput {
@@ -602,21 +674,27 @@ impl RenderOnce for FluentInput {
             } else {
                 (px(1.), crate::theme::control_strong_stroke(cx))
             };
+            // Full width: the frame's 4 px corners clip it, so it follows
+            // the bottom corner curve as WinUI's bottom border does.
             div()
                 .id("fluent-textbox-underline")
                 .test_support()
                 .absolute()
                 .bottom_0()
-                .left(px(2.))
-                .right(px(2.))
+                .left_0()
+                .right_0()
                 .h(height)
-                .rounded_full()
                 .bg(color)
         });
+        if let Some(suffix) = self.suffix {
+            input = input.suffix(suffix);
+        }
         div()
             .id(SharedString::from(format!("{}-frame", self.id)))
             .relative()
             .w_full()
+            .rounded(px(4.))
+            .overflow_hidden()
             .on_hover(move |hovered, window, cx| {
                 hover.update(cx, |value, cx| {
                     if *value != *hovered {
@@ -657,6 +735,29 @@ pub fn fluent_switch(
         label: label.into(),
         checked,
         disabled,
+        content_first: false,
+        on_change: Box::new(on_change),
+    }
+    .into_any_element()
+}
+
+/// ToggleSwitch as the Community Toolkit's SettingsCard shows it
+/// (RightAlignedCompactToggleSwitchStyle): the On/Off content sits before
+/// the switch, 12 px from it, and the whole control aligns to the end.
+#[inline(never)]
+pub fn settings_switch(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    checked: bool,
+    disabled: bool,
+    on_change: impl Fn(&bool, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    FluentSwitch {
+        id: id.into(),
+        label: label.into(),
+        checked,
+        disabled,
+        content_first: true,
         on_change: Box::new(on_change),
     }
     .into_any_element()
@@ -670,6 +771,8 @@ struct FluentSwitch {
     label: SharedString,
     checked: bool,
     disabled: bool,
+    /// Content before the switch, as in a SettingsCard.
+    content_first: bool,
     on_change: SwitchHandler,
 }
 
@@ -790,9 +893,9 @@ impl RenderOnce for FluentSwitch {
             .flex()
             .flex_row()
             .items_center()
-            .gap_2()
+            .gap(px(if self.content_first { 12. } else { 8. }))
             .text_sm();
-        if rtl {
+        if rtl != self.content_first {
             switch = switch.flex_row_reverse();
         }
         switch

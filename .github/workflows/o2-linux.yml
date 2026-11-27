@@ -34,7 +34,7 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v7.0.1
-      - run: sudo apt-get update && sudo apt-get install -y nftables iproute2 libdbus-1-dev
+      - run: bash .github/scripts/install-ubuntu-packages.sh nftables iproute2 libdbus-1-dev
       - uses: ./.github/actions/setup-tools
         with:
           tools: protoc cargo-nextest
@@ -88,7 +88,7 @@ jobs:
           IMAGE: ${{ matrix.image }}
         run: |
           set -euo pipefail
-          sudo apt-get update && sudo apt-get install -y nftables libdbus-1-dev
+          bash .github/scripts/install-ubuntu-packages.sh nftables libdbus-1-dev
           parser=$(cargo test --locked -p etd-sysfx-os --lib --no-run --message-format=json | jq -rs '.[] | select(.target.name == "etd_sysfx_os" and .executable != null) | .executable')
           test -x "$parser"
           container=$(docker run -d --cap-add NET_ADMIN "$IMAGE" sleep infinity)

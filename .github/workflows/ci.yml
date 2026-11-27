@@ -116,8 +116,7 @@ jobs:
       - name: Install Linux development libraries
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential clang cmake pkg-config libssl-dev libdbus-1-dev
+          bash .github/scripts/install-ubuntu-packages.sh build-essential clang cmake pkg-config libssl-dev libdbus-1-dev
       - uses: ./.github/actions/setup-tools
         with:
           tools: protoc cargo-nextest

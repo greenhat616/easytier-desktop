@@ -35,7 +35,7 @@ There is no fake `TrayBackend` here; the `etd-app` and `etd-ui` tests define the
 | `scripted_server` | `ScriptedHost`: real tonic `etd.v1.HostService` stubs over in-memory connections, with host semantics a client relies on (version metadata, idempotency, receipts, event resume with `ResyncRequired`) and scripted Welcome, replies, rejections, lost replies, drops, refusal and an impostor host. `ContractHost`: the real contract service on the same connections. |
 | `transport` | `duplex()` in-memory `BoxConn` pair; `user_host()` builds the real contract service over `MemoryLedger` with a user-host allow-list authorizer. |
 | `no_window` | `NoWindow` trait: `.no_window()` on `std` and tokio `Command` sets `CREATE_NO_WINDOW` on Windows (replacing earlier creation flags) and does nothing elsewhere. Every test spawn on Windows must use it. |
-| `sysdiff` | Independent native inventory for tier 3 (`inventory.py`, Windows enumeration in `windows.ps1`): interfaces, routes, resolvers, firewall and WFP, registry, services, runtime directories and product processes. Snapshots are compared before and after; no product observer or ledger takes part. |
+| `sysdiff` | Independent native inventory for tier 3 (`inventory.py`, Windows enumeration in `windows.ps1`): interfaces, routes, resolvers, firewall and WFP, registry, services, runtime directories and product processes. Snapshots are compared before and after; no product observer or ledger takes part. On Windows a management worker (`powershell.exe` under the installed `etd-host`) is exempt only when its command line matches the script the host sends; a worker candidate seen to exit while the sample is taken is left out with its exited console host, and logged. |
 
 ### `fake-core` binary
 

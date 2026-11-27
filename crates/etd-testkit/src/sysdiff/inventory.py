@@ -100,6 +100,10 @@ def processes(inv, paths):
     roots = [path.resolve() for path in paths]
     psutil.process_iter.cache_clear()
     table = {p.pid: p.info for p in psutil.process_iter(["pid", "ppid", "exe", "create_time"])}
+    # Worker candidates seen to exit after the table was read, with their
+    # descendants that exited too: a process that no longer exists is not a
+    # native change, but only an observed exit leaves a row out.
+    exited = set()
     if sys.platform == "win32" and os.environ.get("GITHUB_WORKSPACE"):
         powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
         script = Path(os.environ["GITHUB_WORKSPACE"]) / "crates/etd-sysfx-os/src/windows/system.ps1"
@@ -120,11 +124,21 @@ def processes(inv, paths):
                 try:
                     proc = psutil.Process(pid)
                     argv = proc.cmdline()
-                    if (argv and Path(argv[0]) == powershell and argv[1:] == args
-                            and proc.create_time() == row["create_time"] and proc.is_running()):
-                        inv.management_workers.add((pid, row["create_time"]))
-                except (psutil.AccessDenied, psutil.NoSuchProcess):
-                    pass  # An unverified process never receives an exemption.
+                    alive = proc.create_time() == row["create_time"] and proc.is_running()
+                except psutil.AccessDenied:
+                    continue  # An unverified process never receives an exemption.
+                except psutil.NoSuchProcess:
+                    argv, alive = None, False
+                if not alive:
+                    # An idle pool worker can exit between the table and its
+                    # command line; it was never verified, so it is left out
+                    # only because its exit was observed.
+                    exited.add(pid)
+                    exited.update(exited_descendants(table, pid))
+                    print(f"management worker candidate {pid} under etd-host {row['ppid']} exited "
+                          f"during the sample; not recorded", flush=True)
+                elif argv and Path(argv[0]) == powershell and argv[1:] == args:
+                    inv.management_workers.add((pid, row["create_time"]))
     children = defaultdict(list)
     for pid, row in table.items():
         if row["ppid"] != pid:
@@ -145,12 +159,44 @@ def processes(inv, paths):
             child = table[pid]
             born = child["create_time"]
             assert born is not None, f"no creation time for product process {pid}"
-            if ("process", str(pid)) not in inv.rows:
+            if ("process", str(pid)) not in inv.rows and pid not in exited:
                 inv.put("process", pid, [child["exe"] or "", born])
                 inv.parents[pid] = child["ppid"]
             pending.extend(p for p in children[pid] if table[p]["create_time"] is None
                            or table[p]["create_time"] >= born)
-        inv.descendants[parent] = {(pid, table[pid]["create_time"]) for pid in seen - {parent}}
+        inv.descendants[parent] = {(pid, table[pid]["create_time"]) for pid in seen - {parent} - exited}
+
+
+def exited_descendants(table, root, timeout=5):
+    """The descendants of `root` in `table` (its console host) seen to exit
+    within `timeout`; one still running stays recorded."""
+    import psutil
+    pending = set()
+    stack = [root]
+    while stack:
+        parent = stack.pop()
+        born = table[parent]["create_time"]
+        for pid, row in table.items():
+            if (row["ppid"] == parent and pid != parent and pid not in pending
+                    and row["create_time"] is not None and born is not None
+                    and row["create_time"] >= born):
+                pending.add(pid)
+                stack.append(pid)
+    gone = set()
+    end = time.monotonic() + timeout
+    while pending:
+        for pid in pending.copy():
+            try:
+                if psutil.Process(pid).create_time() == table[pid]["create_time"]:
+                    continue
+            except psutil.NoSuchProcess:
+                pass
+            pending.discard(pid)
+            gone.add(pid)
+        if not pending or time.monotonic() >= end:
+            break
+        time.sleep(0.2)
+    return gone
 
 
 def assert_exited(identities, timeout=0):

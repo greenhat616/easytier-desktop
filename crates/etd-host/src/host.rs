@@ -575,7 +575,46 @@ pub fn doctor() -> Result<()> {
             Err(error) => println!("  platform adapters unavailable: {error}"),
         }
     }
+    // The first call may take a few seconds: an unlisted build is
+    // self-checked (read-only) on the firewall thread.
+    #[cfg(windows)]
+    {
+        let elevated = NativeServiceManager.entry_is_elevated().unwrap_or(false);
+        println!(
+            "{}",
+            firewall_cleanup_line(
+                etd_sysfx_os::windows::firewall_cleanup_supported(),
+                elevated
+            )
+        );
+    }
     Ok(())
+}
+
+/// Doctor's firewall cleanup line (ruling msg#1980): accepted as listed or
+/// self-checked, not supported with its reason, or undetermined. The
+/// self-check of an unlisted build opens the policy store, which an
+/// unelevated doctor may be refused; the line then says so.
+#[cfg(windows)]
+fn firewall_cleanup_line(support: Result<&str, etd_sysfx_os::OsError>, elevated: bool) -> String {
+    use etd_sysfx_os::{OsError, windows::FIREWALL_UNSUPPORTED_BUILD};
+    match support {
+        Ok(accepted_by) => format!("Firewall cleanup: supported ({accepted_by})"),
+        Err(OsError::Os { message, .. }) if message.starts_with(FIREWALL_UNSUPPORTED_BUILD) => {
+            let reason = message[FIREWALL_UNSUPPORTED_BUILD.len()..].trim_start_matches([':', ' ']);
+            let mut line = "Firewall cleanup: not supported on this Windows build".to_owned();
+            if !reason.is_empty() {
+                line = format!("{line}: {reason}");
+            }
+            if !elevated && reason.contains("self-check failed") {
+                line.push_str(
+                    " (doctor ran without administrator rights; run it elevated for the host's answer)",
+                );
+            }
+            line
+        }
+        Err(error) => format!("Firewall cleanup: undetermined: {error}"),
+    }
 }
 
 fn entry(id: Id, role: Role) -> AllowEntry {
@@ -1461,6 +1500,54 @@ pub async fn remove_core(mode: HostMode, version: &str) -> Result<()> {
     }
     deps.core_store.remove(version).await?;
     resources.close().await
+}
+
+#[cfg(all(test, windows))]
+mod doctor_tests {
+    use super::*;
+    use etd_sysfx_os::{OsError, windows::FIREWALL_UNSUPPORTED_BUILD};
+
+    #[test]
+    fn the_firewall_cleanup_line_says_how_the_build_was_accepted_or_why_not() {
+        let unsupported = |reason: &str| {
+            Err(OsError::Os {
+                code: 50,
+                message: format!("{FIREWALL_UNSUPPORTED_BUILD}: {reason}"),
+            })
+        };
+        assert_eq!(
+            firewall_cleanup_line(Ok("listed"), false),
+            "Firewall cleanup: supported (listed)"
+        );
+        assert_eq!(
+            firewall_cleanup_line(Ok("self-checked"), true),
+            "Firewall cleanup: supported (self-checked)"
+        );
+        assert_eq!(
+            firewall_cleanup_line(unsupported("6.1.7601"), false),
+            "Firewall cleanup: not supported on this Windows build: 6.1.7601"
+        );
+        let failed = "10.0.19045 is not listed and its self-check failed: FWOpenPolicyStore";
+        assert_eq!(
+            firewall_cleanup_line(unsupported(failed), true),
+            format!("Firewall cleanup: not supported on this Windows build: {failed}")
+        );
+        assert!(firewall_cleanup_line(unsupported(failed), false).ends_with(
+            "(doctor ran without administrator rights; run it elevated for the host's answer)"
+        ));
+        let other = firewall_cleanup_line(
+            Err(OsError::Os {
+                code: 1460,
+                message: "firewall call timed out".into(),
+            }),
+            true,
+        );
+        assert!(
+            other.starts_with("Firewall cleanup: undetermined: "),
+            "{other}"
+        );
+        assert!(other.contains("firewall call timed out"), "{other}");
+    }
 }
 
 #[cfg(test)]

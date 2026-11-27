@@ -295,16 +295,31 @@ pub(crate) fn subtle_fill_tertiary(cx: &App) -> Hsla {
 }
 
 /// TextBox fill: `TextControlBackground` = `ControlFillColorDefault`
-/// (#B3FFFFFF / #0FFFFFFF), focused `ControlFillColorInputActive` (#FFFFFF /
+/// (#B3FFFFFF / #0FFFFFFF), pointer-over `ControlFillColorSecondary`
+/// (#80F9F9F9 / #15FFFFFF), focused `ControlFillColorInputActive` (#FFFFFF /
 /// #B31E1E1E), disabled `ControlFillColorDisabled` (#4DF9F9F9 / #0BFFFFFF).
-pub(crate) fn text_control_fill(focused: bool, disabled: bool, cx: &App) -> Hsla {
+pub(crate) fn text_control_fill(focused: bool, hovered: bool, disabled: bool, cx: &App) -> Hsla {
     if disabled {
         winui_brush(cx, 0xF9F9F94D, 0xFFFFFF0B)
     } else if focused {
         winui_brush(cx, 0xFFFFFFFF, 0x1E1E1EB3)
+    } else if hovered {
+        winui_brush(cx, 0xF9F9F980, 0xFFFFFF15)
     } else {
         winui_brush(cx, 0xFFFFFFB3, 0xFFFFFF0F)
     }
+}
+
+/// `ControlStrokeColorDefault` (#0F000000 / #12FFFFFF): the TextBox frame,
+/// and its whole border when disabled (`TextControlBorderBrushDisabled`).
+pub(crate) fn control_stroke(cx: &App) -> Hsla {
+    winui_brush(cx, 0x0000000F, 0xFFFFFF12)
+}
+
+/// `ControlStrongStrokeColorDefault` (#72000000 / #8BFFFFFF): the bottom
+/// edge of `TextControlElevationBorderBrush` at rest.
+pub(crate) fn control_strong_stroke(cx: &App) -> Hsla {
+    winui_brush(cx, 0x00000072, 0xFFFFFF8B)
 }
 
 /// Attach to the Kit-owned root after `gpui_kit::open_window` has created it.
@@ -696,11 +711,13 @@ mod tests {
                     }
                     // FluentInput paints the WinUI TextControlBackground
                     // states over whichever surface holds the field.
-                    let enabled = parent.blend(text_control_fill(false, false, cx).to_rgb());
-                    let focused = parent.blend(text_control_fill(true, false, cx).to_rgb());
-                    let disabled = parent.blend(text_control_fill(false, true, cx).to_rgb());
+                    let enabled = parent.blend(text_control_fill(false, false, false, cx).to_rgb());
+                    let hovered = parent.blend(text_control_fill(false, true, false, cx).to_rgb());
+                    let focused = parent.blend(text_control_fill(true, false, false, cx).to_rgb());
+                    let disabled = parent.blend(text_control_fill(false, false, true, cx).to_rgb());
                     assert_readable("enabled input", t.foreground, enabled);
                     assert_readable("focused input", t.foreground, focused);
+                    assert_readable("hovered input", t.foreground, hovered);
                     assert_readable("input placeholder", t.muted_foreground, enabled);
                     assert_readable("disabled input", t.muted_foreground, disabled);
                     assert_readable(

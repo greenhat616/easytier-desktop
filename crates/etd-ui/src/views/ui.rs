@@ -448,10 +448,13 @@ impl RenderOnce for FluentAlignedRow {
         } else {
             self.label.clone()
         };
+        // BodyTextBlockStyle 14/20: an explicit line box keeps descenders
+        // of Segoe UI Variable inside truncate()'s overflow clip.
         let label = div()
             .min_w_0()
             .truncate()
             .text_size(px(14.))
+            .line_height(px(20.))
             .child(self.label);
         let btn = BaseButton::new(self.id)
             .track_focus(&focus)
@@ -521,11 +524,18 @@ pub fn text_field(
         password: false,
     }
     .into_any_element();
+    // TextBoxTopHeaderMargin 0,0,0,8; the header is BodyTextBlock 14/20.
     div()
         .flex()
         .flex_col()
-        .gap_1()
-        .child(div().text_sm().text_color(fg).child(label.to_owned()))
+        .gap(px(8.))
+        .child(
+            div()
+                .text_size(px(14.))
+                .line_height(px(20.))
+                .text_color(fg)
+                .child(label.to_owned()),
+        )
         .child(input)
         .into_any_element()
 }
@@ -558,24 +568,66 @@ struct FluentInput {
 }
 
 impl RenderOnce for FluentInput {
+    /// WinUI TextBox (TextBox_themeresources.xaml): 4 px corners, a 1 px
+    /// `ControlStrokeColorDefault` frame whose bottom edge is
+    /// `ControlStrongStrokeColorDefault` (`TextControlElevationBorderBrush`);
+    /// focused, the bottom becomes a 2 px accent line
+    /// (`TextControlBorderThemeThicknessFocused` 1,1,1,2). The accent line is
+    /// the keyboard focus indicator, as in WinUI; no extra focus rectangle.
     #[inline(never)]
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let focus = self.state.read(cx).focus_handle(cx);
         let focused = focus.is_focused(window);
+        let hover = window.use_keyed_state(
+            (ElementId::from(self.id), "fluent-textbox-hover"),
+            cx,
+            |_, _| false,
+        );
+        let hovered = *hover.read(cx);
+        let fill = crate::theme::text_control_fill(focused, hovered, self.disabled, cx);
         let mut input = Input::new(&self.state)
             .id(self.id)
             .aria_label(self.aria_label)
             .disabled(self.disabled)
             .focus_ring(false)
-            .bg(crate::theme::text_control_fill(focused, self.disabled, cx));
+            .rounded(px(4.))
+            .border_color(crate::theme::control_stroke(cx))
+            .bg(fill);
         if self.password {
             input = input.content_type(InputContentType::Password).mask_toggle();
         }
+        let underline = (!self.disabled).then(|| {
+            let (height, color) = if focused {
+                (px(2.), cx.theme().primary)
+            } else {
+                (px(1.), crate::theme::control_strong_stroke(cx))
+            };
+            div()
+                .id("fluent-textbox-underline")
+                .test_support()
+                .absolute()
+                .bottom_0()
+                .left(px(2.))
+                .right(px(2.))
+                .h(height)
+                .rounded_full()
+                .bg(color)
+        });
         div()
+            .id(SharedString::from(format!("{}-frame", self.id)))
             .relative()
             .w_full()
+            .on_hover(move |hovered, window, cx| {
+                hover.update(cx, |value, cx| {
+                    if *value != *hovered {
+                        *value = *hovered;
+                        cx.notify();
+                    }
+                });
+                window.refresh();
+            })
             .child(input)
-            .children(focus_visual(focused, window, cx))
+            .children(underline)
     }
 }
 
@@ -877,7 +929,12 @@ impl SidebarItem for FluentNavItem {
                 }),
         );
         if !collapsed {
-            let label = div().min_w_0().truncate().child(self.label);
+            let label = div()
+                .min_w_0()
+                .truncate()
+                .text_size(px(14.))
+                .line_height(px(20.))
+                .child(self.label);
             btn = btn.child(if selected {
                 label.font_semibold()
             } else {

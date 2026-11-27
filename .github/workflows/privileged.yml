@@ -46,6 +46,9 @@ jobs:
           - os: windows-latest
             suite: recovery
           - os: windows-latest
+            suite: session-identities
+            session_test: session_kernel_port_refuses_other_identities
+          - os: windows-latest
             suite: session-recovery
             session_test: session_host_crash_recovery_and_purge
           - os: windows-latest

@@ -320,6 +320,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pinning_refuses_a_window_of_another_process() {
+        use ::windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow;
+        // SAFETY: GetDesktopWindow only returns a handle; nothing is changed.
+        let desktop = unsafe { GetDesktopWindow() };
+        let hwnd = NonZeroIsize::new(desktop.0 as isize).expect("desktop window");
+        assert!(!pin_window_on_top(hwnd));
+    }
+
+    /// Creates a real top-level window, so it runs in Windows CI only
+    /// (ci.yml), never on a developer's desktop.
+    #[test]
+    #[ignore = "creates a real Win32 window; Windows CI only"]
+    fn pinning_makes_a_window_topmost_and_a_tool_window() {
+        use ::windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
+        };
+        // SAFETY: a plain window of the system STATIC class, owned by this
+        // thread and destroyed below.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_APPWINDOW,
+                w!("STATIC"),
+                w!("etd pin test"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                200,
+                120,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("create a test window");
+        // SAFETY: `hwnd` was created above and is still alive.
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        let style = || unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
+        assert_ne!(style() & WS_EX_APPWINDOW.0, 0);
+        assert_eq!(style() & WS_EX_TOPMOST.0, 0);
+
+        let pinned = pin_window_on_top(NonZeroIsize::new(hwnd.0 as isize).unwrap());
+        let after = style();
+        // SAFETY: `hwnd` was created above and is still alive.
+        let visible = unsafe { IsWindowVisible(hwnd).as_bool() };
+        // SAFETY: as above; the window is not used afterwards.
+        unsafe { DestroyWindow(hwnd) }.expect("destroy the test window");
+
+        assert!(pinned);
+        assert_ne!(after & WS_EX_TOOLWINDOW.0, 0, "tool window");
+        assert_eq!(after & WS_EX_APPWINDOW.0, 0, "app window cleared");
+        assert_ne!(after & WS_EX_TOPMOST.0, 0, "topmost");
+        assert!(visible, "shown again after the style change");
+    }
+
+    #[test]
     fn parses_rgb_and_system_foreground() {
         let blue = Color {
             A: 255,

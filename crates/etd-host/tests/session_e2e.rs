@@ -5,7 +5,7 @@
 
 use etd_client::stub::host_service_client::HostServiceClient;
 use etd_contract::{
-    VERSION_MAJOR, VERSION_METADATA_KEY, VERSION_MINOR, capability,
+    Desired, VERSION_MAJOR, VERSION_METADATA_KEY, VERSION_MINOR, capability,
     v1::{Hello, HostMode, LeaseRelease, ReleaseLeaseRequest, Role},
     version_metadata_value,
 };
@@ -19,7 +19,10 @@ use etd_sysfx::{
     sqlite::SqliteLedger,
 };
 use etd_sysfx_os::service::{HostFilesystem, NativeHostFilesystem, session_root};
-use etd_testkit::no_window::NoWindow;
+use etd_testkit::{
+    conformance::ledger::{changes, plan, put},
+    no_window::NoWindow,
+};
 use std::{
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
@@ -32,6 +35,7 @@ const EXIT_NOT_CONFORMING: i32 = 4;
 const EXIT_OTHER_USERS_LEFTOVERS: i32 = 5;
 /// Not a real account: a second user's session root made by the test.
 const OTHER_SID: &str = "S-1-5-21-1000-2000-3000-1999";
+const PLANTED_INSTANCE: &str = "0f661e50-b9a6-4525-9583-9538fe01e928";
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_etd-host"))
@@ -140,7 +144,7 @@ fn wait_exit(child: &mut std::process::Child, within: Duration) -> std::process:
 
 /// A second user's session root, created as protected as the host makes
 /// its own, holding an open instance record that a reclaim can close (the
-/// firewall rule it names does not exist).
+/// process it names never ran).
 async fn plant_leftover() {
     let layout = NativeHostFilesystem.session_layout(OTHER_SID).unwrap();
     NativeHostFilesystem.prepare_session(&layout).unwrap();
@@ -149,7 +153,7 @@ async fn plant_leftover() {
         layout.state.join("repair-index.json"),
         serde_json::json!({
             "install_key": vec![7u8; 32],
-            "instances": ["0f661e50-b9a6-4525-9583-9538fe01e928"],
+            "instances": [PLANTED_INSTANCE],
         })
         .to_string(),
     )
@@ -158,20 +162,36 @@ async fn plant_leftover() {
     let ledger = SqliteLedger::open(layout.state.join("ledger.sqlite3"), boot)
         .await
         .unwrap();
+    // A stopped instance whose first generation is still open: its kernel
+    // process record, planned but never confirmed dead (the image, in the
+    // planted root, does not exist), as a crashed session leaves it.
+    let id = PLANTED_INSTANCE;
+    let instance = etd_contract::InstanceId(id.into());
+    let scope = EffectScope::Instance {
+        instance,
+        epoch: etd_sysfx::Epoch(1),
+    };
+    let mut generation = plan(id, 1, &[]);
+    generation.effects = vec![EffectIntent {
+        scope,
+        kind: EffectKind::Process,
+        key: ObjectKey::Process {
+            exe: layout.cores.join("absent").join("easytier-core.exe"),
+            cmdline_marker: layout.run.join(id).join("1"),
+        },
+        undo: Undo::EnsureAbsent,
+        persistence: Persistence::WithProcess,
+    }];
     ledger
-        .record(EffectIntent {
-            scope: EffectScope::Instance {
-                instance: etd_contract::InstanceId("0f661e50-b9a6-4525-9583-9538fe01e928".into()),
-                epoch: etd_sysfx::Epoch(1),
-            },
-            kind: EffectKind::WinFirewallRule,
-            key: ObjectKey::Rule {
-                name: "etd-es3-ci-absent-rule".into(),
-                group: None,
-            },
-            undo: Undo::EnsureAbsent,
-            persistence: Persistence::Persistent,
-        })
+        .commit(
+            0,
+            changes(
+                id,
+                1,
+                vec![put(id, Desired::Stopped, &[])],
+                vec![generation],
+            ),
+        )
         .await
         .unwrap();
     ledger.close().await.unwrap();

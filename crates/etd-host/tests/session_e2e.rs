@@ -356,9 +356,10 @@ async fn elevated_session_host_end_to_end() {
     std::fs::remove_dir(&junction).unwrap();
 
     // The profile directory the system workers redirect to must be a
-    // directory: a file in its place is refused, never replaced.
+    // directory (the workers have written into it by now): a file in its
+    // place is refused, never replaced.
     let profile = own.profile.clone().unwrap();
-    std::fs::remove_dir(&profile).unwrap();
+    std::fs::remove_dir_all(&profile).unwrap();
     std::fs::write(&profile, b"not a directory").unwrap();
     refused(EXIT_NOT_CONFORMING);
     assert!(profile.is_file(), "left untouched");

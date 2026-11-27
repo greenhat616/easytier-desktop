@@ -45,7 +45,7 @@ Service form (paths come from the OS, never from clients):
 
 Elevated session form (Windows only): everything under
 `%ProgramData%\EasyTierDesk.session\<SID>` (`<SID>` from the host's own token):
-`state\` (ledger, logs, repair index), `run\`, `cores\` and an empty `profile\`, which
+`state\` (ledger, logs, repair index), `run\`, `cores\` and `profile\`, which
 the kernel's and the system workers' profile variables point at. Endpoint
 `\\.\pipe\easytier-desk-session-<SID>`; maintenance directory and locks as the
 service's. `EasyTierDesk.session` and each `<SID>` root are created with the same

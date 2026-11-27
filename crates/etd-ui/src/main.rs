@@ -6,6 +6,10 @@
 //! [`etd_ui::assets::FluentAssets`], and [`etd_ui::NativeTrayBackend`]. Every exit
 //! funnels through [`etd_app::ExitGate`] before `cx.quit()`. Logs and panics
 //! go to a rotated file first ([`logging`]).
+//!
+//! Release builds use the Windows GUI subsystem, so launching the app opens
+//! no console window.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod logging;
 

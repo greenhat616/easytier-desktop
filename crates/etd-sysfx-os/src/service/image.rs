@@ -254,6 +254,23 @@ mod tests {
     }
 
     #[test]
+    fn an_image_moved_aside_by_a_rollback_is_still_the_installed_one() {
+        let (_root, paths, source) = fixture();
+        let source = source.canonicalize().unwrap();
+        // A rollback renamed the running new image to .failed and put the
+        // previous image back.
+        fs::rename(&paths.executable, &paths.failed).unwrap();
+        fs::write(&paths.executable, b"previous image").unwrap();
+        let running = paths.failed.canonicalize().unwrap();
+        assert!(super::super::runs_installed_image(&running, &paths.executable).unwrap());
+        let restored = paths.executable.canonicalize().unwrap();
+        assert!(super::super::runs_installed_image(&restored, &paths.executable).unwrap());
+        assert!(!super::super::runs_installed_image(&source, &paths.executable).unwrap());
+        fs::remove_file(&paths.failed).unwrap();
+        assert!(!super::super::runs_installed_image(&running, &paths.executable).unwrap());
+    }
+
+    #[test]
     fn a_copy_that_does_not_match_its_digest_changes_nothing() {
         // The digest is of the bytes read; a staged file that reads back
         // differently (here: a copy that lies) is never swapped in.

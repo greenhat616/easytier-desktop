@@ -108,18 +108,80 @@ pub fn nav_view_item(
             )));
     }
     if selected {
-        item = item.bg(subtle).child(
-            div()
-                .absolute()
-                .left_0()
-                .top(px(10.))
-                .w(px(3.))
-                .h(px(16.))
-                .rounded(px(2.))
-                .bg(theme::accent_fill(ControlState::Rest, cx)),
-        );
+        item = item.bg(subtle);
     }
     keyboard_focus(key, move |focus| item.track_focus(focus).into_any_element())
+}
+
+/// Distance between the tops of two [`nav_view_item`]s: 36 px tall with a
+/// 2 px margin above and below (NavigationViewItemOnLeftMinHeight,
+/// NavigationViewItemButtonMargin 4,2).
+pub const NAV_ITEM_STRIDE: f32 = 40.;
+
+/// The pane's selection indicator, a 3x16 accent pill with 2 px corners
+/// (NavigationViewSelectionIndicatorWidth/Height/Radius), 10 px into the
+/// item at visible position `to`. Placed absolutely in a pane whose items
+/// start `top` px down, 4 px in from its start edge.
+///
+/// Moving from item `from`, it plays WinUI's indicator animation
+/// (NavigationView.cpp PlayIndicatorAnimations, 600 ms): for the first
+/// third it stretches from the old item towards the new one on
+/// cubic-bezier 0.9,0.1,1,0.2 (c_frame1point1/2), anchored at the old end;
+/// for the rest it shrinks into the new item on 0.1,0.9,0.2,1
+/// (c_frame2point1/2), anchored at the new end.
+pub fn nav_selection_indicator(
+    id: &'static str,
+    top: f32,
+    from: usize,
+    to: usize,
+    cx: &App,
+) -> AnyElement {
+    use gpui_kit::{Animation, AnimationExt as _, base::animation::cubic_bezier};
+    const SIZE: f32 = 16.;
+    let y = |ix: usize| top + ix as f32 * NAV_ITEM_STRIDE + 2. + 10.;
+    let (from_y, to_y) = (y(from), y(to));
+    let pill = |top: f32, height: f32| {
+        div()
+            .id(id)
+            .test_support()
+            .absolute()
+            .inset_s(px(4.), cx)
+            .top(px(top))
+            .w(px(3.))
+            .h(px(height))
+            .rounded(px(2.))
+            .bg(theme::accent_fill(ControlState::Rest, cx))
+    };
+    if from == to {
+        return pill(to_y, SIZE).into_any_element();
+    }
+    let distance = (to_y - from_y).abs();
+    let down = from_y < to_y;
+    pill(to_y, SIZE)
+        .with_animation(
+            SharedString::from(format!("{id}-{from}-{to}")),
+            Animation::new(std::time::Duration::from_millis(600)),
+            move |el, t| {
+                let (top, height) = if t < 1. / 3. {
+                    let grow = cubic_bezier(0.9, 0.1, 1., 0.2)(t * 3.) * distance;
+                    if down {
+                        (from_y, SIZE + grow)
+                    } else {
+                        (from_y - grow, SIZE + grow)
+                    }
+                } else {
+                    let left =
+                        (1. - cubic_bezier(0.1, 0.9, 0.2, 1.)((t - 1. / 3.) * 1.5)) * distance;
+                    if down {
+                        (to_y - left, SIZE + left)
+                    } else {
+                        (to_y, SIZE + left)
+                    }
+                };
+                el.top(px(top)).h(px(height))
+            },
+        )
+        .into_any_element()
 }
 
 /// WinUI BreadcrumbBar (BreadcrumbBar.xaml, BreadcrumbBar_themeresources):

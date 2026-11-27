@@ -119,7 +119,9 @@ pub fn expander(
         .flex()
         .flex_col()
         .child(head)
-        .children(expanded.then(|| {
+        .child(crate::views::motion::expander_content(
+            format!("{id}-content-motion"),
+            expanded,
             div()
                 .id(SharedString::from(format!("{id}-content")))
                 .test_support()
@@ -134,7 +136,8 @@ pub fn expander(
                 .line_height(px(20.))
                 .text_color(fg)
                 .child(content)
-        }))
+                .into_any_element(),
+        ))
         .into_any_element()
 }
 

@@ -640,6 +640,149 @@ mod tests {
     use super::*;
     use gpui_kit::{TestAppContext, test::TestWindowExt as _};
 
+    /// With motion allowed, popups and expanders linger for WinUI's exit
+    /// timings: a MenuFlyout fades for 83 ms, a ContentDialog for 83 ms and
+    /// an Expander's content slides up for 167 ms. An Expander that is open
+    /// when it first appears does not slide in.
+    #[gpui_kit::test]
+    fn gallery_motion_follows_winui_timing(cx: &mut TestAppContext) {
+        use std::time::Duration;
+        let (handle, _view) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            theme::install_palette(cx);
+            cx.set_reduce_motion(false);
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Default::default(),
+                        size: size(px(1440.), px(1300.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| Gallery::new(window, cx)),
+            )
+            .unwrap()
+        });
+        let step = |cx: &mut TestAppContext, ms: u64| {
+            cx.executor().advance_clock(Duration::from_millis(ms));
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        };
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("gallery-nav-menus", cx);
+            window.render_frame(cx);
+            window.click("menu-button", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        // The menu slides in over 250 ms.
+        step(cx, 300);
+        cx.update_window(handle, |_, window, cx| {
+            assert!(window.find("menu-flyout").visible());
+            window.press("escape", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 40);
+        cx.update_window(handle, |_, window, _| {
+            assert!(window.try_find("menu-flyout").is_some(), "menu fading out");
+        })
+        .unwrap();
+        step(cx, 60);
+        cx.update_window(handle, |_, window, _| {
+            assert!(
+                window.try_find("menu-flyout").is_none(),
+                "menu gone after 83 ms"
+            );
+        })
+        .unwrap();
+
+        cx.update_window(handle, |_, window, cx| {
+            window.click("gallery-nav-dialogs", cx);
+            window.render_frame(cx);
+            window.click("dialog-open", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 300);
+        cx.update_window(handle, |_, window, cx| {
+            window.click("dialog-secondary", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 40);
+        cx.update_window(handle, |_, window, _| {
+            assert!(
+                window.try_find("dialog-smoke").is_some(),
+                "dialog fading out"
+            );
+        })
+        .unwrap();
+        step(cx, 60);
+        cx.update_window(handle, |_, window, _| {
+            assert!(
+                window.try_find("dialog-smoke").is_none(),
+                "dialog gone after 83 ms"
+            );
+        })
+        .unwrap();
+
+        cx.update_window(handle, |_, window, cx| {
+            window.click("gallery-nav-layout", cx);
+            window.render_frame(cx);
+            // Open on arrival, so already in place.
+            let header = window.find("layout-expander-header").bounds();
+            let content = window.find("layout-expander-content").bounds();
+            assert_eq!(content.top(), header.bottom());
+            window.click("layout-expander-header", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 100);
+        cx.update_window(handle, |_, window, _| {
+            assert!(
+                window.try_find("layout-expander-content").is_some(),
+                "content sliding up"
+            );
+        })
+        .unwrap();
+        step(cx, 100);
+        cx.update_window(handle, |_, window, _| {
+            assert!(
+                window.try_find("layout-expander-content").is_none(),
+                "content gone after 167 ms"
+            );
+        })
+        .unwrap();
+        // The NavigationView indicator stretches towards the new item for
+        // 200 ms, then settles on it by 600 ms.
+        cx.update_window(handle, |_, window, cx| {
+            window.click("gallery-nav-navigation", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("nav-indicator").bounds().size.height, px(16.));
+            window.click("nav-item-4", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 200);
+        cx.update_window(handle, |_, window, _| {
+            // Items 0 to 4 are 160 px apart: the pill spans both.
+            assert!(window.find("nav-indicator").bounds().size.height > px(150.));
+        })
+        .unwrap();
+        step(cx, 450);
+        cx.update_window(handle, |_, window, _| {
+            let pill = window.find("nav-indicator").bounds();
+            let item = window.find("nav-item-4").bounds();
+            assert_eq!(pill.size.height, px(16.));
+            assert_eq!(pill.top(), item.top() + px(10.));
+        })
+        .unwrap();
+    }
+
     #[gpui_kit::test]
     fn gallery_exercises_controls_without_host(cx: &mut TestAppContext) {
         fn tab_to(window: &mut gpui_kit::Window, id: &'static str, cx: &mut gpui_kit::App) {
@@ -655,6 +798,9 @@ mod tests {
         let (handle, view) = cx.update(|cx| {
             gpui_kit::init(cx);
             theme::install_palette(cx);
+            // Popups and expanders settle at once, as with Windows' animation
+            // effects off; `gallery_motion_follows_winui_timing` covers motion.
+            cx.set_reduce_motion(true);
             gpui_kit::open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds {
@@ -1033,6 +1179,9 @@ mod tests {
             let (handle, _) = cx.update(|cx| {
                 gpui_kit::init(cx);
                 theme::install_palette(cx);
+                // Popups and expanders settle at once, as with Windows' animation
+                // effects off; `gallery_motion_follows_winui_timing` covers motion.
+                cx.set_reduce_motion(true);
                 gpui_kit::open_window(
                     WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(Bounds {
@@ -1237,6 +1386,15 @@ mod tests {
                 window.click("gallery-nav-layout", cx);
                 window.render_frame(cx);
                 assert!(window.find("layout-grid").visible());
+                // Scroll the ScrollViewer so its scroll bar shows.
+                window.scroll(
+                    "layout-scroll-area",
+                    gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-60.))),
+                    cx,
+                );
+                window.render_frame(cx);
+                window.hover("layout-scroll", cx);
+                window.render_frame(cx);
             })
             .unwrap();
             cx.run_until_parked();

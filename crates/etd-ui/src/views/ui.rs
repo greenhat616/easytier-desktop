@@ -13,7 +13,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window,
     base::{
         Button as BaseButton, LayoutDirection, LogicalStyledExt as _, Switch as BaseSwitch,
-        SwitchThumb, SwitchTrack, spring,
+        SwitchThumb, SwitchTrack,
     },
     component::{
         ActiveTheme as _, Collapsible, Disableable as _, FocusableExt as _, Icon, Selectable as _,
@@ -831,17 +831,18 @@ impl RenderOnce for FluentSwitch {
         let focus = focus_for(&id, window, cx);
         let paint = switch_paint(checked, disabled, cx);
         let thumb_size = px(12.);
-        let thumb_x = spring(
-            (id.clone(), "fluent-thumb"),
-            if checked {
-                px(40.) - thumb_size - px(6.)
-            } else {
-                px(0.)
-            },
-            cx.theme().motion_tokens().spring_move,
+        // WinUI slides the knob with RepositionThemeAnimation, whose timing
+        // comes from Windows' animation tables rather than the WinUI source;
+        // ControlNormalAnimationDuration on ControlFastOutSlowInKeySpline
+        // stands in for it. Reduced motion moves the knob at once.
+        let thumb_x = px(gpui_kit::base::transition(
+            SharedString::from(format!("{id:?}-fluent-thumb")),
+            if checked { 40. - 12. - 6. } else { 0. },
+            gpui_kit::base::Transition::new(crate::views::motion::NORMAL)
+                .ease(crate::views::motion::fast_out_slow_in),
             window,
             cx,
-        );
+        ));
         let group = SharedString::from(format!("fluent-switch:{id:?}"));
         let rtl = LayoutDirection::global(cx).is_rtl();
         let mut thumb = div()

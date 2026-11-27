@@ -27,6 +27,7 @@ use gpui_kit::{
 };
 
 use crate::theme::{self, ControlState};
+use crate::views::motion::{PopupKind, PopupMotion};
 use crate::views::ui::{BtnStyle, action_button, keyboard_focus};
 
 pub type Handler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
@@ -289,7 +290,9 @@ pub fn settings_expander(
         .flex()
         .flex_col()
         .child(head)
-        .children(expanded.then(|| {
+        .child(crate::views::motion::expander_content(
+            format!("{id}-content-motion"),
+            expanded,
             div()
                 .id(SharedString::from(format!("{id}-content")))
                 .test_support()
@@ -302,7 +305,8 @@ pub fn settings_expander(
                 .flex()
                 .flex_col()
                 .children(items)
-        }))
+                .into_any_element(),
+        ))
         .into_any_element()
 }
 
@@ -794,6 +798,7 @@ pub fn light_dismiss_layer(on_dismiss: impl Fn(&mut Window, &mut App) + 'static)
 #[inline(never)]
 pub fn flyout(
     id: impl Into<ElementId>,
+    open: bool,
     min_width: f32,
     items: Vec<AnyElement>,
     on_dismiss: impl Fn(&mut Window, &mut App) + 'static,
@@ -803,6 +808,8 @@ pub fn flyout(
     let layer_dismiss = on_dismiss.clone();
     let id = id.into();
     let key = id.clone();
+    let motion = PopupMotion::new(format!("{id:?}"), open, PopupKind::Menu);
+    let animate = motion.clone();
     let surface = flyout_surface(cx)
         .id(id)
         .test_support()
@@ -814,21 +821,27 @@ pub fn flyout(
         .flex()
         .flex_col()
         .children(items);
-    div()
-        .child(light_dismiss_layer(move |window, cx| {
-            layer_dismiss(window, cx)
-        }))
-        .child(
-            deferred(
-                anchored()
-                    .snap_to_window_with_margin(px(8.))
-                    .child(popup_focus(key, move |focus| {
-                        flyout_keys(surface.track_focus(focus), on_dismiss).into_any_element()
-                    })),
+    motion.gate(
+        div()
+            .child(motion.interactive(light_dismiss_layer(move |window, cx| {
+                layer_dismiss(window, cx)
+            })))
+            .child(
+                deferred(
+                    anchored()
+                        .snap_to_window_with_margin(px(8.))
+                        .child(popup_focus(key.clone(), move |focus| {
+                            animate.animate(
+                                SharedString::from(format!("{key:?}-motion")),
+                                flyout_keys(surface.track_focus(focus), on_dismiss)
+                                    .into_any_element(),
+                            )
+                        })),
+                )
+                .with_priority(2),
             )
-            .with_priority(2),
-        )
-        .into_any_element()
+            .into_any_element(),
+    )
 }
 
 /// WinUI DropDownButton: a standard button with the chevron 8 px after its
@@ -974,7 +987,7 @@ pub fn combo_box(
     let hover = theme::control_fill(ControlState::Hover, cx);
     let pressed = theme::control_fill(ControlState::Pressed, cx);
     let on_select = Rc::new(on_select);
-    let menu = open.then(|| {
+    let menu = {
         let items = options
             .iter()
             .enumerate()
@@ -989,14 +1002,15 @@ pub fn combo_box(
                 )
             })
             .collect();
-        flyout(
+        Some(flyout(
             SharedString::from(format!("{id}-popup")),
+            open,
             width,
             items,
             on_dismiss,
             cx,
-        )
-    });
+        ))
+    };
     div()
         .flex()
         .flex_col()

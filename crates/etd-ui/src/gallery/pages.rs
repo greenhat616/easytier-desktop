@@ -27,7 +27,10 @@ use crate::views::{
     dialogs::{DialogButtons, DialogResult, content_dialog, flyout_panel, teaching_tip},
     layout::{expander, scroll_viewer},
     menus::{BarCommand, MenuCheck, MenuEntry, MenuHandler, MenuItem, command_bar, menu_flyout},
-    navigation::{IndexHandler, Tab, breadcrumb_bar, nav_view_item, selector_bar, tab_view},
+    navigation::{
+        IndexHandler, Tab, breadcrumb_bar, nav_selection_indicator, nav_view_item, selector_bar,
+        tab_view,
+    },
     ui::{BtnStyle, action_button, settings_switch},
 };
 
@@ -70,6 +73,7 @@ pub(super) struct DemoState {
     dialog_result: SharedString,
     tip_open: bool,
     nav_selected: usize,
+    nav_prev: usize,
     nav_expanded: bool,
     crumbs: usize,
     selector: usize,
@@ -129,6 +133,7 @@ impl DemoState {
             dialog_result: "None".into(),
             tip_open: false,
             nav_selected: 0,
+            nav_prev: 0,
             nav_expanded: true,
             crumbs: CRUMBS.len(),
             selector: 0,
@@ -466,7 +471,7 @@ pub(super) fn basic_input_page(
         |_, _, _| {},
     );
     let mail = ["Send", "Reply", "Reply all"];
-    let dropdown_menu = (demo.popup == Some(Popup::DropDown)).then(|| {
+    let dropdown_menu = Some({
         let pick = select(cx, |d, ix| {
             d.last = SharedString::from(["Send", "Reply", "Reply all"][ix])
         });
@@ -485,7 +490,14 @@ pub(super) fn basic_input_page(
                 )
             })
             .collect();
-        flyout("basic-dropdown-menu", 120., items, dismiss(cx), cx)
+        flyout(
+            "basic-dropdown-menu",
+            demo.popup == Some(Popup::DropDown),
+            120.,
+            items,
+            dismiss(cx),
+            cx,
+        )
     });
     let dropdown = dropdown_button(
         "basic-dropdown",
@@ -495,7 +507,7 @@ pub(super) fn basic_input_page(
         dropdown_menu,
         cx,
     );
-    let split_menu = (demo.popup == Some(Popup::Split)).then(|| {
+    let split_menu = Some({
         let pick = Rc::new(select(cx, |d, ix| d.split_color = ix));
         let items = SPLIT_COLORS
             .iter()
@@ -511,7 +523,14 @@ pub(super) fn basic_input_page(
                 )
             })
             .collect();
-        flyout("basic-split-menu", 120., items, dismiss(cx), cx)
+        flyout(
+            "basic-split-menu",
+            demo.popup == Some(Popup::Split),
+            120.,
+            items,
+            dismiss(cx),
+            cx,
+        )
     });
     let split = split_button(
         "basic-split",
@@ -699,7 +718,7 @@ pub(super) fn menus_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<AnyEl
 
     // MenuFlyout from a button: icons, accelerators, a toggle item, a
     // submenu of radio items, separators and a disabled item.
-    let menu = (demo.popup == Some(Popup::Menu)).then(|| {
+    let menu = Some({
         let sort_items = SORTS
             .iter()
             .enumerate()
@@ -759,7 +778,14 @@ pub(super) fn menus_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<AnyEl
                     .disabled(true),
             ),
         ];
-        menu_flyout("menu-flyout", entries, None, dismiss(cx), cx)
+        menu_flyout(
+            "menu-flyout",
+            demo.popup == Some(Popup::Menu),
+            entries,
+            None,
+            dismiss(cx),
+            cx,
+        )
     });
     let menu_button = dropdown_button(
         "menu-button",
@@ -771,38 +797,36 @@ pub(super) fn menus_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<AnyEl
     );
 
     // Context menu: the same MenuFlyout, opened at the pointer.
-    let context = demo
-        .context_at
-        .filter(|_| demo.popup == Some(Popup::Context))
-        .map(|at| {
-            let cut = command("Cut", cx);
-            let copy = command("Copy", cx);
-            let paste = command("Paste", cx);
-            menu_flyout(
-                "context-menu",
-                vec![
-                    MenuEntry::Item(
-                        MenuItem::new("context-cut", "Cut")
-                            .accelerator("Ctrl+X")
-                            .on_click(move |e, w, cx| cut(e, w, cx)),
-                    ),
-                    MenuEntry::Item(
-                        MenuItem::new("context-copy", "Copy")
-                            .icon("fluent/copy.svg")
-                            .accelerator("Ctrl+C")
-                            .on_click(move |e, w, cx| copy(e, w, cx)),
-                    ),
-                    MenuEntry::Item(
-                        MenuItem::new("context-paste", "Paste")
-                            .accelerator("Ctrl+V")
-                            .on_click(move |e, w, cx| paste(e, w, cx)),
-                    ),
-                ],
-                Some(at),
-                dismiss(cx),
-                cx,
-            )
-        });
+    let context = demo.context_at.map(|at| {
+        let cut = command("Cut", cx);
+        let copy = command("Copy", cx);
+        let paste = command("Paste", cx);
+        menu_flyout(
+            "context-menu",
+            demo.popup == Some(Popup::Context),
+            vec![
+                MenuEntry::Item(
+                    MenuItem::new("context-cut", "Cut")
+                        .accelerator("Ctrl+X")
+                        .on_click(move |e, w, cx| cut(e, w, cx)),
+                ),
+                MenuEntry::Item(
+                    MenuItem::new("context-copy", "Copy")
+                        .icon("fluent/copy.svg")
+                        .accelerator("Ctrl+C")
+                        .on_click(move |e, w, cx| copy(e, w, cx)),
+                ),
+                MenuEntry::Item(
+                    MenuItem::new("context-paste", "Paste")
+                        .accelerator("Ctrl+V")
+                        .on_click(move |e, w, cx| paste(e, w, cx)),
+                ),
+            ],
+            Some(at),
+            dismiss(cx),
+            cx,
+        )
+    });
     let target = div()
         .id("context-target")
         .test_support()
@@ -829,11 +853,12 @@ pub(super) fn menus_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<AnyEl
         .into_any_element();
 
     // CommandBar: primary commands, a toggle and the overflow menu.
-    let overflow = (demo.popup == Some(Popup::Overflow)).then(|| {
+    let overflow = Some({
         let settings = command("Settings", cx);
         let refresh = command("Refresh", cx);
         menu_flyout(
             "bar-overflow",
+            demo.popup == Some(Popup::Overflow),
             vec![
                 MenuEntry::Item(
                     MenuItem::new("bar-settings", "Settings")
@@ -905,10 +930,11 @@ pub(super) fn dialogs_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<Any
     };
 
     // ContentDialog: Save is the default button.
-    let dialog = demo.dialog_open.then(|| {
+    let dialog = Some({
         let view = cx.entity().downgrade();
         content_dialog(
             "dialog",
+            demo.dialog_open,
             "Save your work?",
             div()
                 .child("You have unsaved changes to this profile. Save them before closing?")
@@ -948,7 +974,7 @@ pub(super) fn dialogs_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<Any
     );
 
     // Flyout: arbitrary content in a light-dismiss popup.
-    let flyout = (demo.popup == Some(Popup::Flyout)).then(|| {
+    let flyout = Some({
         let confirm = cx.listener(|this, _: &gpui_kit::ClickEvent, _, cx| {
             this.demo.popup = None;
             this.demo.last = "Cleared recents".into();
@@ -956,6 +982,7 @@ pub(super) fn dialogs_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<Any
         });
         flyout_panel(
             "flyout",
+            demo.popup == Some(Popup::Flyout),
             div()
                 .flex()
                 .flex_col()
@@ -1058,8 +1085,19 @@ pub(super) fn navigation_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<
     let demo = &view.demo;
 
     // NavigationView pane with an expandable group.
+    // Where an item sits among those shown; a hidden child's indicator
+    // stays on its group, as in WinUI.
+    let shown = |item: usize| {
+        let hidden = |i: usize| NAV_ITEMS[i].2 == Some("child") && !demo.nav_expanded;
+        if hidden(item) {
+            1
+        } else {
+            (0..item).filter(|&i| !hidden(i)).count()
+        }
+    };
     let mut pane = div()
         .id("nav-pane")
+        .relative()
         .w(px(320.))
         .py(px(4.))
         .flex()
@@ -1076,6 +1114,7 @@ pub(super) fn navigation_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<
                     if is_group {
                         this.demo.nav_expanded = !this.demo.nav_expanded;
                     } else {
+                        this.demo.nav_prev = this.demo.nav_selected;
                         this.demo.nav_selected = ix;
                     }
                     cx.notify();
@@ -1094,6 +1133,13 @@ pub(super) fn navigation_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<
             cx,
         ));
     }
+    let pane = pane.child(nav_selection_indicator(
+        "nav-indicator",
+        4.,
+        shown(demo.nav_prev),
+        shown(demo.nav_selected),
+        cx,
+    ));
     let nav = div()
         .flex()
         .flex_row()
@@ -1323,7 +1369,12 @@ pub(super) fn layout_page(
                 .w(px(240.))
                 .child(orientation)
                 .child(headed("Spacing", stack_slider))
-                .child(SharedString::from(format!("Spacing: {stack_spacing:.0}"))),
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .line_height(px(20.))
+                        .child(SharedString::from(format!("Spacing: {stack_spacing:.0}"))),
+                ),
         )
         .into_any_element();
 

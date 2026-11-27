@@ -19,6 +19,7 @@ use crate::theme::{self, ControlState};
 use crate::views::controls::{
     DismissHandler, flyout_keys, flyout_surface, light_dismiss_layer, popup_focus,
 };
+use crate::views::motion::{PopupKind, PopupMotion};
 use crate::views::ui::keyboard_focus;
 
 pub type MenuHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
@@ -320,6 +321,7 @@ impl WhenHasCheck for gpui_kit::Div {
 #[inline(never)]
 pub fn menu_flyout(
     id: &'static str,
+    open: bool,
     entries: Vec<MenuEntry>,
     at: Option<Point<Pixels>>,
     on_dismiss: impl Fn(&mut Window, &mut App) + 'static,
@@ -331,22 +333,29 @@ pub fn menu_flyout(
     }
     let on_dismiss: DismissHandler = Rc::new(on_dismiss);
     let layer_dismiss = on_dismiss.clone();
+    let motion = PopupMotion::new(id, open, PopupKind::Menu);
+    let animate = motion.clone();
     let surface = flyout_surface(cx)
         .id("menu-surface")
         .occlude()
         .mt(px(4.))
         .child(menu_content(id, entries, 160., cx));
-    div()
-        .child(light_dismiss_layer(move |window, cx| {
-            layer_dismiss(window, cx)
-        }))
-        .child(
-            deferred(anchor.child(popup_focus(id, move |focus| {
-                flyout_keys(surface.track_focus(focus), on_dismiss).into_any_element()
+    motion.gate(
+        div()
+            .child(motion.interactive(light_dismiss_layer(move |window, cx| {
+                layer_dismiss(window, cx)
             })))
-            .with_priority(2),
-        )
-        .into_any_element()
+            .child(
+                deferred(anchor.child(popup_focus(id, move |focus| {
+                    animate.animate(
+                        SharedString::from(format!("{id}-motion")),
+                        flyout_keys(surface.track_focus(focus), on_dismiss).into_any_element(),
+                    )
+                })))
+                .with_priority(2),
+            )
+            .into_any_element(),
+    )
 }
 
 /// One CommandBar command.

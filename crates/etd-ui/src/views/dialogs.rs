@@ -20,6 +20,7 @@ use crate::theme;
 use crate::views::controls::{
     DismissHandler, flyout_keys, flyout_surface, light_dismiss_layer, popup_focus,
 };
+use crate::views::motion::{PopupKind, PopupMotion};
 use crate::views::ui::{BtnStyle, action_button, keyboard_focus};
 
 /// Which ContentDialog button the user chose.
@@ -102,24 +103,30 @@ pub struct DialogButtons {
 #[inline(never)]
 pub fn content_dialog(
     id: &'static str,
+    open: bool,
     title: &'static str,
     body: AnyElement,
     buttons: DialogButtons,
     on_result: DialogHandler,
 ) -> AnyElement {
-    ContentDialog {
-        id,
-        title,
-        body,
-        buttons,
-        on_result,
-    }
-    .into_any_element()
+    let motion = PopupMotion::new(id, open, PopupKind::Dialog);
+    motion.gate(
+        ContentDialog {
+            id,
+            motion: motion.clone(),
+            title,
+            body,
+            buttons,
+            on_result,
+        }
+        .into_any_element(),
+    )
 }
 
 #[derive(IntoElement)]
 struct ContentDialog {
     id: &'static str,
+    motion: PopupMotion,
     title: &'static str,
     body: AnyElement,
     buttons: DialogButtons,
@@ -131,7 +138,12 @@ impl RenderOnce for ContentDialog {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let id = self.id;
         let viewport = window.viewport_size();
-        let on_result = self.on_result;
+        // A closing dialog has answered; it ignores further input.
+        let on_result: DialogHandler = if self.motion.open() {
+            self.on_result
+        } else {
+            Rc::new(|_, _, _| {})
+        };
         let default = self.buttons.default;
         let button = |bid: String, label: &'static str, result: DialogResult, cx: &App| {
             let on_result = on_result.clone();
@@ -234,19 +246,22 @@ impl RenderOnce for ContentDialog {
                 .child(dialog.focus_trap(id, focus))
                 .into_any_element()
         });
+        let smoke = div()
+            .id(SharedString::from(format!("{id}-smoke")))
+            .test_support()
+            .w(viewport.width)
+            .h(viewport.height)
+            .bg(gpui_kit::rgba(0x0000004D))
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(dialog)
+            .into_any_element();
         deferred(
             anchored().position(point(px(0.), px(0.))).child(
-                div()
-                    .id(SharedString::from(format!("{id}-smoke")))
-                    .test_support()
-                    .w(viewport.width)
-                    .h(viewport.height)
-                    .bg(gpui_kit::rgba(0x0000004D))
-                    .occlude()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(dialog),
+                self.motion
+                    .animate(SharedString::from(format!("{id}-motion")), smoke),
             ),
         )
         .with_priority(4)
@@ -261,12 +276,15 @@ impl RenderOnce for ContentDialog {
 #[inline(never)]
 pub fn flyout_panel(
     id: &'static str,
+    open: bool,
     content: AnyElement,
     on_dismiss: impl Fn(&mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
     let on_dismiss: DismissHandler = Rc::new(on_dismiss);
     let layer = on_dismiss.clone();
+    let motion = PopupMotion::new(id, open, PopupKind::Flyout);
+    let animate = motion.clone();
     let surface = flyout_surface(cx)
         .id(id)
         .test_support()
@@ -283,19 +301,25 @@ pub fn flyout_panel(
         .line_height(px(20.))
         .text_color(cx.theme().foreground)
         .child(content);
-    div()
-        .child(light_dismiss_layer(move |window, cx| layer(window, cx)))
-        .child(
-            deferred(
-                anchored()
-                    .snap_to_window_with_margin(px(8.))
-                    .child(popup_focus(id, move |focus| {
-                        flyout_keys(surface.track_focus(focus), on_dismiss).into_any_element()
-                    })),
+    motion.gate(
+        div()
+            .child(motion.interactive(light_dismiss_layer(move |window, cx| layer(window, cx))))
+            .child(
+                deferred(
+                    anchored()
+                        .snap_to_window_with_margin(px(8.))
+                        .child(popup_focus(id, move |focus| {
+                            animate.animate(
+                                SharedString::from(format!("{id}-motion")),
+                                flyout_keys(surface.track_focus(focus), on_dismiss)
+                                    .into_any_element(),
+                            )
+                        })),
+                )
+                .with_priority(2),
             )
-            .with_priority(2),
-        )
-        .into_any_element()
+            .into_any_element(),
+    )
 }
 
 /// WinUI TeachingTip (TeachingTip_themeresources.xaml) placed below its

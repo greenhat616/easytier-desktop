@@ -43,6 +43,10 @@ const NRPT: &str = r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPo
 fn busy(message: impl std::fmt::Display) -> WinError {
     WinError::invalid(format!("BUSY: {message}"))
 }
+/// Proven held by another EasyTier: `ReclaimError::HeldBy(holder)`.
+fn held(holder: impl std::fmt::Display) -> WinError {
+    WinError::invalid(format!("{}{holder}", super::HELD_BY))
+}
 
 #[derive(PartialEq, Eq)]
 struct FileIdentity {
@@ -193,6 +197,10 @@ fn gate_candidates(root: &Path, items: Vec<CandidateImage>) -> Result<(), WinErr
     if !is_dir {
         return Err(busy("core store is not a directory"));
     }
+    // An external process is a proven holder only once every candidate is
+    // proven: any candidate that cannot be read or placed stays Busy, even
+    // beside a proven external one.
+    let mut external = None;
     for (name, path) in items {
         let path = path.map_err(|e| busy(format!("cannot read candidate {name}: {e}")))?;
         if !inside_store(&root_id, &path).map_err(|e| {
@@ -200,10 +208,13 @@ fn gate_candidates(root: &Path, items: Vec<CandidateImage>) -> Result<(), WinErr
                 "cannot prove candidate {name} is in core store: {e}"
             ))
         })? {
-            return Err(busy(format!("external EasyTier process {name}")));
+            external.get_or_insert_with(|| format!("{name} image {}", path.display()));
         }
     }
-    Ok(())
+    match external {
+        Some(holder) => Err(held(format!("external EasyTier process {holder}"))),
+        None => Ok(()),
+    }
 }
 fn gate(root: &Path) -> Result<(), WinError> {
     gate_candidates(
@@ -301,18 +312,27 @@ fn confirm(root: &Path, expected: &Recovery) -> Result<(), WinError> {
     }
     Ok(())
 }
+/// A holder that appears once the replay has changed something does not make
+/// the rest someone else's: retry (Busy), so the replay can finish.
+fn mid_replay(e: WinError) -> WinError {
+    match e.message.strip_prefix(super::HELD_BY) {
+        Some(holder) => busy(format!("{holder} started during the replay")),
+        None => e,
+    }
+}
 pub(super) fn replay(root: &Path) -> Result<Reclaimed, WinError> {
     let Some(recovery) = load()? else {
         return Ok(Reclaimed::AlreadyAbsent);
     };
-    // Gate and re-read the record directly before EACH mutating stage.
+    // Gate and re-read the record directly before EACH mutating stage. Only
+    // the first gate, before any change, may answer HeldBy.
     confirm(root, &recovery)?;
     if let Some(nrpt) = Key::open(HKEY_LOCAL_MACHINE, NRPT, KEY_READ | KEY_WRITE)? {
         for id in &recovery.ids {
             nrpt.delete_child(id)?;
         }
     }
-    confirm(root, &recovery)?;
+    confirm(root, &recovery).map_err(mid_replay)?;
     for saved in &recovery.saved {
         if let Some(target) = Key::open(HKEY_LOCAL_MACHINE, &saved.path, KEY_READ | KEY_SET_VALUE)?
         {
@@ -322,7 +342,7 @@ pub(super) fn replay(root: &Path) -> Result<Reclaimed, WinError> {
             }
         }
     }
-    confirm(root, &recovery)?;
+    confirm(root, &recovery).map_err(mid_replay)?;
     delete_key(HKEY_LOCAL_MACHINE, MAGIC, true)?;
     Ok(Reclaimed::Removed)
 }
@@ -330,6 +350,7 @@ pub(super) fn replay(root: &Path) -> Result<Reclaimed, WinError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use etd_sysfx::ReclaimError;
     #[test]
     fn gate_rejects_unreadable_and_outside_candidate() {
         let dir = tempfile::tempdir().unwrap();
@@ -343,12 +364,29 @@ mod tests {
         std::fs::create_dir(&external).unwrap();
         let image = external.join("easytier-core.exe");
         std::fs::write(&image, b"fixture").unwrap();
+        let held = gate_candidates(&root, vec![("external".into(), Ok(image.clone()))])
+            .unwrap_err()
+            .reclaim();
         assert!(
-            gate_candidates(&root, vec![("external".into(), Ok(image))])
-                .unwrap_err()
-                .message
-                .contains("BUSY:")
+            matches!(&held, ReclaimError::HeldBy(h) if h.contains("external") && h.contains("core-other")),
+            "{held:?}"
         );
+        // Beside an unprovable candidate, in either order, it stays Busy.
+        let unreadable = || ("unreadable".into(), Err(WinError::invalid("missing path")));
+        for items in [
+            vec![("external".into(), Ok(image.clone())), unreadable()],
+            vec![unreadable(), ("external".into(), Ok(image.clone()))],
+        ] {
+            assert!(matches!(
+                gate_candidates(&root, items).unwrap_err().reclaim(),
+                ReclaimError::Busy(_)
+            ));
+        }
+        // Found only once the replay changed something: Busy, to finish it.
+        assert!(matches!(
+            mid_replay(held_error(&root, image)).reclaim(),
+            ReclaimError::Busy(m) if m.contains("started during the replay")
+        ));
         assert!(
             gate_candidates(
                 &root,
@@ -364,6 +402,9 @@ mod tests {
                 .message
                 .contains("BUSY:")
         );
+    }
+    fn held_error(root: &Path, image: PathBuf) -> WinError {
+        gate_candidates(root, vec![("external".into(), Ok(image))]).unwrap_err()
     }
     #[test]
     fn candidate_names() {

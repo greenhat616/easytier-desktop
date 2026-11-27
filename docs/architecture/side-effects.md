@@ -19,7 +19,7 @@ The adapter profile for the pinned upstream revision predicts these objects:
 | Effect | Platform | How we recognise ours | After the kernel is killed | Host action |
 | --- | --- | --- | --- | --- |
 | Kernel process | All | pid + start time + executable; command line points into this generation's directory | n/a | Kill the tree after verifying identity |
-| TUN adapter | Windows (wintun) | Name `etd-<8 hex>` derived from the install key and instance; GUID is the name's UUIDv5 | Expected to vanish | Verify by LUID that it is gone; it is never deleted, and a lingering adapter keeps the generation open |
+| TUN adapter | Windows (wintun) | Name `etd-<8 hex>` derived from the install key and instance; GUID is the name's UUIDv5 | Expected to vanish | Verify by LUID that it is gone; it is never deleted: a lingering adapter is a candidate that keeps the generation open until it is gone |
 | | Linux tun | Same derived name | Vanishes with the process | Re-check; delete through netlink if present |
 | | macOS utun | Name assigned by the system, read back once ready | Vanishes with the process | Re-check |
 | Addresses and routes | All | Attached to that adapter | Vanish with the adapter | Verify no route points at the interface |
@@ -148,7 +148,9 @@ for an administrator to confirm item by item.
 The firewall rule group and the Windows Magic DNS registry record are names shared with
 upstream installations. Interface rules are told apart by the `etd-` adapter name.
 Magic DNS cannot be told apart, so it is restored only when no other EasyTier process
-is running; otherwise it is left in place and the reclaim report says why.
+is running. A running one proven to be outside our kernel store makes the record a
+conflict: left in place, the holder named in the report, closed once the key is gone. A
+process that cannot be proven either way is retried, then quarantined.
 
 ## Product-level effects
 

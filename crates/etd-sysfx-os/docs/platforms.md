@@ -37,7 +37,7 @@ variable, never interpolated into script source.
 
 | Kind | Observed as | Reclaim |
 | --- | --- | --- |
-| `win.tun` | Adapter by name or derived GUID; present only with an IP interface or a live PnP devnode (phantom table rows ignored). Credential `WinAdapter { luid, device_instance_id }` | Never uninstalled: returns `Busy` until the adapter is gone |
+| `win.tun` | Adapter by name or derived GUID; present only with an IP interface or a live PnP devnode (phantom table rows ignored). Credential `WinAdapter { luid, device_instance_id }` | Never uninstalled: a live adapter with our credential answers `NotDeletable`, so the record is a candidate that closes once the adapter is gone (whether it can outlive its creator is spike S2) |
 | `route` | Routes whose interface is the adapter | Verify only: `Busy` while any remain |
 | `win.firewall_rule` | Rule by exact display name and group; credential = rule id. A same-name rule in another group is reported as foreign | Delete by rule id, re-checked in the same script step |
 | `win.program_firewall_rule` | Credential = rule id, name, program path, direction, group (core-binary scope) | Delete only if program, direction and group still match |
@@ -52,7 +52,15 @@ variable, never interpolated into script source.
 EasyTier installation. Before each mutating stage the reclaimer re-reads the record and
 checks that no other EasyTier process runs; the kernel processes of this product are
 recognised by the identity of their opened image file inside the protected kernel
-store, not by a path prefix. Otherwise it returns `Busy` and the engine retries.
+store, not by a path prefix. If every running candidate was read and placed, and one is
+outside the store, the first gate (before any change) answers `HeldBy` with that
+process's name and image: the record becomes a conflict, left in place, and closes once
+the key is gone (the other EasyTier's own clean-up removes it). A candidate that cannot be
+read or placed, a failed enumeration, a changed record, or a holder that appears once the
+replay has changed something is `Busy`, and the engine retries towards quarantine. A
+conflict is never replayed: if the other EasyTier never used Magic DNS and exits, our
+state stays in the key until the next EasyTier that enables Magic DNS cleans it (our next
+start included) or an administrator keeps the record.
 
 **Fence.** Key = UUIDv5(sublayer, `instance:epoch:port`). `install` adds, in one WFP
 transaction, four persistent filters at `ALE_AUTH_CONNECT` (IPv4 and IPv6 × permit and
@@ -76,8 +84,8 @@ record and the wintun / WinDivert drivers (candidates only).
 
 **Not reclaimed.** The wintun adapter and routes are verified, never deleted. Drivers
 are product scope; the reclaimer probes them but has no removal path. The UPnP mapping
-is record-only. A registry value someone else changed is left as is. Magic DNS waits
-while another EasyTier process runs.
+is record-only. A registry value someone else changed is left as is. Magic DNS is left
+in place, as a conflict, while another EasyTier process runs.
 
 ## Linux
 

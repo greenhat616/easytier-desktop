@@ -86,7 +86,8 @@ Default host directories (`service`):
   never deleted on Windows and macOS (verify only), and routes never on Linux.
 - Each fence is verified on the live listener: the host must connect, a probe without
   privileges must be refused, and the refusal must come from this fence.
-- Windows Magic DNS is replayed only while no other EasyTier process runs; Linux Magic
+- Windows Magic DNS is replayed only while no other EasyTier process runs (a proven
+  external one leaves it in place as a conflict); Linux Magic
   DNS state is reverted on the credential-checked link; macOS Magic DNS is refused by
   the planner.
 - Every child process on Windows is started with `CREATE_NO_WINDOW`.

@@ -53,7 +53,9 @@ impl WinError {
         }
     }
     fn reclaim(self) -> ReclaimError {
-        if self.message.contains("BUSY:") {
+        if let Some(holder) = self.message.strip_prefix(HELD_BY) {
+            ReclaimError::HeldBy(holder.to_owned())
+        } else if self.message.contains("BUSY:") {
             ReclaimError::Busy(self.message)
         } else {
             ReclaimError::Os {
@@ -69,6 +71,8 @@ impl WinError {
         }
     }
 }
+/// Message prefix of a [`WinError`] that is a proven foreign holder.
+const HELD_BY: &str = "HELD_BY: ";
 fn observation(credential: Option<Credential>, key: ObjectKey, detail: String) -> Observation {
     Observation {
         credential,
@@ -445,7 +449,9 @@ impl Reclaimer for WindowsReclaimer {
         };
         let response = match self.0 {
             EffectKind::WinFenceFilter => {let key=e.key.clone();return blocking(move||wfp::remove(&key)).await.map_err(WinError::reclaim);},
-            EffectKind::WinTunAdapter => return Err(ReclaimError::Busy("live adapter; never uninstall live wintun".into())),
+            // Ours (same credential) but never uninstalled live: listed as a
+            // candidate, closed once gone (topic#59 msg#1766).
+            EffectKind::WinTunAdapter => return Err(ReclaimError::NotDeletable("live adapter; never uninstall live wintun".into())),
             EffectKind::Route => return Err(ReclaimError::Busy("routes still present; never delete routes blindly".into())),
             EffectKind::WinRegistryValue => {
                 let (path,value) = registry_value_key(&e.key).map_err(WinError::reclaim)?;

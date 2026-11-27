@@ -61,10 +61,16 @@ def apt_install(deb, name):
 
 
 def status():
-    """dpkg's two-letter state (`ii` installed, `iF` half-configured), or
-    None when dpkg does not know the package."""
+    """dpkg's two-letter state, desired then current (`ii` installed, `iF`
+    half-configured, `in` wanted but not installed), or None when dpkg does
+    not know the package."""
     result = command("dpkg-query", "-W", "-f=${db:Status-Abbrev}", PACKAGE, check=False)
     return result.stdout.strip() or None if result.returncode == 0 else None
+
+
+def not_installed():
+    state = status()
+    return state is None or state[1:2] == "n"
 
 
 def version():
@@ -127,7 +133,7 @@ def refused_over_cli_install(service, deb):
         result = apt_install(deb, "install-over-cli")
         assert result.returncode != 0, "apt installed over a CLI-installed service"
         assert "remove it first" in result.stdout + result.stderr
-        assert status() in (None, "un", "pn"), f"dpkg state {status()}"
+        assert not_installed(), f"dpkg state {status()}"
         package_files_absent()
         serving(service, "CLI-installed service after the refused package")
         assert journal() == before, "the refused package changed the installation"
@@ -209,7 +215,7 @@ def deb_lifecycle():
         print("dpkg --configure -a reran the postinst: the upgrade to 0.1.2 completed", flush=True)
 
     # 5. Purge (Service.installed compared the machine).
-    assert status() in (None, "un", "pn"), f"dpkg state {status()}"
+    assert not_installed(), f"dpkg state {status()}"
     package_files_absent()
     assert not UNIT.exists(), "purge left the unit"
     print("purged: no payload, link, desktop entry, icon, unit or package", flush=True)

@@ -2,6 +2,7 @@
 //! management provider queries. No request data is executed as code.
 pub mod appearance;
 pub mod driver_refs;
+pub mod elevation;
 
 /// Uninstall: remove the service host's volatile boot marker (see
 /// `registry::remove_machine_boot_marker`).

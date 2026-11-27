@@ -128,6 +128,34 @@ and every kernel exit goes through reclaim before the next generation may start.
 the [architecture overview](docs/architecture/README.md) for the processes, crates,
 channels and state machines.
 
+## Fluent component gallery
+
+Preview the host-free component gallery without starting the product runtime:
+
+```sh
+cargo run -p etd-ui --example gallery
+cargo run -p etd-ui --example gallery -- --dark
+```
+
+Use the sidebar's appearance picker to compare light, dark, and system mode.
+Hover or hold a sample for pointer states, or navigate by Tab and activate
+with Space/Enter. The gallery shows the production button variants, switches,
+text boxes, navigation items, InfoBars, selected cards, progress rings, and
+appearance choices. Its state is in-memory: it does not open a host connection,
+tray, profile library, or production UI preferences.
+
+The control geometry follows Microsoft's [Button template](https://github.com/microsoft/microsoft-ui-xaml/blob/main/controls/dev/CommonStyles/Button_themeresources.xaml)
+(32 epx standard height, 14 epx text, 11/5/11/6 padding, 4 epx radius),
+[NavigationView left-mode guidance](https://learn.microsoft.com/en-us/windows/apps/develop/ui/controls/navigationview)
+(52 epx page header, 24 epx content margins, pane title adjacent to toggle)
+and [InfoBar template](https://github.com/microsoft/microsoft-ui-xaml/blob/main/controls/dev/InfoBar/InfoBar_themeresources.xaml)
+(48 epx minimum, 14 epx title and message, 16 epx icon, 38 epx close target,
+1 epx card stroke and 16 epx content padding). InfoBar uses the
+[WinUI system fill colors](https://github.com/microsoft/microsoft-ui-xaml/blob/main/controls/dev/CommonStyles/Common_themeresources_any.xaml);
+the informational background and severity fills remain opaque over the app's
+content. Example UI is original and uses the shared product wrapper, not a
+copy of WinUI Gallery's interface.
+
 ## Build from source
 
 Prerequisites:

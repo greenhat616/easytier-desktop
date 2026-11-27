@@ -8,6 +8,7 @@ pub mod assets;
 pub mod composition;
 pub mod controller;
 pub mod editor;
+pub mod gallery;
 pub mod model;
 mod preferences;
 pub mod theme;

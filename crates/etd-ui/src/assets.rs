@@ -101,6 +101,14 @@ const FLUENT: &[(&str, &[u8])] = &[
         "info-filled.svg",
         include_bytes!("../assets/fluent/info-filled.svg"),
     ),
+    (
+        "navigation.svg",
+        include_bytes!("../assets/fluent/navigation.svg"),
+    ),
+    (
+        "dismiss-circle-filled.svg",
+        include_bytes!("../assets/fluent/dismiss-circle-filled.svg"),
+    ),
     ("globe.svg", include_bytes!("../assets/fluent/globe.svg")),
     (
         "globe-filled.svg",

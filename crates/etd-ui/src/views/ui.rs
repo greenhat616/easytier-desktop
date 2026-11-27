@@ -35,6 +35,7 @@ pub struct BtnStyle {
     pub loading: bool,
     pub icon: Option<&'static str>,
     selected: bool,
+    icon_only: bool,
 }
 
 impl BtnStyle {
@@ -47,11 +48,18 @@ impl BtnStyle {
             loading: false,
             icon: None,
             selected: false,
+            icon_only: false,
         }
     }
 
     pub const fn icon(mut self, asset: &'static str) -> Self {
         self.icon = Some(asset);
+        self
+    }
+
+    /// Icon-only controls retain their full accessible label.
+    pub const fn icon_only(mut self) -> Self {
+        self.icon_only = true;
         self
     }
 
@@ -161,8 +169,17 @@ impl gpui::RenderOnce for FluentButton {
         let style = self.style;
         let focus = focus_for(&id, window, cx);
         let group = SharedString::from(format!("fluent-button:{id:?}"));
+        // WinUI standard control metrics in effective pixels, independent
+        // of Kit's XSmall/Small density. Larger explicit sizes remain valid.
+        let height = button_height(style.size);
         let mut btn = Button::new(id.clone())
-            .with_size(style.size)
+            .with_size(Size::Medium)
+            .h(height)
+            .min_h(height)
+            .px(px(11.))
+            .pt(px(5.))
+            .pb(px(6.))
+            .rounded(px(4.))
             .with_variant(style.variant)
             .accessibility_label(if style.selected {
                 format!("{} (selected)", self.label).into()
@@ -174,8 +191,16 @@ impl gpui::RenderOnce for FluentButton {
             .focus_ring(false)
             .disabled(style.disabled || style.loading)
             .on_click(move |ev, window, cx| (self.on_click)(ev, window, cx));
-        if style.outline {
+        // WinUI standard buttons already have a subtle 1px stroke; Kit's
+        // Default outline instead uses input-background, making them grey.
+        if style.outline && style.variant != ButtonVariant::Default {
             btn = btn.outline();
+        }
+        if style.icon_only {
+            btn = btn.w(height).min_w(height).px_0().py_0();
+        }
+        if style.selected && style.variant == ButtonVariant::Ghost {
+            btn = btn.bg(cx.theme().secondary.opacity(0.55));
         }
         if style.loading {
             let (fill, ink) = loading_button_colors(style, cx);
@@ -183,7 +208,11 @@ impl gpui::RenderOnce for FluentButton {
             // button is non-activatable but should keep its readable fill.
             btn = btn
                 .bg(fill)
-                .border_color(fill)
+                .border_color(if style.variant == ButtonVariant::Default {
+                    cx.theme().input
+                } else {
+                    fill
+                })
                 .text_color(ink)
                 .child(progress_ring_colored(
                     "button-progress",
@@ -197,20 +226,24 @@ impl gpui::RenderOnce for FluentButton {
         // The content fades slightly during a pointer press; the toolkit's
         // own active color remains the background feedback. Don't scale
         // layout or make disabled targets respond.
-        btn = btn.child(
-            div()
-                .id("fluent-button-label")
-                .min_w_0()
-                .truncate()
-                .group_active(group.clone(), move |s| {
-                    s.opacity(if style.disabled || style.loading {
-                        1.
-                    } else {
-                        0.86
+        if !style.icon_only {
+            btn = btn.child(
+                div()
+                    .id("fluent-button-label")
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(14.))
+                    .line_height(px(19.))
+                    .group_active(group.clone(), move |s| {
+                        s.opacity(if style.disabled || style.loading {
+                            1.
+                        } else {
+                            0.86
+                        })
                     })
-                })
-                .child(self.label),
-        );
+                    .child(self.label),
+            );
+        }
         let elevate = !style.disabled
             && !style.loading
             && !matches!(
@@ -223,6 +256,14 @@ impl gpui::RenderOnce for FluentButton {
             .child(btn)
             .children(elevate.then(|| button_elevation_line(cx)))
             .children(focus_visual(focus.is_focused(window), window, cx))
+    }
+}
+
+fn button_height(size: Size) -> gpui_kit::Pixels {
+    match size {
+        Size::Size(value) => value.max(px(32.)),
+        Size::Large => px(36.),
+        _ => px(32.),
     }
 }
 
@@ -250,7 +291,7 @@ fn button_elevation_line(cx: &App) -> AnyElement {
 
 fn loading_button_colors(style: BtnStyle, cx: &App) -> (Hsla, Hsla) {
     let t = cx.theme();
-    if style.outline {
+    if style.outline && style.variant != ButtonVariant::Default {
         let ink = match style.variant {
             ButtonVariant::Primary => t.primary,
             ButtonVariant::Danger => t.danger,
@@ -355,13 +396,107 @@ fn theme_choice_button(
     choice: crate::preferences::ThemePreference,
     selected: bool,
 ) -> AnyElement {
-    let mut style = BtnStyle::new(ButtonVariant::Ghost, Size::Small).selected(selected);
-    if selected {
-        style = style.icon("fluent/checkmark.svg");
+    FluentAlignedRow {
+        id: id.into(),
+        label: choice.label().into(),
+        selected,
+        appearance_choice: true,
+        on_click: Box::new(move |_, window, cx| crate::theme::set_preference(choice, window, cx)),
     }
-    action_button(id, choice.label(), style, move |_, window, cx| {
-        crate::theme::set_preference(choice, window, cx)
-    })
+    .into_any_element()
+}
+
+/// Start-aligned row button for clickable list entries. The containing card
+/// owns the selection tint/border, so this does not add a second selected fill.
+pub fn list_choice_button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    selected: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    FluentAlignedRow {
+        id: id.into(),
+        label: label.into(),
+        selected,
+        appearance_choice: false,
+        on_click: Box::new(on_click),
+    }
+    .into_any_element()
+}
+
+#[derive(IntoElement)]
+struct FluentAlignedRow {
+    id: ElementId,
+    label: SharedString,
+    selected: bool,
+    appearance_choice: bool,
+    on_click: ClickHandler,
+}
+
+impl RenderOnce for FluentAlignedRow {
+    #[inline(never)]
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let focus = focus_for(&self.id, window, cx);
+        let t = cx.theme();
+        let selected = self.selected;
+        let appearance = self.appearance_choice;
+        let aria_label = if appearance && selected {
+            format!("{} (selected)", self.label).into()
+        } else {
+            self.label.clone()
+        };
+        let label = div()
+            .min_w_0()
+            .truncate()
+            .text_size(px(14.))
+            .child(self.label);
+        let btn = BaseButton::new(self.id)
+            .track_focus(&focus)
+            .selected(selected)
+            .aria_selected(selected)
+            .accessibility_label(aria_label)
+            .w_full()
+            .h(px(32.))
+            .flex_row_dir(cx)
+            .justify_start()
+            .items_center()
+            .gap_2()
+            .px(px(8.))
+            .rounded(px(4.))
+            .text_color(t.foreground)
+            .bg(if appearance && selected {
+                t.secondary.opacity(0.55)
+            } else {
+                t.transparent
+            })
+            .hover(|s| s.bg(t.secondary.opacity(0.55)))
+            .active(|s| s.bg(t.secondary_active))
+            .children(appearance.then(|| {
+                let slot = div().size(px(16.)).flex_shrink_0();
+                if selected {
+                    slot.child(
+                        Icon::default()
+                            .path("fluent/checkmark.svg")
+                            .with_size(Size::Medium),
+                    )
+                } else {
+                    slot
+                }
+            }))
+            .child(if selected {
+                label.font_semibold()
+            } else {
+                label
+            })
+            .on_click(move |e, window, cx| (self.on_click)(e, window, cx));
+        let row = div()
+            .relative()
+            .w_full()
+            .min_w_0()
+            .child(btn)
+            .children(focus_visual(focus.is_focused(window), window, cx));
+        if appearance { row } else { row.flex_1() }
+    }
 }
 
 /// Builds a labeled single-line [`Input`] in its own stack frame.
@@ -726,7 +861,7 @@ impl SidebarItem for FluentNavItem {
         btn = if collapsed {
             btn.justify_center()
         } else {
-            btn.px_3()
+            btn.px_3().justify_start()
         };
         btn = btn.child(
             Icon::default()
@@ -758,6 +893,16 @@ impl SidebarItem for FluentNavItem {
     }
 }
 
+/// The product's instance-card selection surface, also used in the gallery.
+pub fn list_selection_surface(selected: bool, cx: &App) -> (Hsla, Hsla) {
+    let t = cx.theme();
+    if selected {
+        (t.primary.opacity(0.08), t.primary)
+    } else {
+        (t.secondary.opacity(0.25), t.border)
+    }
+}
+
 /// Semantic InfoBar presentation, with neutral text on an opaque composited
 /// tint. The badge's icon matches severity without relying on color alone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -768,20 +913,31 @@ pub enum InfoSeverity {
     Error,
 }
 
-fn info_colors(severity: InfoSeverity, cx: &App) -> (Hsla, Hsla) {
+fn info_colors(severity: InfoSeverity, cx: &App) -> (Hsla, Hsla, Hsla) {
     let t = cx.theme();
-    let color = match severity {
-        InfoSeverity::Informational => t.info,
-        InfoSeverity::Success => t.success,
-        InfoSeverity::Warning => t.warning,
-        InfoSeverity::Error => t.danger,
+    // WinUI Common_themeresources_any.xaml SystemFill colors. Resolve
+    // translucent informational surfaces over our opaque content layer.
+    let (background, icon) = match (t.is_dark(), severity) {
+        (false, InfoSeverity::Informational) => (0xF7F7F7, t.info),
+        (true, InfoSeverity::Informational) => (0x2E2E2E, t.info),
+        (false, InfoSeverity::Success) => (0xDFF6DD, rgb(0x0F7B0F).into()),
+        (true, InfoSeverity::Success) => (0x393D1B, rgb(0x6CCB5F).into()),
+        (false, InfoSeverity::Warning) => (0xFFF4CE, rgb(0x9D5D00).into()),
+        (true, InfoSeverity::Warning) => (0x433519, rgb(0xFCE100).into()),
+        (false, InfoSeverity::Error) => (0xFDE7E9, rgb(0xC42B1C).into()),
+        (true, InfoSeverity::Error) => (0x442726, rgb(0xFF99A4).into()),
     };
-    let bg = Hsla::from(t.popover.to_rgb().blend(color.opacity(0.10).to_rgb()));
-    (bg, color)
+    let bg: Hsla = rgb(background).into();
+    // WinUI's single CardStrokeColorDefault brush composites differently
+    // on each severity fill (light 0x0F000000, dark 0x19000000).
+    let stroke = Hsla::from(rgb(0)).opacity(if t.is_dark() { 25. / 255. } else { 15. / 255. });
+    let border = Hsla::from(bg.to_rgb().blend(stroke.to_rgb()));
+    (bg, icon, border)
 }
 
 pub struct FluentInfoBar {
     id: ElementId,
+    title: Option<SharedString>,
     message: SharedString,
     severity: InfoSeverity,
     role: Role,
@@ -797,12 +953,17 @@ impl FluentInfoBar {
     ) -> Self {
         Self {
             id: id.into(),
+            title: None,
             message: message.into(),
             severity,
             role: Role::Alert,
             actions: Vec::new(),
             close: None,
         }
+    }
+    pub fn title(mut self, title: impl Into<SharedString>) -> Self {
+        self.title = Some(title.into());
+        self
     }
     pub fn status(mut self) -> Self {
         self.role = Role::Status;
@@ -819,17 +980,18 @@ impl FluentInfoBar {
 
     #[inline(never)]
     pub fn render(self, cx: &App) -> AnyElement {
-        let (bg, semantic) = info_colors(self.severity, cx);
+        let (bg, semantic, border) = info_colors(self.severity, cx);
         let icon = match self.severity {
             InfoSeverity::Informational => "fluent/info-filled.svg",
             InfoSeverity::Success => "fluent/checkmark-circle-filled.svg",
-            InfoSeverity::Warning => "fluent/warning-filled.svg",
-            InfoSeverity::Error => "fluent/error-circle-filled.svg",
+            InfoSeverity::Warning => "fluent/error-circle-filled.svg",
+            InfoSeverity::Error => "fluent/dismiss-circle-filled.svg",
         };
         let badge = div()
             .id("infobar-severity")
             .test_support()
-            .size(px(20.))
+            .size(px(16.))
+            .mt(px(12.))
             .flex_shrink_0()
             .flex()
             .items_center()
@@ -837,38 +999,94 @@ impl FluentInfoBar {
             .child(
                 Icon::default()
                     .path(icon)
-                    .with_size(Size::Large)
+                    .with_size(Size::Medium)
                     .text_color(semantic),
             );
+        let aria_label: SharedString = match &self.title {
+            Some(title) => format!("{title} — {}", self.message).into(),
+            None => self.message.clone(),
+        };
+        // Flex-auto retains intrinsic text width for wrap decisions; flex-1's
+        // zero basis squeezed the title and message into a thin column beside
+        // the actions. WinUI exposes one ActionButton; additional actions are
+        // custom content below the message, not a row of three competing for
+        // its text width.
+        let body = div()
+            .id("infobar-body")
+            .test_support()
+            .min_w_0()
+            .flex_auto()
+            .flex_row_dir(cx)
+            .flex_wrap()
+            .items_center()
+            .gap_x(px(12.))
+            .gap_y(px(4.))
+            .py(px(9.))
+            .children(
+                self.title
+                    .map(|title| div().font_semibold().text_size(px(14.)).child(title)),
+            )
+            .child(
+                div()
+                    .flex_auto()
+                    .min_w_0()
+                    .text_size(px(14.))
+                    .child(self.message),
+            );
+        let multi_actions = self.actions.len() > 1;
         let actions = (!self.actions.is_empty()).then(|| {
             div()
+                .id("infobar-actions")
+                .test_support()
+                .min_w_0()
                 .flex_row_dir(cx)
-                .flex_shrink_0()
+                .flex_wrap()
+                .items_center()
                 .gap_2()
+                .py(px(3.))
                 .children(self.actions)
         });
-
+        let content = div().flex_1().min_w_0().flex().gap_x(px(16.)).gap_y(px(4.));
+        let content = if multi_actions {
+            content
+                .flex_col()
+                .items_start()
+                .child(body.w_full().flex_none())
+                .children(actions)
+        } else {
+            content
+                .flex_row_dir(cx)
+                .flex_wrap()
+                .items_center()
+                .child(body)
+                .children(actions)
+        };
+        let close_inset = if self.close.is_some() {
+            px(6.)
+        } else {
+            px(16.)
+        };
         div()
             .id(self.id)
             .role(self.role)
             .test_support()
-            .aria_label(self.message.clone())
-            .mx_3()
-            .my_0p5()
-            .px_3()
-            .py_1()
+            .aria_label(aria_label)
+            .min_h(px(48.))
+            .ps(px(16.), cx)
+            .pe(close_inset, cx)
+            .py(px(4.))
             .rounded(px(4.))
             .border_1()
-            .border_color(cx.theme().border)
+            .border_color(border)
             .bg(bg)
-            .text_sm()
             .text_color(cx.theme().foreground)
+            .text_size(px(14.))
+            .line_height(px(20.))
             .flex_row_dir(cx)
-            .items_center()
-            .gap_3()
+            .items_start()
+            .gap(px(14.))
             .child(badge)
-            .child(div().min_w_0().flex_1().child(self.message))
-            .children(actions)
+            .child(content)
             .children(self.close)
             .into_any_element()
     }
@@ -1052,7 +1270,8 @@ mod tests {
                     InfoSeverity::Warning,
                     InfoSeverity::Error,
                 ] {
-                    let (bg, badge) = info_colors(severity, cx);
+                    let (bg, badge, border) = info_colors(severity, cx);
+                    assert_ne!(bg, border);
                     assert!(
                         contrast(t.foreground, bg) >= 4.5,
                         "InfoBar body {mode:?} {severity:?}"

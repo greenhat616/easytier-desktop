@@ -80,7 +80,11 @@ impl Gallery {
         let normal = cx.new(|cx| InputState::new(window, cx).placeholder("Type here"));
         let filled = cx.new(|cx| InputState::new(window, cx).placeholder("Filled"));
         filled.update(cx, |input, cx| input.set_value("Example value", window, cx));
-        let secret = cx.new(|cx| InputState::new(window, cx).placeholder("Demo only"));
+        let secret = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Demo only")
+                .masked(true)
+        });
         secret.update(cx, |input, cx| input.set_value("example", window, cx));
         Self {
             toggles: [false, true],
@@ -494,7 +498,7 @@ impl Render for Gallery {
                     .child(div().font_semibold().text_size(px(24.)).child("Component gallery"))
                     .child(div().text_sm().text_color(cx.theme().muted_foreground).child(format!("Local actions: {}", self.clicks))))
                 .child(div().id("gallery-scroll").test_support().flex_1().min_h_0().overflow_y_scroll()
-                    .bg(cx.theme().popover).rounded_tl(px(8.)).px(px(24.)).py_4().flex().flex_col().gap_4()
+                    .bg(cx.theme().popover).rounded_tl(px(8.)).border_t_1().border_l_1().border_color(cx.theme().border).px(px(24.)).py_4().flex().flex_col().gap_4()
                     .child(div().text_sm().text_color(cx.theme().muted_foreground)
                         .child("Hover or hold an enabled sample, or press Tab then Space/Enter. Appearance is session-only. No host is used."))
                     .child(buttons).child(inputs).child(lists).child(notifications)))
@@ -629,8 +633,14 @@ mod tests {
             cx.update_window(handle, |_, window, cx| {
                 let center = window.find("gallery-accent-Rest").bounds().center();
                 window.pointer_up(center, gpui_kit::MouseButton::Left, cx);
-                window.press("tab", cx);
-                window.render_frame(cx);
+                for _ in 0..12 {
+                    window.press("tab", cx);
+                    window.render_frame(cx);
+                    if window.find("gallery-accent-Rest").focused() == Some(true) {
+                        break;
+                    }
+                }
+                assert!(window.find("fluent-focus-visual").visible());
             })
             .unwrap();
             cx.capture_screenshot(handle)

@@ -318,6 +318,16 @@ fn pane_and_page_header_share_top_edge_and_banners_are_in_content(cx: &mut TestA
         assert!(notification.origin.x >= content.origin.x + px(24.));
         assert!(notification.origin.y >= content.origin.y);
         assert!(notification.right() <= content.right());
+        // Multiple action buttons are WinUI custom content below the message.
+        let body = window
+            .within("banner-no-host")
+            .find("infobar-body")
+            .bounds();
+        let actions = window
+            .within("banner-no-host")
+            .find("infobar-actions")
+            .bounds();
+        assert!(actions.origin.y >= body.bottom());
         for id in [
             "btn-connect-service",
             "btn-connect-user",

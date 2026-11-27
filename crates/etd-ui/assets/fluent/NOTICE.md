@@ -52,3 +52,4 @@ Copyright (c) 2020 Microsoft Corporation; MIT license in `LICENSE.txt`. The file
 - `error-circle-filled.svg` — `assets/Error Circle/SVG/ic_fluent_error_circle_24_filled.svg`
 
 - `navigation.svg` — `assets/Navigation/SVG/ic_fluent_navigation_24_regular.svg`
+- `dismiss-circle-filled.svg` — `assets/Dismiss Circle/SVG/ic_fluent_dismiss_circle_24_filled.svg`

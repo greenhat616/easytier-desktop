@@ -208,7 +208,11 @@ impl gpui::RenderOnce for FluentButton {
             // button is non-activatable but should keep its readable fill.
             btn = btn
                 .bg(fill)
-                .border_color(fill)
+                .border_color(if style.variant == ButtonVariant::Default {
+                    cx.theme().input
+                } else {
+                    fill
+                })
                 .text_color(ink)
                 .child(progress_ring_colored(
                     "button-progress",
@@ -980,13 +984,14 @@ impl FluentInfoBar {
         let icon = match self.severity {
             InfoSeverity::Informational => "fluent/info-filled.svg",
             InfoSeverity::Success => "fluent/checkmark-circle-filled.svg",
-            InfoSeverity::Warning => "fluent/warning-filled.svg",
-            InfoSeverity::Error => "fluent/error-circle-filled.svg",
+            InfoSeverity::Warning => "fluent/error-circle-filled.svg",
+            InfoSeverity::Error => "fluent/dismiss-circle-filled.svg",
         };
         let badge = div()
             .id("infobar-severity")
             .test_support()
             .size(px(16.))
+            .mt(px(12.))
             .flex_shrink_0()
             .flex()
             .items_center()
@@ -1001,13 +1006,21 @@ impl FluentInfoBar {
             Some(title) => format!("{title} — {}", self.message).into(),
             None => self.message.clone(),
         };
+        // Flex-auto retains intrinsic text width for wrap decisions; flex-1's
+        // zero basis squeezed the title and message into a thin column beside
+        // the actions. WinUI exposes one ActionButton; additional actions are
+        // custom content below the message, not a row of three competing for
+        // its text width.
         let body = div()
+            .id("infobar-body")
+            .test_support()
             .min_w_0()
-            .flex_1()
+            .flex_auto()
             .flex_row_dir(cx)
             .flex_wrap()
             .items_center()
             .gap_x(px(12.))
+            .gap_y(px(4.))
             .py(px(9.))
             .children(
                 self.title
@@ -1015,13 +1028,17 @@ impl FluentInfoBar {
             )
             .child(
                 div()
-                    .flex_1()
+                    .flex_auto()
                     .min_w_0()
                     .text_size(px(14.))
                     .child(self.message),
             );
+        let multi_actions = self.actions.len() > 1;
         let actions = (!self.actions.is_empty()).then(|| {
             div()
+                .id("infobar-actions")
+                .test_support()
+                .min_w_0()
                 .flex_row_dir(cx)
                 .flex_wrap()
                 .items_center()
@@ -1029,16 +1046,21 @@ impl FluentInfoBar {
                 .py(px(3.))
                 .children(self.actions)
         });
-        let content = div()
-            .flex_1()
-            .min_w_0()
-            .flex_row_dir(cx)
-            .flex_wrap()
-            .items_center()
-            .gap_x(px(16.))
-            .gap_y(px(8.))
-            .child(body.min_w(px(180.)))
-            .children(actions);
+        let content = div().flex_1().min_w_0().flex().gap_x(px(16.)).gap_y(px(4.));
+        let content = if multi_actions {
+            content
+                .flex_col()
+                .items_start()
+                .child(body.w_full().flex_none())
+                .children(actions)
+        } else {
+            content
+                .flex_row_dir(cx)
+                .flex_wrap()
+                .items_center()
+                .child(body)
+                .children(actions)
+        };
         let close_inset = if self.close.is_some() {
             px(6.)
         } else {
@@ -1061,7 +1083,7 @@ impl FluentInfoBar {
             .text_size(px(14.))
             .line_height(px(20.))
             .flex_row_dir(cx)
-            .items_center()
+            .items_start()
             .gap(px(14.))
             .child(badge)
             .child(content)

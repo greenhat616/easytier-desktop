@@ -151,9 +151,10 @@ Slider, NumberBox, SettingsCard, SettingsExpander, MenuFlyout, CommandBar,
 ContentDialog, Flyout, TeachingTip, NavigationView items, BreadcrumbBar,
 SelectorBar, TabView, Expander, a ScrollViewer with the Fluent scroll bar,
 ToolTip, a status badge, a copy button, ProgressBar, an empty state and
-selection cards, and an always-on-top pop-out window with its own title bar). They live in `etd-ui`'s
-`views::controls`, `views::menus`, `views::dialogs`, `views::navigation`,
-`views::layout`, `views::motion` and `views::feedback` and take their values
+selection cards, and an always-on-top pop-out window with its own title
+bar). They live in `etd-ui`'s `views::controls`, `views::menus`,
+`views::dialogs`, `views::navigation`, `views::layout`, `views::motion`,
+`views::feedback`, `views::progress` and `views::popout` and take their values
 from the WinUI theme resources and the Windows Community Toolkit
 SettingsControls. Each is a Tab stop with the WinUI focus visual; open
 flyouts take Up, Down and Escape and give focus back when they close.

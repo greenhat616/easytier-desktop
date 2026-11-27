@@ -1,0 +1,134 @@
+# The ES2N gate (doc#17 v2, topic#51 msg#1959): the native system operations
+# against the retired PowerShell worker (which also exercises the FW_RULE
+# layout on each image), then both host forms under HKCU COM plants and
+# Process Monitor, on each Windows Server image of the firewall build list.
+name: Windows native gate
+on:
+  push:
+    branches: [main, wbs/ES2N-native]
+    paths:
+      - 'crates/etd-sysfx-os/**'
+      - 'crates/etd-host/**'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/scripts/es2n-*'
+      - '.github/actions/setup-tools/**'
+      - 'mise.toml'
+      - '.github/workflows/windows-native-gate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+env:
+  CARGO_BUILD_JOBS: '4'
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+
+jobs:
+  gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    env:
+      PM_OUT: C:\pm\out
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-tools
+        with:
+          tools: protoc cargo-nextest
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          save-if: false
+      - name: Windows build
+        shell: pwsh
+        run: |
+          $v = [Environment]::OSVersion.Version
+          Write-Host "build $v"
+          (Get-Item "$env:SystemRoot\System32\FirewallAPI.dll").VersionInfo.FileVersion | Write-Host
+      - run: cargo nextest run --locked -p etd-sysfx-os --lib
+      - name: Build the gate tests
+        run: |
+          cargo xtask fetch-cores --target host --bundle target/debug/cores
+          cargo nextest list --locked --profile privileged -p etd-sysfx-os --features ci-test-fixtures --run-ignored only --test windows_native_parity --test windows_fence
+          cargo nextest list --locked --profile privileged -p etd-host --run-ignored only --test install_roundtrip
+      - name: Fetch Process Monitor
+        id: procmon
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path C:\pm, $env:PM_OUT -Force | Out-Null
+          Invoke-WebRequest https://download.sysinternals.com/files/ProcessMonitor.zip -OutFile C:\pm\pm.zip
+          Expand-Archive C:\pm\pm.zip -DestinationPath C:\pm
+          $sig = Get-AuthenticodeSignature C:\pm\Procmon64.exe
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') { throw "Procmon signature: $($sig.Status) $($sig.SignerCertificate.Subject)" }
+      - name: Parity with the reference worker, junk in combase's key, captured
+        shell: pwsh
+        run: |
+          & .github/scripts/es2n-plant.ps1 -Remove
+          & .github/scripts/es2n-plant.ps1 -Junk
+          Start-Process C:\pm\Procmon64.exe -ArgumentList '/AcceptEula','/Quiet','/Minimized','/BackingFile','C:\pm\parity.pml'
+          Start-Sleep -Seconds 10
+          try {
+            cargo nextest run --locked --profile privileged -p etd-sysfx-os --features ci-test-fixtures --run-ignored only --test windows_native_parity -E 'not test(native_under_plants)' --no-fail-fast --success-output never --failure-output immediate
+            $code = $LASTEXITCODE
+          } finally {
+            & .github/scripts/es2n-plant.ps1 -Remove
+            & .github/scripts/es2n-capture.ps1 -Name parity -Processes '^windows_native_parity-[0-9a-f]+\.exe$' -Allowed $env:GITHUB_WORKSPACE -Out $env:PM_OUT
+            $captured = $LASTEXITCODE
+          }
+          if ($code -ne 0 -or $captured -ne 0) { exit 1 }
+      - name: Both host forms and the native operations under COM plants, captured
+        # Also after a parity failure, but only once the tests and Procmon exist.
+        if: ${{ !cancelled() && steps.procmon.outcome == 'success' }}
+        shell: pwsh
+        env:
+          CI: 'true'
+          ETD_HOST_CI_INSTALL: '1'
+        run: |
+          $tag = [guid]::NewGuid().ToString('N').Substring(0, 8)
+          $env:ETD_GATE_PROGRAM = "C:\etd-gate-$tag\core.exe"
+          $env:ETD_GATE_NAME = "EasyTier $env:ETD_GATE_PROGRAM (Inbound)"
+          $env:ETD_GATE_RULE = "etd-gate-$tag-a'q\b`"c"
+          New-NetFirewallRule -Name $env:ETD_GATE_RULE -DisplayName $env:ETD_GATE_NAME -Direction Inbound -Program $env:ETD_GATE_PROGRAM -Action Allow | Out-Null
+          & .github/scripts/es2n-plant.ps1 -Remove
+          $code = 0
+          $test = { param($package, $filter, [string[]]$features = @())
+            cargo nextest run --locked --profile privileged -p $package @features --run-ignored only -E $filter --success-output never --failure-output immediate | Out-Host
+            $LASTEXITCODE }
+          try {
+            & .github/scripts/es2n-plant.ps1 -Com -Junk
+            # Under the plants without Process Monitor: both host forms must pass.
+            if ((& $test etd-sysfx-os 'binary(windows_fence) & test(session_fence)' '--features','ci-test-fixtures') -ne 0) { $code = 1 }
+            if ((& $test etd-host 'binary(install_roundtrip) & test(install_connect_uninstall)') -ne 0) { $code = 1 }
+            Start-Process C:\pm\Procmon64.exe -ArgumentList '/AcceptEula','/Quiet','/Minimized','/BackingFile','C:\pm\hosts.pml'
+            Start-Sleep -Seconds 10
+            if ((& $test etd-sysfx-os 'binary(windows_native_parity) & test(native_under_plants)' '--features','ci-test-fixtures') -ne 0) { $code = 1 }
+            if ((& $test etd-sysfx-os 'binary(windows_fence) & test(session_fence)' '--features','ci-test-fixtures') -ne 0) { $code = 1 }
+            # Captured for its accesses only: under Process Monitor the service
+            # handshake fails with a closed pipe (seen with the PowerShell
+            # worker too), so this run's result is reported, not judged.
+            $captured = & $test etd-host 'binary(install_roundtrip) & test(install_connect_uninstall)'
+            Write-Host "install_connect_uninstall under Process Monitor: exit $captured"
+          } finally {
+            & .github/scripts/es2n-plant.ps1 -Remove
+            Remove-NetFirewallRule -Name $env:ETD_GATE_RULE -ErrorAction SilentlyContinue
+            & .github/scripts/es2n-capture.ps1 -Name hosts -Processes '^(etd-host|windows_native_parity-[0-9a-f]+|windows_fence-[0-9a-f]+|install_roundtrip-[0-9a-f]+)\.exe$' -Allowed $env:GITHUB_WORKSPACE, "$env:ProgramFiles\EasyTierDesk", "$env:ProgramData\EasyTierDesk.maintenance" -Absent 'etd-host.exe=windows.storage.dll' -Out $env:PM_OUT
+            if ($LASTEXITCODE -ne 0) { $code = 1 }
+          }
+          exit $code
+      - name: Call stacks of etd-host's Shell Folders, AppCompat and Safer reads
+        # Attribution only (topic#51 msg#2045): Windows frames under our
+        # CreateProcess, or an etd-host frame. Module names, no symbols.
+        if: ${{ !cancelled() && steps.procmon.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --quiet procmon-parser==0.4.0
+          python .github/scripts/es2n-stacks.py C:\pm\hosts.pml etd-host.exe 'shell folders' 'appcompatflags\layers' 'safer\codeidentifiers' | Tee-Object "$env:PM_OUT\hosts-stacks.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-native-gate-${{ matrix.os }}
+          path: C:\pm\out

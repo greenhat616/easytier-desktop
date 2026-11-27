@@ -1,3 +1,9 @@
+# The retired PowerShell worker (src/windows/system.ps1 before ES2N), kept
+# unchanged below as the parity reference of tests/windows_native_parity.rs:
+# the gate runs it as a plain child of the test, beside the native
+# operations, on every Windows runner image. Never shipped or run by the
+# product.
+
 # Invoked only via the fixed system PowerShell path; request data is JSON,
 # never interpolated into executable script source. All output is UTF-8 JSON.
 # No module is autoloaded: autoloading searches the user's Documents module

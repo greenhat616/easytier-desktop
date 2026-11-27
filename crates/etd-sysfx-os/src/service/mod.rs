@@ -81,6 +81,35 @@ impl HostLock {
         Ok(Self { files: vec![file] })
     }
 }
+/// Rule 4 (doc#17): a host lock never goes while a firewall mutation started
+/// under it can still run, on every exit, errors included. Dropping it
+/// settles the firewall thread first; if a call is still in flight the lock
+/// files are leaked, so the lock holds until the process ends. Blocks for at
+/// most [`crate::HELPERS_SHUTDOWN_WORST`].
+impl Drop for HostLock {
+    fn drop(&mut self) {
+        release(&mut self.files, helpers_quiescent);
+    }
+}
+fn helpers_quiescent() -> bool {
+    #[cfg(windows)]
+    {
+        crate::windows::quiesce_helpers()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+fn release(files: &mut Vec<File>, quiescent: impl FnOnce() -> bool) {
+    if files.is_empty() || quiescent() {
+        files.clear();
+    } else {
+        for file in files.drain(..) {
+            std::mem::forget(file);
+        }
+    }
+}
 
 /// Serialize whole maintenance commands, including the interval when the
 /// host lifetime lock must be released before starting the service.
@@ -513,7 +542,7 @@ impl HostFilesystem for NativeHostFilesystem {
             && let Some(runtime) = &layout.socket_dir
             && runtime != &layout.state
         {
-            guard.files.extend(HostLock::acquire(runtime)?.files);
+            guard.files.append(&mut HostLock::acquire(runtime)?.files);
         }
         Ok(guard)
     }
@@ -617,4 +646,37 @@ fn service_layout() -> io::Result<HostLayout> {
         profile: None,
         user_host: false,
     })
+}
+
+#[cfg(test)]
+mod host_lock_tests {
+    use super::*;
+
+    fn directory(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("etd-host-lock-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A maintenance command that fails while a firewall call is still in
+    /// flight drops its lock on the error path: the lock must stay held.
+    #[test]
+    fn a_lock_dropped_with_a_call_in_flight_stays_held() {
+        let dir = directory("kept");
+        let mut held = HostLock::acquire(&dir).unwrap();
+        release(&mut held.files, || false);
+        drop(held);
+        let error = HostLock::acquire(&dir)
+            .err()
+            .expect("the lock must still be held");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn a_lock_dropped_when_quiescent_is_released() {
+        let dir = directory("released");
+        let mut held = HostLock::acquire(&dir).unwrap();
+        release(&mut held.files, || true);
+        HostLock::acquire(&dir).expect("released");
+    }
 }

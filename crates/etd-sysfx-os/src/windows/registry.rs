@@ -192,6 +192,41 @@ impl Key {
     pub fn delete_child(&self, name: &str) -> Result<(), WinError> {
         delete_key(self.0, name, false)
     }
+    /// The names of this key's values, in registry order ("" is the
+    /// default value).
+    pub fn value_names(&self) -> Result<Vec<String>, WinError> {
+        let mut out = Vec::new();
+        let mut index = 0;
+        loop {
+            // A value name is at most 16383 characters.
+            let mut buf = vec![0u16; 16384];
+            let mut len = buf.len() as u32;
+            // SAFETY: the name buffer and its length are valid for the call;
+            // type and data are not requested.
+            let rc = unsafe {
+                RegEnumValueW(
+                    self.0,
+                    index,
+                    Some(PWSTR(buf.as_mut_ptr())),
+                    &mut len,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            };
+            if rc == ERROR_NO_MORE_ITEMS {
+                break;
+            }
+            check(rc, "enumerate registry values")?;
+            out.push(
+                String::from_utf16(&buf[..len as usize])
+                    .map_err(|_| WinError::invalid("invalid registry value name"))?,
+            );
+            index += 1;
+        }
+        Ok(out)
+    }
 }
 pub(super) fn delete_key(root: HKEY, path: &str, recursive: bool) -> Result<(), WinError> {
     let rc = unsafe {

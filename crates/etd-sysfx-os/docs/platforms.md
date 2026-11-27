@@ -30,35 +30,24 @@ ever executed as code.
 
 ## Windows
 
-System queries and changes use native APIs (IP Helper, CfgMgr, WFP, registry, SCM) and
-one constant PowerShell script (`system.ps1`) run by `execution.rs` from the system
-directory with a fixed environment; requests are JSON lines on its standard input,
-never interpolated into script source.
+System queries and changes use native APIs only (IP Helper, CfgMgr, WFP, registry, SCM,
+ToolHelp, and FirewallAPI.dll's flat functions for firewall rules); no host form starts a
+helper process or uses COM (doc#17, ES2N). Firewall cleanup runs on Windows builds the
+gate has passed on (20348, 26100, 26200) and on any other build whose read-only self-check
+passes; otherwise it reports "firewall cleanup not supported on this Windows build".
 
 **Host form.** Derived from the host's own token, never configured: a SYSTEM token is
 the system service; any other elevated token is the elevated session (doc#13), whose
 fence differs (below) and whose user profile, HKCU and environment are untrusted,
-because the same user's non-elevated processes can write them. The script therefore
-turns module autoloading off (`$PSModuleAutoLoadingPreference = 'None'`) and imports
-every module it uses by absolute path under `$PSHOME\Modules` (in every form); the
-worker keeps `-NoProfile` and an explicit environment, and under an elevated host that
-is not SYSTEM `USERPROFILE`, `APPDATA`, `LOCALAPPDATA` and `HOMEDRIVE`/`HOMEPATH` point
-at `<state_dir>\..\profile`, the protected empty directory of the session tree, with
-`PSModuleAnalysisCachePath=NUL`. It is never created here: when it is absent (an
-administrator's command over the service layout) the worker gets no profile variables
-at all, as before; when it is present it must be a plain directory owned by SYSTEM or
-Administrators, with no allow entry that gives anyone else a write right, whose final
-path (links and junctions resolved) is the path itself, or the worker fails closed.
-There is never a fallback to the user's profile.
-
-The .NET Framework runtime also reads its settings from the user's
-`HKCU\Software\Microsoft\.NETFramework`. On the CI runner, profiler settings there
-(`COR_ENABLE_PROFILING`, `COR_PROFILER`, `COR_PROFILER_PATH`) make an elevated
-PowerShell try to load the named DLL. The environment takes precedence, so workers of
-an elevated host that is not SYSTEM run with `COR_ENABLE_PROFILING=0`. This is defence
-in depth, not a fix: other runtime settings in HKCU are not neutralised and the list is
-not closed; replacing PowerShell with native APIs for the session form is the open
-alternative (topic#51).
+because the same user's non-elevated processes can write them. An elevated process
+also follows COM class and proxy/stub registrations in that HKCU (shown on the CI
+runner, doc#17 v2), so no host form does COM activation or remoting: every query and
+deletion is an in-process native call, and DLLs are loaded from System32 only. The
+Windows native gate checks this under planted HKCU COM registrations with Process
+Monitor on every run. The one HKCU read left is combase's start-up feature-flag key
+(`HKCU\Software\Classes\Local Settings\Software\Microsoft\Ole\FeatureDevelopmentProperties`),
+present because the `windows` crate's error type imports oleaut32 and the WinRT error
+API set; it does no activation, and the gate shows junk there changes nothing.
 
 | Kind | Observed as | Reclaim |
 | --- | --- | --- |
@@ -109,7 +98,7 @@ refusal (`WSAEACCES`) seen by a probe of the form's unprivileged identity.
 | Permit descriptor | `D:P(A;;0x1;;;SY)` | `D:P(A;;0x1;;;SY)(A;;0x1;;;BA)`: Administrators matches only where the group is enabled, so SYSTEM and elevated administrators; never the user SID or a group a non-elevated token has enabled |
 | Filters, provider, sublayer | persistent; owner SYSTEM | non-persistent, in a non-dynamic engine session: they outlive the host until BFE stops; owner Administrators |
 | Ledger persistence | `Persistent` | `UntilReboot`: the next start closes the record by boot id; a BFE restart while running is caught by the runtime fence re-verification (all filters missing) |
-| Negative probe | PowerShell started with `LogonUserW` as LocalService (no stored password); the script exits unless it runs as `S-1-5-19` | No child process: a dedicated host thread impersonates (`SetThreadToken`, `SecurityImpersonation`) a restricted copy of the host token (Administrators deny-only, minimal privileges, Medium integrity), checks that its effective token is that user with Administrators deny-only at Medium, then creates, binds and connects a socket in separate steps (only the connect's `WSAEACCES` is a refusal; any earlier failure is an error), and reverts. The probe's application id is `etd-host.exe`: a third-party filter keyed on another executable is outside what it represents. A child of the same user could be ended by any of the user's processes with the "refused" exit code; a thread of the elevated host cannot be reached that way |
+| Negative probe | No child process: a dedicated host thread impersonates (`SetThreadToken`, `SecurityImpersonation`) a `LogonUserW` LocalService token (no stored password), checks that its effective token is `S-1-5-19`, not SYSTEM, without enabled Administrators, at System integrity, then connects as below; only the connect's `WSAEACCES` is a refusal | No child process: a dedicated host thread impersonates (`SetThreadToken`, `SecurityImpersonation`) a restricted copy of the host token (Administrators deny-only, minimal privileges, Medium integrity), checks that its effective token is that user with Administrators deny-only at Medium, then creates, binds and connects a socket in separate steps (only the connect's `WSAEACCES` is a refusal; any earlier failure is an error), and reverts. The probe's application id is `etd-host.exe`: a third-party filter keyed on another executable is outside what it represents. A child of the same user could be ended by any of the user's processes with the "refused" exit code; a thread of the elevated host cannot be reached that way |
 
 An existing fence is read back as exactly one of the two shapes (persistence flag and
 permit descriptor must agree, and all four filters must have the same form), whichever

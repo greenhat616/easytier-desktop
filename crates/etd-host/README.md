@@ -21,7 +21,7 @@ that embeds the trusted kernel table. Binary only.
 | `resume-service` | Re-enable a service disabled by an uninstall that stopped before reclaim finished. |
 | `reclaim [--mode ...] [--all --purge]` | Reclaim ownership records while the host is stopped. `--purge` also removes product records and every configuration and requires `--all`, its explicit switch; `--all` alone changes nothing. |
 | `remove-core <version> [--mode ...]` | Reclaim a kernel's binary-scoped records, then delete it from the store. |
-| `doctor` | Print version, directories and adapter availability; no privileges needed. |
+| `doctor` | Print version, directories, adapter availability and, on Windows, whether firewall cleanup supports this build (listed, self-checked, or not supported with the reason); no privileges needed. |
 | `--console-ctrl <pid>` (hidden) | Windows graceful-stop helper; see `etd_proc::console_ctrl`. |
 
 Flows, locks, paths and the per-OS install steps are described in

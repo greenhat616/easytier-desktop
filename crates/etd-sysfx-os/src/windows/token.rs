@@ -1,5 +1,5 @@
 //! The host process's own token: which host form it is (decides the fence
-//! and the worker environment), the restricted copy the session fence probe
+//! and the fence probe identity), the restricted copy the session fence probe
 //! impersonates, and the identity the probing thread checks it really has.
 //! Nothing here is configured: it is read from the token.
 use super::{WinError, registry::Handle};
@@ -271,13 +271,55 @@ pub(super) fn restricted_impersonation() -> Result<Handle, WinError> {
     Ok(Handle(raw))
 }
 
+/// An impersonation token of the built-in LocalService account, for the
+/// service-form probe thread. LogonUserW documents this logon without a
+/// stored password; the service (SYSTEM) holds SeImpersonatePrivilege, so
+/// the thread gets SecurityImpersonation, which the thread check confirms.
+pub(super) fn local_service_impersonation() -> Result<Handle, WinError> {
+    use ::windows::Win32::Security::{LOGON32_LOGON_SERVICE, LOGON32_PROVIDER_DEFAULT, LogonUserW};
+    let mut raw = HANDLE::default();
+    // SAFETY: the documented built-in account with no password; `raw`
+    // receives a primary token handle that `Handle` closes.
+    unsafe {
+        LogonUserW(
+            &HSTRING::from("LocalService"),
+            &HSTRING::from("NT AUTHORITY"),
+            ::windows::core::PCWSTR::null(),
+            LOGON32_LOGON_SERVICE,
+            LOGON32_PROVIDER_DEFAULT,
+            &mut raw,
+        )
+    }
+    .map_err(WinError::windows)?;
+    let primary = Handle(raw);
+    let mut raw = HANDLE::default();
+    // SAFETY: a fresh logon token carries TOKEN_DUPLICATE; `raw` receives a
+    // token handle that `Handle` closes.
+    unsafe {
+        DuplicateTokenEx(
+            primary.0,
+            TOKEN_IMPERSONATE | TOKEN_QUERY,
+            None,
+            SecurityImpersonation,
+            TokenImpersonation,
+            &mut raw,
+        )
+    }
+    .map_err(WinError::windows)?;
+    Ok(Handle(raw))
+}
+
 /// What the probing thread sees in its effective token: whether it is the
-/// identity a non-elevated process of the host's user has at the fence.
+/// identity the fence must refuse.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct ProbeIdentity {
     pub user: String,
     /// BUILTIN\Administrators is present, deny-only and not enabled.
     pub admins_deny_only: bool,
+    /// BUILTIN\Administrators is an enabled group.
+    pub admins_enabled: bool,
+    /// LocalSystem (S-1-5-18) is the user or an enabled group.
+    pub local_system: bool,
     /// The mandatory integrity level RID.
     pub integrity: u32,
     /// The thread impersonates at SecurityImpersonation (not merely
@@ -287,11 +329,26 @@ pub(super) struct ProbeIdentity {
 impl ProbeIdentity {
     /// SECURITY_MANDATORY_MEDIUM_RID.
     pub const MEDIUM: u32 = 0x2000;
+    /// SECURITY_MANDATORY_SYSTEM_RID.
+    pub const SYSTEM: u32 = 0x4000;
+    /// NT AUTHORITY\LocalService.
+    pub const LOCAL_SERVICE: &str = "S-1-5-19";
     pub fn is_non_elevated(&self, user: &str) -> bool {
         self.impersonating
             && self.user == user
             && self.admins_deny_only
+            && !self.admins_enabled
+            && !self.local_system
             && self.integrity == Self::MEDIUM
+    }
+    /// The LocalService logon the service-form probe uses: not SYSTEM, no
+    /// enabled Administrators, System integrity (a service logon's level).
+    pub fn is_local_service(&self) -> bool {
+        self.impersonating
+            && self.user == Self::LOCAL_SERVICE
+            && !self.admins_enabled
+            && !self.local_system
+            && self.integrity == Self::SYSTEM
     }
 }
 
@@ -307,16 +364,28 @@ pub(super) fn thread_identity() -> Result<ProbeIdentity, WinError> {
     let groups = token_info(&token, TokenGroups)?;
     // SAFETY: the buffer holds a TOKEN_GROUPS with GroupCount entries; the
     // SIDs point into the same buffer.
-    let admins_deny_only = unsafe {
+    let (admins_deny_only, admins_enabled, system_group) = unsafe {
         let groups = &*groups.as_ptr().cast::<TOKEN_GROUPS>();
-        std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize)
-            .iter()
-            .filter(|g| IsWellKnownSid(g.Sid, WinBuiltinAdministratorsSid).as_bool())
-            .any(|g| {
+        let groups = std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize);
+        let enabled = |g: &&SID_AND_ATTRIBUTES| g.Attributes & SE_GROUP_ENABLED as u32 != 0;
+        let admins = || {
+            groups
+                .iter()
+                .filter(|g| IsWellKnownSid(g.Sid, WinBuiltinAdministratorsSid).as_bool())
+        };
+        (
+            admins().any(|g| {
                 g.Attributes & SE_GROUP_USE_FOR_DENY_ONLY as u32 != 0
                     && g.Attributes & SE_GROUP_ENABLED as u32 == 0
-            })
+            }),
+            admins().any(|g| enabled(&g)),
+            groups
+                .iter()
+                .filter(enabled)
+                .any(|g| IsWellKnownSid(g.Sid, WinLocalSystemSid).as_bool()),
+        )
     };
+    let local_system = system_group || user == "S-1-5-18";
     let label = token_info(&token, TokenIntegrityLevel)?;
     // SAFETY: the buffer holds a TOKEN_MANDATORY_LABEL whose SID points into
     // it; the last sub-authority is the integrity RID.
@@ -344,6 +413,8 @@ pub(super) fn thread_identity() -> Result<ProbeIdentity, WinError> {
     Ok(ProbeIdentity {
         user,
         admins_deny_only,
+        admins_enabled,
+        local_system,
         integrity,
         impersonating: level == SecurityImpersonation,
     })

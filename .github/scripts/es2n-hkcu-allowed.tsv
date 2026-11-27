@@ -1,0 +1,28 @@
+# HKCU accesses etd-host may make (lead rulings, topic#51 msg#2039 and
+# msg#2045; call stacks in the gate's hosts-stacks.txt): exact
+# operation and path (case-insensitive), nothing below them, matched alike
+# in HKCU and every hive under HKU, a <SID>_Classes hive as
+# HKCU\Software\Classes (msg#2109, msg#2157). RegSetInfoKey is listed with
+# its information class. Every other user-hive access by etd-host fails
+# the Windows native gate. Columns: group, operations (comma-separated),
+# path, reason. Mirrored in doc#17.
+startup	RegOpenKey,RegCloseKey,RegQueryKey	HKCU	the user hive root, opened by every process's start-up
+startup	RegOpenKey,RegCloseKey	HKCU\Control Panel\Desktop	UI language and DPI at start-up (kernelbase MUI, user32)
+startup	RegQueryValue	HKCU\Control Panel\Desktop\EnablePerProcessSystemDPI	DPI awareness at start-up (user32)
+startup	RegOpenKey	HKCU\Control Panel\Desktop\LanguageConfiguration	UI language at start-up (kernelbase MUI)
+startup	RegOpenKey,RegCloseKey	HKCU\Control Panel\Desktop\MuiCached	UI language at start-up (kernelbase MUI)
+startup	RegOpenKey	HKCU\Control Panel\Desktop\MuiCached\MachineLanguageConfiguration	UI language at start-up (kernelbase MUI)
+startup	RegQueryValue	HKCU\Control Panel\Desktop\MuiCached\MachinePreferredUILanguages	UI language at start-up (kernelbase MUI)
+startup	RegQueryValue	HKCU\Control Panel\Desktop\PreferredUILanguages	UI language at start-up (kernelbase MUI)
+startup	RegOpenKey	HKCU\Software\Policies\Microsoft\Control Panel\Desktop	UI language policy at start-up (kernelbase MUI)
+startup	RegOpenKey	HKCU\Software\Policies\Microsoft\Windows\Control Panel\Desktop	UI language policy at start-up (kernelbase MUI)
+startup	RegOpenKey,RegCloseKey	HKCU\Software\Microsoft\Windows NT\CurrentVersion	opened on the way to AppCompatFlags (CreateProcess) and by start-up
+createprocess	RegOpenKey	HKCU\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers	compatibility layers checked by CreateProcess for each child (ES4 hardening item)
+createprocess	RegOpenKey	HKCU\Software\Policies\Microsoft\Windows\Safer\CodeIdentifiers	software restriction policy checked by CreateProcess for each child (ES4 hardening item)
+createprocess	RegOpenKey,RegCloseKey	HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders	known-folder paths for the compatibility check: kernel32 under CreateProcess for each child, apphelp at the uninstall helper copy's start-up (ES4 hardening item)
+createprocess	RegQueryValue	HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders\Cache	the same compatibility check's known-folder cache (ES4 hardening item)
+combase	RegOpenKey,RegCloseKey,RegQueryKey,RegSetInfoKey:KeySetHandleTagsInformation	HKCU\Software\Classes\Local Settings	combase's feature-flag lookup, on the way down; RegSetInfoKey is KeySetHandleTagsInformation on the open handle, not a write
+combase	RegOpenKey,RegCloseKey	HKCU\Software\Classes\Local Settings\Software\Microsoft	combase's feature-flag lookup, on the way down
+combase	RegOpenKey	HKCU\Software\Classes\Local Settings\Software\Microsoft\Ole	combase's feature-flag lookup, on the way down
+combase	RegOpenKey,RegCloseKey,RegQueryKey	HKCU\Software\Classes\Local Settings\Software\Microsoft\Ole\FeatureDevelopmentProperties	combase's feature-flag key, read at load (rule msg#1959)
+combase	RegQueryValue	HKCU\Software\Classes\Local Settings\Software\Microsoft\Ole\FeatureDevelopmentProperties\BreakOnBadCombaseDllLoad	the one value combase reads there; junk planted beside it changes nothing (gate -Junk)

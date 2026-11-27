@@ -67,10 +67,21 @@ fn denied() -> io::Error {
 
 /// The current user's LocalAppData (the user host only). shell32 is loaded
 /// for this call alone, from System32, so the privileged hosts, which only
-/// use the machine locations below, never load it.
+/// use the machine locations below, never load it. An elevated token is
+/// refused before any lookup: a user-redirectable folder is never resolved
+/// through the shell for an administrator or LocalSystem, and the user form
+/// refuses an elevated token anyway.
 pub(super) fn local_app_data() -> io::Result<PathBuf> {
+    if elevated()? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            ELEVATED_USER_FOLDER,
+        ));
+    }
     shell_known_folder(&FOLDERID_LocalAppData)
 }
+const ELEVATED_USER_FOLDER: &str =
+    "an elevated token cannot operate a user host; use the installed system service instead";
 
 fn shell_known_folder(id: &GUID) -> io::Result<PathBuf> {
     type KnownFolderPath =
@@ -1275,6 +1286,21 @@ mod location_tests {
             "C:/ProgramData",
         ] {
             assert!(expand(refused).is_err(), "{refused}");
+        }
+    }
+
+    /// The user folder is resolved for an unelevated token only; an elevated
+    /// one (CI runners, an administrator, LocalSystem) is refused before
+    /// the shell is asked.
+    #[test]
+    fn an_elevated_token_never_resolves_the_user_folder() {
+        match (elevated().unwrap(), local_app_data()) {
+            (true, Err(error)) => {
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                assert_eq!(error.to_string(), ELEVATED_USER_FOLDER);
+            }
+            (false, Ok(path)) => assert!(path.is_absolute(), "{}", path.display()),
+            (elevated, result) => panic!("elevated={elevated}: {result:?}"),
         }
     }
 

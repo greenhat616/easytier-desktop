@@ -66,6 +66,25 @@ fn ps(script: &str) -> String {
     String::from_utf8_lossy(&output.stdout).trim().into()
 }
 
+/// A driver image path as one canonical full path: `\??\` dropped,
+/// `\SystemRoot\` and a leading `System32\` resolved against the Windows
+/// directory, lowercase.
+fn driver_path(path: &str) -> String {
+    let windows = std::env::var("SystemRoot")
+        .expect("SystemRoot")
+        .trim_end_matches('\\')
+        .to_lowercase();
+    let p = path.trim().to_lowercase();
+    let p = p.strip_prefix(r"\??\").unwrap_or(&p);
+    if let Some(rest) = p.strip_prefix(r"\systemroot\") {
+        format!(r"{windows}\{rest}")
+    } else if p.starts_with(r"system32\") {
+        format!(r"{windows}\{p}")
+    } else {
+        p.to_owned()
+    }
+}
+
 /// A string field, with null and "" the same.
 fn text(v: &Value, key: &str) -> String {
     v[key].as_str().unwrap_or("").to_owned()
@@ -221,6 +240,54 @@ fn firewall_deletion_is_by_id_and_verified() {
         [json!("removed")]
     );
     assert_eq!(count(&b, "PersistentStore"), 0);
+}
+
+/// opus msg#2113 minor-1: a foreign rule using a feature newer than 2.27 (a
+/// dynamic keyword address) stops neither the listing nor the deletion of
+/// ours. Records whether 2.27 reads it fully (listed) or not (skipped) in
+/// the gate's artifacts.
+#[test]
+#[ignore = "elevated disposable Windows CI runner only"]
+fn a_foreign_rule_with_a_newer_feature_does_not_stop_cleanup() {
+    let tag = uuid();
+    let keyword = format!("{{{}}}", uuid());
+    let foreign = format!("etd-parity-{tag}-keyword");
+    let ours = format!("etd-parity-{tag}-ours");
+    let name = format!("EasyTier etd-parity-{tag} - TCP Protocol (Inbound)");
+    let _cleanup = Cleanup(vec![
+        format!("Remove-NetFirewallRule -Name '{foreign}','{ours}' -ErrorAction SilentlyContinue"),
+        format!(
+            "Remove-NetFirewallDynamicKeywordAddress -Id '{keyword}' -ErrorAction SilentlyContinue"
+        ),
+    ]);
+    ps(&format!(
+        "New-NetFirewallDynamicKeywordAddress -Id '{keyword}' -Keyword 'etd-parity-{tag}' -Addresses '192.0.2.1' | Out-Null"
+    ));
+    ps(&format!(
+        "New-NetFirewallRule -Name '{foreign}' -DisplayName '{foreign}' -Direction Outbound -Action Block -RemoteDynamicKeywordAddresses '{keyword}' | Out-Null"
+    ));
+    ps(&format!(
+        "New-NetFirewallRule -Name '{ours}' -DisplayName '{name}' -Group 'EasyTier' -Direction Inbound -Protocol TCP -Action Allow | Out-Null"
+    ));
+    let rows = native(&json!({"op":"firewall"})).unwrap();
+    let seen = if rows.iter().any(|r| text(r, "id") == foreign) {
+        "read fully at 2.27 (status OK): listed"
+    } else {
+        "not read fully at 2.27: skipped with a warning"
+    };
+    let note = format!("a foreign rule with a dynamic keyword address is {seen}\n");
+    eprint!("{note}");
+    if let Some(out) = std::env::var_os("PM_OUT") {
+        let _ = std::fs::write(
+            std::path::Path::new(&out).join("firewall-newer-feature.txt"),
+            note,
+        );
+    }
+    assert!(rows.iter().any(|r| text(r, "id") == ours));
+    assert_eq!(
+        native(&json!({"op":"delete_firewall","id":ours,"name":name,"group":"EasyTier"})).unwrap(),
+        [json!("removed")]
+    );
 }
 
 const FIXTURE: &str = r"SOFTWARE\etd-parity";
@@ -461,10 +528,11 @@ fn service_driver_and_process_rows_match() {
         for (name, o) in &old {
             let (o, n) = (text(o, "description"), text(new[name], "description"));
             let (o, n): (Vec<&str>, Vec<&str>) = (o.split('|').collect(), n.split('|').collect());
-            let file = |p: &str| p.rsplit('\\').next().unwrap_or("").to_lowercase();
-            // Declared: WMI expands driver paths (\SystemRoot\..., System32\...).
+            // Declared: WMI expands driver paths (\SystemRoot\..., System32\...,
+            // \??\); both sides are compared as full paths after the same
+            // expansion (opus msg#2113 nit-2).
             let path_same = if op == "drivers" {
-                file(o[0]) == file(n[0])
+                driver_path(o[0]) == driver_path(n[0])
             } else {
                 o[0] == n[0]
             };

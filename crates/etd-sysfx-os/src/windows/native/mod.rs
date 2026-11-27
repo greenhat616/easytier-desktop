@@ -11,7 +11,7 @@ mod net;
 mod reg;
 mod scm;
 
-pub(super) use fw::{SHUTDOWN_WAIT, UNSUPPORTED_BUILD, shutdown};
+pub(super) use fw::{SHUTDOWN_WAIT, UNSUPPORTED_BUILD, quiesce, shutdown};
 
 /// Sweep mode: an object that fails becomes a `{warning, object}` row
 /// instead of failing the whole query.

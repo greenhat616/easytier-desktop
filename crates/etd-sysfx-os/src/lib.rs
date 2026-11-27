@@ -99,12 +99,13 @@ pub const HELPERS_SHUTDOWN_WORST: std::time::Duration = windows::HELPERS_SHUTDOW
 #[cfg(not(windows))]
 pub const HELPERS_SHUTDOWN_WORST: std::time::Duration = std::time::Duration::ZERO;
 
-/// Host shutdown: end every system-management helper process (Windows: the
-/// warm PowerShell workers) and confirm they are gone, so none outlives the
-/// host's singleton lock. Admission closes first: no helper starts in this
-/// process afterwards. Takes at most [`HELPERS_SHUTDOWN_WORST`]. `Err`: some
-/// could not be confirmed gone; whatever they were reclaiming stays open in
-/// the ledger. Elsewhere there is nothing to end.
+/// Host shutdown: settle every system-management helper (Windows: the
+/// firewall thread's call in flight) so none outlives the host's singleton
+/// lock. Admission closes first: no helper call starts in this process
+/// afterwards. Takes at most [`HELPERS_SHUTDOWN_WORST`]. `Err`: one could not
+/// be confirmed finished; whatever it was reclaiming stays open in the
+/// ledger. Elsewhere there is nothing to end. Every other host-lock release
+/// settles the same way ([`service::HostLock`]'s drop).
 pub fn shutdown_helpers() -> Result<(), OsError> {
     #[cfg(windows)]
     {

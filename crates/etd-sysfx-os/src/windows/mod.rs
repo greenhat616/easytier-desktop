@@ -122,6 +122,13 @@ pub(crate) fn shutdown_helpers() -> Result<(), crate::OsError> {
         message: e.message,
     })
 }
+/// See [`crate::service::HostLock`]: settle the firewall thread before a
+/// host lock goes. `false`: a call is still in flight.
+pub(crate) fn quiesce_helpers() -> bool {
+    native::quiesce()
+        .inspect_err(|e| tracing::warn!(stage = "host_lock.kept", error = %e.message, "a firewall call is still in flight; keeping the host lock until the process ends"))
+        .is_ok()
+}
 async fn query(request: Value) -> Result<Vec<Value>, WinError> {
     blocking(move || native::run(&request)).await
 }

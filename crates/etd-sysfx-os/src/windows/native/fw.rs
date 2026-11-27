@@ -273,7 +273,7 @@ fn check_build((major, minor, build): (u32, u32, u32)) -> Result<bool, WinError>
 /// (the layout asserts hold at compile time). Nothing is changed.
 fn self_check(api: Api) -> Result<usize, WinError> {
     let store = Store::open(api, false)?;
-    Ok(checked_rules(&store)?.len())
+    Ok(all_rules_ok(&store)?.len())
 }
 
 /// FirewallAPI.dll from System32, after the build check. Loaded once per
@@ -537,8 +537,46 @@ impl RuleRow {
     }
 }
 
-/// Rules of the store; fails closed if any rule's status is not OK.
-fn checked_rules(store: &Store) -> Result<Vec<RuleRow>, WinError> {
+/// Whether a rule could be one of ours (opus msg#2113 minor-1): its id is
+/// `target`, its name starts with `EasyTier `, or its group is EasyTier.
+fn could_be_ours(rule: &RuleRow, target: Option<&str>) -> bool {
+    target.is_some_and(|id| same(&rule.id, id))
+        || rule
+            .name
+            .as_deref()
+            .and_then(|n| n.get(..9))
+            .is_some_and(|p| same(p, "EasyTier "))
+        || rule.group.as_deref().is_some_and(|g| same(g, "EasyTier"))
+}
+
+/// Rules of the store whose status is OK. A rule that 2.27 could not read
+/// fully (status not OK) fails the whole call if it could be ours
+/// ([`could_be_ours`]); a foreign one is logged and left out. Structural
+/// faults (a list that disagrees with its count, a rule without an id,
+/// invalid text) fail in [`Store::rules`] already.
+fn checked_rules(store: &Store, target: Option<&str>) -> Result<Vec<RuleRow>, WinError> {
+    let mut rules = store.rules()?;
+    if let Some(bad) = rules
+        .iter()
+        .find(|r| r.status != FW_RULE_STATUS_OK && could_be_ours(r, target))
+    {
+        return Err(unsupported(format_args!(
+            "rule {} has status {:#x}",
+            bad.id, bad.status
+        )));
+    }
+    rules.retain(|r| {
+        let ok = r.status == FW_RULE_STATUS_OK;
+        if !ok {
+            tracing::warn!(stage = "firewall.rule_skipped", id = %r.id, status = r.status, "a foreign firewall rule could not be read fully at 2.27; skipped");
+        }
+        ok
+    });
+    Ok(rules)
+}
+
+/// The read-only self-check (ruling msg#1980): every rule's status OK.
+fn all_rules_ok(store: &Store) -> Result<Vec<RuleRow>, WinError> {
     let rules = store.rules()?;
     if let Some(bad) = rules.iter().find(|r| r.status != FW_RULE_STATUS_OK) {
         return Err(unsupported(format_args!(
@@ -552,8 +590,11 @@ fn checked_rules(store: &Store) -> Result<Vec<RuleRow>, WinError> {
 // ---- The module-owned thread ----
 
 type Job = Box<dyn FnOnce() + Send>;
+/// One thread runs every firewall call, one at a time. A job carries the
+/// epoch it was queued in; [`Worker::settle`] starts a new epoch, so a job
+/// queued before it never runs after it returns.
 struct Worker {
-    queue: Mutex<Option<mpsc::Sender<Job>>>,
+    queue: Mutex<Option<mpsc::Sender<(u64, Job)>>>,
     busy: Mutex<Busy>,
     idle: Condvar,
 }
@@ -561,37 +602,109 @@ struct Worker {
 struct Busy {
     in_flight: bool,
     closed: bool,
+    epoch: u64,
 }
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
-fn worker() -> &'static Worker {
-    static WORKER: OnceLock<Worker> = OnceLock::new();
-    WORKER.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Job>();
-        let spawned = std::thread::Builder::new()
-            .name("etd-firewall".into())
-            .spawn(move || {
-                for job in rx {
-                    let w = worker();
-                    {
-                        let mut busy = lock(&w.busy);
-                        if busy.closed {
-                            continue;
-                        }
-                        busy.in_flight = true;
-                    }
-                    job();
-                    lock(&w.busy).in_flight = false;
-                    w.idle.notify_all();
-                }
-            });
-        Worker {
-            queue: Mutex::new(spawned.ok().map(|_| tx)),
+impl Worker {
+    fn start() -> &'static Worker {
+        let (tx, rx) = mpsc::channel::<(u64, Job)>();
+        let w: &'static Worker = Box::leak(Box::new(Worker {
+            queue: Mutex::new(Some(tx)),
             busy: Mutex::new(Busy::default()),
             idle: Condvar::new(),
+        }));
+        let spawned = std::thread::Builder::new()
+            .name("etd-firewall".into())
+            .spawn(move || w.serve(rx));
+        if spawned.is_err() {
+            lock(&w.queue).take();
         }
-    })
+        w
+    }
+    fn serve(&self, rx: mpsc::Receiver<(u64, Job)>) {
+        for (epoch, job) in rx {
+            {
+                let mut busy = lock(&self.busy);
+                if busy.closed || epoch != busy.epoch {
+                    continue; // dropping the job tells its caller it never ran
+                }
+                busy.in_flight = true;
+            }
+            job();
+            lock(&self.busy).in_flight = false;
+            self.idle.notify_all();
+        }
+    }
+    /// Run `work` on the thread, waiting at most `bound` for its result.
+    fn run<R: Send + 'static>(
+        &self,
+        bound: Duration,
+        work: impl FnOnce() -> Result<R, WinError> + Send + 'static,
+    ) -> Result<R, WinError> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let epoch = lock(&self.busy).epoch;
+        {
+            let queue = lock(&self.queue);
+            let Some(queue) = queue.as_ref() else {
+                return Err(WinError::invalid("the firewall thread is shut down"));
+            };
+            queue
+                .send((
+                    epoch,
+                    Box::new(move || {
+                        let _ = tx.send(work());
+                    }),
+                ))
+                .map_err(|_| WinError::invalid("the firewall thread is gone"))?;
+        }
+        match rx.recv_timeout(bound) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(WinError::invalid(format!(
+                "a firewall call exceeded {}s; its outcome is indeterminate",
+                bound.as_secs()
+            ))),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(WinError::invalid(
+                "the firewall call was not run (the host lock was being released)",
+            )),
+        }
+    }
+    /// No queued call runs after this returns, and the call in flight, if
+    /// any, has finished: wait up to `wait` for it. `close`: admit nothing
+    /// afterwards either. `Err`: a call is still in flight; admission is
+    /// then closed for good and the caller must keep its lock until the
+    /// process ends.
+    fn settle(&self, wait: Duration, close: bool) -> Result<(), WinError> {
+        if close {
+            lock(&self.queue).take();
+        }
+        let deadline = Instant::now() + wait;
+        let mut busy = lock(&self.busy);
+        busy.epoch += 1;
+        busy.closed |= close;
+        while busy.in_flight {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                busy.closed = true;
+                drop(busy);
+                lock(&self.queue).take();
+                return Err(WinError::invalid(
+                    "a firewall call is still in flight; the lock is kept until the process ends",
+                ));
+            }
+            busy = self
+                .idle
+                .wait_timeout(busy, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        Ok(())
+    }
+}
+static WORKER: OnceLock<&'static Worker> = OnceLock::new();
+fn worker() -> &'static Worker {
+    WORKER.get_or_init(Worker::start)
 }
 
 /// FirewallAPI, loaded on the firewall thread the first time.
@@ -614,54 +727,25 @@ fn api() -> Result<Api, WinError> {
 fn call<R: Send + 'static>(
     work: impl FnOnce(Api) -> Result<R, WinError> + Send + 'static,
 ) -> Result<R, WinError> {
-    let w = worker();
-    let (tx, rx) = mpsc::sync_channel(1);
-    {
-        let queue = lock(&w.queue);
-        let Some(queue) = queue.as_ref() else {
-            return Err(WinError::invalid("the firewall thread is shut down"));
-        };
-        queue
-            .send(Box::new(move || {
-                let _ = tx.send(api().and_then(work));
-            }))
-            .map_err(|_| WinError::invalid("the firewall thread is gone"))?;
-    }
-    match rx.recv_timeout(CALL_BOUND) {
-        Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(WinError::invalid(format!(
-            "a firewall call exceeded {}s; its outcome is indeterminate",
-            CALL_BOUND.as_secs()
-        ))),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(WinError::invalid(
-            "the firewall call was not run (shutting down)",
-        )),
-    }
+    worker().run(CALL_BOUND, move || api().and_then(work))
 }
 
 /// Host shutdown: admit no further call, drop queued ones, and wait up to
 /// [`SHUTDOWN_WAIT`] for the call in flight. `Err`: one is still in flight;
 /// the host then keeps its lock until the process ends.
 pub(crate) fn shutdown() -> Result<(), WinError> {
-    let w = worker();
-    lock(&w.queue).take();
-    let deadline = Instant::now() + SHUTDOWN_WAIT;
-    let mut busy = lock(&w.busy);
-    busy.closed = true;
-    while busy.in_flight {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(WinError::invalid(
-                "a firewall call is still in flight at shutdown",
-            ));
-        }
-        busy = w
-            .idle
-            .wait_timeout(busy, left)
-            .unwrap_or_else(PoisonError::into_inner)
-            .0;
-    }
-    Ok(())
+    worker().settle(SHUTDOWN_WAIT, true)
+}
+
+/// Before a host lock is released (rule 4, doc#17): drop queued calls and
+/// wait up to [`SHUTDOWN_WAIT`] for the call in flight, so no firewall
+/// mutation started under the lock outlives it. Admission stays open on
+/// success. `Err`: still in flight; the lock must be kept until the process
+/// ends. Starts nothing in a process that never used the firewall.
+pub(crate) fn quiesce() -> Result<(), WinError> {
+    WORKER
+        .get()
+        .map_or(Ok(()), |w| w.settle(SHUTDOWN_WAIT, false))
 }
 
 // ---- Operations ----
@@ -709,7 +793,7 @@ fn same(a: &str, b: &str) -> bool {
 pub(super) fn rows(name: Option<String>, sweep: Sweep) -> Result<Vec<Value>, WinError> {
     call(move |api| {
         let store = Store::open(api, false)?;
-        let rules = checked_rules(&store)?;
+        let rules = checked_rules(&store, None)?;
         drop(store);
         let key = Key::open(HKEY_LOCAL_MACHINE, RULES_KEY, KEY_READ)?;
         let mut out = Vec::new();
@@ -776,7 +860,7 @@ fn delete_with(
     registry: impl Fn(&str) -> Result<bool, WinError>,
 ) -> Result<&'static str, WinError> {
     let store = Store::open(api, true)?;
-    let before = checked_rules(&store)?;
+    let before = checked_rules(&store, Some(&c.id))?;
     let matching: Vec<&RuleRow> = before
         .iter()
         .filter(|r| {
@@ -801,7 +885,7 @@ fn delete_with(
     }
     let id = rule.id.clone();
     store.delete(&id)?;
-    let after = checked_rules(&store)?;
+    let after = checked_rules(&store, Some(&id))?;
     if after.iter().any(|r| same(&r.id, &id)) || registry(&id)? {
         return Err(WinError::invalid(
             "firewall rule still present after deletion",
@@ -813,10 +897,15 @@ fn delete_with(
 /// The build check alone, for doctor and the gate.
 /// Queue [`loaded`] on the firewall thread without waiting for it.
 pub(super) fn warm() {
-    if let Some(queue) = lock(&worker().queue).as_ref() {
-        let _ = queue.send(Box::new(|| {
-            let _ = loaded();
-        }));
+    let w = worker();
+    let epoch = lock(&w.busy).epoch;
+    if let Some(queue) = lock(&w.queue).as_ref() {
+        let _ = queue.send((
+            epoch,
+            Box::new(|| {
+                let _ = loaded();
+            }),
+        ));
     }
 }
 
@@ -1035,11 +1124,117 @@ mod tests {
         assert_eq!((FREED.get(), CLOSED.get()), (1, 1));
     }
 
+    /// opus msg#2113 minor-1: a foreign rule 2.27 cannot read fully does
+    /// not stop cleanup; one that could be ours does.
+    #[test]
+    fn only_a_partly_read_rule_that_could_be_ours_fails_deletion() {
+        const PARTIAL: u32 = 0x0002_0000;
+        let api = fake(
+            &[
+                ("a", "EasyTier rule", FW_RULE_STATUS_OK),
+                ("f", "Foreign app", PARTIAL),
+            ],
+            0,
+        );
+        assert_eq!(
+            delete_with(api, &credential("a"), |_| Ok(false)).unwrap(),
+            "removed"
+        );
+        for (id, name) in [("b", "EasyTier other"), ("a", "Renamed")] {
+            let api = fake(
+                &[
+                    ("a", "EasyTier rule", FW_RULE_STATUS_OK),
+                    (id, name, PARTIAL),
+                ],
+                0,
+            );
+            assert!(delete_with(api, &credential("a"), |_| Ok(false)).is_err());
+            assert!(DELETED.with_borrow(Vec::is_empty));
+        }
+    }
+
     #[test]
     fn program_rule_names() {
         assert!(program_rule_name(r"EasyTier C:\a\b.exe (Inbound)"));
         assert!(program_rule_name(r"EasyTier \\srv\b.exe (Outbound)"));
         assert!(!program_rule_name(r"EasyTier relative.exe (Inbound)"));
         assert!(!program_rule_name(r"EasyTier C:\a\b.exe (Both)"));
+    }
+
+    // ---- The firewall thread and rule 4 ----
+
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    const SHORT: Duration = Duration::from_millis(30);
+    const LONG: Duration = Duration::from_secs(5);
+
+    /// A call taking `ms`, which sets `done` when it finishes.
+    fn slow(
+        ms: u64,
+        done: &Arc<AtomicBool>,
+    ) -> impl FnOnce() -> Result<(), WinError> + Send + use<> {
+        let done = Arc::clone(done);
+        move || {
+            std::thread::sleep(Duration::from_millis(ms));
+            done.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A maintenance command whose call timed out (it errors and drops its
+    /// lock): settling waits for that call, so it finishes before the lock goes.
+    #[test]
+    fn settling_waits_for_a_call_its_caller_gave_up_on() {
+        let w = Worker::start();
+        let done = Arc::new(AtomicBool::new(false));
+        assert!(w.run(SHORT, slow(300, &done)).is_err());
+        assert!(!done.load(Ordering::SeqCst));
+        w.settle(LONG, false).unwrap();
+        assert!(done.load(Ordering::SeqCst));
+        // Admission stays open for the next lock holder in this process.
+        let again = Arc::new(AtomicBool::new(false));
+        w.run(LONG, slow(0, &again)).unwrap();
+        assert!(again.load(Ordering::SeqCst));
+    }
+
+    /// Still in flight after the wait: `Err`, so the lock is kept, and
+    /// nothing is admitted afterwards.
+    #[test]
+    fn a_call_still_in_flight_fails_the_settle_and_closes_admission() {
+        let w = Worker::start();
+        let done = Arc::new(AtomicBool::new(false));
+        assert!(w.run(SHORT, slow(500, &done)).is_err());
+        assert!(w.settle(SHORT, false).is_err());
+        assert!(!done.load(Ordering::SeqCst));
+        let later = Arc::new(AtomicBool::new(false));
+        assert!(w.run(LONG, slow(0, &later)).is_err());
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(!later.load(Ordering::SeqCst));
+    }
+
+    /// A call queued behind the one in flight never runs once the lock it
+    /// was queued under has been released.
+    #[test]
+    fn calls_queued_before_a_settle_never_run_after_it() {
+        let w = Worker::start();
+        let first = Arc::new(AtomicBool::new(false));
+        let queued = Arc::new(AtomicBool::new(false));
+        assert!(w.run(SHORT, slow(200, &first)).is_err());
+        assert!(w.run(SHORT, slow(0, &queued)).is_err());
+        w.settle(LONG, false).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(first.load(Ordering::SeqCst));
+        assert!(!queued.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn shutdown_admits_nothing_afterwards() {
+        let w = Worker::start();
+        w.settle(LONG, true).unwrap();
+        let later = Arc::new(AtomicBool::new(false));
+        assert!(w.run(LONG, slow(0, &later)).is_err());
     }
 }

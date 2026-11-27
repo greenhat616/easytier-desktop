@@ -194,13 +194,17 @@ jobs:
           mkdir -p "$RUNNER_TEMP/nfpm" && tar -xzf "$RUNNER_TEMP/nfpm.tar.gz" -C "$RUNNER_TEMP/nfpm" nfpm
           export PATH="$RUNNER_TEMP/nfpm:$PATH"
           echo "$RUNNER_TEMP/nfpm" >> "$GITHUB_PATH"
-          # The libraries the binaries load and the packages that ship them
-          # (the Depends lists in xtask/src/dist/linux.rs come from this).
+          # The libraries the binaries link and the packages that ship them,
+          # then the library names they hold for loading at run time (the
+          # Depends lists in xtask/src/dist/linux.rs come from this).
           for bin in etd-ui etd-host etd-ctl; do
-            echo "== $bin"
+            echo "== $bin linked"
             ldd "target/debug/$bin" | awk '/=>/ {print $3}' | sort -u | while read -r lib; do
               echo "$lib $(dpkg -S "$(readlink -f "$lib")" 2>/dev/null | cut -d: -f1 | head -n1)"
             done
+            echo "== $bin loadable"
+            { grep -aoE 'lib[A-Za-z0-9_+-]+\.so(\.[0-9]+)*' "target/debug/$bin" || true; } | sort -u | tr '\n' ' '
+            echo
           done
           # The fixture build carries the marker: dist must refuse it unless allowed.
           if refused=$(cargo xtask dist --dry-run --bin-dir target/debug --cores target/debug/cores/2.7.1 \

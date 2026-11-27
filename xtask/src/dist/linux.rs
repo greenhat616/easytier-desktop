@@ -141,6 +141,26 @@ fn quoted(value: &str) -> String {
     out
 }
 
+/// `path` made absolute with `.` and `..` resolved by name, with forward
+/// slashes: nfpm's globbing does not accept `..` (xtask's root is
+/// `xtask/..`), and the packages it writes do not exist yet.
+fn plain(path: &Path) -> Result<String> {
+    let mut out = PathBuf::new();
+    for part in std::path::absolute(path)?.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    Ok(out
+        .to_str()
+        .context("path is not UTF-8")?
+        .replace('\\', "/"))
+}
+
 /// `maintainer.sh` for one format and hook.
 fn script(source: &str, format: &str, hook: &str) -> Result<String> {
     ensure!(
@@ -254,12 +274,7 @@ fn check_nfpm() -> Result<()> {
 /// `dry_run`, build the three packages.
 pub(super) fn package(root: &Path, payload: &Payload, dry_run: bool) -> Result<Vec<PathBuf>> {
     let arch = arch(&payload.triple)?;
-    let utf8 = |path: &Path| -> Result<String> {
-        Ok(std::path::absolute(path)?
-            .to_str()
-            .context("path is not UTF-8")?
-            .replace('\\', "/"))
-    };
+    let utf8 = |path: &Path| plain(path);
     let source = fs::read_to_string(root.join(SCRIPT)).context(SCRIPT)?;
     let scripts = payload.out.join("scripts");
     fs::create_dir_all(&scripts)?;
@@ -396,6 +411,18 @@ mod tests {
         let mut other = payload();
         other.triple = "riscv64gc-unknown-linux-gnu".into();
         assert!(render(&template(), &other, "/p", "/r", "/s").is_err());
+    }
+
+    #[test]
+    fn paths_reach_nfpm_without_dot_components() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let plain = plain(&root.join("./packaging/linux")).unwrap();
+        assert!(plain.ends_with("/packaging/linux"), "{plain}");
+        assert!(
+            !plain.contains("/..") && !plain.contains("/./") && !plain.contains('\\'),
+            "{plain}"
+        );
+        assert!(!plain.contains("/xtask/"), "{plain}");
     }
 
     #[test]

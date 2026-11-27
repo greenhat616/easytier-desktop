@@ -351,8 +351,8 @@ async fn plant_leftover() {
         .await
         .unwrap();
     // A running instance whose first generation is still open: its kernel
-    // process record, planned but never confirmed dead (the image, in the
-    // planted root, does not exist), as a crashed session leaves it.
+    // process and runtime-directory records, planned but never confirmed
+    // gone (neither exists), as a crashed session leaves them.
     let id = PLANTED_INSTANCE;
     let instance = etd_contract::InstanceId(id.into());
     let scope = EffectScope::Instance {
@@ -360,16 +360,29 @@ async fn plant_leftover() {
         epoch: etd_sysfx::Epoch(1),
     };
     let mut generation = plan(id, 1, &[]);
-    generation.effects = vec![EffectIntent {
-        scope,
-        kind: EffectKind::Process,
-        key: ObjectKey::Process {
-            exe: layout.cores.join("absent").join("easytier-core.exe"),
-            cmdline_marker: layout.run.join(id).join("1"),
+    generation.effects = vec![
+        EffectIntent {
+            scope: scope.clone(),
+            kind: EffectKind::Process,
+            key: ObjectKey::Process {
+                exe: layout.cores.join("absent").join("easytier-core.exe"),
+                cmdline_marker: layout.run.join(id).join("1"),
+            },
+            undo: Undo::EnsureAbsent,
+            persistence: Persistence::WithProcess,
         },
-        undo: Undo::EnsureAbsent,
-        persistence: Persistence::WithProcess,
-    }];
+        // Persistent: blocks in any boot (the process record, written in
+        // the planting "boot", counts as ended with a reboot).
+        EffectIntent {
+            scope,
+            kind: EffectKind::RuntimeDir,
+            key: ObjectKey::Path {
+                path: layout.run.join(id).join("1"),
+            },
+            undo: Undo::EnsureAbsent,
+            persistence: Persistence::Persistent,
+        },
+    ];
     ledger
         .commit(
             0,

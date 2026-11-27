@@ -39,6 +39,7 @@ const EXIT_NOT_CONFORMING: i32 = 4;
 const EXIT_OTHER_USERS_LEFTOVERS: i32 = 5;
 /// Not a real account: a second user's session root made by the test.
 const OTHER_SID: &str = "S-1-5-21-1000-2000-3000-1999";
+const STRAY_SID: &str = "S-1-5-21-1000-2000-3000-1998";
 const PLANTED_INSTANCE: &str = "0f661e50-b9a6-4525-9583-9538fe01e928";
 
 fn binary() -> PathBuf {
@@ -569,6 +570,38 @@ async fn elevated_session_host_end_to_end() {
     let status = tokio::task::block_in_place(|| wait_exit(&mut child, Duration::from_secs(60)));
     assert!(status.success(), "{status:?}");
     drop(session);
+
+    // A root a host got further in but which has no ledger: its ownership
+    // is unknown. It blocks the start and is never purged; only an
+    // administrator removes it.
+    let stray = NativeHostFilesystem.session_layout(STRAY_SID).unwrap();
+    NativeHostFilesystem.prepare_session(&stray).unwrap();
+    std::fs::write(stray.state.join("host.log"), b"no ledger").unwrap();
+    let result = output(&["run", "--mode", "elevated-session"]);
+    assert_eq!(
+        result.status.code(),
+        Some(EXIT_OTHER_USERS_LEFTOVERS),
+        "{}",
+        text(&result)
+    );
+    assert!(String::from_utf8_lossy(&result.stderr).contains(STRAY_SID));
+    let purge = output(&[
+        "reclaim",
+        "--mode",
+        "elevated-session",
+        "--all-users",
+        "--all",
+        "--purge",
+    ]);
+    assert!(!purge.status.success(), "{}", text(&purge));
+    assert!(
+        String::from_utf8_lossy(&purge.stderr).contains(STRAY_SID),
+        "{}",
+        text(&purge)
+    );
+    assert!(stray.state.join("host.log").exists(), "kept");
+    assert!(own.state.exists(), "nothing purged");
+    std::fs::remove_dir_all(stray.state.parent().unwrap()).unwrap();
 
     // 9. The app uninstaller's purge removes every session root. The MSI
     // runs it as LocalSystem, whose token is not a session owner's.

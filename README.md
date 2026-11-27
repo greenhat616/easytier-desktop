@@ -150,7 +150,8 @@ Navigation, Layout and Status & info pages show controls that the product does n
 Slider, NumberBox, SettingsCard, SettingsExpander, MenuFlyout, CommandBar,
 ContentDialog, Flyout, TeachingTip, NavigationView items, BreadcrumbBar,
 SelectorBar, TabView, Expander, a ScrollViewer with the Fluent scroll bar,
-ToolTip, a status badge and a copy button). They live in `etd-ui`'s
+ToolTip, a status badge, a copy button, ProgressBar, an empty state and
+selection cards). They live in `etd-ui`'s
 `views::controls`, `views::menus`, `views::dialogs`, `views::navigation`,
 `views::layout`, `views::motion` and `views::feedback` and take their values
 from the WinUI theme resources and the Windows Community Toolkit

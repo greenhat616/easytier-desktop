@@ -602,7 +602,7 @@ impl Render for Gallery {
             Page::Dialogs => ("Dialogs & flyouts", pages::dialogs_page(self, cx)),
             Page::Navigation => ("Navigation", pages::navigation_page(self, cx)),
             Page::Layout => ("Layout", pages::layout_page(self, window, cx)),
-            Page::Feedback => ("Status & info", pages::feedback_page(cx)),
+            Page::Feedback => ("Status & info", pages::feedback_page(self, cx)),
         };
         div()
             .id("gallery-root")
@@ -693,7 +693,7 @@ mod tests {
     #[gpui_kit::test]
     fn gallery_feedback_controls(cx: &mut TestAppContext) {
         use std::time::Duration;
-        let (handle, _view) = cx.update(|cx| {
+        let (handle, view) = cx.update(|cx| {
             gpui_kit::init(cx);
             theme::install_palette(cx);
             cx.set_reduce_motion(true);
@@ -747,6 +747,22 @@ mod tests {
             window.press("enter", cx);
             window.render_frame(cx);
             assert!(window.find("copy-ip-copied").visible());
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            // ProgressBar: 3 px tall; 40 % determinate.
+            let bar = window.find("progress-determinate").bounds();
+            assert_eq!(bar.size.height, px(3.));
+            // Selection cards: one Tab stop; arrows and clicks choose.
+            assert_eq!(view.read(cx).demo_mode(), 0);
+            window.click("mode-cards-1", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_mode(), 1);
+            assert_eq!(window.find("mode-cards-1").selected(), Some(true));
+            window.press("left", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_mode(), 0);
+            assert!(window.find("empty-networks").visible());
         })
         .unwrap();
     }
@@ -1520,6 +1536,8 @@ mod tests {
                 window.click("copy-ip", cx);
                 window.render_frame(cx);
                 assert!(window.find("copy-ip-copied").visible());
+                window.click("mode-cards-1", cx);
+                window.render_frame(cx);
             })
             .unwrap();
             cx.run_until_parked();

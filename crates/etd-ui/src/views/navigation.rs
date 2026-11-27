@@ -516,6 +516,7 @@ mod tests {
     use crate::theme::{self, ControlState, contrast};
     use crate::views::dialogs;
     use crate::views::feedback::{Status, status_colors};
+    use crate::views::progress::{ProgressState, indicator_color};
 
     /// `top` composited over the opaque `bottom`, as 0xRRGGBB.
     fn over(top: Hsla, bottom: Hsla) -> u32 {
@@ -585,6 +586,19 @@ mod tests {
                         ) >= 3.,
                         "scroll bar thumb {mode:?}"
                     );
+                    for state in [
+                        ProgressState::Running,
+                        ProgressState::Paused,
+                        ProgressState::Error,
+                    ] {
+                        assert!(
+                            contrast(
+                                over(indicator_color(state, cx), surface),
+                                over(surface, surface)
+                            ) >= 3.,
+                            "{state:?} progress indicator {mode:?}"
+                        );
+                    }
                     for status in [
                         Status::Success,
                         Status::Caution,

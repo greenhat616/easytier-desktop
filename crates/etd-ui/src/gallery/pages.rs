@@ -32,6 +32,7 @@ use crate::views::{
         IndexHandler, Tab, breadcrumb_bar, nav_selection_indicator, nav_view_item, selector_bar,
         tab_view,
     },
+    progress::{CardChoice, ProgressState, empty_state, progress_bar, selection_cards},
     ui::{BtnStyle, action_button, settings_switch},
 };
 
@@ -82,6 +83,7 @@ pub(super) struct DemoState {
     tab_selected: usize,
     next_tab: usize,
     layout_open: [bool; 2],
+    mode_choice: usize,
     stack_horizontal: bool,
     stack_spacing: Entity<SliderState>,
     grid_columns: Entity<SliderState>,
@@ -142,6 +144,7 @@ impl DemoState {
             tab_selected: 0,
             next_tab: 3,
             layout_open: [true, false],
+            mode_choice: 0,
             stack_horizontal: false,
             stack_spacing,
             grid_columns,
@@ -163,6 +166,9 @@ impl Gallery {
     }
     pub(super) fn demo_dialog_result(&self) -> SharedString {
         self.demo.dialog_result.clone()
+    }
+    pub(super) fn demo_mode(&self) -> usize {
+        self.demo.mode_choice
     }
     pub(super) fn demo_layout(&self) -> [bool; 2] {
         self.demo.layout_open
@@ -1476,7 +1482,7 @@ pub(super) fn layout_page(
 }
 
 #[inline(never)]
-pub(super) fn feedback_page(cx: &mut Context<Gallery>) -> Vec<AnyElement> {
+pub(super) fn feedback_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<AnyElement> {
     use gpui_kit::{StatefulInteractiveElement as _, component::Sizable as _};
     let fg = cx.theme().foreground;
     let badges = div()
@@ -1570,9 +1576,105 @@ pub(super) fn feedback_page(cx: &mut Context<Gallery>) -> Vec<AnyElement> {
         )
         .into_any_element();
 
+    let caption = |text: &'static str, cx: &Context<Gallery>| {
+        div()
+            .text_size(px(12.))
+            .line_height(px(16.))
+            .text_color(crate::theme::text_secondary(cx))
+            .child(crate::views::pseudo::t(text))
+            .into_any_element()
+    };
+    let bars = div()
+        .w(px(360.))
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .child(caption("Creating virtual adapter (step 1 of 2)", cx))
+        .child(progress_bar(
+            "progress-determinate",
+            "Creating virtual adapter",
+            Some(0.4),
+            ProgressState::Running,
+            cx,
+        ))
+        .child(caption("Connecting", cx))
+        .child(progress_bar(
+            "progress-indeterminate",
+            "Connecting",
+            None,
+            ProgressState::Running,
+            cx,
+        ))
+        .child(caption("Paused", cx))
+        .child(progress_bar(
+            "progress-paused",
+            "Paused",
+            Some(0.6),
+            ProgressState::Paused,
+            cx,
+        ))
+        .child(caption("Failed", cx))
+        .child(progress_bar(
+            "progress-error",
+            "Failed",
+            Some(0.8),
+            ProgressState::Error,
+            cx,
+        ))
+        .into_any_element();
+
+    let empty = empty_state(
+        "empty-networks",
+        "fluent/globe.svg",
+        "No networks yet",
+        "Create a network or join one with a share link.",
+        Some(action_button(
+            "empty-create",
+            "Create network",
+            BtnStyle::new(ButtonVariant::Primary, Size::Medium),
+            cx.listener(|this, _: &gpui_kit::ClickEvent, _, cx| {
+                this.demo.last = "Create network".into();
+                cx.notify();
+            }),
+        )),
+        cx,
+    );
+
+    let cards = selection_cards(
+        "mode-cards",
+        "How do you want to use EasyTier?",
+        &[
+            CardChoice {
+                icon: "fluent/people-community.svg",
+                title: "Simple",
+                description: "Join or create a room with friends. Settings stay out of the way.",
+            },
+            CardChoice {
+                icon: "fluent/developer-board.svg",
+                title: "Professional",
+                description: "Manage several networks, peers, routes and access rules.",
+            },
+        ],
+        view.demo.mode_choice,
+        {
+            let view = cx.entity().downgrade();
+            Rc::new(move |ix, _, cx| {
+                view.update(cx, |this, cx| {
+                    this.demo.mode_choice = ix;
+                    cx.notify();
+                })
+                .ok();
+            })
+        },
+        cx,
+    );
+
     vec![
         section("Status badge", [badges, narrow], cx),
         section("Copy button", [ip_row], cx),
         section("ToolTip", [hint], cx),
+        section("ProgressBar", [bars], cx),
+        section("Empty state", [empty], cx),
+        section("Selection cards", [cards], cx),
     ]
 }

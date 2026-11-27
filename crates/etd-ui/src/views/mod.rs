@@ -3,6 +3,7 @@
 pub mod banners;
 pub mod controls;
 pub mod instances;
+pub mod menus;
 pub mod reclaim;
 pub mod ui;
 

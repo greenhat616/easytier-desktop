@@ -5,8 +5,8 @@
 use std::rc::Rc;
 
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, IntoElement, ParentElement as _,
-    SharedString, Styled as _, Window,
+    AnyElement, App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
+    ParentElement as _, SharedString, Styled as _, TestSupportExt as _, Window,
     base::CheckboxState,
     component::{
         ActiveTheme as _, Size, StyledExt as _,
@@ -24,6 +24,7 @@ use crate::views::{
         flyout_item, number_box, settings_card, settings_expander, settings_expander_item,
         split_button, toggle_button,
     },
+    menus::{BarCommand, MenuCheck, MenuEntry, MenuHandler, MenuItem, command_bar, menu_flyout},
     ui::{BtnStyle, action_button, fluent_switch},
 };
 
@@ -35,6 +36,9 @@ pub(super) enum Popup {
     DropDown,
     Split,
     Combo,
+    Menu,
+    Context,
+    Overflow,
 }
 
 pub(super) struct DemoState {
@@ -53,6 +57,11 @@ pub(super) struct DemoState {
     slider_disabled: Entity<SliderState>,
     number: Entity<InputState>,
     last: SharedString,
+    context_at: Option<gpui_kit::Point<gpui_kit::Pixels>>,
+    submenu: bool,
+    show_hidden: bool,
+    sort: usize,
+    preview: bool,
 }
 
 impl DemoState {
@@ -89,6 +98,11 @@ impl DemoState {
             slider_disabled,
             number,
             last: "None".into(),
+            context_at: None,
+            submenu: false,
+            show_hidden: true,
+            sort: 0,
+            preview: false,
         }
     }
 }
@@ -100,6 +114,9 @@ impl Gallery {
     }
     pub(super) fn demo_number(&self, cx: &App) -> SharedString {
         self.demo.number.read(cx).value()
+    }
+    pub(super) fn demo_last(&self) -> SharedString {
+        self.demo.last.clone()
     }
 }
 
@@ -142,6 +159,7 @@ fn dismiss(cx: &mut Context<Gallery>) -> impl Fn(&mut Window, &mut App) + 'stati
     move |_, cx| {
         view.update(cx, |this, cx| {
             this.demo.popup = None;
+            this.demo.submenu = false;
             cx.notify();
         })
         .ok();
@@ -597,5 +615,222 @@ pub(super) fn basic_input_page(
             cx,
         ),
         section("NumberBox", [number], cx),
+    ]
+}
+
+/// Records a command from a menu or the command bar and closes any popup.
+fn command(label: &'static str, cx: &mut Context<Gallery>) -> MenuHandler {
+    Rc::new(cx.listener(move |this, _: &gpui_kit::ClickEvent, _, cx| {
+        this.demo.last = SharedString::from(label);
+        this.demo.popup = None;
+        this.demo.submenu = false;
+        cx.notify();
+    }))
+}
+
+const SORTS: [&str; 3] = ["Name", "Date modified", "Size"];
+
+#[inline(never)]
+pub(super) fn menus_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<AnyElement> {
+    let demo = &view.demo;
+    let note = div()
+        .text_size(px(12.))
+        .line_height(px(16.))
+        .text_color(crate::theme::text_secondary(cx))
+        .child(SharedString::from(format!("Last command: {}", demo.last)))
+        .into_any_element();
+
+    // MenuFlyout from a button: icons, accelerators, a toggle item, a
+    // submenu of radio items, separators and a disabled item.
+    let menu = (demo.popup == Some(Popup::Menu)).then(|| {
+        let sort_items = SORTS
+            .iter()
+            .enumerate()
+            .map(|(ix, label)| {
+                MenuEntry::Item(
+                    MenuItem::new(SharedString::from(format!("menu-sort-{ix}")), *label)
+                        .check(MenuCheck::Radio(ix == demo.sort))
+                        .on_click(cx.listener(move |this, _: &gpui_kit::ClickEvent, _, cx| {
+                            this.demo.sort = ix;
+                            this.demo.last = SharedString::from(format!("Sort by {}", SORTS[ix]));
+                            this.demo.popup = None;
+                            this.demo.submenu = false;
+                            cx.notify();
+                        })),
+                )
+            })
+            .collect();
+        let open = command("Open", cx);
+        let save = command("Save", cx);
+        let entries = vec![
+            MenuEntry::Item(
+                MenuItem::new("menu-open", "Open")
+                    .icon("fluent/folder.svg")
+                    .accelerator("Ctrl+O")
+                    .on_click(move |e, w, cx| open(e, w, cx)),
+            ),
+            MenuEntry::Item(
+                MenuItem::new("menu-save", "Save")
+                    .icon("fluent/document.svg")
+                    .accelerator("Ctrl+S")
+                    .on_click(move |e, w, cx| save(e, w, cx)),
+            ),
+            MenuEntry::Separator,
+            MenuEntry::Item(
+                MenuItem::new("menu-hidden", "Show hidden items")
+                    .check(MenuCheck::Toggle(demo.show_hidden))
+                    .on_click(cx.listener(|this, _: &gpui_kit::ClickEvent, _, cx| {
+                        this.demo.show_hidden = !this.demo.show_hidden;
+                        this.demo.last = "Toggle hidden items".into();
+                        this.demo.popup = None;
+                        cx.notify();
+                    })),
+            ),
+            MenuEntry::Item(
+                MenuItem::new("menu-sort", "Sort by")
+                    .submenu(demo.submenu, sort_items)
+                    .on_click(cx.listener(|this, _: &gpui_kit::ClickEvent, _, cx| {
+                        this.demo.submenu = !this.demo.submenu;
+                        cx.notify();
+                    })),
+            ),
+            MenuEntry::Separator,
+            MenuEntry::Item(
+                MenuItem::new("menu-delete", "Delete")
+                    .icon("fluent/delete.svg")
+                    .accelerator("Del")
+                    .disabled(true),
+            ),
+        ];
+        menu_flyout("menu-flyout", entries, None, dismiss(cx), cx)
+    });
+    let menu_button = dropdown_button(
+        "menu-button",
+        "Options",
+        demo.popup == Some(Popup::Menu),
+        popup_toggle(Popup::Menu, cx),
+        menu,
+        cx,
+    );
+
+    // Context menu: the same MenuFlyout, opened at the pointer.
+    let context = demo
+        .context_at
+        .filter(|_| demo.popup == Some(Popup::Context))
+        .map(|at| {
+            let cut = command("Cut", cx);
+            let copy = command("Copy", cx);
+            let paste = command("Paste", cx);
+            menu_flyout(
+                "context-menu",
+                vec![
+                    MenuEntry::Item(
+                        MenuItem::new("context-cut", "Cut")
+                            .accelerator("Ctrl+X")
+                            .on_click(move |e, w, cx| cut(e, w, cx)),
+                    ),
+                    MenuEntry::Item(
+                        MenuItem::new("context-copy", "Copy")
+                            .icon("fluent/copy.svg")
+                            .accelerator("Ctrl+C")
+                            .on_click(move |e, w, cx| copy(e, w, cx)),
+                    ),
+                    MenuEntry::Item(
+                        MenuItem::new("context-paste", "Paste")
+                            .accelerator("Ctrl+V")
+                            .on_click(move |e, w, cx| paste(e, w, cx)),
+                    ),
+                ],
+                Some(at),
+                dismiss(cx),
+                cx,
+            )
+        });
+    let target = div()
+        .id("context-target")
+        .test_support()
+        .h(px(96.))
+        .w(px(320.))
+        .rounded(px(4.))
+        .border_1()
+        .border_color(crate::theme::control_stroke(cx))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(14.))
+        .line_height(px(20.))
+        .text_color(crate::theme::text_secondary(cx))
+        .child("Right-click here")
+        .on_mouse_down(
+            gpui_kit::MouseButton::Right,
+            cx.listener(|this, e: &gpui_kit::MouseDownEvent, _, cx| {
+                this.demo.context_at = Some(e.position);
+                this.demo.popup = Some(Popup::Context);
+                cx.notify();
+            }),
+        )
+        .into_any_element();
+
+    // CommandBar: primary commands, a toggle and the overflow menu.
+    let overflow = (demo.popup == Some(Popup::Overflow)).then(|| {
+        let settings = command("Settings", cx);
+        let refresh = command("Refresh", cx);
+        menu_flyout(
+            "bar-overflow",
+            vec![
+                MenuEntry::Item(
+                    MenuItem::new("bar-settings", "Settings")
+                        .icon("fluent/settings.svg")
+                        .on_click(move |e, w, cx| settings(e, w, cx)),
+                ),
+                MenuEntry::Item(
+                    MenuItem::new("bar-refresh", "Refresh")
+                        .icon("fluent/arrow-clockwise.svg")
+                        .accelerator("F5")
+                        .on_click(move |e, w, cx| refresh(e, w, cx)),
+                ),
+            ],
+            None,
+            dismiss(cx),
+            cx,
+        )
+    });
+    let button = |id, label, icon, cx: &mut Context<Gallery>| BarCommand::Button {
+        id,
+        label,
+        icon,
+        toggled: None,
+        on_click: command(label, cx),
+    };
+    let primary = vec![
+        button("bar-add", "Add", "fluent/add.svg", cx),
+        button("bar-edit", "Edit", "fluent/edit.svg", cx),
+        button("bar-copy", "Copy", "fluent/copy.svg", cx),
+        BarCommand::Separator,
+        BarCommand::Button {
+            id: "bar-preview",
+            label: "Preview",
+            icon: "fluent/eye.svg",
+            toggled: Some(demo.preview),
+            on_click: Rc::new(cx.listener(|this, _: &gpui_kit::ClickEvent, _, cx| {
+                this.demo.preview = !this.demo.preview;
+                this.demo.last = "Toggle preview".into();
+                cx.notify();
+            })),
+        },
+    ];
+    let bar = command_bar(
+        "command-bar",
+        primary,
+        demo.popup == Some(Popup::Overflow),
+        popup_toggle(Popup::Overflow, cx),
+        overflow,
+        cx,
+    );
+
+    vec![
+        section("MenuFlyout", [menu_button, note], cx),
+        section("Context menu", std::iter::once(target).chain(context), cx),
+        section("CommandBar", [bar], cx),
     ]
 }

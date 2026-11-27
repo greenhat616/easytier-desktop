@@ -581,7 +581,7 @@ pub(crate) fn flyout_surface(cx: &App) -> gpui_kit::Div {
 /// ComboBoxItemCornerRadius 3, `SubtleFillColorSecondary` on hover and when
 /// selected, `SubtleFillColorTertiary` pressed, and a 3×16 accent pill with
 /// 1.5 px corners (ComboBoxItemPillWidth/Height, ComboBoxItemPillCornerRadius)
-/// on the selected item. Items sit 4 px inside the surface (margin 5,2).
+/// on the selected item. Items sit 4 px inside the surface (MenuFlyoutItemMargin 4,2,4,2).
 #[inline(never)]
 pub fn flyout_item(
     id: impl Into<ElementId>,
@@ -626,8 +626,34 @@ pub fn flyout_item(
     item.into_any_element()
 }
 
+/// WinUI's light-dismiss layer: while a flyout is open, a press anywhere
+/// outside it closes the flyout and goes no further. It is a window-sized
+/// occluding layer drawn just under the open popups.
+pub fn light_dismiss_layer(on_dismiss: impl Fn(&mut Window, &mut App) + 'static) -> AnyElement {
+    let on_dismiss = Rc::new(on_dismiss);
+    let right = on_dismiss.clone();
+    deferred(
+        div()
+            .id("light-dismiss-layer")
+            .absolute()
+            .top(px(-8000.))
+            .left(px(-8000.))
+            .w(px(16000.))
+            .h(px(16000.))
+            .occlude()
+            .on_mouse_down(gpui_kit::MouseButton::Left, move |_, window, cx| {
+                on_dismiss(window, cx)
+            })
+            .on_mouse_down(gpui_kit::MouseButton::Right, move |_, window, cx| {
+                right(window, cx)
+            }),
+    )
+    .with_priority(1)
+    .into_any_element()
+}
+
 /// Opens `items` in a flyout under the element that precedes it in a
-/// column. `on_dismiss` runs for a pointer press outside the flyout.
+/// column. `on_dismiss` runs for a press outside the flyout.
 #[inline(never)]
 pub fn flyout(
     id: impl Into<ElementId>,
@@ -636,23 +662,27 @@ pub fn flyout(
     on_dismiss: impl Fn(&mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
-    deferred(
-        anchored().snap_to_window_with_margin(px(8.)).child(
-            flyout_surface(cx)
-                .id(id)
-                .test_support()
-                .role(Role::Menu)
-                .mt(px(4.))
-                .min_w(px(min_width))
-                .py(px(2.))
-                .flex()
-                .flex_col()
-                .on_mouse_down_out(move |_, window, cx| on_dismiss(window, cx))
-                .children(items),
-        ),
-    )
-    .with_priority(1)
-    .into_any_element()
+    div()
+        .child(light_dismiss_layer(on_dismiss))
+        .child(
+            deferred(
+                anchored().snap_to_window_with_margin(px(8.)).child(
+                    flyout_surface(cx)
+                        .id(id)
+                        .test_support()
+                        .role(Role::Menu)
+                        .occlude()
+                        .mt(px(4.))
+                        .min_w(px(min_width))
+                        .py(px(2.))
+                        .flex()
+                        .flex_col()
+                        .children(items),
+                ),
+            )
+            .with_priority(2),
+        )
+        .into_any_element()
 }
 
 /// WinUI DropDownButton: a standard button with the chevron 8 px after its

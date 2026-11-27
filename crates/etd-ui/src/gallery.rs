@@ -73,6 +73,7 @@ enum Page {
     Controls,
     Settings,
     BasicInput,
+    Menus,
 }
 
 struct Gallery {
@@ -181,6 +182,14 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
         "fluent/checkmark-circle-filled.svg",
         cx,
     );
+    let menus = nav(
+        Page::Menus,
+        "gallery-nav-menus",
+        "Menus & toolbars",
+        "fluent/more-horizontal.svg",
+        "fluent/more-horizontal.svg",
+        cx,
+    );
     let mut sidebar = Sidebar::new("gallery-sidebar")
         .w(px(220.))
         .h_full()
@@ -190,6 +199,7 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
         .header(header)
         .child(first)
         .child(basic)
+        .child(menus)
         .child(settings);
     if !view.collapsed {
         sidebar = sidebar.footer(div().w_full().child(theme_menu(cx)));
@@ -536,6 +546,7 @@ impl Render for Gallery {
             ),
             Page::Settings => ("Settings", pages::settings_page(self, cx)),
             Page::BasicInput => ("Basic input", pages::basic_input_page(self, window, cx)),
+            Page::Menus => ("Menus & toolbars", pages::menus_page(self, cx)),
         };
         div()
             .id("gallery-root")
@@ -664,6 +675,25 @@ mod tests {
             window.click("basic-number-Increase", cx);
             window.render_frame(cx);
             assert_eq!(view.read(cx).demo_number(cx).as_ref(), "13");
+            window.click("gallery-nav-menus", cx);
+            window.render_frame(cx);
+            window.click("menu-button", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("menu-hidden").checked(), Some(true));
+            window.click("menu-sort", cx);
+            window.render_frame(cx);
+            window.click("menu-sort-2", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("menu-flyout").is_none());
+            assert_eq!(view.read(cx).demo_last().as_ref(), "Sort by Size");
+            window.click("bar-preview", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("bar-preview").checked(), Some(true));
+            window.click("command-bar-more", cx);
+            window.render_frame(cx);
+            window.click("bar-refresh", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_last().as_ref(), "Refresh");
         })
         .unwrap();
     }
@@ -761,7 +791,12 @@ mod tests {
             cx.update_window(handle, |_, window, cx| {
                 window.click("gallery-input", cx);
                 window.render_frame(cx);
-                assert!(window.find("fluent-textbox-underline").visible());
+                assert!(
+                    window
+                        .within("gallery-input-frame")
+                        .find("fluent-textbox-underline")
+                        .visible()
+                );
             })
             .unwrap();
             cx.capture_screenshot(handle)
@@ -798,6 +833,23 @@ mod tests {
             cx.capture_screenshot(handle)
                 .unwrap()
                 .save(output.join(format!("gallery-basic-input-{name}-open.png")))
+                .unwrap();
+            // Menus page: the MenuFlyout with its submenu open.
+            cx.update_window(handle, |_, window, cx| {
+                window.click("basic-combo", cx);
+                window.render_frame(cx);
+                window.click("gallery-nav-menus", cx);
+                window.render_frame(cx);
+                window.click("menu-button", cx);
+                window.render_frame(cx);
+                window.click("menu-sort", cx);
+                window.render_frame(cx);
+                assert!(window.find("menu-sort-submenu").visible());
+            })
+            .unwrap();
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(format!("gallery-menus-{name}.png")))
                 .unwrap();
         }
     }

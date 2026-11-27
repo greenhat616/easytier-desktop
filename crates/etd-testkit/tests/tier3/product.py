@@ -657,6 +657,15 @@ def upgrade_running():
                     raise
                 time.sleep(2)
                 continue
+            except UnpredictedChanges as err:
+                # A short-lived process outside the product's tree (seen: a
+                # runner powershell.exe) is gone from the next snapshot; a
+                # change the product made stays and fails at the deadline.
+                if time.monotonic() >= end:
+                    raise
+                print(f"generation check again: {err}", flush=True)
+                time.sleep(2)
+                continue
             break
         print("upgrade with a running network: old generation closed, new generation matches its records",
               flush=True)

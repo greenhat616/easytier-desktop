@@ -32,7 +32,17 @@ class Reporter:
         self.body.update(fields)
         partial = self.path.with_name(self.path.name + ".partial")
         partial.write_text(json.dumps(self.body), encoding="utf-8")
-        os.replace(partial, self.path)
+        # Windows refuses to replace a file the test is reading at this
+        # instant (PermissionError); a read takes milliseconds, so retry.
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                os.replace(partial, self.path)
+                return
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.005)
 
 
 def alive(pid, born):

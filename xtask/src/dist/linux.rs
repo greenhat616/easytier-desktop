@@ -170,21 +170,65 @@ fn script(source: &str, format: &str, hook: &str) -> Result<String> {
     Ok(text)
 }
 
-fn depends(names: &[&str]) -> String {
+/// A YAML list of `names`, with `versioned` (the C library) given a lower
+/// bound written by `bound`.
+fn depends(names: &[&str], versioned: &str, bound: impl Fn(&str) -> String) -> String {
     names
         .iter()
-        .map(|name| format!("      - {name}"))
+        .map(|name| {
+            let name = if *name == versioned {
+                bound(name)
+            } else {
+                (*name).to_owned()
+            };
+            format!("      - \"{}\"", quoted(&name))
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-/// Render `nfpm.yaml`: `payload_dir`, `root` and `scripts` are absolute.
+/// The highest glibc symbol version (`GLIBC_2.35` gives `2.35`) any of
+/// `binaries` needs: the oldest C library the package can run on. Read from
+/// the version-need strings in the dynamic string table; nothing else in a
+/// Rust binary looks like `GLIBC_<digits>.<digits>`.
+fn glibc_floor<'a>(binaries: impl IntoIterator<Item = &'a [u8]>) -> Option<String> {
+    const TAG: &[u8] = b"GLIBC_";
+    let mut best: Option<Vec<u32>> = None;
+    for bytes in binaries {
+        let mut rest = bytes;
+        while let Some(at) = rest.windows(TAG.len()).position(|w| w == TAG) {
+            rest = &rest[at + TAG.len()..];
+            let end = rest
+                .iter()
+                .position(|b| !(b.is_ascii_digit() || *b == b'.'))
+                .unwrap_or(rest.len());
+            let text = std::str::from_utf8(&rest[..end]).unwrap_or_default();
+            let parts: Option<Vec<u32>> = text.split('.').map(|p| p.parse().ok()).collect();
+            if let Some(parts) = parts.filter(|p| p.len() >= 2)
+                && best.as_ref().is_none_or(|best| parts > *best)
+            {
+                best = Some(parts);
+            }
+        }
+    }
+    best.map(|parts| {
+        parts
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(".")
+    })
+}
+
+/// Render `nfpm.yaml`: `payload_dir`, `root` and `scripts` are absolute;
+/// `glibc` is the oldest C library the binaries run on.
 fn render(
     template: &str,
     payload: &Payload,
     payload_dir: &str,
     root: &str,
     scripts: &str,
+    glibc: &str,
 ) -> Result<String> {
     let arch = arch(&payload.triple)?;
     let mut cores = String::new();
@@ -219,9 +263,16 @@ fn render(
         ("@SCRIPTS@", quoted(scripts)),
         ("@CORE_CONTENTS@", cores.trim_end().to_owned()),
         ("@ICON_CONTENTS@", icons.trim_end().to_owned()),
-        ("@DEB_DEPENDS@", depends(DEB_DEPENDS)),
-        ("@RPM_DEPENDS@", depends(RPM_DEPENDS)),
-        ("@ARCH_DEPENDS@", depends(ARCH_DEPENDS)),
+        (
+            "@DEB_DEPENDS@",
+            depends(DEB_DEPENDS, "libc6", |name| format!("{name} (>= {glibc})")),
+        ),
+        (
+            "@RPM_DEPENDS@",
+            depends(RPM_DEPENDS, "glibc", |name| format!("{name} >= {glibc}")),
+        ),
+        // Arch is rolling: its glibc is never older than the build's.
+        ("@ARCH_DEPENDS@", depends(ARCH_DEPENDS, "", str::to_owned)),
     ];
     // Check the template's placeholders before filling any in: a value
     // (such as a path) may itself contain an at sign.
@@ -290,6 +341,14 @@ pub(super) fn package(root: &Path, payload: &Payload, dry_run: bool) -> Result<V
     let template = fs::read_to_string(root.join(TEMPLATE))
         .context(TEMPLATE)?
         .replace("\r\n", "\n");
+    let mut binaries = Vec::new();
+    for name in ["etd-ui", "etd-host", "etd-ctl"] {
+        let path = payload.dir.join(name);
+        binaries.push(fs::read(&path).with_context(|| path.display().to_string())?);
+    }
+    let glibc = glibc_floor(binaries.iter().map(Vec::as_slice))
+        .context("the binaries name no GLIBC_ symbol version: not a glibc build")?;
+    println!("the binaries need glibc {glibc} or newer");
     let config = payload.out.join("nfpm.yaml");
     fs::write(
         &config,
@@ -299,6 +358,7 @@ pub(super) fn package(root: &Path, payload: &Payload, dry_run: bool) -> Result<V
             &utf8(&payload.dir)?,
             &utf8(root)?,
             &utf8(&scripts)?,
+            &glibc,
         )?,
     )?;
     println!("rendered {}", config.display());
@@ -365,7 +425,15 @@ mod tests {
 
     #[test]
     fn the_definition_installs_the_payload_links_desktop_entry_and_icons() {
-        let text = render(&template(), &payload(), "/b \"q\"/payload", "/r@x", "/s").unwrap();
+        let text = render(
+            &template(),
+            &payload(),
+            "/b \"q\"/payload",
+            "/r@x",
+            "/s",
+            "2.35",
+        )
+        .unwrap();
         assert!(text.contains("arch: amd64\n"), "{text}");
         assert!(text.contains("version: 0.2.3\n"));
         assert!(
@@ -394,17 +462,47 @@ mod tests {
                 );
             }
         }
-        assert!(text.contains("      - nftables"));
+        assert!(text.contains("      - \"nftables\""));
+        // The C library carries the binaries' floor for deb and rpm.
+        let deb = &text[text.find("  deb:").unwrap()..text.find("  rpm:").unwrap()];
+        let rpm = &text[text.find("  rpm:").unwrap()..text.find("  archlinux:").unwrap()];
+        let arch = &text[text.find("  archlinux:").unwrap()..];
+        assert!(deb.contains("      - \"libc6 (>= 2.35)\"\n"), "{deb}");
+        assert!(rpm.contains("      - \"glibc >= 2.35\"\n"), "{rpm}");
+        assert!(arch.contains("      - \"glibc\"\n"), "{arch}");
+        // A Vulkan driver is recommended, not required.
+        assert!(
+            deb.contains("recommends:\n      - \"mesa-vulkan-drivers | vulkan-icd\""),
+            "{deb}"
+        );
+        assert!(
+            rpm.contains("recommends:\n      - mesa-vulkan-drivers"),
+            "{rpm}"
+        );
+        assert!(
+            arch.contains("recommends:\n      - \"vulkan-driver: "),
+            "{arch}"
+        );
         assert!(!text.contains("@ARCH@") && !text.contains("@CORE_CONTENTS@"));
     }
 
     #[test]
     fn placeholders_are_checked_before_values_are_filled_in() {
         let broken = template().replace("@SCRIPTS@", "@SCRIPT@");
-        assert!(render(&broken, &payload(), "/p", "/r", "/s").is_err());
+        assert!(render(&broken, &payload(), "/p", "/r", "/s", "2.35").is_err());
         let mut other = payload();
         other.triple = "riscv64gc-unknown-linux-gnu".into();
-        assert!(render(&template(), &other, "/p", "/r", "/s").is_err());
+        assert!(render(&template(), &other, "/p", "/r", "/s", "2.35").is_err());
+    }
+
+    #[test]
+    fn the_glibc_floor_is_the_highest_symbol_version() {
+        let ui = b"\0GLIBC_2.2.5\0GLIBC_2.34\0GLIBC_PRIVATE\0GLIBC_2.9\0".as_slice();
+        let host = b"x GLIBC_2.35\0 GLIBC_2.3.4\0 GLIBC_\0".as_slice();
+        assert_eq!(glibc_floor([ui]).as_deref(), Some("2.34"));
+        // Compared as numbers across binaries: 2.35 > 2.34 > 2.9.
+        assert_eq!(glibc_floor([ui, host]).as_deref(), Some("2.35"));
+        assert_eq!(glibc_floor([b"musl".as_slice()]), None);
     }
 
     #[test]
@@ -481,8 +579,9 @@ mod hook_tests {
             fs::write(
                 &host,
                 format!(
-                    "#!/bin/sh\necho \"$*\" >> \"{}\"\nexit {status}\n",
-                    dir.path().join("log").display()
+                    "#!/bin/sh\necho \"$*\" >> \"{}\"\necho \"$PATH\" > \"{}\"\nexit {status}\n",
+                    dir.path().join("log").display(),
+                    dir.path().join("path").display()
                 ),
             )
             .unwrap();
@@ -532,6 +631,13 @@ mod hook_tests {
             )
             .unwrap();
             Command::new("sh").arg(&file).args(args).output().unwrap()
+        }
+        /// The PATH etd-host last ran with.
+        fn path(&self) -> String {
+            fs::read_to_string(self.dir.path().join("path"))
+                .unwrap()
+                .trim()
+                .to_owned()
         }
         fn calls(&self) -> Vec<String> {
             fs::read_to_string(self.dir.path().join("log"))
@@ -586,6 +692,38 @@ mod hook_tests {
         let removal = Machine::new(0).with_service();
         ok(&removal.run("deb", "preremove", &["remove"]));
         assert_eq!(removal.calls(), [UNINSTALL]);
+
+        // dpkg --configure retrying a first install whose service already
+        // registered: install --owner again, and etd-host resumes only an
+        // installation recorded with this owner (it refuses any other).
+        let retry = Machine::new(0).with_service();
+        ok(&retry.run("deb", "postinstall", &["configure", ""]));
+        assert_eq!(retry.calls(), [INSTALL]);
+        let foreign = Machine::new(1).with_service();
+        assert!(
+            !foreign
+                .run("deb", "postinstall", &["configure", ""])
+                .status
+                .success()
+        );
+    }
+
+    #[test]
+    fn etd_host_runs_with_the_system_paths_only() {
+        let machine = Machine::new(0);
+        let file = machine.dir.path().join("hook.sh");
+        fs::write(&file, machine.script("deb", "postinstall")).unwrap();
+        let output = Command::new("sh")
+            .arg(&file)
+            .args(["configure", ""])
+            .env(
+                "PATH",
+                format!("/tmp/evil:{}", std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        ok(&output);
+        assert_eq!(machine.path(), "/usr/sbin:/usr/bin:/sbin:/bin");
     }
 
     #[test]
@@ -627,7 +765,7 @@ mod hook_tests {
 
         let foreign = Machine::new(0).with_service();
         let warning = ok(&foreign.run_arch("postinstall", "post_install", &["0.1.0-1"]));
-        assert!(warning.contains("leaves it alone"), "{warning}");
+        assert!(warning.contains("will not manage it"), "{warning}");
         assert!(
             warning.contains("/usr/local/lib/easytier-desk/etd-host uninstall"),
             "{warning}"
@@ -652,7 +790,8 @@ mod hook_tests {
         ] {
             let notice = ok(&container.run(format, hook, args));
             assert!(
-                notice.contains("systemd is not running"),
+                notice.contains("systemd is not running")
+                    && notice.contains("install --owner easytier-desktop-package"),
                 "{format} {hook}: {notice}"
             );
         }

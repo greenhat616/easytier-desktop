@@ -55,6 +55,10 @@ overrides:
   deb:
     depends:
 @DEB_DEPENDS@
+    # etd-ui draws with Vulkan: the loader is a dependency, a driver (ICD)
+    # is recommended (vulkan-icd is Debian's virtual package for one).
+    recommends:
+      - "mesa-vulkan-drivers | vulkan-icd"
     scripts:
       preinstall: "@SCRIPTS@/deb-preinstall.sh"
       postinstall: "@SCRIPTS@/deb-postinstall.sh"
@@ -62,6 +66,8 @@ overrides:
   rpm:
     depends:
 @RPM_DEPENDS@
+    recommends:
+      - mesa-vulkan-drivers
     scripts:
       preinstall: "@SCRIPTS@/rpm-preinstall.sh"
       postinstall: "@SCRIPTS@/rpm-postinstall.sh"
@@ -69,6 +75,9 @@ overrides:
   archlinux:
     depends:
 @ARCH_DEPENDS@
+    # nfpm writes these as optdepends.
+    recommends:
+      - "vulkan-driver: a Vulkan driver to draw the window"
     scripts:
       postinstall: "@SCRIPTS@/arch-postinstall.sh"
       preremove: "@SCRIPTS@/arch-preremove.sh"

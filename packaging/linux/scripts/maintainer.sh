@@ -12,7 +12,14 @@
 # A service another installer made is never upgraded or removed here: deb and
 # rpm refuse to install over it, Arch leaves it alone. Without systemd every
 # hook only prints a notice.
+#
+# A retried first install (dpkg --configure after an interrupted configure)
+# runs `install --owner` again: etd-host resumes an installation recorded
+# with this owner and refuses any other.
 set -eu
+# Run as root: give etd-host and anything it starts the system paths only.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
 FORMAT=@FORMAT@
 HOOK=@HOOK@
 HOST=/usr/lib/easytier-desktop/etd-host
@@ -56,7 +63,8 @@ refuse_existing() {
 # pacman cannot abort from a hook: leave a foreign service alone.
 arch_install() {
     if [ -e "$UNIT" ]; then
-        note "a service installed by something else exists ($UNIT); this package leaves it alone and will not upgrade or remove it."
+        note "a service installed by something else exists ($UNIT)."
+        note "this package will not manage it: it leaves it alone and will not upgrade or remove it."
         note "to let the package manage it: $INSTALLED uninstall, then reinstall easytier-desktop (pacman -S easytier-desktop)."
         return 0
     fi
@@ -66,7 +74,8 @@ arch_install() {
 main() {
     if [ ! -d "$SYSTEMD" ]; then
         if [ "$HOOK" != preinstall ]; then
-            note "systemd is not running; the service is not managed here. On a systemd host run: $HOST install"
+            note "systemd is not running; the service is not managed here. On a systemd host run: $HOST install --owner $OWNER"
+            note "(with --owner, the package's later upgrades and removal manage that service; without it they leave it alone)"
         fi
         return 0
     fi

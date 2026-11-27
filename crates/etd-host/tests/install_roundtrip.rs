@@ -662,6 +662,7 @@ impl Installed {
             .chain([
                 self.layout.maintenance.join("upgrade-manifest.json"),
                 self.layout.maintenance.join("upgrade-registration"),
+                self.layout.maintenance.join("upgrade-registration.tmp"),
             ])
             .filter(|path| path.exists())
             .collect()
@@ -690,6 +691,30 @@ impl Installed {
             String::from_utf8_lossy(&result.stderr)
         );
     }
+}
+
+#[cfg(target_os = "linux")]
+const UNIT: &str = "/etc/systemd/system/easytier-desk-host.service";
+#[cfg(target_os = "macos")]
+const UNIT: &str = "/Library/LaunchDaemons/easytier-desk-host.plist";
+
+/// Make the installed registration the stand-in for a previous build's
+/// (`ci-test-fixtures` accepts it), so the upgrade must replace it.
+#[cfg(unix)]
+fn mark_registration_as_previous() {
+    let content = std::fs::read_to_string(UNIT).unwrap();
+    let marked = if cfg!(target_os = "linux") {
+        format!("{content}# etd-upgrade-ci\n")
+    } else {
+        content.replacen("<plist", "<!-- etd-upgrade-ci -->\n<plist", 1)
+    };
+    std::fs::write(UNIT, marked).unwrap();
+}
+#[cfg(unix)]
+fn registration_is_previous() -> bool {
+    std::fs::read_to_string(UNIT)
+        .unwrap()
+        .contains("etd-upgrade-ci")
 }
 
 /// This build as a new installation payload in its own directory: a
@@ -775,6 +800,8 @@ async fn upgrade_replaces_the_image_and_keeps_state() {
     let service = Installed::install();
     let (_, before) = service.served().await;
     let (_payload, new_image, bytes) = payload(&service.binary, "a");
+    #[cfg(unix)]
+    mark_registration_as_previous();
 
     let refused = command(&service.image).arg("upgrade").output().unwrap();
     let upgraded = command(&new_image).arg("upgrade").output().unwrap();
@@ -783,6 +810,8 @@ async fn upgrade_replaces_the_image_and_keeps_state() {
     let image_after = std::fs::read(&service.layout.executable).unwrap();
     let stage = service.journal().upgrade_stage();
     let leftovers = service.leftovers();
+    #[cfg(unix)]
+    let registration_replaced = !registration_is_previous();
 
     // Windows: uninstall from the upgraded installed image (deferred removal).
     #[cfg(windows)]
@@ -810,6 +839,11 @@ async fn upgrade_replaces_the_image_and_keeps_state() {
         "service runs the installed image"
     );
     assert!(leftovers.is_empty(), "upgrade left {leftovers:?}");
+    #[cfg(unix)]
+    assert!(
+        registration_replaced,
+        "the previous registration was not replaced"
+    );
     assert_eq!(stage, None);
     assert_eq!(
         after, before,
@@ -829,6 +863,8 @@ async fn upgrade_rolls_back_when_the_new_host_is_not_ready() {
     let service = Installed::install();
     let (_, before) = service.served().await;
     let (_payload, new_image, _) = payload(&service.binary, "unready");
+    #[cfg(unix)]
+    mark_registration_as_previous();
     // The new host refuses to serve; the upgrade must restore the old one.
     service.fault(Some("new-host-unready"));
     let upgraded = command(&new_image).arg("upgrade").output().unwrap();
@@ -838,9 +874,16 @@ async fn upgrade_rolls_back_when_the_new_host_is_not_ready() {
     let image_after = std::fs::read(&service.layout.executable).unwrap();
     let stage = service.journal().upgrade_stage();
     let leftovers = service.leftovers();
+    #[cfg(unix)]
+    let registration_restored = registration_is_previous();
     service.uninstall(&service.binary).await;
 
     assert!(!upgraded.status.success(), "{}", text(&upgraded));
+    #[cfg(unix)]
+    assert!(
+        registration_restored,
+        "the previous registration was not restored"
+    );
     assert!(
         String::from_utf8_lossy(&upgraded.stderr).contains("upgrade rolled back"),
         "{}",
@@ -949,4 +992,153 @@ recovered: {}",
     println!(
         "an upgrade interrupted at Replacing was refused by resume-service, restored by the next upgrade, and by uninstall"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable elevated CI runner and ETD_HOST_CI_INSTALL=1"]
+async fn a_rollback_interrupted_after_the_new_host_ran_is_finished_later() {
+    use etd_sysfx_os::service::UpgradeStage;
+    if !ci_install_enabled() {
+        return;
+    }
+    let service = Installed::install();
+    let (_, before) = service.served().await;
+    let (_payload, new_image, new_bytes) = payload(&service.binary, "rollback");
+    #[cfg(unix)]
+    mark_registration_as_previous();
+    // The new host never serves; the rollback stops after the image.
+    service.fault(Some("new-host-unready\ncrash-in-rollback"));
+    let crashed = command(&new_image).arg("upgrade").output().unwrap();
+    service.fault(None);
+    let crashed_stage = service.journal().upgrade_stage();
+    let resume = command(&service.binary)
+        .arg("resume-service")
+        .output()
+        .unwrap();
+    // A host started now must refuse (Unix: run it directly as root).
+    #[cfg(unix)]
+    let started = {
+        let mut child = command(&service.image)
+            .args(["run", "--mode", "service"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if child.try_wait().unwrap().is_none() {
+            let _ = child.kill();
+        }
+        child.wait_with_output().unwrap()
+    };
+    println!(
+        "crashed: {}\nresume-service: {}",
+        text(&crashed),
+        text(&resume)
+    );
+    let recovered = command(&new_image).arg("upgrade").output().unwrap();
+    println!("recovered: {}", text(&recovered));
+    let (identity, after) = service.served().await;
+    let image_after = std::fs::read(&service.layout.executable).unwrap();
+    let stage_after = service.journal().upgrade_stage();
+    let leftovers = service.leftovers();
+    #[cfg(unix)]
+    let registration_replaced = !registration_is_previous();
+    service.uninstall(&service.binary).await;
+
+    assert_eq!(crashed.status.code(), Some(87), "{}", text(&crashed));
+    assert_eq!(crashed_stage, Some(UpgradeStage::RollingBack));
+    assert!(!resume.status.success(), "{}", text(&resume));
+    #[cfg(unix)]
+    {
+        assert!(!started.status.success(), "{}", text(&started));
+        assert!(
+            String::from_utf8_lossy(&started.stderr)
+                .contains("upgrade of this service is incomplete"),
+            "{}",
+            text(&started)
+        );
+    }
+    assert!(recovered.status.success(), "{}", text(&recovered));
+    assert!(
+        String::from_utf8_lossy(&recovered.stdout).contains("restoring an interrupted upgrade"),
+        "{}",
+        text(&recovered)
+    );
+    assert!(
+        image_after == new_bytes,
+        "installed image is not the payload's"
+    );
+    assert_eq!(identity.exe, service.image);
+    assert_eq!(stage_after, None);
+    assert!(leftovers.is_empty(), "upgrade left {leftovers:?}");
+    #[cfg(unix)]
+    assert!(
+        registration_replaced,
+        "the previous registration was not replaced"
+    );
+    assert_eq!(
+        after, before,
+        "recovery changed install id, install key or allow list"
+    );
+    println!(
+        "a rollback interrupted after the new host ran left RollingBack; no host started; the next upgrade finished the restore and completed"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable elevated CI runner and ETD_HOST_CI_INSTALL=1"]
+async fn a_failure_before_replacing_never_restores_old_backups() {
+    if !ci_install_enabled() {
+        return;
+    }
+    let service = Installed::install();
+    let (_, before) = service.served().await;
+    let (_payload, new_image, _) = payload(&service.binary, "early");
+    // Backups an earlier, committed upgrade failed to remove.
+    let stale_image = service.layout.executable.with_extension("prev");
+    std::fs::write(&stale_image, b"an image from an earlier upgrade").unwrap();
+    let manifest = service.layout.cores.join("manifest.json");
+    let manifest_before = std::fs::read(&manifest).unwrap();
+    let stale_manifest = service.layout.maintenance.join("upgrade-manifest.json");
+    let mut stale = manifest_before.clone();
+    stale.extend_from_slice(b"\n\n");
+    std::fs::write(&stale_manifest, &stale).unwrap();
+    service.fault(Some("fail-before-replacing"));
+    let upgraded = command(&new_image).arg("upgrade").output().unwrap();
+    service.fault(None);
+    println!("upgrade failing before Replacing: {}", text(&upgraded));
+    let (identity, after) = service.served().await;
+    let image_after = std::fs::read(&service.layout.executable).unwrap();
+    let manifest_after = std::fs::read(&manifest).unwrap();
+    let stage = service.journal().upgrade_stage();
+    let stale_image_kept = std::fs::read(&stale_image).unwrap();
+    let _ = std::fs::remove_file(&stale_image);
+    let _ = std::fs::remove_file(&stale_manifest);
+    service.uninstall(&service.binary).await;
+
+    assert!(!upgraded.status.success(), "{}", text(&upgraded));
+    assert!(
+        String::from_utf8_lossy(&upgraded.stderr).contains("CI fault: failing before"),
+        "{}",
+        text(&upgraded)
+    );
+    assert!(
+        image_after == service.original,
+        "an old backup replaced the image"
+    );
+    assert!(
+        manifest_after == manifest_before,
+        "an old manifest backup came back"
+    );
+    assert_eq!(stale_image_kept, b"an image from an earlier upgrade");
+    assert_eq!(
+        identity.exe, service.image,
+        "the previous service runs again"
+    );
+    assert_eq!(stage, None);
+    assert_eq!(after, before);
+    println!("a failure before Replacing restarted the service and restored no earlier backup");
 }

@@ -104,3 +104,10 @@ fn installed_network_survives_upgrade() {
 fn msi_installs_upgrades_rolls_back_and_uninstalls() {
     run_script("package.py", "msi_lifecycle");
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "installs, upgrades and purges the Debian package on a disposable hosted runner"]
+fn deb_installs_upgrades_rolls_back_and_purges() {
+    run_script("deb.py", "deb_lifecycle");
+}

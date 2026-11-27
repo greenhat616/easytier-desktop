@@ -1,5 +1,5 @@
 //! The host process's own token: which host form it is (decides the fence
-//! and the worker environment), the restricted copy the session fence probe
+//! and the fence probe identity), the restricted copy the session fence probe
 //! impersonates, and the identity the probing thread checks it really has.
 //! Nothing here is configured: it is read from the token.
 use super::{WinError, registry::Handle};

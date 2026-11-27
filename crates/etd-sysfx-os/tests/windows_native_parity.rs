@@ -504,7 +504,10 @@ fn unknown_requests_fail_in_both() {
         assert!(reference(&request).is_err());
         assert!(native(&request).is_err());
     }
-    etd_sysfx_os::windows::firewall_cleanup_supported().unwrap();
+    assert_eq!(
+        etd_sysfx_os::windows::firewall_cleanup_supported().unwrap(),
+        "listed"
+    );
 }
 
 fn uuid() -> String {

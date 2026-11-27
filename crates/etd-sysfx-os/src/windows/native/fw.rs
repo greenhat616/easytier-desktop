@@ -27,8 +27,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Windows builds (major 10, minor 0) the parity gate has run D on.
-const SUPPORTED_BUILDS: &[u32] = &[20348, 26100];
+/// Windows builds (major 10, minor 0) accepted without the self-check: the
+/// ones the parity gate has run on, and 26200 (an enablement package over
+/// 26100, same binaries). Any other build is accepted only if
+/// [`self_check`] passes (human ruling msg#1980).
+const SUPPORTED_BUILDS: &[u32] = &[20348, 26100, 26200];
 /// FW_VERSION(2, 27).
 const BINARY_VERSION: u16 = 0x021B;
 const FW_STORE_TYPE_LOCAL: i32 = 2;
@@ -55,9 +58,10 @@ const ERROR_NOT_SUPPORTED: i64 = 50;
 /// The message of the error an untested Windows build gets.
 pub const UNSUPPORTED_BUILD: &str = "firewall cleanup not supported on this Windows build";
 
-// ---- FW_RULE, binary version 2.27 (firewall.h) ----
+// ---- FW_RULE, binary version 2.27 ([MS-FASP] revision 36.1) ----
 
-/// Any `{ DWORD count; T* items; }` list of firewall.h.
+/// Any `{ unsigned long count; T* items; }` list of [MS-FASP] (2.2.13,
+/// 2.2.17, 2.2.18, 2.2.31, 2.2.101 and the address lists of 2.2.22).
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct List {
@@ -90,7 +94,8 @@ struct Addresses {
     v6_subnets: List,
     v6_ranges: List,
 }
-/// FW_RULE as of binary version 2.27.
+/// FW_RULE as of binary version 2.27: `FW_RULE2_27`, [MS-FASP] 2.2.107, the
+/// members of `FW_RULE` (2.2.37) up to `compartmentId`.
 #[repr(C)]
 struct Rule {
     next: *mut Rule,
@@ -131,8 +136,14 @@ struct Rule {
     compartment_id: u32,
 }
 
-/// The x64/ARM64 layout of firewall.h; the gate checks the same numbers
-/// against the SDK header with the C compiler (`fw_layout.c`).
+/// The x64/ARM64 C layout (natural alignment) of `FW_RULE2_27` ([MS-FASP]
+/// 2.2.107) and the structures it references: 2.2.13 FW_PORT_RANGE_LIST,
+/// 2.2.15 FW_PORTS, 2.2.17 FW_ICMP_TYPE_CODE_LIST, 2.2.18
+/// FW_INTERFACE_LUIDS, 2.2.22 FW_ADDRESSES, 2.2.31 FW_OS_PLATFORM_LIST,
+/// 2.2.101 FW_NETWORK_NAMES; cross-checked with learn.microsoft.com's
+/// FW_RULE page. No public SDK header declares it. At run time the parity
+/// gate reads id, name, group, application, direction and status through
+/// these offsets on each runner image and compares them with PowerShell.
 #[cfg(target_pointer_width = "64")]
 const _: () = {
     use std::mem::{align_of, offset_of, size_of};
@@ -230,21 +241,45 @@ fn build() -> Result<(u32, u32, u32), WinError> {
     Ok((info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber))
 }
 
-fn check_build((major, minor, build): (u32, u32, u32)) -> Result<(), WinError> {
-    if cfg!(target_pointer_width = "64")
-        && (major, minor) == (10, 0)
-        && SUPPORTED_BUILDS.contains(&build)
-    {
-        Ok(())
-    } else {
-        Err(unsupported(format_args!("{major}.{minor}.{build}")))
+/// How this Windows build was accepted for firewall cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Acceptance {
+    /// On [`SUPPORTED_BUILDS`].
+    Listed,
+    /// Not listed; the read-only self-check passed at load.
+    SelfChecked,
+}
+impl Acceptance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Listed => "listed",
+            Self::SelfChecked => "self-checked",
+        }
     }
+}
+
+/// `Ok(true)`: a listed build. `Ok(false)`: the self-check decides. `Err`:
+/// never (not Windows 10/11, or a 32-bit build whose layout is unchecked).
+fn check_build((major, minor, build): (u32, u32, u32)) -> Result<bool, WinError> {
+    if !cfg!(target_pointer_width = "64") || (major, minor) != (10, 0) {
+        return Err(unsupported(format_args!("{major}.{minor}.{build}")));
+    }
+    Ok(SUPPORTED_BUILDS.contains(&build))
+}
+
+/// The read-only self-check of an unlisted build: open the store at 2.27,
+/// enumerate every rule, each status OK and the list matching its count
+/// (the layout asserts hold at compile time). Nothing is changed.
+fn self_check(api: Api) -> Result<usize, WinError> {
+    let store = Store::open(api)?;
+    Ok(checked_rules(&store)?.len())
 }
 
 /// FirewallAPI.dll from System32, after the build check. Loaded once per
 /// process, never unloaded.
-fn load() -> Result<Api, WinError> {
-    check_build(build()?)?;
+fn load() -> Result<(Api, Acceptance), WinError> {
+    let version = build()?;
+    let listed = check_build(version)?;
     let name: Vec<u16> = "FirewallAPI.dll\0".encode_utf16().collect();
     // SAFETY: a NUL-terminated name; System32-only search.
     let module = unsafe {
@@ -280,17 +315,43 @@ fn load() -> Result<Api, WinError> {
             Ok(p)
         }
     };
-    // SAFETY: each export has the prototype of its type (firewall.h, and
+    // SAFETY: each export has the prototype of its type (learn.microsoft.com
+    // firewall API pages, and
     // FWFreeFirewallRulesByHandle as observed in the spike).
-    unsafe {
-        Ok(Api {
+    let api = unsafe {
+        Api {
             open: std::mem::transmute::<*mut c_void, Open>(get(c"FWOpenPolicyStore")?),
             close: std::mem::transmute::<*mut c_void, Close>(get(c"FWClosePolicyStore")?),
             enumerate: std::mem::transmute::<*mut c_void, Enumerate>(get(c"FWEnumFirewallRules")?),
             delete: std::mem::transmute::<*mut c_void, Delete>(get(c"FWDeleteFirewallRule")?),
             free: std::mem::transmute::<*mut c_void, Free>(get(c"FWFreeFirewallRulesByHandle")?),
-        })
-    }
+        }
+    };
+    let (major, minor, build) = version;
+    let acceptance = if listed {
+        Acceptance::Listed
+    } else {
+        let rules = self_check(api).map_err(|e| {
+            unsupported(format_args!(
+                "{major}.{minor}.{build} is not listed and its self-check failed: {}",
+                e.message
+            ))
+        })?;
+        tracing::info!(
+            stage = "firewall.self_check",
+            build,
+            rules,
+            "unlisted Windows build passed the firewall self-check"
+        );
+        Acceptance::SelfChecked
+    };
+    tracing::info!(
+        stage = "firewall.accepted",
+        version = %format_args!("{major}.{minor}.{build}"),
+        accepted_by = acceptance.as_str(),
+        "firewall cleanup accepted for this Windows build"
+    );
+    Ok((api, acceptance))
 }
 
 fn status(code: u32, what: &str) -> Result<(), WinError> {
@@ -528,9 +589,19 @@ fn worker() -> &'static Worker {
 }
 
 /// FirewallAPI, loaded on the firewall thread the first time.
+/// FirewallAPI and how the build was accepted, decided once per process
+/// (host start) before any firewall call; a failed load stays failed.
+static LOADED: OnceLock<Result<(Api, Acceptance), WinError>> = OnceLock::new();
+fn loaded() -> Result<(Api, Acceptance), WinError> {
+    LOADED.get_or_init(|| {
+        load().inspect_err(|e| {
+            tracing::warn!(stage = "firewall.unsupported", error = %e, "firewall cleanup is not available");
+        })
+    })
+    .clone()
+}
 fn api() -> Result<Api, WinError> {
-    static API: OnceLock<Result<Api, WinError>> = OnceLock::new();
-    API.get_or_init(load).clone()
+    loaded().map(|(api, _)| api)
 }
 
 /// Run `work` on the firewall thread, waiting at most [`CALL_BOUND`].
@@ -734,8 +805,24 @@ fn delete_with(
 }
 
 /// The build check alone, for doctor and the gate.
-pub(super) fn supported() -> Result<(), WinError> {
-    check_build(build()?)
+/// Queue [`loaded`] on the firewall thread without waiting for it.
+pub(super) fn warm() {
+    if let Some(queue) = lock(&worker().queue).as_ref() {
+        let _ = queue.send(Box::new(|| {
+            let _ = loaded();
+        }));
+    }
+}
+
+/// Whether firewall cleanup is available here and how the build was
+/// accepted, for doctor: loads FirewallAPI (and self-checks) on the firewall
+/// thread if no call has yet.
+pub(super) fn supported() -> Result<Acceptance, WinError> {
+    // Decided once: answer from the cache without queueing behind a call.
+    if let Some(decided) = LOADED.get() {
+        return decided.clone().map(|(_, acceptance)| acceptance);
+    }
+    call(|_| loaded().map(|(_, acceptance)| acceptance))
 }
 
 #[cfg(test)]
@@ -908,12 +995,30 @@ mod tests {
     }
 
     #[test]
-    fn only_tested_builds_are_supported() {
-        assert!(check_build((10, 0, 26100)).is_ok());
-        assert!(check_build((10, 0, 20348)).is_ok());
-        let e = check_build((10, 0, 22631)).unwrap_err();
+    fn listed_builds_skip_the_self_check() {
+        for build in [20348, 26100, 26200] {
+            assert!(check_build((10, 0, build)).unwrap());
+        }
+        assert!(!check_build((10, 0, 22631)).unwrap());
+        assert!(!check_build((10, 0, 19045)).unwrap());
+        let e = check_build((6, 3, 26100)).unwrap_err();
         assert!(e.message.starts_with(UNSUPPORTED_BUILD), "{}", e.message);
-        assert!(check_build((6, 3, 26100)).is_err());
+    }
+
+    #[test]
+    fn the_self_check_is_read_only_and_fails_closed() {
+        let api = fake(
+            &[("a", "x", FW_RULE_STATUS_OK), ("b", "y", FW_RULE_STATUS_OK)],
+            0,
+        );
+        assert_eq!(self_check(api).unwrap(), 2);
+        assert!(DELETED.with_borrow(Vec::is_empty));
+        assert_eq!((FREED.get(), CLOSED.get()), (1, 1));
+        let api = fake(&[("a", "x", 0x0002_0000)], 0);
+        assert!(self_check(api).is_err());
+        let api = fake(&[("a", "x", FW_RULE_STATUS_OK)], 1);
+        assert!(self_check(api).is_err());
+        assert_eq!((FREED.get(), CLOSED.get()), (1, 1));
     }
 
     #[test]

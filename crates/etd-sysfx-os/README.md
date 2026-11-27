@@ -28,9 +28,8 @@ reclaimed, privileged tests) are in [docs/platforms.md](docs/platforms.md).
 | `windows`, `linux`, `macos` | Platform modules (compiled only on their OS); internals are private |
 
 Feature `ci-test-fixtures` compiles the Windows identity fixture `service::ci_fixture`
-and `windows::worker_diagnostics`. Only `etd-host`'s dev-dependency and the privileged
-`windows_session_inputs` run enable it, on disposable CI runners; without it the worker
-refuses the script's `diagnostics` request.
+and `windows::native_rows`. Only `etd-host`'s dev-dependency and the Windows native gate
+(`windows_native_parity`) enable it, on disposable CI runners.
 
 ## What each platform provides
 
@@ -70,9 +69,9 @@ Default host directories (`service`):
 | --- | --- |
 | `lib.rs` | `OsConfig`, `OsAdapters`, dispatch to the platform module |
 | `windows/mod.rs` | Reclaimers, observer, sweeper, fence wiring |
-| `windows/wfp.rs`, `probe.rs`, `token.rs` | WFP fence of the host's form (persistent for the service, non-persistent for the elevated session); LocalService probe (service) or a host thread impersonating a restricted Medium token (session); host form from the process token |
+| `windows/wfp.rs`, `probe.rs`, `token.rs` | WFP fence of the host's form (persistent for the service, non-persistent for the elevated session); the fence probe, a host thread impersonating LocalService (service) or a restricted Medium token (session); host form from the process token |
 | `windows/interfaces.rs`, `registry.rs`, `magic.rs` | wintun identity, registry and boot marker, Magic DNS recovery replay |
-| `windows/execution.rs`, `system.ps1` | Constant PowerShell script for firewall, NRPT, profiles, registry and listener queries; no module autoloading, absolute imports, explicit environment (under an elevated host that is not SYSTEM: profile variables in the session tree, and the CLR profiler off as defence in depth against HKCU runtime settings) |
+| `windows/native/` | The system queries and deletions, in-process and without COM (doc#17): registry (`reg.rs`), IP Helper (`net.rs`), SCM and ToolHelp (`scm.rs`), firewall rules through FirewallAPI.dll's flat functions on one module-owned thread (`fw.rs`: binary version 2.27, Windows build list or read-only self-check, deletion by id then verified) |
 | `windows/driver_refs.rs`, `appearance.rs` | Driver references into the kernel store; DWM / appearance |
 | `linux/mod.rs`, `network.rs`, `observe.rs` | Reclaimers, sweeper, links / routes / listeners, runtime directories |
 | `linux/fence.rs`, `resolved.rs` | nftables fence; resolve1 per-link DNS |
@@ -102,7 +101,7 @@ cargo test --doc -p etd-sysfx-os
 ```
 
 The unprivileged run covers the unit tests inside the platform modules (key and name
-grammar, listener parsing, credential matching, PowerShell encoding, ACL checks,
+grammar, listener parsing, credential matching, registry value semantics, FirewallAPI list handling (fake API), ACL checks,
 sweep error handling) for the system it runs on. Everything that touches real system
 objects is `#[ignore]`, guarded by CI-only environment variables, and runs only with
 `--profile privileged --run-ignored only` in the platform workflows

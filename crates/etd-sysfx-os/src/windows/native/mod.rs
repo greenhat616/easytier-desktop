@@ -84,6 +84,14 @@ pub(super) fn run(request: &Value) -> Result<Vec<Value>, WinError> {
 }
 
 /// Whether this Windows build is one firewall cleanup supports.
-pub(super) fn firewall_supported() -> Result<(), WinError> {
-    fw::supported()
+/// How it was accepted: "listed" or "self-checked".
+pub(super) fn firewall_supported() -> Result<&'static str, WinError> {
+    fw::supported().map(fw::Acceptance::as_str)
+}
+
+/// Host start: decide firewall support (and self-check an unlisted build)
+/// on the firewall thread now, so the host log says how the build was
+/// accepted before any firewall call. Does not wait.
+pub(super) fn warm_firewall() {
+    fw::warm();
 }

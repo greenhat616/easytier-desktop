@@ -11,10 +11,11 @@ pub fn remove_service_boot_marker() -> Result<(), crate::OsError> {
         message: e.message,
     })
 }
-/// Whether firewall cleanup supports this Windows build (doc#17 v2): `Err`
-/// carries [`FIREWALL_UNSUPPORTED_BUILD`] on a build the parity gate has not
-/// passed on. For doctor.
-pub fn firewall_cleanup_supported() -> Result<(), crate::OsError> {
+/// Whether firewall cleanup supports this Windows build (doc#17 v2, ruling
+/// msg#1980), for doctor. `Ok`: how it was accepted, "listed" or
+/// "self-checked". `Err` carries [`FIREWALL_UNSUPPORTED_BUILD`] when the
+/// build is unlisted and its read-only self-check failed.
+pub fn firewall_cleanup_supported() -> Result<&'static str, crate::OsError> {
     native::firewall_supported().map_err(|e| crate::OsError::Os {
         code: e.code,
         message: e.message,
@@ -32,26 +33,6 @@ pub fn native_rows(request: &Value) -> Result<Vec<Value>, crate::OsError> {
         message: e.message,
     })
 }
-/// Disposable CI runners only: the management worker's own report of its
-/// environment, loaded modules and runtime settings, for the elevated
-/// session input tests. Uses the worker profile `adapters()` set.
-#[cfg(feature = "ci-test-fixtures")]
-pub fn worker_diagnostics() -> Result<Value, crate::OsError> {
-    crate::ci_test_fixtures_build();
-    let mut rows =
-        execution::run(json!({"op": "diagnostics"})).map_err(|e| crate::OsError::Os {
-            code: e.code,
-            message: e.message,
-        })?;
-    if rows.len() != 1 {
-        return Err(crate::OsError::Os {
-            code: -1,
-            message: "expected exactly one diagnostics row".into(),
-        });
-    }
-    Ok(rows.remove(0))
-}
-mod execution;
 mod interfaces;
 mod magic;
 mod native;
@@ -131,52 +112,12 @@ async fn blocking<T: Send + 'static>(
         .await
         .map_err(|e| WinError::invalid(format!("Windows blocking worker: {e}")))?
 }
-// Windows PowerShell expects UTF-16LE for -EncodedCommand. Encoding the
-// constant script avoids command-line quoting and newline ambiguities.
-fn encoded_command(script: &str) -> String {
-    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let a = chunk[0];
-        let b = chunk.get(1).copied().unwrap_or(0);
-        let c = chunk.get(2).copied().unwrap_or(0);
-        out.push(alphabet[(a >> 2) as usize] as char);
-        out.push(alphabet[(((a & 3) << 4) | (b >> 4)) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            alphabet[(((b & 15) << 2) | (c >> 6)) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            alphabet[(c & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
 /// See [`crate::shutdown_helpers`].
-pub(crate) const HELPERS_SHUTDOWN_WORST: Duration =
-    if native::SHUTDOWN_WAIT.as_millis() > execution::SHUTDOWN_WORST.as_millis() {
-        native::SHUTDOWN_WAIT
-    } else {
-        execution::SHUTDOWN_WORST
-    };
-/// See [`crate::shutdown_helpers`]: the firewall thread's call in flight
-/// and the PowerShell workers, together.
+pub(crate) const HELPERS_SHUTDOWN_WORST: Duration = native::SHUTDOWN_WAIT;
+/// See [`crate::shutdown_helpers`]: no helper process exists any more; wait
+/// for the firewall thread's call in flight, if any.
 pub(crate) fn shutdown_helpers() -> Result<(), crate::OsError> {
-    let (firewall, workers) = std::thread::scope(|s| {
-        let workers = s.spawn(execution::shutdown);
-        let firewall = native::shutdown();
-        (
-            firewall,
-            workers
-                .join()
-                .unwrap_or_else(|_| Err(WinError::invalid("worker shutdown panicked"))),
-        )
-    });
-    firewall.and(workers).map_err(|e| crate::OsError::Os {
+    native::shutdown().map_err(|e| crate::OsError::Os {
         code: e.code,
         message: e.message,
     })
@@ -1211,19 +1152,9 @@ pub(crate) fn adapters(config: &OsConfig) -> Result<OsAdapters, OsError> {
         message: e.message,
     };
     let host = token::host_token().map_err(os_error)?;
-    // An elevated host that is not SYSTEM runs its PowerShell workers with
-    // profile variables in the protected session tree (doc#13#untrusted):
-    // <state_dir>\..\profile, created and verified by the composition root.
-    execution::set_worker_profile(match host {
-        token::HostToken::Elevated => Some(
-            config
-                .state_dir
-                .parent()
-                .ok_or_else(|| os_error(WinError::invalid("state directory has no parent")))?
-                .join("profile"),
-        ),
-        token::HostToken::System | token::HostToken::Standard => None,
-    });
+    if host != token::HostToken::Standard {
+        native::warm_firewall();
+    }
     let reclaimers: Vec<Arc<dyn Reclaimer>> = [
         EffectKind::WinFenceFilter,
         EffectKind::WinTunAdapter,
@@ -1472,9 +1403,5 @@ mod tests {
             ..found
         };
         assert_eq!(foreign_program_rule(&unreadable).key, None);
-    }
-    #[test]
-    fn powershell_encoding() {
-        assert_eq!(encoded_command("abc"), "YQBiAGMA");
     }
 }

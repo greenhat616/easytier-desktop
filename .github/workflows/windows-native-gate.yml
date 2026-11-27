@@ -1,7 +1,7 @@
 # The ES2N gate (doc#17 v2, topic#51 msg#1959): the native system operations
-# against the retired PowerShell worker, the FW_RULE layout against the SDK,
-# and both host forms under HKCU COM plants and Process Monitor, on every
-# Windows Server image the firewall support list names.
+# against the retired PowerShell worker (which also exercises the FW_RULE
+# layout on each image), then both host forms under HKCU COM plants and
+# Process Monitor, on each Windows Server image of the firewall build list.
 name: Windows native gate
 on:
   push:
@@ -48,12 +48,6 @@ jobs:
           $v = [Environment]::OSVersion.Version
           Write-Host "build $v"
           (Get-Item "$env:SystemRoot\System32\FirewallAPI.dll").VersionInfo.FileVersion | Write-Host
-      - name: FW_RULE layout against the SDK header
-        shell: pwsh
-        run: |
-          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
-          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && cl /nologo /c /W4 /WX /Fo%TEMP%\fw_layout.obj crates\etd-sysfx-os\tests\c\fw_layout.c"
-          if ($LASTEXITCODE -ne 0) { exit 1 }
       - run: cargo nextest run --locked -p etd-sysfx-os --lib
       - name: Build the gate tests
         run: |
@@ -98,11 +92,11 @@ jobs:
           $env:ETD_GATE_RULE = "etd-gate-$tag-a'q\b`"c"
           New-NetFirewallRule -Name $env:ETD_GATE_RULE -DisplayName $env:ETD_GATE_NAME -Direction Inbound -Program $env:ETD_GATE_PROGRAM -Action Allow | Out-Null
           & .github/scripts/es2n-plant.ps1 -Remove
-          & .github/scripts/es2n-plant.ps1 -Com -Junk
-          Start-Process C:\pm\Procmon64.exe -ArgumentList '/AcceptEula','/Quiet','/Minimized','/BackingFile','C:\pm\hosts.pml'
-          Start-Sleep -Seconds 10
           $code = 0
           try {
+            & .github/scripts/es2n-plant.ps1 -Com -Junk
+            Start-Process C:\pm\Procmon64.exe -ArgumentList '/AcceptEula','/Quiet','/Minimized','/BackingFile','C:\pm\hosts.pml'
+            Start-Sleep -Seconds 10
             cargo nextest run --locked --profile privileged -p etd-sysfx-os --features ci-test-fixtures --run-ignored only --test windows_native_parity -E 'test(native_under_plants)' --success-output never --failure-output immediate
             if ($LASTEXITCODE -ne 0) { $code = 1 }
             cargo nextest run --locked --profile privileged -p etd-sysfx-os --run-ignored only --test windows_fence -E 'test(session_fence)' --success-output never --failure-output immediate

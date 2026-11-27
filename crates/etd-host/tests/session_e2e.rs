@@ -162,7 +162,7 @@ async fn plant_leftover() {
     let ledger = SqliteLedger::open(layout.state.join("ledger.sqlite3"), boot)
         .await
         .unwrap();
-    // A stopped instance whose first generation is still open: its kernel
+    // A running instance whose first generation is still open: its kernel
     // process record, planned but never confirmed dead (the image, in the
     // planted root, does not exist), as a crashed session leaves it.
     let id = PLANTED_INSTANCE;
@@ -188,7 +188,7 @@ async fn plant_leftover() {
             changes(
                 id,
                 1,
-                vec![put(id, Desired::Stopped, &[])],
+                vec![put(id, Desired::Running, &[])],
                 vec![generation],
             ),
         )

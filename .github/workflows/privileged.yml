@@ -122,11 +122,24 @@ jobs:
           (Get-Date).ToUniversalTime().ToString('o') | Set-Content (Join-Path $env:RUNNER_TEMP 'ipv6-start')
           & auditpol /set /subcategory:Registry /success:enable
           if ($LASTEXITCODE) { throw 'Could not enable registry write auditing' }
-          $acl = Get-Acl -LiteralPath $root -Audit
-          $sid = [Security.Principal.SecurityIdentifier]::new('S-1-1-0')
-          $rule = [Security.AccessControl.RegistryAuditRule]::new($sid,'SetValue','ContainerInherit','None','Success')
-          $acl.AddAuditRule($rule)
-          Set-Acl -LiteralPath $root -AclObject $acl
+          & $env:ETD_G2_PYTHON -m pip install --only-binary=:all: pywin32==311
+          if ($LASTEXITCODE) { throw 'Could not install the registry audit API' }
+          @'
+          import win32api, win32con, win32security as sec
+          key = r"MACHINE\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces"
+          proc = sec.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_ADJUST_PRIVILEGES | win32con.TOKEN_QUERY)
+          audit = sec.LookupPrivilegeValue(None, "SeSecurityPrivilege")
+          sec.AdjustTokenPrivileges(proc, False, [(audit, win32con.SE_PRIVILEGE_ENABLED)])
+          kind = sec.SE_REGISTRY_KEY
+          info = sec.SACL_SECURITY_INFORMATION
+          acl = sec.GetNamedSecurityInfo(key, kind, info).GetSecurityDescriptorSacl()
+          if acl is None:
+              acl = sec.ACL()
+          acl.AddAuditAccessAceEx(sec.ACL_REVISION_DS, win32con.CONTAINER_INHERIT_ACE, win32con.KEY_SET_VALUE,
+                                  sec.ConvertStringSidToSid("S-1-1-0"), 1, 0)
+          sec.SetNamedSecurityInfo(key, kind, info, None, None, None, acl)
+          '@ | & $env:ETD_G2_PYTHON -
+          if ($LASTEXITCODE) { throw 'Could not set the IPv6 registry audit rule' }
       - name: Installed service tests (administrator)
         if: runner.os == 'Windows' && matrix.suite == 'recovery'
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=installed_kernel_and_host_crash_recovery)' --success-output immediate

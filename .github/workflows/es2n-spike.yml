@@ -1,0 +1,51 @@
+# Throwaway ES2N step-0 spike (doc#17); removed before the branch is merged.
+name: ES2N spike
+on:
+  push:
+    branches: [wbs/ES2N-native]
+    paths:
+      - 'spike/**'
+      - '.github/workflows/es2n-spike.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  spike:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Build the spike
+        run: cargo build --manifest-path spike/es2n-wmi/Cargo.toml
+      - name: WMI firewall by id under planted HKCU COM overrides
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          whoami /groups | Select-String 'Mandatory Label'
+          $a = 'etd-es2n-a''q\b"c'
+          $b = 'etd-es2n-b'
+          foreach ($id in $a, $b) {
+            New-NetFirewallRule -Name $id -DisplayName 'etd-es2n-dup' -Group 'etd-es2n' -Direction Inbound -Program 'C:\etd-es2n\core.exe' -Action Allow | Out-Null
+          }
+          Get-NetFirewallRule -Name $a, $b | Format-Table Name, DisplayName, Group, Direction | Out-String | Write-Host
+          $count = @(Get-NetFirewallRule -PolicyStore PersistentStore).Count
+          $env:ETD_SPIKE_A = $a
+          $env:ETD_SPIKE_B = $b
+          try {
+            & spike/es2n-wmi/target/debug/es2n-wmi-spike.exe $count
+            $code = $LASTEXITCODE
+            Write-Host "PowerShell view afterwards:"
+            foreach ($store in 'PersistentStore', 'ActiveStore') {
+              foreach ($id in $a, $b) {
+                $found = @(Get-NetFirewallRule -PolicyStore $store -Name $id -ErrorAction SilentlyContinue).Count
+                Write-Host "$store $id : $found"
+                if ($id -eq $a -and $found -ne 0) { $code = 1 }
+                if ($id -eq $b -and $found -ne 1) { $code = 1 }
+              }
+            }
+            if (Test-Path 'HKCU:\Software\Classes\CLSID\{4590F811-1D3A-11D0-891F-00AA004B2E24}') { Write-Host 'plant left behind'; $code = 1 }
+          } finally {
+            Remove-NetFirewallRule -Name $a, $b -ErrorAction SilentlyContinue
+          }
+          exit $code

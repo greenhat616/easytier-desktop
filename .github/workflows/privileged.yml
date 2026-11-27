@@ -181,6 +181,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # etd-ui's GUI build libraries, as in ci.yml.
+          bash .github/scripts/install-ubuntu-packages.sh build-essential clang cmake pkg-config \
+            libfontconfig1-dev libfreetype6-dev libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev libxcb-dri3-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libwayland-dev libvulkan-dev
           cargo build --locked -p etd-host --features etd-sysfx-os/ci-test-fixtures
           cargo build --locked -p etd-ui
           curl -fsSL -o "$RUNNER_TEMP/nfpm.tar.gz" \

@@ -72,6 +72,13 @@ fn plan_uses_the_derived_name_and_guid() {
             panic!("registry record without registry key");
         };
         assert!(key.ends_with(&guid), "{key}");
+        // The Windows sweep finds these values by the lower-case braced GUID
+        // (`etd-sysfx-os` sweeper) and reports the path as enumerated; the
+        // plan spells it upper case. They agree ignoring ASCII case, which
+        // is how the engine matches registry keys on Windows.
+        let swept = format!("{{{}}}", naming::wintun_guid(&name));
+        assert_ne!(guid, swept);
+        assert!(key.to_ascii_lowercase().ends_with(&swept), "{key}");
     }
     // Linux uses the same name, macOS none.
     let linux = plan_for(&ctx(basic()), Platform::Linux).unwrap();

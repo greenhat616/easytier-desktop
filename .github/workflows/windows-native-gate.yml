@@ -119,6 +119,14 @@ jobs:
             if ($LASTEXITCODE -ne 0) { $code = 1 }
           }
           exit $code
+      - name: Call stacks of etd-host's Shell Folders, AppCompat and Safer reads
+        # Attribution only (topic#51 msg#2045): Windows frames under our
+        # CreateProcess, or an etd-host frame. Module names, no symbols.
+        if: ${{ !cancelled() && steps.procmon.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --quiet procmon-parser==0.4.0
+          python .github/scripts/es2n-stacks.py C:\pm\hosts.pml etd-host.exe 'shell folders' 'appcompatflags\layers' 'safer\codeidentifiers' | Tee-Object "$env:PM_OUT\hosts-stacks.txt"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

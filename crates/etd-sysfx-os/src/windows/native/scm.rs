@@ -125,7 +125,15 @@ fn services(kind: ENUM_SERVICE_TYPE) -> Result<Vec<Value>, WinError> {
             };
             // SAFETY: as above.
             let name = unsafe { wide(entry.lpServiceName) }?;
-            let (path, start) = config(&scm, entry.lpServiceName)?;
+            let (mut path, start) = config(&scm, entry.lpServiceName)?;
+            if path.is_empty() && kind == SERVICE_DRIVER {
+                // No ImagePath: the kernel loads System32\drivers\<name>.sys,
+                // which is what Win32_SystemDriver shows.
+                path = format!(
+                    r"{}\system32\drivers\{name}.sys",
+                    super::super::driver_refs::windows_dir()?.display()
+                );
+            }
             out.push(json!({
                 "name": name,
                 "description": format!(

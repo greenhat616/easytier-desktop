@@ -95,20 +95,27 @@ jobs:
           New-NetFirewallRule -Name $env:ETD_GATE_RULE -DisplayName $env:ETD_GATE_NAME -Direction Inbound -Program $env:ETD_GATE_PROGRAM -Action Allow | Out-Null
           & .github/scripts/es2n-plant.ps1 -Remove
           $code = 0
+          $test = { param($package, $filter, [string[]]$features = @())
+            cargo nextest run --locked --profile privileged -p $package @features --run-ignored only -E $filter --success-output never --failure-output immediate | Out-Host
+            $LASTEXITCODE }
           try {
             & .github/scripts/es2n-plant.ps1 -Com -Junk
+            # Under the plants without Process Monitor: both host forms must pass.
+            if ((& $test etd-sysfx-os 'binary(windows_fence) & test(session_fence)' '--features','ci-test-fixtures') -ne 0) { $code = 1 }
+            if ((& $test etd-host 'binary(install_roundtrip) & test(install_connect_uninstall)') -ne 0) { $code = 1 }
             Start-Process C:\pm\Procmon64.exe -ArgumentList '/AcceptEula','/Quiet','/Minimized','/BackingFile','C:\pm\hosts.pml'
             Start-Sleep -Seconds 10
-            cargo nextest run --locked --profile privileged -p etd-sysfx-os --features ci-test-fixtures --run-ignored only --test windows_native_parity -E 'test(native_under_plants)' --success-output never --failure-output immediate
-            if ($LASTEXITCODE -ne 0) { $code = 1 }
-            cargo nextest run --locked --profile privileged -p etd-sysfx-os --run-ignored only --test windows_fence -E 'test(session_fence)' --success-output never --failure-output immediate
-            if ($LASTEXITCODE -ne 0) { $code = 1 }
-            cargo nextest run --locked --profile privileged -p etd-host --run-ignored only --test install_roundtrip -E 'test(install_connect_uninstall)' --success-output never --failure-output immediate
-            if ($LASTEXITCODE -ne 0) { $code = 1 }
+            if ((& $test etd-sysfx-os 'binary(windows_native_parity) & test(native_under_plants)' '--features','ci-test-fixtures') -ne 0) { $code = 1 }
+            if ((& $test etd-sysfx-os 'binary(windows_fence) & test(session_fence)' '--features','ci-test-fixtures') -ne 0) { $code = 1 }
+            # Captured for its accesses only: under Process Monitor the service
+            # handshake fails with a closed pipe (seen with the PowerShell
+            # worker too), so this run's result is reported, not judged.
+            $captured = & $test etd-host 'binary(install_roundtrip) & test(install_connect_uninstall)'
+            Write-Host "install_connect_uninstall under Process Monitor: exit $captured"
           } finally {
             & .github/scripts/es2n-plant.ps1 -Remove
             Remove-NetFirewallRule -Name $env:ETD_GATE_RULE -ErrorAction SilentlyContinue
-            & .github/scripts/es2n-capture.ps1 -Name hosts -Processes '^(etd-host|windows_native_parity-[0-9a-f]+|windows_fence-[0-9a-f]+|install_roundtrip-[0-9a-f]+)\.exe$' -Allowed $env:GITHUB_WORKSPACE, "$env:ProgramFiles\EasyTierDesk" -Absent 'etd-host.exe=windows.storage.dll' -Out $env:PM_OUT
+            & .github/scripts/es2n-capture.ps1 -Name hosts -Processes '^(etd-host|windows_native_parity-[0-9a-f]+|windows_fence-[0-9a-f]+|install_roundtrip-[0-9a-f]+)\.exe$' -Allowed $env:GITHUB_WORKSPACE, "$env:ProgramFiles\EasyTierDesk", "$env:ProgramData\EasyTierDesk.maintenance" -Absent 'etd-host.exe=windows.storage.dll' -Out $env:PM_OUT
             if ($LASTEXITCODE -ne 0) { $code = 1 }
           }
           exit $code

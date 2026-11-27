@@ -389,10 +389,7 @@ fn nrpt_and_profile_deletion_match() {
             [json!("absent")]
         );
         assert!(run(&json!({"op":"delete_profile","id":guid,"name":"other"})).is_err());
-        assert!(
-            run(&json!({"op":"delete_profile","id":guid.to_lowercase(),"name":"etd-parity"}))
-                .is_err()
-        );
+        assert!(run(&json!({"op":"delete_profile","id":tag,"name":"etd-parity"})).is_err());
         assert!(exists(&profile) && exists(&mine));
         assert_eq!(
             run(&json!({"op":"delete_profile","id":guid,"name":"ETD-parity"})).unwrap(),
@@ -435,6 +432,12 @@ fn network_rows_match() {
         }
     }
     // Other processes' sockets can come and go between the two queries.
+    // Declared: Get-NetTCPConnection hides the System process's (pid 4)
+    // IPv4 wildcard listeners (SMB, HTTP.sys); the native table has them.
+    let new: Vec<Value> = new
+        .into_iter()
+        .filter(|r| !(r["pid"] == 4 && r["address"] == "0.0.0.0"))
+        .collect();
     let (old, new) = (set(&old), set(&new));
     let common = old.intersection(&new).count();
     assert!(

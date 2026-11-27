@@ -101,6 +101,14 @@ const FLUENT: &[(&str, &[u8])] = &[
         "info-filled.svg",
         include_bytes!("../assets/fluent/info-filled.svg"),
     ),
+    (
+        "navigation.svg",
+        include_bytes!("../assets/fluent/navigation.svg"),
+    ),
+    (
+        "dismiss-circle-filled.svg",
+        include_bytes!("../assets/fluent/dismiss-circle-filled.svg"),
+    ),
     ("globe.svg", include_bytes!("../assets/fluent/globe.svg")),
     (
         "globe-filled.svg",
@@ -203,6 +211,181 @@ impl AssetSource for FluentAssets {
     }
 }
 
+/// Embedded Triad application and tray icon PNGs generated from
+/// `packaging/assets/icons/` (see `packaging/assets/README.md`).
+pub mod app_icons {
+    use std::sync::Arc;
+
+    use etd_app::TrayIndicator;
+
+    /// Desktop/taskbar appearance variant for the monochrome tray glyph.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TrayTheme {
+        /// Dark ink (`#1B1B1B`) for light taskbars (and macOS template images).
+        Light,
+        /// White ink (`#FFFFFF`) for dark taskbars.
+        Dark,
+    }
+
+    impl TrayTheme {
+        pub fn from_taskbar_dark(dark: bool) -> Self {
+            if dark { Self::Dark } else { Self::Light }
+        }
+    }
+
+    /// Pixel-aligned tray raster size chosen from system DPI / scale factor.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TraySize {
+        Px16,
+        Px24,
+    }
+
+    impl TraySize {
+        pub const fn px(self) -> u32 {
+            match self {
+                Self::Px16 => 16,
+                Self::Px24 => 24,
+            }
+        }
+
+        /// Pick 24px whenever the OS small-icon metric is 20px or larger
+        /// (125% / 120 DPI and above on Windows), and 16px at 100% DPI.
+        pub const fn for_icon_px(icon_px: u32) -> Self {
+            if icon_px >= 20 {
+                Self::Px24
+            } else {
+                Self::Px16
+            }
+        }
+
+        /// Pick 24px for HiDPI scale factors (>= 1.25x) and 16px for 1x.
+        pub fn for_scale_factor(scale_factor: f32) -> Self {
+            if scale_factor >= 1.25 {
+                Self::Px24
+            } else {
+                Self::Px16
+            }
+        }
+    }
+
+    /// Triad tray state variants corresponding to the three pixel-aligned glyphs.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TrayVisualState {
+        Connected,
+        Connecting,
+        Disconnected,
+    }
+
+    impl TrayVisualState {
+        /// Map [`TrayIndicator`] to the three Triad tray glyphs:
+        /// - `Connected` -> solid nodes + struts (`connected`)
+        /// - `Attention` -> solid nodes + broken struts (`connecting`)
+        /// - `Idle` / `Error` -> hollow rings (`disconnected`)
+        pub fn from_indicator(indicator: TrayIndicator) -> Self {
+            match indicator {
+                TrayIndicator::Connected => Self::Connected,
+                TrayIndicator::Attention => Self::Connecting,
+                TrayIndicator::Idle | TrayIndicator::Error => Self::Disconnected,
+                _ => Self::Disconnected,
+            }
+        }
+    }
+
+    const APP_ICON_64_PNG: &[u8] = include_bytes!("../../../packaging/assets/icons/png/app-64.png");
+
+    const TRAY_LIGHT_16_CONNECTED: &[u8] =
+        include_bytes!("../../../packaging/assets/icons/tray/light-16-connected.png");
+    const TRAY_LIGHT_16_CONNECTING: &[u8] =
+        include_bytes!("../../../packaging/assets/icons/tray/light-16-connecting.png");
+    const TRAY_LIGHT_16_DISCONNECTED: &[u8] =
+        include_bytes!("../../../packaging/assets/icons/tray/light-16-disconnected.png");
+    const TRAY_LIGHT_24_CONNECTED: &[u8] =
+        include_bytes!("../../../packaging/assets/icons/tray/light-24-connected.png");
+    const TRAY_LIGHT_24_CONNECTING: &[u8] =
+        include_bytes!("../../../packaging/assets/icons/tray/light-24-connecting.png");
+    const TRAY_LIGHT_24_DISCONNECTED: &[u8] =
+        include_bytes!("../../../packaging/assets/icons/tray/light-24-disconnected.png");
+
+    const TRAY_DARK_16_CONNECTED: &[u8] =
+        include_bytes!("../../../packaging/assets/icons/tray/dark-16-connected.png");
+    const TRAY_DARK_16_CONNECTING: &[u8] =
+        include_bytes!("../../../packaging/assets/icons/tray/dark-16-connecting.png");
+    const TRAY_DARK_16_DISCONNECTED: &[u8] =
+        include_bytes!("../../../packaging/assets/icons/tray/dark-16-disconnected.png");
+    const TRAY_DARK_24_CONNECTED: &[u8] =
+        include_bytes!("../../../packaging/assets/icons/tray/dark-24-connected.png");
+    const TRAY_DARK_24_CONNECTING: &[u8] =
+        include_bytes!("../../../packaging/assets/icons/tray/dark-24-connecting.png");
+    const TRAY_DARK_24_DISCONNECTED: &[u8] =
+        include_bytes!("../../../packaging/assets/icons/tray/dark-24-disconnected.png");
+
+    /// Return the embedded PNG bytes for a tray theme, size, and state.
+    pub const fn tray_icon_png(
+        theme: TrayTheme,
+        size: TraySize,
+        state: TrayVisualState,
+    ) -> &'static [u8] {
+        match (theme, size, state) {
+            (TrayTheme::Light, TraySize::Px16, TrayVisualState::Connected) => {
+                TRAY_LIGHT_16_CONNECTED
+            }
+            (TrayTheme::Light, TraySize::Px16, TrayVisualState::Connecting) => {
+                TRAY_LIGHT_16_CONNECTING
+            }
+            (TrayTheme::Light, TraySize::Px16, TrayVisualState::Disconnected) => {
+                TRAY_LIGHT_16_DISCONNECTED
+            }
+            (TrayTheme::Light, TraySize::Px24, TrayVisualState::Connected) => {
+                TRAY_LIGHT_24_CONNECTED
+            }
+            (TrayTheme::Light, TraySize::Px24, TrayVisualState::Connecting) => {
+                TRAY_LIGHT_24_CONNECTING
+            }
+            (TrayTheme::Light, TraySize::Px24, TrayVisualState::Disconnected) => {
+                TRAY_LIGHT_24_DISCONNECTED
+            }
+            (TrayTheme::Dark, TraySize::Px16, TrayVisualState::Connected) => TRAY_DARK_16_CONNECTED,
+            (TrayTheme::Dark, TraySize::Px16, TrayVisualState::Connecting) => {
+                TRAY_DARK_16_CONNECTING
+            }
+            (TrayTheme::Dark, TraySize::Px16, TrayVisualState::Disconnected) => {
+                TRAY_DARK_16_DISCONNECTED
+            }
+            (TrayTheme::Dark, TraySize::Px24, TrayVisualState::Connected) => TRAY_DARK_24_CONNECTED,
+            (TrayTheme::Dark, TraySize::Px24, TrayVisualState::Connecting) => {
+                TRAY_DARK_24_CONNECTING
+            }
+            (TrayTheme::Dark, TraySize::Px24, TrayVisualState::Disconnected) => {
+                TRAY_DARK_24_DISCONNECTED
+            }
+        }
+    }
+
+    fn decode_embedded_png(bytes: &'static [u8]) -> image::RgbaImage {
+        image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+            .expect("embedded Triad PNG asset is valid")
+            .into_rgba8()
+    }
+
+    /// Decode an embedded Triad tray icon to `(width, height, rgba_bytes)`.
+    pub fn tray_icon_rgba(
+        theme: TrayTheme,
+        size: TraySize,
+        state: TrayVisualState,
+    ) -> (u32, u32, Vec<u8>) {
+        let img = decode_embedded_png(tray_icon_png(theme, size, state));
+        let (w, h) = img.dimensions();
+        debug_assert_eq!(w, size.px());
+        debug_assert_eq!(h, size.px());
+        (w, h, img.into_raw())
+    }
+
+    /// Decode the 64x64 Triad app icon for GPUI window options (`_NET_WM_ICON` on X11).
+    pub fn window_icon_rgba() -> Arc<image::RgbaImage> {
+        Arc::new(decode_embedded_png(APP_ICON_64_PNG))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +422,44 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|p| p.as_ref() == "fluent/LICENSE.txt")
+        );
+    }
+
+    #[test]
+    fn triad_app_and_tray_pngs_decode_with_expected_dimensions() {
+        use super::app_icons::*;
+
+        let window_icon = window_icon_rgba();
+        assert_eq!(window_icon.dimensions(), (64, 64));
+        assert!(
+            window_icon
+                .as_raw()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|px| px[3] > 0)
+        );
+
+        for theme in [TrayTheme::Light, TrayTheme::Dark] {
+            for size in [TraySize::Px16, TraySize::Px24] {
+                let connected = tray_icon_rgba(theme, size, TrayVisualState::Connected);
+                let connecting = tray_icon_rgba(theme, size, TrayVisualState::Connecting);
+                let disconnected = tray_icon_rgba(theme, size, TrayVisualState::Disconnected);
+                for (w, h, rgba) in [&connected, &connecting, &disconnected] {
+                    assert_eq!((*w, *h), (size.px(), size.px()));
+                    assert_eq!(rgba.len(), (w * h * 4) as usize);
+                    assert!(rgba.as_chunks::<4>().0.iter().any(|px| px[3] > 0));
+                }
+                assert_ne!(connected.2, connecting.2);
+                assert_ne!(connecting.2, disconnected.2);
+                assert_ne!(connected.2, disconnected.2);
+            }
+        }
+
+        // Light and dark variants must use distinct ink colors.
+        assert_ne!(
+            tray_icon_rgba(TrayTheme::Light, TraySize::Px16, TrayVisualState::Connected).2,
+            tray_icon_rgba(TrayTheme::Dark, TraySize::Px16, TrayVisualState::Connected).2
         );
     }
 }

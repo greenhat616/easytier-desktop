@@ -9,17 +9,17 @@ is split between `etd-host` (composition root, CLI, install) and `etd-host-core`
 
 ## Host forms
 
-| | System service | User host | Elevated session (planned) |
+| | System service | User host | Elevated session |
 | --- | --- | --- | --- |
 | Started by | SCM, systemd or launchd at boot; restarted after a crash | The UI, as a child process | The UI, through one UAC prompt |
 | Identity | SYSTEM / root | Current user | Elevated administrator |
 | TUN instances | Yes | No (SOCKS5, port forwarding only) | Yes |
 | When the UI exits | Keeps running | Stops its instances and exits after a 30 s lease grace | Same as user host |
 | After a crash | Service manager restarts it; self-check reclaims | The UI starts it again | The UI offers to clean up with another prompt |
-| Status | Implemented | Implemented | Designed, Windows only |
+| Status | Implemented | Implemented | Host implemented, Windows only; UI integration planned |
 
-`etd-host run --mode service|user` selects the form. A user host started from an
-elevated token is refused; use the installed service instead.
+`etd-host run --mode service|user|elevated-session` selects the form. A user host
+started from an elevated token is refused; use the installed service instead.
 
 ### Locations
 
@@ -211,14 +211,15 @@ GPUI dependency and is tested with a fake tray backend under out-of-order events
 the host is unreachable, window and tray stay as they are and the UI shows "host
 reconnecting".
 
-## Elevated session (planned)
+## Elevated session
 
-The elevated session form is designed but not implemented. Summary of the design:
+The host side is implemented ([etd-host CLI](../../crates/etd-host/docs/cli-and-install.md#run---mode-elevated-session));
+the UI launcher and its messages are planned. Summary:
 Windows only; started with `run --mode elevated-session` through UAC (or directly when
 the UI already runs elevated), only when no system service is registered and only for
 administrator accounts; it takes the same machine locks as the service, so at most one
 privileged host manages kernel objects at a time; its ledger lives per user under a
 protected `%ProgramData%` directory whose owner and ACL are verified on every start; its
-fence admits SYSTEM or elevated administrators and does not persist across reboots; it
-exits when the UI releases its lease or after the lease grace. The contract already has
-the `HOST_MODE_ELEVATED_SESSION` value.
+fence (session form in progress) admits SYSTEM or elevated administrators and does not
+persist across reboots; it exits when the UI releases its lease or after the lease
+grace. The contract already has the `HOST_MODE_ELEVATED_SESSION` value.

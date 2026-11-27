@@ -8,10 +8,24 @@ How to build, check, change frozen interfaces and commit. Code style is in the
 | Tool | Version | Notes |
 | --- | --- | --- |
 | Rust | 1.100.0 | Installed by `rustup` from `rust-toolchain.toml`, with rustfmt and Clippy. MSVC toolchain on Windows. |
-| protoc | 36.2 | Must be on `PATH`. CI installs it with `.github/scripts/setup-protoc.ps1`. |
+| protoc | 36.2 | Must be on `PATH`. CI exports its real executable and include directory from the locked mise installation. |
 | cargo-nextest | 0.9.x | Test runner used by CI (`0.9.152` there) and by the `.config/nextest.toml` profiles. |
 | cargo-deny | 0.22.x | Dependency policy check (`deny.toml`). |
-| buf | any v2 | Optional locally: contract lint and breaking-change check (`buf.yaml`). |
+| buf | 1.75.0 | Contract lint and breaking-change check (`buf.yaml`). |
+
+The optional [mise configuration](../../mise.toml) and [lockfile](../../mise.lock)
+pin releases for Linux x64/arm64, macOS arm64 and Windows x64. Install them
+with `mise install --locked`. The tools come from their upstream binary
+releases, including CPython from Astral's python-build-standalone. To update a
+pin, edit `mise.toml`, run `mise lock`, review the download URLs and checksums
+for every platform, then run `mise lock --check`. Keep Rust in
+`rust-toolchain.toml`. On Intel Macs, install the prerequisites directly:
+cargo-deny 0.22.1 publishes a macOS binary only for arm64.
+
+The [justfile](../../justfile) exposes `check`, `test`, `lint`, `deny`,
+`proto-lint`, `boundaries` and `fetch-cores`. The last command prepares the
+verified host bundle in `target/debug/cores`. Each recipe contains the command
+you can also run directly.
 
 Platform toolchains: MSVC and the Windows SDK on Windows; Xcode Command Line Tools on
 macOS; on Linux, the native build, graphics and windowing libraries listed in the

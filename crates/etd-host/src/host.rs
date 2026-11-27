@@ -47,10 +47,20 @@ use serving::policy;
 #[cfg(windows)]
 use serving::valid_sid;
 pub(crate) use serving::{LayoutLock, serve_with_deps_and};
+#[path = "session.rs"]
+mod session;
 #[path = "upgrade.rs"]
 pub(crate) mod upgrade;
+// Used by main.rs; tests that include this file do not.
+#[cfg_attr(test, allow(unused_imports))]
+pub(crate) use session::SessionRefusal;
 /// See [`serving::RUNTIME_SHUTDOWN`].
 pub(crate) const RUNTIME_SHUTDOWN: std::time::Duration = serving::RUNTIME_SHUTDOWN;
+/// See [`serving::stop_worst_case`].
+#[cfg(windows)]
+pub(crate) fn stop_worst_case() -> std::time::Duration {
+    serving::stop_worst_case()
+}
 const LEDGER: &str = "ledger.sqlite3";
 
 fn layout(mode: HostMode) -> Result<HostLayout> {
@@ -65,27 +75,57 @@ fn layout(mode: HostMode) -> Result<HostLayout> {
             let runtime: Option<std::path::PathBuf> = None;
             Ok(NativeHostFilesystem.user_layout(None, runtime.as_deref())?)
         }
-        _ => bail!("unsupported host mode"),
+        // Only an elevated administrator's token gets a layout: the
+        // directories come from ProgramData and the token's own SID.
+        HostMode::ElevatedSession => {
+            #[cfg(windows)]
+            {
+                let token = etd_sysfx_os::service::elevated_session_token()?;
+                Ok(NativeHostFilesystem.session_layout(&token.sid)?)
+            }
+            #[cfg(unix)]
+            bail!("the elevated session host is Windows-only")
+        }
+        HostMode::Unspecified => bail!("unsupported host mode"),
     }
+}
+
+/// How a host form owns its listener.
+fn host_form(mode: HostMode) -> Result<HostForm> {
+    Ok(match mode {
+        HostMode::Service => HostForm::Service,
+        HostMode::User => HostForm::User,
+        HostMode::ElevatedSession => HostForm::ElevatedSession,
+        HostMode::Unspecified => bail!("unsupported host mode"),
+    })
 }
 
 fn endpoint(mode: HostMode, layout: &HostLayout) -> Result<Endpoint> {
     #[cfg(windows)]
     {
         let _ = layout;
-        if mode == HostMode::Service {
-            return Ok(Endpoint::NamedPipe(etd_ipc::SERVICE_PIPE_NAME.into()));
-        }
-        let OsUserId::WindowsSid(sid) = platform::current_user()? else {
-            bail!("Windows user SID unavailable")
+        let user_sid = || match platform::current_user()? {
+            OsUserId::WindowsSid(sid) => Ok(sid),
+            _ => bail!("Windows user SID unavailable"),
         };
-        Ok(Endpoint::NamedPipe(format!(
-            r"\\.\pipe\easytier-desk-user-{sid}"
-        )))
+        match mode {
+            HostMode::Service => Ok(Endpoint::NamedPipe(etd_ipc::SERVICE_PIPE_NAME.into())),
+            HostMode::User => Ok(Endpoint::NamedPipe(format!(
+                r"\\.\pipe\easytier-desk-user-{}",
+                user_sid()?
+            ))),
+            HostMode::ElevatedSession => {
+                Ok(Endpoint::NamedPipe(session::endpoint_name(&user_sid()?)))
+            }
+            HostMode::Unspecified => bail!("unsupported host mode"),
+        }
     }
     #[cfg(unix)]
     {
-        let _ = mode;
+        ensure!(
+            matches!(mode, HostMode::Service | HostMode::User),
+            "unsupported host mode on this platform"
+        );
         Ok(Endpoint::UnixSocket(
             layout
                 .socket_dir
@@ -114,9 +154,38 @@ fn prepare(mode: HostMode, layout: &HostLayout) -> Result<()> {
             NativeHostFilesystem.prepare_user(layout)?;
         }
         HostMode::Service => NativeHostFilesystem.validate_service(layout)?,
-        _ => bail!("unsupported host mode"),
+        // Prepared under its locks by `session::acquire` / `reclaim_own`.
+        HostMode::ElevatedSession => {
+            bail!("the elevated session host is prepared under its locks")
+        }
+        HostMode::Unspecified => bail!("unsupported host mode"),
     }
     Ok(())
+}
+
+/// The kernel's profile variables under the elevated session host: the
+/// protected, empty `<SID>\profile`, never the user's own profile.
+fn profile_env(profile: &std::path::Path) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> =
+        ["USERPROFILE", "APPDATA", "LOCALAPPDATA"]
+            .into_iter()
+            .map(|name| (name.into(), profile.as_os_str().to_owned()))
+            .collect();
+    let mut components = profile.components();
+    if let Some(std::path::Component::Prefix(drive)) = components.next() {
+        env.push(("HOMEDRIVE".into(), drive.as_os_str().to_owned()));
+        env.push((
+            "HOMEPATH".into(),
+            components.as_path().as_os_str().to_owned(),
+        ));
+    }
+    env
+}
+
+/// The account a host form serves and, for the elevated session, its
+/// Windows session (peers must share it).
+fn host_owner(mode: HostMode) -> Result<(Option<OsUserId>, Option<u32>)> {
+    serving::host_owner(mode).map_err(Into::into)
 }
 
 struct Dependencies {
@@ -137,9 +206,11 @@ impl Dependencies {
 
 async fn dependencies(mode: HostMode, layout: &HostLayout) -> Result<Dependencies> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let process: Arc<dyn ProcessEngine> = Arc::new(ProcessKitEngine::with_console_helper(
-        layout.executable.clone(),
-    ));
+    let mut engine = ProcessKitEngine::with_console_helper(layout.executable.clone());
+    if let Some(profile) = &layout.profile {
+        engine = engine.with_env(profile_env(profile));
+    }
+    let process: Arc<dyn ProcessEngine> = Arc::new(engine);
     let index = Arc::new(FileIndex::new(&layout.state));
     let ledger_exists = storage::ledger_exists(&layout.state)?;
     let fresh = !ledger_exists && index.load()?.is_none();
@@ -200,7 +271,12 @@ async fn dependencies(mode: HostMode, layout: &HostLayout) -> Result<Dependencie
         driver.clone(),
         storage::trusted_cores(),
     )?;
-    let store = Arc::new(if mode == HostMode::Service {
+    // Privileged hosts may load drivers from a kernel directory.
+    let privileged = match mode {
+        HostMode::Service | HostMode::ElevatedSession => true,
+        HostMode::User | HostMode::Unspecified => false,
+    };
+    let store = Arc::new(if privileged {
         store.with_removal_guard(|dir| {
             etd_sysfx_os::driver_bundle_referenced(dir)
                 .map_err(|error| etd_host_core::core_store::StoreError::Io(error.to_string()))
@@ -221,12 +297,8 @@ async fn dependencies(mode: HostMode, layout: &HostLayout) -> Result<Dependencie
         boot_id: os.boot_id.clone(),
         repair_index: index.clone(),
     }));
-    let owner = if mode == HostMode::User {
-        Some(platform::current_user()?)
-    } else {
-        None
-    };
-    let authorizer = Arc::new(AllowListAuthorizer::new(mode, owner));
+    let (owner, session) = host_owner(mode)?;
+    let authorizer = Arc::new(AllowListAuthorizer::new(mode, owner).with_session(session));
     authorizer.load(ledger.as_ref()).await?;
     let host = Arc::new(HostDeps {
         mode,
@@ -244,11 +316,7 @@ async fn dependencies(mode: HostMode, layout: &HostLayout) -> Result<Dependencie
         boot_id: os.boot_id,
         install_key,
         observer: os.observer,
-        fence: if mode == HostMode::Service {
-            os.fence
-        } else {
-            None
-        },
+        fence: if privileged { os.fence } else { None },
         core: driver,
         core_store: store,
         authorizer,
@@ -325,33 +393,11 @@ async fn serve_until(
     managed_stop: Option<watch::Receiver<bool>>,
 ) -> Result<HostExit> {
     let layout = layout(mode)?;
-    prepare(mode, &layout)?;
-    if mode == HostMode::Service {
-        ensure!(
-            NativeHostFilesystem.is_installed_image(&layout)?,
-            "service must run from the protected installed executable"
-        );
-        #[cfg(windows)]
-        ensure!(
-            matches!(platform::current_user()?, OsUserId::WindowsSid(ref sid) if sid == "S-1-5-18"),
-            "service requires LocalSystem"
-        );
-        #[cfg(unix)]
-        ensure!(
-            matches!(platform::current_user()?, OsUserId::UnixUid(0)),
-            "service requires root"
-        );
-    }
-    let form = if mode == HostMode::Service {
-        HostForm::Service
+    let guard = if mode == HostMode::ElevatedSession {
+        session::acquire(&layout).await?
     } else {
-        HostForm::User
+        lock_service_or_user(mode, &layout)?
     };
-    let guard = LayoutLock::new(
-        NativeHostFilesystem.lock(&layout)?,
-        endpoint(mode, &layout)?,
-        form,
-    );
     let mut on_serving: Option<Box<dyn FnOnce() + Send>> = None;
     if mode == HostMode::Service {
         let journal = LifecycleJournal::open(&layout)?
@@ -379,6 +425,43 @@ async fn serve_until(
             }
         }
     }
+    serve_locked(mode, layout, guard, managed_stop, on_serving).await
+}
+
+/// The service and user forms: prepare, then the host lock.
+fn lock_service_or_user(mode: HostMode, layout: &HostLayout) -> Result<LayoutLock> {
+    prepare(mode, layout)?;
+    if mode == HostMode::Service {
+        ensure!(
+            NativeHostFilesystem.is_installed_image(layout)?,
+            "service must run from the protected installed executable"
+        );
+        #[cfg(windows)]
+        ensure!(
+            matches!(platform::current_user()?, OsUserId::WindowsSid(ref sid) if sid == "S-1-5-18"),
+            "service requires LocalSystem"
+        );
+        #[cfg(unix)]
+        ensure!(
+            matches!(platform::current_user()?, OsUserId::UnixUid(0)),
+            "service requires root"
+        );
+    }
+    Ok(LayoutLock::new(
+        NativeHostFilesystem.lock(layout)?,
+        endpoint(mode, layout)?,
+        host_form(mode)?,
+    ))
+}
+
+/// Serve holding `guard` until stopped, then close the ledger.
+async fn serve_locked(
+    mode: HostMode,
+    layout: HostLayout,
+    guard: LayoutLock,
+    managed_stop: Option<watch::Receiver<bool>>,
+    on_serving: Option<Box<dyn FnOnce() + Send>>,
+) -> Result<HostExit> {
     let logging = logging(&layout)?;
     let Dependencies {
         host,
@@ -481,12 +564,27 @@ fn entry(id: Id, role: Role) -> AllowEntry {
     }
 }
 
+/// A local or domain account SID: `S-1-5-21-<three domain parts>-<RID>`
+/// with RID 1000 or above. Well-known accounts, built-in groups, Everyone
+/// and other authorities are not accounts that can be enrolled here.
+#[cfg(windows)]
+fn account_sid(sid: &str) -> bool {
+    let parts: Vec<&str> = sid.split('-').collect();
+    valid_sid(sid)
+        && parts.len() == 8
+        && parts[..4] == ["S", "1", "5", "21"]
+        && parts[7].parse::<u32>().is_ok_and(|rid| rid >= 1000)
+}
+
 fn enrolled_users(users: &[String]) -> Result<Vec<AllowEntry>> {
     let mut entries = Vec::new();
     for user in users {
         #[cfg(windows)]
         let id = {
-            ensure!(valid_sid(user), "expected a numeric SID");
+            ensure!(
+                account_sid(user),
+                "expected an account SID (S-1-5-21-..., RID 1000 or above), not a group or well-known SID"
+            );
             Id::WindowsUserSid(user.clone())
         };
         #[cfg(unix)]
@@ -543,7 +641,7 @@ async fn maintenance_change(ledger: &dyn Ledger, change: Change) -> Result<v1::R
         .await?)
 }
 
-pub async fn install(users: &[String]) -> Result<()> {
+pub async fn install(users: &[String], owner: Option<String>) -> Result<()> {
     let users = enrolled_users(users)?;
     let mode = HostMode::Service;
     let layout = layout(mode)?;
@@ -570,8 +668,15 @@ pub async fn install(users: &[String]) -> Result<()> {
         );
         rollback_install(&layout, &guard, journal)?;
     }
+    // Under the maintenance and host locks no elevated session runs:
+    // reclaim and purge every session root first (doc#13), refusing with
+    // the report if anything is left.
+    session::drain(true)
+        .await
+        .context("leftover elevated sessions could not be reclaimed; install refused")?;
     NativeServiceManager.preflight_install(&layout)?;
-    let mut journal = LifecycleJournal::begin(&layout)?;
+    let mut journal = LifecycleJournal::begin_owned(&layout, owner)?;
+    let mut enrolled = Vec::new();
     let result: Result<()> = async {
         NativeServiceManager.prepare_install(&layout, &mut journal)?;
         journal.plan(Resource::Data)?;
@@ -586,6 +691,7 @@ pub async fn install(users: &[String]) -> Result<()> {
         let seed: Result<()> = async {
             let entries = seed_entries(users)?;
             policy(mode, &entries)?;
+            enrolled = entries.iter().map(describe_entry).collect();
             maintenance_change(deps.host.ledger.as_ref(), Change::SetAllowList(entries)).await?;
             Ok(())
         }
@@ -614,7 +720,26 @@ pub async fn install(users: &[String]) -> Result<()> {
     finish_install_handoff(command, start_and_verify(&layout, &install_id), || {
         uninstall_locked(&layout, Some(&install_id))
     })
-    .await
+    .await?;
+    println!("installed; allow list: {}", enrolled.join(", "));
+    Ok(())
+}
+
+/// One allow-list entry for the installer's report, e.g. `admin user S-1-5-18`.
+fn describe_entry(entry: &AllowEntry) -> String {
+    let role = match Role::try_from(entry.role) {
+        Ok(Role::Admin) => "admin",
+        Ok(Role::Control) => "control",
+        _ => "other",
+    };
+    let who = match entry.principal.as_ref().and_then(|p| p.id.as_ref()) {
+        Some(Id::WindowsUserSid(sid)) => format!("user {sid}"),
+        Some(Id::WindowsGroupSid(sid)) => format!("group {sid}"),
+        Some(Id::UnixUid(uid)) => format!("uid {uid}"),
+        Some(Id::UnixGid(gid)) => format!("gid {gid}"),
+        None => "nobody".to_owned(),
+    };
+    format!("{role} {who}")
 }
 
 async fn finish_install_handoff<F, Fut>(
@@ -973,8 +1098,33 @@ fn print_report(report: &ReclaimReport) {
     }
 }
 
-pub async fn reclaim(mode: HostMode, _all: bool, purge: bool) -> Result<()> {
+pub async fn reclaim(mode: HostMode, _all: bool, purge: bool, all_users: bool) -> Result<()> {
+    ensure!(
+        !all_users || mode == HostMode::ElevatedSession,
+        "--all-users applies only to --mode elevated-session"
+    );
+    #[cfg(unix)]
+    ensure!(
+        mode != HostMode::ElevatedSession,
+        "the elevated session host is Windows-only"
+    );
+    if all_users {
+        // Every user's sessions, independent of the caller's token: the
+        // app uninstaller runs this as LocalSystem. Only the shared
+        // maintenance and host locks are taken from a layout, and the
+        // service's has the same ones.
+        ensure!(
+            NativeServiceManager.entry_is_elevated()?,
+            "administrator privileges required"
+        );
+        let locks = NativeHostFilesystem.service_layout()?;
+        return session::reclaim_all_users(&locks, purge).await;
+    }
     let layout = layout(mode)?;
+    match mode {
+        HostMode::ElevatedSession => return session::reclaim_own(&layout, purge).await,
+        HostMode::Service | HostMode::User | HostMode::Unspecified => (),
+    }
     let _command = service_maintenance(mode, &layout)?;
     prepare(mode, &layout)?;
     let _guard = NativeHostFilesystem.lock(&layout)?;
@@ -983,7 +1133,10 @@ pub async fn reclaim(mode: HostMode, _all: bool, purge: bool) -> Result<()> {
     deps.close().await
 }
 
-pub async fn uninstall() -> Result<()> {
+/// `only_owner`: remove only an installation recorded with that owner and
+/// otherwise succeed without touching anything, so an installer's rollback
+/// never removes an installation it did not make.
+pub async fn uninstall(only_owner: Option<&str>) -> Result<()> {
     let mode = HostMode::Service;
     let layout = layout(mode)?;
     ensure!(
@@ -991,7 +1144,21 @@ pub async fn uninstall() -> Result<()> {
         "administrator privileges required"
     );
     let _command = NativeHostFilesystem.lock_maintenance(&layout)?;
-    uninstall_locked(&layout, None).await
+    let Some(owner) = only_owner else {
+        return uninstall_locked(&layout, None).await;
+    };
+    // The maintenance-command lock keeps the journal from changing until
+    // uninstall_locked checks the same transaction again.
+    match LifecycleJournal::open(&layout)? {
+        Some(journal) if journal.owner() == Some(owner) => {
+            let id = journal.install_id().to_owned();
+            uninstall_locked(&layout, Some(&id)).await
+        }
+        _ => {
+            println!("no installation owned by {owner}; nothing removed");
+            Ok(())
+        }
+    }
 }
 
 /// Caller holds the maintenance-command mutex until this returns, including
@@ -1242,6 +1409,10 @@ fn service_maintenance(mode: HostMode, layout: &HostLayout) -> Result<Option<Mai
 }
 
 pub async fn remove_core(mode: HostMode, version: &str) -> Result<()> {
+    ensure!(
+        mode != HostMode::ElevatedSession,
+        "remove-core is not available for the elevated session host"
+    );
     let layout = layout(mode)?;
     let _command = service_maintenance(mode, &layout)?;
     prepare(mode, &layout)?;
@@ -2012,5 +2183,38 @@ mod lock_after_stop_tests {
         .unwrap_err();
         assert_eq!(tries, 1);
         assert!(error.to_string().contains("denied"));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod account_sid_tests {
+    use super::account_sid;
+
+    #[test]
+    fn only_local_or_domain_account_sids_are_enrolled() {
+        for sid in [
+            "S-1-5-21-1111111111-2222222222-3333333333-1001",
+            "S-1-5-21-1-2-3-1000",
+        ] {
+            assert!(account_sid(sid), "{sid}");
+        }
+        for sid in [
+            "S-1-1-0",                                       // Everyone
+            "S-1-5-11",                                      // Authenticated Users
+            "S-1-5-18",                                      // LocalSystem
+            "S-1-5-32-544",                                  // Administrators
+            "S-1-5-32-545",                                  // Users
+            "S-1-5-21-1111111111-2222222222-3333333333-500", // built-in Administrator
+            "S-1-5-21-1111111111-2222222222-3333333333-513", // Domain Users
+            "S-1-5-21-1111111111-2222222222-3333333333-999",
+            "S-1-5-21-1-2-1000",
+            "S-1-5-21-1-2-3-4-1000",
+            "S-1-12-1-1-2-3-4",
+            "S-1-5-21-1-2-3-01000",
+            "S-1-5-21-1-2-3-1000\" --allow-user \"S-1-1-0",
+            "",
+        ] {
+            assert!(!account_sid(sid), "{sid}");
+        }
     }
 }

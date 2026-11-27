@@ -213,6 +213,10 @@ impl Builder<'_> {
         // Explicit dev_name, GUID = UUIDv5 of it (`tun_name.rs`). Whether the
         // adapter vanishes with the process is spike S2's question; until it
         // is answered the record is probed like any persistent object.
+        // TODO(S2): revisit once spike S2 answers. A live adapter with our
+        // credential is a candidate today (the Windows reclaimer answers
+        // NotDeletable, topic#59 msg#1766): if adapters die with their
+        // creator, one still live after our kernel is dead is someone else's.
         self.absent(
             EffectKind::WinTunAdapter,
             interface_key(Platform::Windows, &name),

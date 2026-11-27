@@ -37,6 +37,7 @@ pub fn native_rows(request: &Value) -> Result<Vec<Value>, crate::OsError> {
 /// session input tests. Uses the worker profile `adapters()` set.
 #[cfg(feature = "ci-test-fixtures")]
 pub fn worker_diagnostics() -> Result<Value, crate::OsError> {
+    crate::ci_test_fixtures_build();
     let mut rows =
         execution::run(json!({"op": "diagnostics"})).map_err(|e| crate::OsError::Os {
             code: e.code,
@@ -502,7 +503,9 @@ impl Reclaimer for WindowsReclaimer {
         };
         let response = match self.0 {
             EffectKind::WinFenceFilter => {let key=e.key.clone();return blocking(move||wfp::remove(&key)).await.map_err(WinError::reclaim);},
-            EffectKind::WinTunAdapter => return Err(ReclaimError::Busy("live adapter; never uninstall live wintun".into())),
+            // Ours (same credential) but never uninstalled live: listed as a
+            // candidate, closed once gone (topic#59 msg#1766).
+            EffectKind::WinTunAdapter => return Err(ReclaimError::NotDeletable("live adapter; never uninstall live wintun".into())),
             EffectKind::Route => return Err(ReclaimError::Busy("routes still present; never delete routes blindly".into())),
             EffectKind::WinRegistryValue => {
                 let (path,value) = registry_value_key(&e.key).map_err(WinError::reclaim)?;
@@ -511,7 +514,7 @@ impl Reclaimer for WindowsReclaimer {
             }
             EffectKind::WinMagicDnsRecovery => {
                 if e.undo != Undo::ReplayUpstreamRecovery { return Err(ReclaimError::CredentialMismatch); }
-                let root=self.1.clone();return blocking(move||magic::replay(&root)).await.map_err(WinError::reclaim);
+                let root=self.1.clone();return blocking(move||Ok(magic::replay(&root))).await.map_err(WinError::reclaim)?.map_err(magic::ReplayError::reclaim);
             }
             EffectKind::WinFirewallRule | EffectKind::WinProgramFirewallRule | EffectKind::WinNrptRule | EffectKind::WinNetworkProfile => {
                 if e.undo != Undo::EnsureAbsent { return Err(ReclaimError::CredentialMismatch); }

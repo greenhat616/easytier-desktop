@@ -21,8 +21,9 @@ reclaimed, privileged tests) are in [docs/platforms.md](docs/platforms.md).
 | `OsConfig` | `state_dir` (ledger, repair index), `run_dir` (root of `run/<instance>/<epoch>/`), `core_store_dir` (protected kernel store) |
 | `OsAdapters` | `reclaimers` (one per OS kind), `sweeper`, `boot_id`, `observer`, `fence: Option<_>` |
 | `OsError` | `Unsupported`, `PermissionDenied`, `Os { code, message }` |
-| `driver_bundle_referenced`, `driver_bundle_reference` | Windows: does any registered or loaded driver point into a kernel bundle (checked before a kernel is removed); always `false` / `None` elsewhere |
+| `driver_bundle_referenced`, `driver_bundle_reference` | Windows: does any registered or loaded driver point into a kernel bundle (checked before a kernel is removed); always `false` / `None` elsewhere. Loaded drivers come from `EnumDeviceDrivers` with SeDebugPrivilege enabled on a thread token; a token that cannot enable it (a Windows Installer custom action) reads `NtQuerySystemInformation(SystemModuleInformation)` instead, whose entry count must match `EnumDeviceDrivers`. Any empty, truncated or unconvertible path fails closed |
 | `service::{HostLayout, HostFilesystem, NativeHostFilesystem, ServiceManager, NativeServiceManager, HostLock, MaintenanceLock, LifecycleJournal, SERVICE_NAME, installed_host_dir, ...}` | Host directories, singleton locks, service install / uninstall (SCM, systemd, launchd) |
+| `service::{NotConforming, session_root, elevated_session_token, harden_dll_search, ProcessPin, SessionEnd, ...}` (Windows) | Elevated session host: the protected `%ProgramData%\EasyTierDesk.session\<SID>` tree (created, verified, enumerated, removed through `HostFilesystem`), the elevated-administrator token check, the System32-only DLL search path, the UI-image pin for lease holders and the session-end window |
 | `appearance::{AppearanceSnapshot, AccentRamp, AppearanceWatch, mica_backdrop_accepted, set_window_dark_mode}` | Desktop appearance for the UI; inert stubs outside Windows |
 | `windows`, `linux`, `macos` | Platform modules (compiled only on their OS); internals are private |
 
@@ -87,7 +88,8 @@ Default host directories (`service`):
   never deleted on Windows and macOS (verify only), and routes never on Linux.
 - Each fence is verified on the live listener: the host must connect, a probe without
   privileges must be refused, and the refusal must come from this fence.
-- Windows Magic DNS is replayed only while no other EasyTier process runs; Linux Magic
+- Windows Magic DNS is replayed only while no other EasyTier process runs (a proven
+  external one leaves it in place as a conflict); Linux Magic
   DNS state is reverted on the credential-checked link; macOS Magic DNS is refused by
   the planner.
 - Every child process on Windows is started with `CREATE_NO_WINDOW`.

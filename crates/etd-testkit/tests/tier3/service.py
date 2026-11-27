@@ -224,11 +224,18 @@ class Service:
               f"{status.stdout.strip()} {status.stderr.strip()}", flush=True)
 
     @contextmanager
-    def installed(self, *, fixture_tunnel=False):
+    def installed(self, *, fixture_tunnel=False, install=None, uninstall=None):
+        """Install, yield, uninstall, then compare the machine with before
+        the install. `install` and `uninstall` replace `etd-host install`
+        and `etd-host uninstall` (the MSI runs them itself); `uninstall`
+        returns a CompletedProcess."""
         if self.state.exists() or self.host.exists() or self.cores.exists():
             raise RuntimeError("test needs a fresh service installation")
         before = self.inventory()
-        self.call(self.installer, "install")
+        if install is None:
+            self.call(self.installer, "install")
+        else:
+            install()
         try:
             self.verify_bundle()
             version = self.call(self.core, "--version").strip()
@@ -257,7 +264,7 @@ class Service:
                     else:
                         prior.pop(name, None)
             # Inventory the result even when a failed uninstall retains files.
-            result = self.uninstall()
+            result = self.uninstall() if uninstall is None else uninstall()
             if not result.returncode:
                 eventually("uninstall journal closed",
                            lambda: self.call(self.installer, "uninstall", "--status"),

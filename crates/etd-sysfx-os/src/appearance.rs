@@ -19,6 +19,11 @@ pub struct AppearanceSnapshot {
     pub windows_build: Option<u32>,
     pub transparency: Option<bool>,
     pub dark: Option<bool>,
+    /// System shell / taskbar dark mode (independent of app dark mode on Windows).
+    pub taskbar_dark: Option<bool>,
+    /// OS small icon dimension in physical pixels (e.g. Windows `SM_CXSMICON`:
+    /// 16 at 100% DPI, 20 at 125%, 24 at 150%, 32 at 200%).
+    pub tray_icon_px: Option<u32>,
     pub light_accent: Option<AccentRamp>,
     pub dark_accent: Option<AccentRamp>,
 }
@@ -32,7 +37,8 @@ impl AppearanceSnapshot {
 
 #[cfg(windows)]
 pub use crate::windows::appearance::{
-    AppearanceWatch, mica_backdrop_accepted, set_window_dark_mode,
+    AppearanceWatch, mica_backdrop_accepted, query_taskbar_dark, query_tray_icon_px,
+    set_window_dark_mode, set_window_icon_from_resource,
 };
 
 #[cfg(not(windows))]
@@ -60,6 +66,24 @@ pub fn mica_backdrop_accepted(_hwnd: NonZeroIsize) -> bool {
 #[cfg(not(windows))]
 pub fn set_window_dark_mode(_hwnd: NonZeroIsize, _dark: bool) -> bool {
     false
+}
+
+/// Non-Windows has no Win32 executable icon resource to attach via `WM_SETICON`.
+#[cfg(not(windows))]
+pub fn set_window_icon_from_resource(_hwnd: NonZeroIsize, _resource_id: u16) -> bool {
+    false
+}
+
+/// Non-Windows callers determine tray light/dark appearance from the desktop toolkit.
+#[cfg(not(windows))]
+pub fn query_taskbar_dark() -> Option<bool> {
+    None
+}
+
+/// Non-Windows callers determine tray icon size from the toolkit scale factor.
+#[cfg(not(windows))]
+pub fn query_tray_icon_px() -> Option<u32> {
+    None
 }
 
 #[cfg(test)]
@@ -95,5 +119,11 @@ mod tests {
         assert!(AppearanceWatch::new(|| panic!("no WinRT event on non-Windows")).is_none());
         assert!(!mica_backdrop_accepted(NonZeroIsize::new(1).unwrap()));
         assert!(!set_window_dark_mode(NonZeroIsize::new(1).unwrap(), true));
+        assert!(!set_window_icon_from_resource(
+            NonZeroIsize::new(1).unwrap(),
+            1
+        ));
+        assert!(query_taskbar_dark().is_none());
+        assert!(query_tray_icon_px().is_none());
     }
 }

@@ -32,17 +32,35 @@ struct Cli {
     command: Option<Action>,
 }
 
-#[derive(Debug, Copy, Clone, ValueEnum)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum Mode {
     User,
     Service,
+    /// The current user's privileged host, started from an elevated
+    /// administrator token (Windows only; no path options).
+    ElevatedSession,
 }
 impl From<Mode> for HostMode {
     fn from(value: Mode) -> Self {
         match value {
             Mode::User => Self::User,
             Mode::Service => Self::Service,
+            Mode::ElevatedSession => Self::ElevatedSession,
         }
+    }
+}
+
+/// An installer tag: 1 to 64 ASCII letters, digits, braces, hyphens,
+/// underscores or dots (an MSI ProductCode fits).
+fn owner_tag(value: &str) -> Result<String, String> {
+    let valid = (1..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'{' | b'}' | b'-' | b'_' | b'.'));
+    if valid {
+        Ok(value.to_owned())
+    } else {
+        Err("expected 1-64 letters, digits, braces, hyphens, underscores or dots".into())
     }
 }
 
@@ -55,8 +73,14 @@ enum Action {
     },
     /// Install the system service (requires administrator privileges).
     Install {
+        /// One more administrator: an account SID (S-1-5-21-..., RID 1000
+        /// or above) on Windows, a UID elsewhere. Repeatable.
         #[arg(long, value_name = "SID_OR_UID")]
         allow_user: Vec<String>,
+        /// Record who installs (an MSI passes its ProductCode); see
+        /// `uninstall --only-owner`.
+        #[arg(long, value_name = "TAG", value_parser = owner_tag)]
+        owner: Option<String>,
     },
     /// Replace the installed service with this build, keeping its state
     /// (requires administrator privileges; run from the new payload).
@@ -70,6 +94,11 @@ enum Action {
         wait_parent: Option<u32>,
         #[arg(long, hide = true, requires = "wait_parent")]
         install_id: Option<String>,
+        /// Uninstall only an installation recorded with this owner; when
+        /// there is none, do nothing and succeed (an installer's rollback).
+        #[arg(long, value_name = "TAG", value_parser = owner_tag,
+              conflicts_with_all = ["status", "wait_parent", "install_id"])]
+        only_owner: Option<String>,
     },
     /// Re-enable a service disabled by an incomplete uninstall (before reclaim finished).
     ResumeService,
@@ -85,6 +114,10 @@ enum Action {
         /// instance configuration. Requires `--all`.
         #[arg(long, requires = "all")]
         purge: bool,
+        /// With --mode elevated-session: every user's elevated session
+        /// state, not only the current user's.
+        #[arg(long)]
+        all_users: bool,
     },
     /// Read-only diagnostic information (no special privileges required).
     Doctor,
@@ -97,11 +130,22 @@ enum Action {
 }
 
 fn main() -> ExitCode {
+    // First thing, for every command: DLLs load from System32 only, never
+    // from the (possibly user-writable) image directory.
+    #[cfg(windows)]
+    if let Err(error) = etd_sysfx_os::service::harden_dll_search() {
+        eprintln!("etd-host: cannot restrict the DLL search path: {error}");
+        return ExitCode::FAILURE;
+    }
     match execute(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("etd-host: {error:#}");
-            ExitCode::FAILURE
+            // The elevated session's refusals have their own exit codes,
+            // so the UI can tell them apart.
+            host::SessionRefusal::find(&error).map_or(ExitCode::FAILURE, |refusal| {
+                ExitCode::from(refusal.exit_code())
+            })
         }
     }
 }
@@ -137,22 +181,31 @@ fn execute(cli: Cli) -> Result<()> {
         .build()?;
     match command {
         Action::Doctor => host::doctor(),
+        Action::Run {
+            mode: Mode::ElevatedSession,
+        } => run_elevated_session(runtime),
         Action::Run { mode } => {
             let (exit, settled) = run_bounded(runtime, host::run(mode.into()));
             exit.finish(settled)
         }
-        Action::Reclaim { mode, all, purge } => {
-            run_bounded(runtime, host::reclaim(mode.into(), all, purge)).0
-        }
+        Action::Reclaim {
+            mode,
+            all,
+            purge,
+            all_users,
+        } => run_bounded(runtime, host::reclaim(mode.into(), all, purge, all_users)).0,
         Action::RemoveCore { mode, version } => {
             run_bounded(runtime, host::remove_core(mode.into(), &version)).0
         }
-        Action::Install { allow_user } => run_bounded(runtime, host::install(&allow_user)).0,
+        Action::Install { allow_user, owner } => {
+            run_bounded(runtime, host::install(&allow_user, owner)).0
+        }
         Action::Upgrade => run_bounded(runtime, host::upgrade::upgrade()).0,
         Action::Uninstall {
             status,
             wait_parent,
             install_id,
+            only_owner,
         } => {
             if status {
                 return host::uninstall_status();
@@ -168,10 +221,47 @@ fn execute(cli: Cli) -> Result<()> {
                     bail!("uninstall worker is Windows-only");
                 }
             }
-            run_bounded(runtime, host::uninstall()).0
+            run_bounded(runtime, host::uninstall(only_owner.as_deref())).0
         }
         Action::ResumeService => run_bounded(runtime, host::resume_service()).0,
     }
+}
+
+/// `run --mode elevated-session`: Ctrl+C or the end of the Windows session
+/// stops it. The session end is held (shutdown block reason) until the
+/// host has wound down and released its lock, within the stop's worst case.
+#[cfg(windows)]
+fn run_elevated_session(runtime: tokio::runtime::Runtime) -> Result<()> {
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let stop = std::sync::Arc::new(stop);
+    let on_end = {
+        let stop = stop.clone();
+        move || {
+            let _ = stop.send(true);
+        }
+    };
+    let mut session_end =
+        etd_sysfx_os::service::SessionEnd::watch(Box::new(on_end), host::stop_worst_case())
+            .context("cannot watch for the end of the Windows session")?;
+    let (exit, settled) = run_bounded(runtime, async move {
+        let interrupt = tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                let _ = stop.send(true);
+            }
+        });
+        let exit = host::run_until(HostMode::ElevatedSession, Some(stopped)).await;
+        interrupt.abort();
+        exit
+    });
+    let result = exit.finish(settled);
+    session_end.finished();
+    result
+}
+
+#[cfg(not(windows))]
+fn run_elevated_session(runtime: tokio::runtime::Runtime) -> Result<()> {
+    drop(runtime);
+    bail!("the elevated session host is Windows-only")
 }
 
 /// Run `work` on `runtime`, then shut the runtime down within
@@ -230,5 +320,29 @@ mod run_bounded_tests {
             tokio::task::spawn_blocking(|| ()).await.unwrap();
         });
         assert!(settled);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn owner_tags_take_a_product_code_and_nothing_that_splits_a_command_line() {
+        Cli::command().debug_assert();
+        let code = "{89AB7D73-819C-4BB3-BA52-DCB90C01C4ED}";
+        assert_eq!(owner_tag(code).unwrap(), code);
+        for bad in ["", "a b", "a\"b", "a;b", &"x".repeat(65)] {
+            assert!(owner_tag(bad).is_err(), "{bad}");
+        }
+        let cli = Cli::try_parse_from(["etd-host", "uninstall", "--only-owner", code]).unwrap();
+        assert!(
+            matches!(cli.command, Some(Action::Uninstall { only_owner: Some(ref o), .. }) if o == code)
+        );
+        assert!(
+            Cli::try_parse_from(["etd-host", "uninstall", "--only-owner", code, "--status"])
+                .is_err()
+        );
     }
 }

@@ -34,7 +34,7 @@ impl FakeHostLauncher {
                 requirement: match mode {
                     HostMode::Service => ServerRequirement::Service,
                     HostMode::ElevatedSession => ServerRequirement::CurrentUserElevated,
-                    _ => ServerRequirement::CurrentUser,
+                    HostMode::User | HostMode::Unspecified => ServerRequirement::CurrentUser,
                 },
             },
         }

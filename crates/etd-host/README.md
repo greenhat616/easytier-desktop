@@ -38,8 +38,17 @@ Flows, locks, paths and the per-OS install steps are described in
   connection counts as a lease; 30 s after the last one closes the host stops its
   instances, reclaims and exits. On first start it installs the bundled kernels into
   its private store.
-- **Elevated session**: rejected by the CLI (`run --mode elevated-session` fails);
-  planned.
+- **Elevated session** (`run --mode elevated-session`, Windows only): run by the
+  current user's elevated administrator token (TokenElevation, integrity High, not
+  SYSTEM), never while the service is registered or its state directory remains. It
+  shares the service's maintenance and host locks, keeps its state in the protected
+  tree `%ProgramData%\EasyTierDesk.session\<SID>`, uses the fence, advertises `TUN`
+  and `LEASE` (no allow list) and serves `\\.\pipe\easytier-desk-session-<SID>`. The
+  owner in the host's Windows session controls it; an elevated owner administers it.
+  Only connections from the `etd-ui.exe` beside the host image hold its lease (an
+  image check, not an authentication). Refusals have their own exit codes; see
+  [docs/cli-and-install.md](docs/cli-and-install.md#run---mode-elevated-session).
+  The UI integration (launcher, messages) is planned (ES4).
 
 ## Trusted kernels
 
@@ -94,8 +103,17 @@ accepted targets and validation rules are in the header of `cores.lock` and in
 cargo nextest run -p etd-host
 ```
 
-- `cli.rs`: `--help` and `doctor` work unprivileged; unknown commands, `--purge`
-  without `--all` and `--mode elevated-session` are rejected.
+- `cli.rs`: `--help` and `doctor` work unprivileged; unknown commands and `--purge`
+  without `--all` are rejected; the elevated session mode parses without any path
+  option, `--all-users` only with it, and on Unix it is refused as Windows-only.
+- `session_e2e.rs` (Windows, privileged, `ETD_HOST_CI_INSTALL=1`): refusals for a
+  non-conforming session root, a leftover service state directory, a registered
+  service and a junction in the tree; a real run with handshake, `install` and
+  `reclaim` failing on the shared lock, exit after the lease grace with a non-UI
+  client, a real kernel (the bundled release) applied, ready and stopped, then
+  `ReleaseLease`; a file in place of `profile`; another user's leftover blocking until
+  `reclaim --all-users`; the uninstaller purge run as LocalSystem; `install` draining
+  a session root.
 - `core_lock.rs`: `cores.lock` parser (row forms, invalid names, duplicates, targets).
 - `singleton.rs`: a second process cannot take the host lock until it is released.
 - `user_mode_e2e.rs`: native IPC, the production composition and lease loop, real

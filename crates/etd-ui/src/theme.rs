@@ -14,13 +14,18 @@ use gpui_kit::{
     transparent_black,
 };
 
-use crate::preferences::{ThemePreference, UiPreferencesStore};
+use crate::{
+    assets::app_icons::TraySize,
+    preferences::{ThemePreference, UiPreferencesStore},
+};
 
 const PALETTE: &str = include_str!("../assets/fluent-theme.json");
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct SystemStyle {
     mica_requested: bool,
     dark: Option<bool>,
+    taskbar_dark: Option<bool>,
+    tray_icon_px: Option<u32>,
     light_accent: Option<AccentRamp>,
     dark_accent: Option<AccentRamp>,
 }
@@ -82,6 +87,17 @@ pub fn init(cx: &mut App) {
     chrome.preference = preference;
     chrome.preference_path_unavailable = store.is_none();
     chrome.preferences = store;
+    set_native_preference(preference, cx);
+    apply_theme(cx.window_appearance(), cx);
+    #[cfg(target_os = "windows")]
+    windows::init(cx);
+}
+
+/// The standalone component gallery follows the same appearance machinery,
+/// but never opens or mutates the product's UI preference file.
+pub(crate) fn init_gallery(preference: ThemePreference, cx: &mut App) {
+    install_palette(cx);
+    cx.global_mut::<FluentChrome>().preference = preference;
     set_native_preference(preference, cx);
     apply_theme(cx.window_appearance(), cx);
     #[cfg(target_os = "windows")]
@@ -243,14 +259,29 @@ pub(crate) fn bind_window(window: &mut Window, cx: &mut App) {
     if !cx.has_global::<FluentChrome>() {
         return;
     }
+    #[cfg(target_os = "windows")]
+    windows::set_window_icon(window);
+    sync_tray_for_window(window);
     apply_theme(window.appearance(), cx);
     sync_material(window, cx);
     window
         .observe_window_appearance(|window, cx| {
+            sync_tray_for_window(window);
             apply_theme(window.appearance(), cx);
             sync_material(window, cx);
         })
         .detach();
+}
+
+fn sync_tray_for_window(window: &Window) {
+    let size = Some(TraySize::for_scale_factor(window.scale_factor()));
+    // On Windows the taskbar theme comes from HKCU SystemUsesLightTheme via
+    // `AppearanceWatch`, not from the app window appearance.
+    #[cfg(target_os = "windows")]
+    let taskbar_dark = None;
+    #[cfg(not(target_os = "windows"))]
+    let taskbar_dark = Some(ThemeMode::from(window.appearance()).is_dark());
+    crate::tray::update_system_tray_appearance(taskbar_dark, size);
 }
 
 #[cfg(any(test, target_os = "windows"))]
@@ -303,6 +334,8 @@ fn system_style(
     SystemStyle {
         mica_requested: snapshot.supports_mica() && direct_composition,
         dark: snapshot.dark,
+        taskbar_dark: snapshot.taskbar_dark.or(snapshot.dark),
+        tray_icon_px: snapshot.tray_icon_px,
         light_accent: snapshot
             .light_accent
             .and_then(|r| readable_accent(r, false)),
@@ -365,13 +398,35 @@ fn readable_accent(ramp: AccentRamp, dark: bool) -> Option<AccentRamp> {
 #[cfg(target_os = "windows")]
 mod windows {
     use super::*;
-    use etd_sysfx_os::appearance::{AppearanceWatch, mica_backdrop_accepted, set_window_dark_mode};
+    use etd_sysfx_os::appearance::{
+        AppearanceWatch, mica_backdrop_accepted, set_window_dark_mode,
+        set_window_icon_from_resource,
+    };
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    const APP_ICON_RESOURCE_ID: u16 = 1;
 
     fn read_style(watch: &AppearanceWatch) -> SystemStyle {
         let dcomp = !std::env::var("GPUI_DISABLE_DIRECT_COMPOSITION")
             .is_ok_and(|v| v == "1" || v == "true");
         system_style(watch.snapshot(), dcomp)
+    }
+
+    fn sync_tray_appearance(style: SystemStyle) {
+        crate::tray::update_system_tray_appearance(
+            style.taskbar_dark,
+            style.tray_icon_px.map(TraySize::for_icon_px),
+        );
+    }
+
+    pub(super) fn set_window_icon(window: &Window) {
+        let Ok(handle) = HasWindowHandle::window_handle(window) else {
+            return;
+        };
+        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+            return;
+        };
+        let _ = set_window_icon_from_resource(handle.hwnd, APP_ICON_RESOURCE_ID);
     }
 
     pub(super) fn set_dark_mode(window: &Window, dark: bool) -> bool {
@@ -408,7 +463,9 @@ mod windows {
             apply_theme(cx.window_appearance(), cx);
             return;
         };
-        cx.global_mut::<FluentChrome>().system = read_style(&watch);
+        let initial = read_style(&watch);
+        cx.global_mut::<FluentChrome>().system = initial;
+        sync_tray_appearance(initial);
         apply_theme(cx.window_appearance(), cx);
         cx.spawn(async move |cx| {
             let watch = watch;
@@ -420,6 +477,11 @@ mod windows {
                         return;
                     }
                     cx.global_mut::<FluentChrome>().system = next;
+                    if previous.taskbar_dark != next.taskbar_dark
+                        || previous.tray_icon_px != next.tray_icon_px
+                    {
+                        sync_tray_appearance(next);
+                    }
                     apply_theme(cx.window_appearance(), cx);
                     if previous.mica_requested != next.mica_requested || previous.dark != next.dark
                     {

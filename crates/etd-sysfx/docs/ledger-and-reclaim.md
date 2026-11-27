@@ -44,8 +44,8 @@ stateDiagram-v2
     Applied --> Reclaimed
     Reclaiming --> Reclaimed: verified gone / restored
     Reclaiming --> Quarantined: 5 failures, or process liveness unknown
-    Reclaiming --> Candidate: present, no credential on record
-    Reclaiming --> Conflict: present, different credential
+    Reclaiming --> Candidate: present, no credential on record, or NotDeletable
+    Reclaiming --> Conflict: present, different credential, or HeldBy
     Quarantined --> Reclaiming: retry (failures reset)
     Quarantined --> Reclaimed
     Candidate --> Reclaiming: administrator DELETE
@@ -165,7 +165,15 @@ Per record: move to `Reclaiming`, probe, decide, act, verify.
 | present, record never got a credential | `Candidate` (never deleted automatically) |
 
 After a delete the object must probe absent, otherwise it is a failure. A reclaimer's
-`CredentialMismatch` becomes a conflict. At `QUARANTINE_AFTER` (5) consecutive failures
+`CredentialMismatch` becomes a conflict, and so does `HeldBy(holder)`: a positive proof
+that another owner holds the object now, named in a report note. `HeldBy` counts only on
+the record's first attempt: the engine marks a record `Reclaiming` durably before calling
+its reclaimer, so a record already `Reclaiming` when the run starts may have been changed
+part-way by an earlier run (one that crashed included), and `HeldBy` is then a failure. `NotDeletable(reason)`
+(ours, but that reclaimer never deletes it, such as a live wintun adapter) makes the record
+a candidate; an administrator's DELETE meets the same answer and leaves it a candidate
+with a note. Neither counts as a failure; both are re-probed on every run and close once
+the object is gone. An unprovable holder is `Busy`, a failure. At `QUARANTINE_AFTER` (5) consecutive failures
 the record is quarantined; `retry` moves quarantined records back to `Reclaiming` and
 runs the instance's open generations again. A held record stores the credential it saw
 only in the observation detail, so nothing it saw can later authorise a delete.
@@ -192,8 +200,11 @@ only in the observation detail, so nothing it saw can later authorise a delete.
 
 The platform `Sweeper` finds product-marked objects outside the ledger. Objects an
 open record already locates are skipped; interface names and GUIDs match without
-regard to ASCII case, and so do service names on Windows (the service control manager
-may report another case than the planned key). Other keys match exactly. Objects in an exclusive container (WFP
+regard to ASCII case. On Windows so do service names (the service control manager
+may report another case than the planned key), registry key paths and value names (the
+plan spells an adapter GUID in upper case, the sweep reports it as enumerated), firewall
+and NRPT rule names and groups, and network profile names, as the Windows observer
+matches them. Other keys, and every key on other platforms, match exactly. Objects in an exclusive container (WFP
 sublayer, nftables table, PF anchor, host-owned runtime root) are removed, but only
 once no kernel process record is open. Everything else is a candidate: names
 re-derived from the repair index (`FoundBy::DerivedName`) or a bare `etd-` prefix

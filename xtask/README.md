@@ -1,8 +1,9 @@
 # xtask
 
-Repository tasks for the workspace (binary, not published). It has two commands:
-`cargo xtask check-boundaries`, which enforces the architecture dependency rules, and
-`cargo xtask fetch-cores`, which downloads and verifies the bundled upstream kernels.
+Repository tasks for the workspace (binary, not published). It has three commands:
+`cargo xtask check-boundaries`, which enforces the architecture dependency rules,
+`cargo xtask fetch-cores`, which downloads and verifies the bundled upstream kernels, and
+`cargo xtask dist`, which stages a release payload and builds its installer package.
 Two test-only checks that run as ordinary unit tests: the Windows `CREATE_NO_WINDOW`
 spawn check and the privileged CI profile check. The `cargo xtask` alias is defined in
 `.cargo/config.toml` (`run --package xtask --`).
@@ -88,6 +89,47 @@ and is left out). The command:
 CI uses it in `ci.yml` (`session_real` on every OS, `install_roundtrip` beside the test
 host image) and in the O1/O2/O3 workflows. Binaries are never committed.
 
+## `cargo xtask dist`
+
+```sh
+cargo xtask dist                       # this machine's target, release binaries
+cargo xtask dist --dry-run             # stage, verify and render; no packaging tool
+cargo xtask dist --bin-dir target/debug --cores target/debug/cores/2.7.1 --out out --package-version 0.1.1
+```
+
+1. Copies `etd-ui`, `etd-host` and `etd-ctl` and every file of the kernel bundle into a
+   fresh `<out>/<triple>/payload/` (`cores/<version>/` beside the binaries, the layout the
+   package installs). Links and directories are refused.
+2. Checks the staged bundle against `crates/etd-host/cores.lock` with `etd-host`'s own
+   `core_lock.rs`: the executable and every companion with its SHA-256, and no other file.
+   Only the payload that was checked is packaged. The staged `etd-host` must embed every
+   digest of that row (it was built from the same `cores.lock`) and must not carry the CI
+   fault hook (`ci-test-fixtures`, recognised by the `ETD-CI-TEST-FIXTURES-BUILD` marker
+   that feature compiles in); on
+   Windows `etd-ui.exe` must be a GUI-subsystem (release) build, so it opens no console.
+   `--allow-test-fixtures` lifts the last two checks for CI test packages.
+3. Runs the target's packager: on Windows (`dist/windows.rs`) it renders
+   `packaging/windows/Product.wxs.tmpl` into `<out>/<triple>/Product.wxs` (MSI version,
+   payload paths, one component per kernel file) and, unless `--dry-run`, runs
+   `wix build -acceptEula wix7 -arch x64 -ext WixToolset.Util.wixext` (WiX 7.0.1 required,
+   `CREATE_NO_WINDOW`) into `easytier-desktop-<version>-<arch>.msi`. Linux comes with PK4
+   (`dist/linux.rs`); other targets fail.
+4. Runs the sign hook; `none`, the only one, leaves the package unsigned.
+
+| Option | Effect |
+| --- | --- |
+| `--target <triple>` | Default `host` |
+| `--bin-dir <dir>` | Built binaries. Default `<target dir>/<triple>/release`, else `<target dir>/release` |
+| `--cores <dir>` | Kernel bundle. Default `<target dir>/etd-cores/<triple>/<kernel version>` (`fetch-cores` output) |
+| `--out <dir>` | Default `<target dir>/dist` |
+| `--package-version <x.y.z>` | Default the workspace version; no pre-release tag (installers order versions numerically) |
+| `--dry-run` | Skip the packaging tool |
+| `--sign-hook none` | Default; v1 packages are unsigned (issue #2) |
+| `--allow-test-fixtures` | CI test packages only: accept an `etd-host` built with `ci-test-fixtures` and a debug `etd-ui` |
+
+The MSI's design, custom actions and failure behaviour are in
+[`../docs/packaging/README.md`](../docs/packaging/README.md).
+
 ## Test-only repository checks
 
 These live in `src/spawn_flags.rs` and `src/ci_config.rs`, compiled only under
@@ -132,7 +174,9 @@ cargo nextest run -p xtask
 This runs the spawn-flag and CI-config checks over the real repository, the
 `fetch-cores` checks (the committed `cores.lock` covers exactly the pinned targets and
 companions, pin validation, `SHA256SUMS` parsing, extraction from a synthetic zip; no
-network), plus the
+network), the `dist` checks (staging, bundle verification against a lock, the staged host's
+fixture marker and embedded digests, the PE subsystem, MSI template rendering and
+placeholders, custom-action conditions, MSI version limits), plus the
 boundary rule tests in `src/boundaries/tests.rs`. Those generate synthetic workspaces
 of empty path crates in a temporary directory and run `cargo metadata --offline` on
 them, so each rule is exercised with Cargo's real metadata shape (every dependency kind,
@@ -143,7 +187,7 @@ dependencies). Nothing is privileged and nothing needs the network.
 
 Depends on `anyhow`, `cargo_metadata`, `clap`, `serde`, `serde_json`, `sha2`,
 `tempfile`, `toml` and `zip` (deflate only), and needs `curl` on `PATH` for
-`fetch-cores`. It depends on no workspace crate (it compiles `etd-host`'s `core_lock.rs`
+`fetch-cores` and `wix` 7.0.1 for `dist` on Windows. It depends on no workspace crate (it compiles `etd-host`'s `core_lock.rs`
 by path) and nothing depends on it. See
 [`../docs/development/workflow.md`](../docs/development/workflow.md) and
 [`../docs/architecture/README.md`](../docs/architecture/README.md).

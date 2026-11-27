@@ -15,7 +15,7 @@ use etd_contract::{HostMode, HostPhase, InstanceId};
 use gpui_kit::{
     AnyElement, App, Context, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Role,
     SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _,
-    component::{ActiveTheme as _, Size, StyledExt as _, button::ButtonVariant},
+    component::{ActiveTheme as _, Size, button::ButtonVariant},
     div,
 };
 
@@ -29,11 +29,9 @@ use crate::{
 
 #[inline(never)]
 pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement {
-    let fg = cx.theme().foreground;
     let sec_bg = cx.theme().secondary;
     let sec_fg = cx.theme().secondary_foreground;
     let warn = cx.theme().warning;
-    let border = cx.theme().border;
     let title_bar = crate::theme::chrome_fill(cx, cx.theme().title_bar);
 
     let (link_label, tray_available) = {
@@ -65,32 +63,20 @@ pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
         (link_label, model.tray_available)
     };
 
-    let mut left = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_3()
-        .child(
-            div()
-                .text_base()
-                .font_semibold()
-                .text_color(fg)
-                .child("EasyTier Desktop"),
-        )
-        .child(
-            div()
-                .id("header-host-status")
-                .role(Role::Status)
-                .test_support()
-                .aria_label(SharedString::from(link_label.clone()))
-                .px_2()
-                .py_1()
-                .rounded_sm()
-                .bg(sec_bg)
-                .text_xs()
-                .text_color(sec_fg)
-                .child(link_label),
-        );
+    let mut left = div().flex().flex_row().items_center().gap_3().child(
+        div()
+            .id("header-host-status")
+            .role(Role::Status)
+            .test_support()
+            .aria_label(SharedString::from(link_label.clone()))
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .bg(sec_bg)
+            .text_xs()
+            .text_color(sec_fg)
+            .child(link_label),
+    );
 
     if !tray_available {
         let note = "No system tray";
@@ -155,6 +141,7 @@ pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
     );
 
     let right = div()
+        .flex_shrink_0()
         .flex()
         .flex_row()
         .items_center()
@@ -166,14 +153,15 @@ pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
 
     div()
         .id("app-header")
+        .test_support()
+        .h(gpui_kit::px(52.))
+        .flex_shrink_0()
         .flex()
         .flex_row()
         .items_center()
         .justify_between()
         .px_4()
         .py_2()
-        .border_b_1()
-        .border_color(border)
         .bg(title_bar)
         .child(left)
         .child(right)
@@ -308,13 +296,20 @@ pub fn render_banners(view: &MainView, cx: &mut Context<MainView>) -> AnyElement
         items.push(render_operations_bar(&actionable_ops, cx));
     }
 
-    div()
+    let has_items = !items.is_empty();
+    let stack = div()
         .id("banners-stack")
+        .test_support()
         .flex()
         .flex_col()
-        .bg(cx.theme().popover)
-        .children(items)
-        .into_any_element()
+        .gap_2()
+        .children(items);
+    let stack = if has_items {
+        stack.px(gpui_kit::px(24.)).pt_3().pb_2()
+    } else {
+        stack
+    };
+    stack.into_any_element()
 }
 
 #[inline(never)]
@@ -331,6 +326,7 @@ fn render_reconnecting_banner(attempt: u32, cx: &mut Context<MainView>) -> AnyEl
         }),
     );
     FluentInfoBar::new("banner-reconnecting", InfoSeverity::Warning, msg)
+        .title("Connection interrupted")
         .actions([btn])
         .render(cx)
 }
@@ -363,13 +359,14 @@ fn render_cut_unconfirmed_banner(
         ));
     }
     FluentInfoBar::new("banner-cut-unconfirmed", InfoSeverity::Error, summary)
+        .title("Stop confirmation required")
         .actions(action_btns)
         .render(cx)
 }
 
 #[inline(never)]
 fn render_elevated_refused_banner(cx: &mut Context<MainView>) -> AnyElement {
-    let msg = "Elevated user host refused: an elevated process cannot operate a user host. Use or install the system service instead.";
+    let msg = "An elevated process cannot operate a user host. Use or install the system service instead.";
     let connect_btn = action_button(
         "btn-offer-service-connect",
         "Use System Service",
@@ -388,6 +385,7 @@ fn render_elevated_refused_banner(cx: &mut Context<MainView>) -> AnyElement {
         }),
     );
     FluentInfoBar::new("banner-elevated-user-refused", InfoSeverity::Warning, msg)
+        .title("Elevated user host refused")
         .actions([connect_btn, install_btn])
         .render(cx)
 }
@@ -399,9 +397,7 @@ fn render_not_installed_banner(
     is_elevated: bool,
     cx: &mut Context<MainView>,
 ) -> AnyElement {
-    let msg = format!(
-        "System service is not installed. Install the service for full TUN support ({preview})."
-    );
+    let msg = format!("Install the service for full TUN support ({preview}).");
     let mut btns = vec![action_button(
         "btn-install-service",
         if installing {
@@ -426,16 +422,14 @@ fn render_not_installed_banner(
         ));
     }
     FluentInfoBar::new("banner-not-installed", InfoSeverity::Informational, msg)
+        .title("System service not installed")
         .actions(btns)
         .render(cx)
 }
 
 #[inline(never)]
 fn render_launch_failed_banner(failure: &LaunchFailure, cx: &mut Context<MainView>) -> AnyElement {
-    let msg = format!(
-        "Host launch failed ({:?}): {}",
-        failure.kind, failure.message
-    );
+    let msg = format!("{:?}: {}", failure.kind, failure.message);
     let btn = action_button(
         "btn-retry-autoconnect",
         "Retry Auto-Connect",
@@ -445,6 +439,7 @@ fn render_launch_failed_banner(failure: &LaunchFailure, cx: &mut Context<MainVie
         }),
     );
     FluentInfoBar::new("banner-launch-failed", InfoSeverity::Error, msg)
+        .title("Host launch failed")
         .actions([btn])
         .render(cx)
 }
@@ -452,9 +447,9 @@ fn render_launch_failed_banner(failure: &LaunchFailure, cx: &mut Context<MainVie
 #[inline(never)]
 fn render_no_host_banner(is_elevated: bool, cx: &mut Context<MainView>) -> AnyElement {
     let msg = if is_elevated {
-        "No host is running. Running elevated: install or connect to the system service."
+        "Running elevated: install or connect to the system service."
     } else {
-        "No host is running. Install the system service for TUN mode, or start a user host."
+        "Install the system service for TUN mode, or start a user host."
     };
     let mut btns = vec![
         action_button(
@@ -487,6 +482,7 @@ fn render_no_host_banner(is_elevated: bool, cx: &mut Context<MainView>) -> AnyEl
         ));
     }
     FluentInfoBar::new("banner-no-host", InfoSeverity::Informational, msg)
+        .title("No host is running")
         .status()
         .actions(btns)
         .render(cx)
@@ -498,12 +494,15 @@ fn render_keep_window_banner(cx: &mut Context<MainView>) -> AnyElement {
     let btn = action_button(
         "btn-dismiss-keep-window",
         "Dismiss",
-        BtnStyle::new(ButtonVariant::Ghost, Size::XSmall).icon("fluent/dismiss.svg"),
+        BtnStyle::new(ButtonVariant::Ghost, Size::Size(gpui_kit::px(38.)))
+            .icon("fluent/dismiss.svg")
+            .icon_only(),
         cx.listener(|this, _, _, cx| {
             this.controller.dismiss_keep_window_notice(cx);
         }),
     );
     FluentInfoBar::new("banner-keep-window", InfoSeverity::Informational, msg)
+        .title("No system tray")
         .status()
         .close(btn)
         .render(cx)
@@ -516,7 +515,13 @@ fn render_simple_alert(
     severity: InfoSeverity,
     cx: &App,
 ) -> AnyElement {
-    FluentInfoBar::new(id, severity, msg).render(cx)
+    FluentInfoBar::new(id, severity, msg)
+        .title(if severity == InfoSeverity::Error {
+            "Problem"
+        } else {
+            "Warning"
+        })
+        .render(cx)
 }
 
 #[inline(never)]
@@ -560,7 +565,9 @@ fn render_operation_row(op: &Operation, cx: &mut Context<MainView>) -> Option<An
     btns.push(action_button(
         SharedString::from(format!("btn-op-dismiss-{}", req_id_dismiss.0)),
         "Dismiss",
-        BtnStyle::new(ButtonVariant::Ghost, Size::XSmall).icon("fluent/dismiss.svg"),
+        BtnStyle::new(ButtonVariant::Ghost, Size::Size(gpui_kit::px(38.)))
+            .icon("fluent/dismiss.svg")
+            .icon_only(),
         cx.listener(move |this, _, _, _| {
             this.controller
                 .send_command(UserCommand::DismissOperation(req_id_dismiss.clone()));

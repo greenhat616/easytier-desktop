@@ -114,7 +114,38 @@ fn same_key(a: &ObjectKey, b: &ObjectKey) -> bool {
         (ObjectKey::Service { name }, ObjectKey::Service { name: bn }) if cfg!(windows) => {
             name.eq_ignore_ascii_case(bn)
         }
+        // Registry key paths and value names are case-insensitive: the plan
+        // spells the adapter GUID in upper case, the sweep reports it as
+        // enumerated. Firewall / NRPT rule names and groups, and network
+        // profile names, are matched case-insensitively by the Windows
+        // observer too. Ordinal (ASCII) comparison, as Windows does for
+        // these names.
+        (ObjectKey::Registry { key, value }, ObjectKey::Registry { key: bk, value: bv })
+            if cfg!(windows) =>
+        {
+            key.eq_ignore_ascii_case(bk) && same_name(value, bv)
+        }
+        (
+            ObjectKey::Rule { name, group },
+            ObjectKey::Rule {
+                name: bn,
+                group: bg,
+            },
+        ) if cfg!(windows) => name.eq_ignore_ascii_case(bn) && same_name(group, bg),
+        (
+            ObjectKey::NetworkProfile { profile_name },
+            ObjectKey::NetworkProfile { profile_name: bn },
+        ) if cfg!(windows) => profile_name.eq_ignore_ascii_case(bn),
         _ => a == b,
+    }
+}
+
+/// Both absent, or both present and equal ignoring ASCII case.
+fn same_name(a: &Option<String>, b: &Option<String>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -379,19 +410,126 @@ mod tests {
         ));
     }
 
+    fn record(kind: EffectKind, key: ObjectKey) -> Effect {
+        Effect {
+            kind,
+            key,
+            ..driver_record("unused")
+        }
+    }
+
+    /// Registry path of a per-adapter value, with the GUID as the plan
+    /// spells it (`adapter_guid`: braced, upper case) or as a sweep may
+    /// report it.
+    fn tcpip6(guid: &str, value: &str) -> ObjectKey {
+        ObjectKey::Registry {
+            key: format!(
+                r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\{guid}"
+            ),
+            value: Some(value.into()),
+        }
+    }
+
+    const PLANNED: &str = "{8D2E9F3A-1B4C-5D6E-8F70-A1B2C3D4E5F6}";
+    const SWEPT: &str = "{8d2e9f3a-1b4c-5d6e-8f70-a1b2c3d4e5f6}";
+
     #[test]
-    fn other_keys_stay_exact() {
-        let rule = |name: &str| ObjectKey::Rule {
+    fn registry_keys_match_case_insensitively_only_on_windows() {
+        let planned = record(
+            EffectKind::WinRegistryValue,
+            tcpip6(PLANNED, "MaxNumberOfAddressesToRegister"),
+        );
+        let swept = tcpip6(SWEPT, "maxnumberofaddressestoregister");
+        assert!(locates_record(
+            &planned,
+            EffectKind::WinRegistryValue,
+            &tcpip6(PLANNED, "MaxNumberOfAddressesToRegister")
+        ));
+        assert_eq!(
+            locates_record(&planned, EffectKind::WinRegistryValue, &swept),
+            cfg!(windows)
+        );
+        // Another GUID, another value, or a value against the key itself:
+        // never the same object.
+        let other = "{8D2E9F3A-1B4C-5D6E-8F70-A1B2C3D4E5F7}";
+        for different in [
+            tcpip6(other, "MaxNumberOfAddressesToRegister"),
+            tcpip6(SWEPT, "RegistrationEnabled"),
+            ObjectKey::Registry {
+                key: format!(
+                    r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\{SWEPT}"
+                ),
+                value: None,
+            },
+        ] {
+            assert!(
+                !locates_record(&planned, EffectKind::WinRegistryValue, &different),
+                "{different:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rule_and_profile_names_match_case_insensitively_only_on_windows() {
+        let rule = |name: &str, group: Option<&str>| ObjectKey::Rule {
             name: name.into(),
-            group: Some("EasyTier".into()),
+            group: group.map(str::to_owned),
         };
-        let mut record = driver_record("unused");
-        record.kind = EffectKind::WinFirewallRule;
-        record.key = rule("EasyTier etd-1 (in)");
-        assert!(!locates_record(
-            &record,
+        let firewall = record(
             EffectKind::WinFirewallRule,
-            &rule("easytier ETD-1 (in)")
+            rule("EasyTier etd-1 (in)", Some("EasyTier")),
+        );
+        assert_eq!(
+            locates_record(
+                &firewall,
+                EffectKind::WinFirewallRule,
+                &rule("easytier ETD-1 (IN)", Some("easytier"))
+            ),
+            cfg!(windows)
+        );
+        assert!(!locates_record(
+            &firewall,
+            EffectKind::WinFirewallRule,
+            &rule("EasyTier etd-1 (in)", None)
+        ));
+        let nrpt = record(EffectKind::WinNrptRule, rule(PLANNED, None));
+        assert_eq!(
+            locates_record(&nrpt, EffectKind::WinNrptRule, &rule(SWEPT, None)),
+            cfg!(windows)
+        );
+        let profile = |name: &str| ObjectKey::NetworkProfile {
+            profile_name: name.into(),
+        };
+        let planned = record(EffectKind::WinNetworkProfile, profile("etd-1a2b3c4d"));
+        assert_eq!(
+            locates_record(
+                &planned,
+                EffectKind::WinNetworkProfile,
+                &profile("ETD-1A2B3C4D")
+            ),
+            cfg!(windows)
+        );
+    }
+
+    #[test]
+    fn paths_and_fences_stay_exact() {
+        let path = |p: &str| ObjectKey::Path { path: p.into() };
+        let dir = record(EffectKind::RuntimeDir, path("run/a/1"));
+        assert!(!locates_record(
+            &dir,
+            EffectKind::RuntimeDir,
+            &path("RUN/A/1")
+        ));
+        let fence = |rule: &str| ObjectKey::Fence {
+            container: "etd-fence".into(),
+            rule: rule.into(),
+            port: 15888,
+        };
+        let planned = record(EffectKind::WinFenceFilter, fence("8d2e9f3a"));
+        assert!(!locates_record(
+            &planned,
+            EffectKind::WinFenceFilter,
+            &fence("8D2E9F3A")
         ));
     }
 }

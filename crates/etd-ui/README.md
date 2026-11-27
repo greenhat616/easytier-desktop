@@ -15,8 +15,7 @@ cargo run -p etd-ui
 
 The binary looks for `etd-host` next to its own executable (to start a user host or to
 run the service installer) and for an installed service host at the platform's
-protected install directory. Logging uses `tracing-subscriber` with `RUST_LOG`
-(default `info`). Start-up wiring in `src/main.rs`:
+protected install directory. Start-up wiring in `src/main.rs`:
 
 1. `build_local_services()`: real gRPC client factory (`GrpcHostClient` over
    `LocalConnector`), `LocalHostLauncher` wrapped in `ElevatedAwareLauncher`, and
@@ -43,11 +42,32 @@ protected install directory. Logging uses `tracing-subscriber` with `RUST_LOG`
 
 `lib.rs` and `Cargo.toml` are part of the `freeze-v1` interface set.
 
+### Logs and panics
+
+`src/logging.rs` sends `tracing` output (filter from `RUST_LOG`, default `info`) to
+`etd-ui.log` in the per-user local data directory, which never roams:
+
+| Platform | Folder |
+| --- | --- |
+| Windows | `%LOCALAPPDATA%\EasyTierDesk\data\logs` |
+| macOS | `~/Library/Application Support/EasyTierDesk/logs` |
+| Linux | `$XDG_DATA_HOME/easytierdesk/logs` (default `~/.local/share/easytierdesk/logs`) |
+
+A file is rotated before a write would take it past 1 MiB; the current file and four
+older ones (`etd-ui.log.1`, newest, to `.4`) are kept, so the folder stays under about
+5 MiB. A panic hook writes the panic message, the thread name and a captured backtrace
+to the same file synchronously, then runs the default hook. A debug build also logs to
+stdout; a release build (no console on Windows) logs to stdout only if the folder cannot
+be opened. No network secret reaches these events: the store strips it from every spec,
+and the host redacts its own errors. Panic messages are written as they are. There is
+no "Open log folder" entry in the UI yet.
+
 ## Dependencies and boundaries
 
 - **Used by:** nothing in the workspace (top of the UI side).
 - **Depends on:** `etd-app`, `etd-client`, `etd-contract`, `etd-ipc`, `etd-sysfx-os`
   (elevation check, installed host directory, Windows appearance and DWM calls);
+  `directories` for the log folder;
   `etd-testkit` as a dev-dependency only.
 - **Must not depend on:** `etd-core-easytier` or any `easytier*` crate anywhere in its
   closure (rule 1), nor directly on system binding crates such as `windows*`, `nix` or
@@ -59,6 +79,7 @@ protected install directory. Logging uses `tracing-subscriber` with `RUST_LOG`
 | Module | Responsibility |
 | --- | --- |
 | `main.rs` | Binary entry point, wiring described above. |
+| `logging` (binary) | Rotated log file and panic hook (above). |
 | `composition` | Production services; elevation-aware launcher (an elevated UI refuses to start a user host and offers the service instead); platform service installer. |
 | `controller` | `UiController`: applies `WindowAction`s, pumps tray events, runs the exit gate. When GPUI quits without our exit command (logoff or shutdown; on macOS also Quit from the Dock), its quit hook runs the gate with `ExitReason::SessionEnd`, blocking under the gate's deadlines because the process ends right after. |
 | `model` | `UiModel`; detail tabs Nodes / Routes / Traffic are gated on host capabilities. |
@@ -69,8 +90,8 @@ protected install directory. Logging uses `tracing-subscriber` with `RUST_LOG`
 | `views/reclaim.rs` | Reclaim report with per-item candidate decisions (Delete / Keep), conflict release, quarantine retries. |
 | `views/ui.rs` | Small `#[inline(never)]` element builders and the appearance menu. |
 | `theme` / `preferences` | Fluent theme and the persisted theme choice (below). |
-| `assets` | `FluentAssets`: embedded Fluent icons composed with `gpui-kit`'s own assets. |
-| `tray` | `NativeTrayBackend`, generated indicator icons. |
+| `assets` | `FluentAssets` (embedded Fluent UI icons composed with `gpui-kit`) and `app_icons` (embedded Triad tray and X11 window PNGs). |
+| `tray` | `NativeTrayBackend`, rendering the Triad tray icon per state (`connected`, `connecting`, `disconnected`), taskbar theme (`light`/`dark`), and DPI (`16`/`24`). |
 
 The `#[inline(never)]` helpers returning `AnyElement` are deliberate: unoptimised debug
 builds otherwise overflow the 1 MiB main-thread stack on Windows.
@@ -87,11 +108,18 @@ host or network data; an unreadable file falls back to Follow system.
 
 ### Icons
 
-`assets/fluent/` holds a subset of Microsoft's Fluent System Icons (24 px regular SVGs,
-unmodified, MIT). [`assets/fluent/NOTICE.md`](assets/fluent/NOTICE.md) lists each file
-with its upstream path and commit; the license text is in
-[`assets/fluent/LICENSE.txt`](assets/fluent/LICENSE.txt). Keep both in sync when adding
-an icon, and add the file to the table in `src/assets.rs`.
+- **UI icons:** `assets/fluent/` holds a subset of Microsoft's Fluent System Icons (24 px
+  regular SVGs, unmodified, MIT). [`assets/fluent/NOTICE.md`](assets/fluent/NOTICE.md)
+  lists each file with its upstream path and commit; the license text is in
+  [`assets/fluent/LICENSE.txt`](assets/fluent/LICENSE.txt). Keep both in sync when adding
+  an icon, and add the file to the table in `src/assets.rs`.
+- **Application & tray icons:** the Triad icon set lives in
+  [`packaging/assets/icons/`](../../packaging/assets/README.md). On Windows, `build.rs`
+  and `app.rc` embed `packaging/assets/icons/app.ico` as icon resource `1` (used by
+  Explorer, shortcuts, GPUI, and `WM_SETICON`); on Linux, `WindowOptions` sets
+  `app_id = "easytier-desktop"` and embeds `app-64.png` for X11 `_NET_WM_ICON`; the system
+  tray loads the pre-rendered Triad tray PNGs and switches `light`/`dark` and `16`/`24`
+  live with taskbar theme and DPI.
 
 ## Platform notes
 
@@ -123,4 +151,6 @@ hide to tray and restore,
 the icon asset source, and rendering every view on a 768 KiB stack (the Windows
 stack-overflow guard). Unit tests in `src/theme.rs`, `src/preferences.rs`,
 `src/assets.rs` and `src/tray.rs` cover accent contrast, Mica fallback, font choice,
-preference round trips and indicator icons. Nothing here is privileged.
+preference round trips and indicator icons; those in `src/logging.rs` (binary target)
+cover size rotation, the kept count, appending to an existing file, the panic record and
+the local (non-roaming) folder. Nothing here is privileged.

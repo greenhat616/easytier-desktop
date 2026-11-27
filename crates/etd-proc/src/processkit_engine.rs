@@ -23,6 +23,8 @@ use tokio::{
 #[derive(Default, Clone)]
 pub struct ProcessKitEngine {
     console_helper: Option<PathBuf>,
+    /// Appended to every launch's own environment (see [`Self::with_env`]).
+    extra_env: Vec<(OsString, OsString)>,
 }
 
 impl ProcessKitEngine {
@@ -35,7 +37,16 @@ impl ProcessKitEngine {
     pub fn with_console_helper(executable: PathBuf) -> Self {
         Self {
             console_helper: Some(executable),
+            extra_env: Vec::new(),
         }
+    }
+
+    /// Variables the composition root adds to every kernel launch (the
+    /// elevated session host's profile variables). They join the launch's
+    /// own extra environment; engine-owned variables still win.
+    pub fn with_env(mut self, env: Vec<(OsString, OsString)>) -> Self {
+        self.extra_env = env;
+        self
     }
 }
 
@@ -259,11 +270,86 @@ fn match_criteria(
         return Ok(false);
     }
     if fields.contains(&None) {
-        return Err(ProcessError::Enumeration(
-            "candidate marker fields are unobservable".into(),
-        ));
+        let missing: Vec<&str> = ["owner", "image", "argv"]
+            .into_iter()
+            .zip(fields)
+            .filter_map(|(name, field)| field.is_none().then_some(name))
+            .collect();
+        return Err(ProcessError::Enumeration(format!(
+            "candidate marker fields are unobservable: {}",
+            missing.join(", ")
+        )));
     }
     Ok(true)
+}
+
+/// One re-observation of a marker candidate.
+enum Observed {
+    /// Every criterion was read: whether it matches.
+    Matches(bool),
+    /// Not in the fresh snapshot.
+    Missing,
+    /// Some criterion could not be read.
+    Unobservable(ProcessError),
+}
+
+/// How often, and how far apart, a candidate that is not fully observable
+/// is looked at again. A process caught starting or exiting becomes
+/// observable, a zombie or gone within moments (topic#59 msg#1911).
+const SETTLE_ATTEMPTS: usize = 20;
+const SETTLE_PAUSE: Duration = Duration::from_millis(10);
+
+/// Re-observe a candidate until its criteria settle. Excluded (`Ok(false)`)
+/// only on positive evidence: a mismatch in a criterion that was read, or a
+/// confirmed exit. Still unobservable after `attempts` is the last error;
+/// nothing is excluded for being unreadable. An error comes with the number
+/// of observations made.
+fn settle(
+    attempts: usize,
+    mut observe: impl FnMut() -> Result<Observed, ProcessError>,
+    mut exited: impl FnMut() -> Result<bool, ProcessError>,
+    mut pause: impl FnMut(),
+) -> Result<bool, (usize, ProcessError)> {
+    let mut last = ProcessError::Enumeration("candidate not observed".into());
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            pause();
+        }
+        let seen = attempt + 1;
+        match observe().map_err(|error| (seen, error))? {
+            Observed::Matches(matches) => return Ok(matches),
+            Observed::Missing | Observed::Unobservable(_)
+                if exited().map_err(|error| (seen, error))? =>
+            {
+                return Ok(false);
+            }
+            Observed::Missing => {
+                last = ProcessError::Enumeration(
+                    "candidate disappeared from snapshot but is not confirmed exited".into(),
+                );
+            }
+            Observed::Unobservable(error) => last = error,
+        }
+    }
+    Err((attempts, last))
+}
+
+/// An enumeration error with what the system says about the process now
+/// (Linux: `/proc` state, exiting flag, uid, existence).
+fn diagnosed(pid: u32, observations: usize, error: ProcessError) -> ProcessError {
+    #[cfg(target_os = "linux")]
+    return match error {
+        ProcessError::Enumeration(message) => ProcessError::Enumeration(format!(
+            "{message} after {observations} observation(s); now {}",
+            identity::proc_summary(pid)
+        )),
+        other => other,
+    };
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, observations);
+        error
+    }
 }
 
 fn candidate_matches(
@@ -372,24 +458,24 @@ fn marked_candidate(
         return Ok(None);
     };
     let pids = [identity::pid(pid)];
-    let fresh = identity::snapshot(ProcessesToUpdate::Some(&pids))?;
-    let Some(p) = fresh.process(pids[0]) else {
-        if read_token(pid).map_err(candidate_error)?.is_none() {
-            return Ok(None);
-        }
-        return Err(ProcessError::Enumeration(
-            "candidate disappeared from snapshot but is not confirmed exited".into(),
-        ));
-    };
-    match candidate_matches(p, own, marker) {
-        Ok(false) => return Ok(None),
-        Ok(true) => {}
-        Err(error) => {
-            if read_token(pid).map_err(candidate_error)?.is_none() {
-                return Ok(None);
-            }
-            return Err(candidate_error(error));
-        }
+    let matches = settle(
+        SETTLE_ATTEMPTS,
+        || {
+            let fresh = identity::snapshot(ProcessesToUpdate::Some(&pids))?;
+            Ok(match fresh.process(pids[0]) {
+                None => Observed::Missing,
+                Some(p) => match candidate_matches(p, own, marker) {
+                    Ok(matches) => Observed::Matches(matches),
+                    Err(error) => Observed::Unobservable(error),
+                },
+            })
+        },
+        || Ok(read_token(pid)?.is_none()),
+        || std::thread::sleep(SETTLE_PAUSE),
+    )
+    .map_err(|(observations, error)| candidate_error(diagnosed(pid, observations, error)))?;
+    if !matches {
+        return Ok(None);
     }
     let current = match inspect(pid) {
         Ok(current) => current,
@@ -845,7 +931,8 @@ fn kill_orphan(
 }
 #[async_trait]
 impl ProcessEngine for ProcessKitEngine {
-    async fn spawn(&self, cmd: Command) -> Result<Box<dyn ProcessHandle>, ProcessError> {
+    async fn spawn(&self, mut cmd: Command) -> Result<Box<dyn ProcessHandle>, ProcessError> {
+        cmd.env.extend(self.extra_env.iter().cloned());
         let (ready, receiver) = oneshot::channel();
         let helper = self.console_helper.clone();
         parent_death::worker(move || {
@@ -1444,6 +1531,115 @@ mod audit_tests {
         assert!(match_criteria(Some(true), Some(true), None).is_err());
         assert!(!match_criteria(None, Some(false), None).unwrap());
         assert!(match_criteria(Some(true), Some(true), Some(true)).unwrap());
+        // The error names what could not be read.
+        let error = match_criteria(Some(true), None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.ends_with("unobservable: image, argv"), "{error}");
+    }
+
+    /// A candidate caught half-observable (starting or exiting) is looked at
+    /// again; only positive evidence excludes it, and one that stays
+    /// unreadable is an error, never a skip.
+    #[test]
+    fn a_half_observable_candidate_settles_only_on_evidence() {
+        use std::cell::{Cell, RefCell};
+        fn unreadable() -> Observed {
+            Observed::Unobservable(ProcessError::Enumeration(
+                "candidate marker fields are unobservable: image, argv".into(),
+            ))
+        }
+        // `script`: what each observation sees; `gone_from`: the attempt from
+        // which exit is confirmed.
+        let run = |script: Vec<Observed>, gone_from: usize| {
+            let script = RefCell::new(script.into_iter());
+            let seen = Cell::new(0);
+            let pauses = Cell::new(0);
+            let verdict = settle(
+                5,
+                || {
+                    seen.set(seen.get() + 1);
+                    Ok(script.borrow_mut().next().unwrap_or_else(unreadable))
+                },
+                || Ok(seen.get() > gone_from),
+                || pauses.set(pauses.get() + 1),
+            );
+            (verdict, seen.get(), pauses.get())
+        };
+        // Exiting, then gone: excluded on the confirmed exit.
+        let (verdict, seen, _) = run(vec![unreadable(), unreadable()], 2);
+        assert!(!verdict.unwrap());
+        assert_eq!(seen, 3);
+        // Becomes readable: a mismatch excludes, a match goes on.
+        let (verdict, _, _) = run(vec![unreadable(), Observed::Matches(false)], usize::MAX);
+        assert!(!verdict.unwrap());
+        let (verdict, _, _) = run(vec![unreadable(), Observed::Matches(true)], usize::MAX);
+        assert!(verdict.unwrap());
+        // Missing from the snapshot but not confirmed exited, then readable.
+        let (verdict, _, _) = run(vec![Observed::Missing, Observed::Matches(true)], usize::MAX);
+        assert!(verdict.unwrap());
+        // Stays unreadable and alive: an error after every attempt.
+        let (verdict, seen, pauses) = run(vec![], usize::MAX);
+        let (observations, error) = verdict.unwrap_err();
+        assert_eq!(observations, 5);
+        let error = error.to_string();
+        assert!(error.contains("unobservable: image, argv"), "{error}");
+        assert_eq!((seen, pauses), (5, 4));
+        // An observation that fails outright ends early, with its count.
+        let mut n = 0;
+        let failed = settle(
+            5,
+            || {
+                n += 1;
+                if n == 2 {
+                    Err(ProcessError::Enumeration("snapshot failed".into()))
+                } else {
+                    Ok(unreadable())
+                }
+            },
+            || Ok(false),
+            || {},
+        );
+        assert_eq!(failed.unwrap_err().0, 2);
+    }
+
+    /// The diagnostic names the `/proc` state of a half-observable process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_diagnostic_reports_proc_state() {
+        // no-window: Linux only
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        // Bounded wait for the unreaped child to become a zombie.
+        let summary = (0..500)
+            .map(|_| {
+                let summary = identity::proc_summary(pid);
+                if !summary.starts_with("state Z") {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                summary
+            })
+            .find(|summary| summary.starts_with("state Z"));
+        child.wait().unwrap();
+        let summary = summary.expect("the child never became a zombie");
+        assert!(summary.contains("exiting "), "{summary}");
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        assert!(summary.contains(&format!("uid {uid}")), "{summary}");
+        assert!(identity::proc_summary(pid).contains("exited"));
+        let error = diagnosed(
+            pid,
+            3,
+            ProcessError::Enumeration("unobservable: image".into()),
+        );
+        assert!(
+            error.to_string().contains("after 3 observation(s)"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("now no /proc entry (exited)"),
+            "{error}"
+        );
     }
 
     /// A leader that left with a raw `exit` while another thread runs is the

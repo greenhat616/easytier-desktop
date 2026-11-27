@@ -25,6 +25,7 @@ use crate::views::{
         split_button, toggle_button,
     },
     dialogs::{DialogButtons, DialogResult, content_dialog, flyout_panel, teaching_tip},
+    feedback::{Status, TOOLTIP_SHOW_DELAY, copy_button, fluent_tooltip, status_badge},
     layout::{expander, scroll_viewer},
     menus::{BarCommand, MenuCheck, MenuEntry, MenuHandler, MenuItem, command_bar, menu_flyout},
     navigation::{
@@ -1471,5 +1472,107 @@ pub(super) fn layout_page(
         section("StackPanel", [stack_row], cx),
         section("Grid", [grid_row], cx),
         section("ScrollViewer", [scroller], cx),
+    ]
+}
+
+#[inline(never)]
+pub(super) fn feedback_page(cx: &mut Context<Gallery>) -> Vec<AnyElement> {
+    use gpui_kit::{StatefulInteractiveElement as _, component::Sizable as _};
+    let fg = cx.theme().foreground;
+    let badges = div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .gap(px(8.))
+        .child(status_badge(
+            "badge-success",
+            Status::Success,
+            "18 ms · Direct",
+            cx,
+        ))
+        .child(status_badge(
+            "badge-caution",
+            Status::Caution,
+            "Relayed",
+            cx,
+        ))
+        .child(status_badge(
+            "badge-critical",
+            Status::Critical,
+            "Offline",
+            cx,
+        ))
+        .child(status_badge(
+            "badge-info",
+            Status::Informational,
+            "Connecting",
+            cx,
+        ))
+        .child(status_badge(
+            "badge-neutral",
+            Status::Neutral,
+            "Stopped",
+            cx,
+        ))
+        .into_any_element();
+    // A badge in a narrow column truncates and shows its text in a tooltip.
+    let narrow = div()
+        .w(px(140.))
+        .flex()
+        .child(status_badge(
+            "badge-long",
+            Status::Success,
+            "42 ms · Direct via relay-eu-west-1",
+            cx,
+        ))
+        .into_any_element();
+
+    let ip_row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(4.))
+        .child(
+            div()
+                .text_size(px(14.))
+                .line_height(px(20.))
+                .text_color(fg)
+                .child("10.144.144.3"),
+        )
+        .child(copy_button(
+            "copy-ip",
+            "Copy IP address",
+            "Copied",
+            "10.144.144.3",
+        ))
+        .into_any_element();
+
+    let hint = div()
+        .id("tooltip-target")
+        .test_support()
+        .tooltip(fluent_tooltip(
+            "Peers exchange traffic directly when they can, and through a relay when they cannot.",
+        ))
+        .tooltip_show_delay(TOOLTIP_SHOW_DELAY)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(4.))
+        .text_size(px(14.))
+        .line_height(px(20.))
+        .text_color(fg)
+        .child("Connection type")
+        .child(
+            gpui_kit::component::Icon::default()
+                .path("fluent/info.svg")
+                .with_size(gpui_kit::component::Size::Size(px(16.)))
+                .text_color(crate::theme::text_secondary(cx)),
+        )
+        .into_any_element();
+
+    vec![
+        section("Status badge", [badges, narrow], cx),
+        section("Copy button", [ip_row], cx),
+        section("ToolTip", [hint], cx),
     ]
 }

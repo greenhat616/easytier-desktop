@@ -77,6 +77,7 @@ enum Page {
     Dialogs,
     Navigation,
     Layout,
+    Feedback,
 }
 
 struct Gallery {
@@ -217,6 +218,14 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
         "fluent/grid.svg",
         cx,
     );
+    let feedback = nav(
+        Page::Feedback,
+        "gallery-nav-feedback",
+        "Status & info",
+        "fluent/info.svg",
+        "fluent/info.svg",
+        cx,
+    );
     let mut sidebar = Sidebar::new("gallery-sidebar")
         .w(px(220.))
         .h_full()
@@ -230,6 +239,7 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
         .child(dialogs)
         .child(navigation)
         .child(layout)
+        .child(feedback)
         .child(settings);
     if !view.collapsed {
         sidebar = sidebar.footer(div().w_full().child(theme_menu(cx)));
@@ -580,6 +590,7 @@ impl Render for Gallery {
             Page::Dialogs => ("Dialogs & flyouts", pages::dialogs_page(self, cx)),
             Page::Navigation => ("Navigation", pages::navigation_page(self, cx)),
             Page::Layout => ("Layout", pages::layout_page(self, window, cx)),
+            Page::Feedback => ("Status & info", pages::feedback_page(cx)),
         };
         div()
             .id("gallery-root")
@@ -639,6 +650,65 @@ impl Render for Gallery {
 mod tests {
     use super::*;
     use gpui_kit::{TestAppContext, test::TestWindowExt as _};
+
+    /// The copy button writes to the clipboard and says "Copied" for two
+    /// seconds, also from the keyboard; a status badge is 20 px tall and
+    /// a narrow one truncates.
+    #[gpui_kit::test]
+    fn gallery_feedback_controls(cx: &mut TestAppContext) {
+        use std::time::Duration;
+        let (handle, _view) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            theme::install_palette(cx);
+            cx.set_reduce_motion(true);
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Default::default(),
+                        size: size(px(1440.), px(1300.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| Gallery::new(window, cx)),
+            )
+            .unwrap()
+        });
+        let step = |cx: &mut TestAppContext, ms: u64| {
+            cx.executor().advance_clock(Duration::from_millis(ms));
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        };
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("gallery-nav-feedback", cx);
+            window.render_frame(cx);
+            let badge = window.find("badge-success").bounds();
+            assert_eq!(badge.size.height, px(20.));
+            let narrow = window.find("badge-long").bounds();
+            assert!(narrow.size.width <= px(140.));
+            assert_eq!(window.find("copy-ip").label(), Some("Copy IP address"));
+            window.click("copy-ip", cx);
+            window.render_frame(cx);
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+                Some("10.144.144.3")
+            );
+            assert!(window.find("copy-ip-copied").visible());
+            assert_eq!(window.find("copy-ip").label(), Some("Copied"));
+        })
+        .unwrap();
+        step(cx, 2100);
+        cx.update_window(handle, |_, window, cx| {
+            assert!(window.try_find("copy-ip-copied").is_none());
+            // Enter on the focused button copies again.
+            window.press("enter", cx);
+            window.render_frame(cx);
+            assert!(window.find("copy-ip-copied").visible());
+        })
+        .unwrap();
+    }
 
     /// With motion allowed, popups and expanders linger for WinUI's exit
     /// timings: a MenuFlyout fades for 83 ms, a ContentDialog for 83 ms and
@@ -1401,6 +1471,20 @@ mod tests {
             cx.capture_screenshot(handle)
                 .unwrap()
                 .save(output.join(format!("gallery-layout-{name}.png")))
+                .unwrap();
+            // Status & info page, with the copy confirmation showing.
+            cx.update_window(handle, |_, window, cx| {
+                window.click("gallery-nav-feedback", cx);
+                window.render_frame(cx);
+                window.click("copy-ip", cx);
+                window.render_frame(cx);
+                assert!(window.find("copy-ip-copied").visible());
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(format!("gallery-feedback-{name}.png")))
                 .unwrap();
             // Navigation page.
             cx.update_window(handle, |_, window, cx| {

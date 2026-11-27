@@ -3,6 +3,7 @@
 pub mod banners;
 pub mod controls;
 pub mod dialogs;
+pub mod feedback;
 pub mod instances;
 pub mod layout;
 pub mod menus;

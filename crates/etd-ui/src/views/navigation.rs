@@ -503,6 +503,7 @@ mod tests {
 
     use crate::theme::{self, ControlState, contrast};
     use crate::views::dialogs;
+    use crate::views::feedback::{Status, status_colors};
 
     /// `top` composited over the opaque `bottom`, as 0xRRGGBB.
     fn over(top: Hsla, bottom: Hsla) -> u32 {
@@ -572,6 +573,27 @@ mod tests {
                         ) >= 3.,
                         "scroll bar thumb {mode:?}"
                     );
+                    for status in [
+                        Status::Success,
+                        Status::Caution,
+                        Status::Critical,
+                        Status::Informational,
+                        Status::Neutral,
+                    ] {
+                        let (dot, fill) = status_colors(status, cx);
+                        let fill = over(fill, surface);
+                        assert!(
+                            contrast(over(fg, surface), fill) >= 4.5,
+                            "{status:?} badge text {mode:?}"
+                        );
+                        // The text carries the status; the coloured dots
+                        // still reach 3:1. Neutral's SystemFillColorSolidNeutral
+                        // dot is grey on grey by design and is left out.
+                        assert!(
+                            status == Status::Neutral || contrast(over(dot, surface), fill) >= 3.,
+                            "{status:?} badge dot {mode:?}"
+                        );
+                    }
                 }
                 for (what, fill) in [
                     ("dialog body", layer),

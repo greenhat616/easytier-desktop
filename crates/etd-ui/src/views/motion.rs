@@ -53,7 +53,8 @@ pub enum PopupKind {
 impl PopupKind {
     fn duration(self, open: bool) -> Duration {
         match (self, open) {
-            (Self::Menu | Self::Flyout | Self::Dialog, true) => NORMAL,
+            (Self::Menu | Self::Flyout, true) => NORMAL,
+            (Self::Dialog, true) => FASTER,
             (_, false) => FASTER,
         }
     }
@@ -177,7 +178,8 @@ impl RenderOnce for Animated {
                         .top(px(-50. * (1. - eased)))
                         .opacity(fade)
                         .child(self.surface),
-                    PopupKind::Dialog => div().id(self.id).opacity(fade).child(self.surface),
+                    // The dialog's whole entrance is the 83 ms fade.
+                    PopupKind::Dialog => div().id(self.id).opacity(t).child(self.surface),
                 }
             }
         }

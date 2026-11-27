@@ -84,6 +84,8 @@ pub(super) struct DemoState {
     next_tab: usize,
     layout_open: [bool; 2],
     mode_choice: usize,
+    /// The room pop-out, while it is open; one at a time.
+    pub(super) popout: Option<gpui_kit::AnyWindowHandle>,
     stack_horizontal: bool,
     stack_spacing: Entity<SliderState>,
     grid_columns: Entity<SliderState>,
@@ -145,6 +147,7 @@ impl DemoState {
             next_tab: 3,
             layout_open: [true, false],
             mode_choice: 0,
+            popout: None,
             stack_horizontal: false,
             stack_spacing,
             grid_columns,
@@ -1640,6 +1643,28 @@ pub(super) fn feedback_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<An
         cx,
     );
 
+    let popout = div()
+        .flex()
+        .flex_col()
+        .items_start()
+        .gap(px(8.))
+        .child(
+            div()
+                .text_size(px(14.))
+                .line_height(px(20.))
+                .text_color(fg)
+                .child(crate::views::pseudo::t(
+                    "Keeps one room's status above other windows, even while the main window is hidden.",
+                )),
+        )
+        .child(action_button(
+            "popout-open",
+            "Pop out",
+            BtnStyle::new(ButtonVariant::Default, Size::Medium),
+            cx.listener(|this, _: &gpui_kit::ClickEvent, _, cx| this.open_popout(cx)),
+        ))
+        .into_any_element();
+
     let cards = selection_cards(
         "mode-cards",
         "How do you want to use EasyTier?",
@@ -1676,5 +1701,95 @@ pub(super) fn feedback_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<An
         section("ProgressBar", [bars], cx),
         section("Empty state", [empty], cx),
         section("Selection cards", [cards], cx),
+        section("Pop-out window", [popout], cx),
     ]
+}
+
+/// The room status pop-out: an always-on-top window with its own title bar.
+pub(super) struct RoomPopOut;
+
+impl gpui_kit::Render for RoomPopOut {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::views::popout;
+        let fg = cx.theme().foreground;
+        div()
+            .id("popout-root")
+            .test_support()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(popout::surface(cx))
+            .border_1()
+            .border_color(crate::theme::flyout_stroke(cx))
+            .text_color(fg)
+            .child(popout::title_bar(
+                "popout-title",
+                "fluent/people-community.svg",
+                "Weekend LAN",
+                "Close",
+                Rc::new(|_, window, _| window.remove_window()),
+                window,
+                cx,
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .px(px(16.))
+                    .pb(px(16.))
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .gap(px(8.))
+                    .child(status_badge(
+                        "popout-badge",
+                        Status::Success,
+                        "18 ms · Direct",
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.))
+                            .child(
+                                div()
+                                    .text_size(px(14.))
+                                    .line_height(px(20.))
+                                    .child("10.144.144.3"),
+                            )
+                            .child(copy_button(
+                                "popout-copy",
+                                "Copy IP address",
+                                "Copied",
+                                "10.144.144.3",
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .line_height(px(16.))
+                            .text_color(crate::theme::text_secondary(cx))
+                            .child(crate::views::pseudo::t("3 of 4 peers online")),
+                    ),
+            )
+    }
+}
+
+impl Gallery {
+    /// Opens the room pop-out, or brings the open one forward: one per room.
+    pub(super) fn open_popout(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.demo.popout
+            && handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+        {
+            return;
+        }
+        let options = crate::views::popout::window_options("Weekend LAN", px(320.), px(168.), cx);
+        self.demo.popout = gpui_kit::open_window(options, cx, |_, cx| cx.new(|_| RoomPopOut))
+            .ok()
+            .map(|(handle, _)| handle);
+    }
 }

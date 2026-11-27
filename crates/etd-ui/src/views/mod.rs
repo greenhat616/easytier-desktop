@@ -9,6 +9,7 @@ pub mod layout;
 pub mod menus;
 pub mod motion;
 pub mod navigation;
+pub mod popout;
 pub mod progress;
 pub mod pseudo;
 pub mod reclaim;

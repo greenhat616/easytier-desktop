@@ -687,6 +687,76 @@ mod tests {
     use super::*;
     use gpui_kit::{TestAppContext, test::TestWindowExt as _};
 
+    /// "Pop out" opens one always-on-top room window with its own title
+    /// bar; a second press brings the same one forward, and its close
+    /// button closes it.
+    #[gpui_kit::test]
+    fn gallery_pops_out_one_room_window(cx: &mut TestAppContext) {
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            theme::install_palette(cx);
+            cx.set_reduce_motion(true);
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Default::default(),
+                        size: size(px(1440.), px(1300.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| Gallery::new(window, cx)),
+            )
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("gallery-nav-feedback", cx);
+            window.render_frame(cx);
+            window.click("popout-open", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let popout = view
+            .read_with(cx, |g, _| g.demo.popout)
+            .expect("pop-out opened");
+        assert_eq!(cx.windows().len(), 2);
+        cx.update_window(popout, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("popout-title").bounds().size.height, px(32.));
+            assert_eq!(
+                window.find("popout-title-close").bounds().size.width,
+                px(46.)
+            );
+            assert_eq!(window.find("popout-title-close").label(), Some("Close"));
+            assert!(window.find("popout-badge").visible());
+        })
+        .unwrap();
+        // A second press brings the same window forward.
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("popout-open", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(cx.windows().len(), 2);
+        assert_eq!(view.read_with(cx, |g, _| g.demo.popout), Some(popout));
+        cx.update_window(popout, |_, window, cx| {
+            window.click("popout-title-close", cx)
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(cx.windows().len(), 1);
+        // With it closed, "Pop out" opens a new one.
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("popout-open", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(cx.windows().len(), 2);
+    }
+
     /// The copy button writes to the clipboard and says "Copied" for two
     /// seconds, also from the keyboard; a status badge is 20 px tall and
     /// a narrow one truncates.
@@ -1545,6 +1615,26 @@ mod tests {
                 .unwrap()
                 .save(output.join(format!("gallery-feedback-{name}.png")))
                 .unwrap();
+            // The room pop-out window on its own.
+            cx.update_window(handle, |_, window, cx| window.click("popout-open", cx))
+                .unwrap();
+            cx.run_until_parked();
+            let popout = cx
+                .windows()
+                .into_iter()
+                .find(|w| *w != handle)
+                .expect("pop-out opened");
+            cx.update_window(popout, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+            cx.capture_screenshot(popout)
+                .unwrap()
+                .save(output.join(format!("gallery-popout-{name}.png")))
+                .unwrap();
+            cx.update_window(popout, |_, window, cx| {
+                window.click("popout-title-close", cx)
+            })
+            .unwrap();
+            cx.run_until_parked();
             // Navigation page.
             cx.update_window(handle, |_, window, cx| {
                 window.click("gallery-nav-navigation", cx);

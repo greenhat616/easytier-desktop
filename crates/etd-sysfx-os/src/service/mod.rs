@@ -284,6 +284,7 @@ impl ServiceManager for NativeServiceManager {
 /// line naming `point`. Only an administrator can create that file.
 #[cfg(feature = "ci-test-fixtures")]
 pub fn ci_upgrade_fault(layout: &HostLayout, point: &str) -> bool {
+    crate::ci_test_fixtures_build();
     fs::read_to_string(layout.maintenance.join("ci-upgrade-fault"))
         .is_ok_and(|faults| faults.lines().any(|fault| fault.trim() == point))
 }
@@ -301,6 +302,15 @@ pub(super) fn is_image(current: &Path, executable: &Path) -> io::Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+/// Whether `current` (canonical) is the installed image: `executable`, or
+/// the new image an upgrade rollback moved aside to `.failed` while it was
+/// running (Windows keeps a running image mapped under its new name).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn runs_installed_image(current: &Path, executable: &Path) -> io::Result<bool> {
+    Ok(is_image(current, executable)?
+        || is_image(current, &image::ImagePaths::of(executable).failed)?)
 }
 
 pub fn current_exe() -> io::Result<PathBuf> {

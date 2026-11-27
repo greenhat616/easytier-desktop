@@ -54,6 +54,10 @@ struct Record {
     /// cleared together with the stage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     registration_backup: Option<String>,
+    /// Who installed this service, if the installer said (an MSI passes its
+    /// ProductCode): its rollback removes only an installation it owns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
 }
 
 /// Durable stages of `etd-host upgrade`, written before the step they name.
@@ -101,7 +105,15 @@ impl LifecycleJournal {
     pub fn begin(layout: &HostLayout) -> io::Result<Self> {
         Self::new_at(Self::path(layout))
     }
+    /// [`Self::begin`] recording `owner` with the first durable write, so a
+    /// rollback can tell this installation from one that already existed.
+    pub fn begin_owned(layout: &HostLayout, owner: Option<String>) -> io::Result<Self> {
+        Self::new_owned_at(Self::path(layout), owner)
+    }
     fn new_at(path: PathBuf) -> io::Result<Self> {
+        Self::new_owned_at(path, None)
+    }
+    fn new_owned_at(path: PathBuf, owner: Option<String>) -> io::Result<Self> {
         if path.try_exists()? {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -119,6 +131,7 @@ impl LifecycleJournal {
                 deferred: None,
                 upgrade: None,
                 registration_backup: None,
+                owner,
             },
         };
         journal.save()?;
@@ -126,6 +139,9 @@ impl LifecycleJournal {
     }
     pub fn phase(&self) -> Phase {
         self.record.phase
+    }
+    pub fn owner(&self) -> Option<&str> {
+        self.record.owner.as_deref()
     }
     pub fn install_id(&self) -> &str {
         &self.record.install_id
@@ -421,6 +437,22 @@ mod tests {
         new.advance(Phase::StateRemoved).unwrap();
         assert!(!new.can_finish_deferred(&id));
     }
+    #[test]
+    fn the_owner_is_durable_from_the_first_write_and_absent_otherwise() {
+        let temp = tempfile::tempdir().unwrap();
+        let owned = temp.path().join("owned");
+        LifecycleJournal::new_owned_at(owned.clone(), Some("{PRODUCT-CODE}".into())).unwrap();
+        let journal = LifecycleJournal::read(owned).unwrap().unwrap();
+        assert_eq!(journal.owner(), Some("{PRODUCT-CODE}"));
+        let plain = temp.path().join("plain");
+        LifecycleJournal::new_at(plain.clone()).unwrap();
+        assert!(!fs::read_to_string(&plain).unwrap().contains("owner"));
+        assert_eq!(
+            LifecycleJournal::read(plain).unwrap().unwrap().owner(),
+            None
+        );
+    }
+
     #[test]
     fn upgrade_stage_is_durable_and_invisible_when_clear() {
         let temp = tempfile::tempdir().unwrap();

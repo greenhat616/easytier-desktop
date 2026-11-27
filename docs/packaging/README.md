@@ -63,7 +63,9 @@ user's elevated (policy) install cannot pass it.
 A package installs only where no service exists or as an upgrade of an installed
 product. If the service is already installed without a matching product (installed with
 `etd-host install`, or the product registration was lost), the package refuses before
-any change: uninstall it first (`etd-host uninstall`). Same-version rebuilds upgrade
+any change: uninstall it first (`etd-host uninstall`). If you just uninstalled it, restart
+Windows first: while any program still holds the service open, Windows keeps it marked
+for deletion and the package still finds it. Same-version rebuilds upgrade
 (`AllowSameVersionUpgrades`), so a rebuilt package replaces the installed product instead
 of installing beside it; ICE61 flags this by design, and `wix build` runs no ICE
 validation.
@@ -153,4 +155,5 @@ rebuild and a major upgrade, both keeping install id, install key and ledger set
 an upgrade whose new host never serves (rolled back by `etd-host` and by Windows
 Installer); and an uninstall compared with the machine before install. Those test
 packages carry the CI upgrade fault (`ci-test-fixtures`) and a debug `etd-ui`; without
-`--allow-test-fixtures`, `dist` refuses both (PK5 also checks the release artifacts).
+`--allow-test-fixtures`, `dist` refuses both, and the workflow checks that it refuses
+that `etd-host` (PK5 also checks the release artifacts).

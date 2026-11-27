@@ -43,7 +43,7 @@
                       Name="Type" Type="raw" Bitness="always64" />
     </Property>
     <Launch Condition="Installed OR WIX_UPGRADE_DETECTED OR NOT ETD_SERVICE_PRESENT"
-            Message="EasyTier Desktop's service is already installed on this computer. Uninstall it first (etd-host uninstall), or install a package that upgrades the installed product." />
+            Message="EasyTier Desktop's service is already installed on this computer. Uninstall it first (etd-host uninstall), or install a package that upgrades the installed product. If you just uninstalled it, restart Windows first." />
 
     <!-- ETD_ALLOW_USER (optional, set by an administrator on the command
          line): one more account SID allowed to administer the service,

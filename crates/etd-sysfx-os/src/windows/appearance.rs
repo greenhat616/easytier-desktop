@@ -1,7 +1,7 @@
 //! Windows appearance queries and DWM acknowledgement. The only write is
 //! the dark-mode attribute of an application-owned window; never OS settings.
 
-use std::{num::NonZeroIsize, sync::Arc};
+use std::{ffi::c_void, num::NonZeroIsize, sync::Arc};
 
 use ::windows::{
     Foundation::TypedEventHandler,
@@ -11,15 +11,22 @@ use ::windows::{
     },
     Wdk::System::SystemServices::RtlGetVersion,
     Win32::{
-        Foundation::HWND,
+        Foundation::{HINSTANCE, HWND, LPARAM, WPARAM},
         Graphics::Dwm::{
             DWM_SYSTEMBACKDROP_TYPE, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
             DWMWA_USE_IMMERSIVE_DARK_MODE, DwmGetWindowAttribute, DwmSetWindowAttribute,
         },
-        System::SystemInformation::OSVERSIONINFOW,
-        UI::WindowsAndMessaging::GetWindowThreadProcessId,
+        System::{
+            Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
+            SystemInformation::OSVERSIONINFOW,
+        },
+        UI::WindowsAndMessaging::{
+            GWLP_HINSTANCE, GetSystemMetrics, GetWindowLongPtrW, GetWindowThreadProcessId,
+            ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_SHARED, LoadImageW, SM_CXICON, SM_CXSMICON,
+            SM_CYICON, SM_CYSMICON, SendMessageW, WM_SETICON,
+        },
     },
-    core::{BOOL, IInspectable},
+    core::{BOOL, IInspectable, PCWSTR, w},
 };
 
 use crate::appearance::{AccentRamp, AppearanceSnapshot};
@@ -103,6 +110,8 @@ impl AppearanceWatch {
                 .GetColorValue(UIColorType::Foreground)
                 .ok()
                 .map(foreground_is_light),
+            taskbar_dark: query_taskbar_dark(),
+            tray_icon_px: query_tray_icon_px(),
             light_accent: ramp(
                 &self.settings,
                 [
@@ -121,6 +130,41 @@ impl AppearanceWatch {
             ),
         }
     }
+}
+
+fn system_uses_light_theme_to_dark(dword: u32) -> bool {
+    dword == 0
+}
+
+/// Read the Windows taskbar/shell theme (`SystemUsesLightTheme`) from HKCU.
+/// This is distinct from `AppsUseLightTheme`: Windows allows a dark taskbar
+/// with light apps. Returns `Some(true)` for a dark taskbar, `Some(false)` for
+/// a light taskbar, or `None` if the registry value cannot be read.
+pub fn query_taskbar_dark() -> Option<bool> {
+    let mut value: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    // SAFETY: `value` is a caller-owned writable u32 buffer and `size` matches its byte length.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
+            w!("SystemUsesLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut value as *mut u32).cast::<c_void>()),
+            Some(&mut size),
+        )
+    };
+    (status.0 == 0 && size == std::mem::size_of::<u32>() as u32)
+        .then(|| system_uses_light_theme_to_dark(value))
+}
+
+/// Query the Windows system small-icon dimension (`SM_CXSMICON`), which tracks
+/// system DPI (16 at 100%, 20 at 125%, 24 at 150%, 32 at 200%).
+pub fn query_tray_icon_px() -> Option<u32> {
+    // SAFETY: `GetSystemMetrics` has no preconditions and takes a scalar index.
+    let px = unsafe { GetSystemMetrics(SM_CXSMICON) };
+    u32::try_from(px).ok().filter(|&v| v > 0)
 }
 
 impl Drop for AppearanceWatch {
@@ -178,6 +222,54 @@ pub fn set_window_dark_mode(hwnd: NonZeroIsize, dark: bool) -> bool {
     .is_ok()
 }
 
+/// Attach both `ICON_SMALL` (titlebar, pixel-tuned 16/24px frame) and `ICON_BIG`
+/// (Alt+Tab / taskbar, 32/48px frame) from the executable's embedded icon
+/// resource to an application-owned window. Only HWNDs owned by the current
+/// process are accepted.
+pub fn set_window_icon_from_resource(hwnd: NonZeroIsize, resource_id: u16) -> bool {
+    let hwnd = HWND(hwnd.get() as *mut c_void);
+    let mut owner = 0;
+    // SAFETY: HWND is borrowed from the UI; owner is a valid output buffer.
+    if unsafe { GetWindowThreadProcessId(hwnd, Some(&mut owner)) } == 0
+        || owner != std::process::id()
+    {
+        return false;
+    }
+    // SAFETY: `hwnd` is verified to belong to the current process.
+    let raw_instance = unsafe { GetWindowLongPtrW(hwnd, GWLP_HINSTANCE) };
+    if raw_instance == 0 {
+        return false;
+    }
+    let hinst = HINSTANCE(raw_instance as *mut c_void);
+    let name = PCWSTR(usize::from(resource_id) as *const u16);
+
+    let mut applied = false;
+    for (icon_slot, cx_metric, cy_metric) in [
+        (ICON_SMALL, SM_CXSMICON, SM_CYSMICON),
+        (ICON_BIG, SM_CXICON, SM_CYICON),
+    ] {
+        // SAFETY: `GetSystemMetrics` and `LoadImageW` with `LR_SHARED` load a
+        // shared handle owned by the module that does not need `DestroyIcon`.
+        let cx = unsafe { GetSystemMetrics(cx_metric) };
+        let cy = unsafe { GetSystemMetrics(cy_metric) };
+        if let Ok(handle) = unsafe { LoadImageW(Some(hinst), name, IMAGE_ICON, cx, cy, LR_SHARED) }
+            && !handle.is_invalid()
+        {
+            // SAFETY: `hwnd` belongs to this process and `handle` is a valid shared HICON.
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_SETICON,
+                    Some(WPARAM(icon_slot as usize)),
+                    Some(LPARAM(handle.0 as isize)),
+                );
+            }
+            applied = true;
+        }
+    }
+    applied
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +295,17 @@ mod tests {
             G: 27,
             B: 27
         }));
+    }
+
+    #[test]
+    fn system_uses_light_theme_maps_zero_to_dark() {
+        assert!(system_uses_light_theme_to_dark(0));
+        assert!(!system_uses_light_theme_to_dark(1));
+    }
+
+    #[test]
+    fn tray_icon_metric_is_positive_on_windows() {
+        let px = query_tray_icon_px().expect("SM_CXSMICON should be positive");
+        assert!(px >= 16);
     }
 }

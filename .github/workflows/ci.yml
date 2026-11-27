@@ -42,10 +42,9 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
-      - uses: bufbuild/buf-action@v1.7.0
+      - uses: ./.github/actions/setup-tools
         with:
-          version: 1.75.0
-          setup_only: true
+          tools: buf
       - run: buf lint
       - run: buf breaking --against '.git#tag=freeze-v1'
       - name: buf breaking against the start of the change
@@ -71,9 +70,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential clang cmake pkg-config libssl-dev libfontconfig1-dev libfreetype6-dev libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev libxcb-dri3-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libdbus-1-dev
-      - name: Install pinned protoc
-        shell: pwsh
-        run: ./.github/scripts/setup-protoc.ps1
+      - uses: ./.github/actions/setup-tools
+        with:
+          tools: protoc cargo-nextest
       - name: Check toolchain
         run: |
           rustc --version
@@ -85,9 +84,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@0.9.152
       # Without dev-dependencies, so this also catches a feature that only
       # tests enable. There is no separate `cargo build` step: the test step
       # compiles and links the workspace.
@@ -122,15 +118,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential clang cmake pkg-config libssl-dev libdbus-1-dev
-      - name: Install pinned protoc
-        shell: pwsh
-        run: ./.github/scripts/setup-protoc.ps1
+      - uses: ./.github/actions/setup-tools
+        with:
+          tools: protoc cargo-nextest
       - uses: Swatinem/rust-cache@v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@0.9.152
       # `etd-host install` imports cores/<version> beside its image, here
       # the test build's, as listed in crates/etd-host/cores.lock.
       - name: Fetch the release kernel beside the host image
@@ -185,7 +178,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: taiki-e/install-action@v2
+      - uses: ./.github/actions/setup-tools
         with:
-          tool: cargo-deny@0.22.1
+          tools: cargo-deny
       - run: cargo deny --locked check

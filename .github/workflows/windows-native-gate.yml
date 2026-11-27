@@ -11,7 +11,7 @@ on:
       - 'crates/etd-host/**'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
-      - '.github/scripts/es2n-*.ps1'
+      - '.github/scripts/es2n-*'
       - '.github/actions/setup-tools/**'
       - 'mise.toml'
       - '.github/workflows/windows-native-gate.yml'

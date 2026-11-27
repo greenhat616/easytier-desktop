@@ -1,10 +1,6 @@
 //! Tier 2: real subprocess host composition + fake-core + native IPC.
 mod host_process;
 #[path = "../../../etd-host/src/serving.rs"]
-#[allow(
-    dead_code,
-    reason = "the tier 2 host compiles etd-host's serving code but reads less of it than etd-host's main"
-)]
 mod serving;
 
 use etd_proc::{Liveness, ProcessEngine, ProcessIdentity, processkit_engine::ProcessKitEngine};

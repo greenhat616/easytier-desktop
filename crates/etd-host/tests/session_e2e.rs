@@ -6,7 +6,11 @@
 use etd_client::stub::host_service_client::HostServiceClient;
 use etd_contract::{
     Desired, VERSION_MAJOR, VERSION_METADATA_KEY, VERSION_MINOR, capability,
-    v1::{Hello, HostMode, LeaseRelease, ReleaseLeaseRequest, Role},
+    v1::{
+        ApplyRequest, Hello, HostMode, HostPhase, InstanceState, LeaseRelease, MutationHeader,
+        NetworkSpec, ReleaseLeaseRequest, Role, SetDesiredRequest, SnapshotRequest,
+        SubscribeRequest, event,
+    },
     version_metadata_value,
 };
 use etd_ipc::{
@@ -49,6 +53,72 @@ fn host(args: &[&str]) -> Command {
 
 fn output(args: &[&str]) -> Output {
     host(args).output().unwrap()
+}
+
+/// Run the host as LocalSystem through a one-off scheduled task; its exit
+/// code and combined output.
+fn as_system(args: &[&str]) -> (i64, String) {
+    let dir = tempfile::Builder::new()
+        .prefix("etd-es3-system-")
+        .tempdir_in(r"C:\Windows\Temp")
+        .unwrap();
+    let log = dir.path().join("out.txt");
+    let script = dir.path().join("run.cmd");
+    std::fs::write(
+        &script,
+        format!(
+            "@\"{}\" {} > \"{}\" 2>&1\r\n@exit /b %errorlevel%\r\n",
+            binary().display(),
+            args.join(" "),
+            log.display()
+        ),
+    )
+    .unwrap();
+    let schtasks = |args: &[&str]| {
+        let out = Command::new(r"C:\Windows\System32\schtasks.exe")
+            .no_window()
+            .args(args)
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            text(&out),
+        )
+    };
+    const TASK: &str = "etd-es3-ci-system";
+    let tr = format!("\"{}\"", script.display());
+    let (created, _, detail) = schtasks(&[
+        "/create", "/f", "/tn", TASK, "/ru", "SYSTEM", "/rl", "HIGHEST", "/sc", "once", "/st",
+        "00:00", "/tr", &tr,
+    ]);
+    assert!(created, "{detail}");
+    let (ran, _, detail) = schtasks(&["/run", "/tn", TASK]);
+    assert!(ran, "{detail}");
+    let until = Instant::now() + Duration::from_secs(180);
+    // 267009: running; 267011: not yet run.
+    let code = loop {
+        std::thread::sleep(Duration::from_secs(1));
+        let (_, listing, _) = schtasks(&["/query", "/tn", TASK, "/fo", "list", "/v"]);
+        let field = |name: &str| {
+            listing
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .map(|value| value.trim().to_owned())
+        };
+        let status = field("Status:").unwrap_or_default();
+        let result = field("Last Result:").and_then(|value| value.parse::<i64>().ok());
+        match result {
+            Some(code) if status != "Running" && code != 267009 && code != 267011 => break code,
+            _ => assert!(
+                Instant::now() < until,
+                "the SYSTEM task did not finish: {listing}"
+            ),
+        }
+    };
+    let _ = schtasks(&["/delete", "/f", "/tn", TASK]);
+    let output = std::fs::read_to_string(&log).unwrap_or_default();
+    (code, output)
 }
 
 fn text(output: &Output) -> String {
@@ -109,6 +179,99 @@ fn request<T>(body: T) -> tonic::Request<T> {
         version_metadata_value().parse().unwrap(),
     );
     request
+}
+
+/// Apply a TUN-less instance, wait until the real kernel is ready, stop it
+/// and wait until it stopped.
+async fn run_a_real_kernel(session: &mut HostServiceClient<tonic::transport::Channel>) {
+    let snapshot = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let snapshot = session
+                .snapshot(request(SnapshotRequest {}))
+                .await
+                .unwrap()
+                .into_inner();
+            if snapshot.phase() == HostPhase::Serving {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the session host serves");
+    let mut events = session
+        .subscribe(request(SubscribeRequest {
+            after: snapshot.cursor.clone(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let instance = "6a4c1c0e-6f43-4b55-9a39-3c1c7e3e5a01".to_owned();
+    let receipt = session
+        .apply(request(ApplyRequest {
+            header: Some(MutationHeader {
+                request_id: "es3-apply".into(),
+                expected_revision: snapshot.revision,
+            }),
+            instance_id: instance.clone(),
+            spec: Some(NetworkSpec {
+                network_name: "etd-es3-ci".into(),
+                no_tun: true,
+                ..Default::default()
+            }),
+            desired: Desired::Running as i32,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .receipt
+        .unwrap();
+    wait_for(
+        &mut events,
+        |state| matches!(state, InstanceState::ReadyBasic | InstanceState::ReadyFull),
+        Duration::from_secs(20),
+    )
+    .await
+    .expect("the real kernel became ready");
+    session
+        .set_desired(request(SetDesiredRequest {
+            header: Some(MutationHeader {
+                request_id: "es3-stop".into(),
+                expected_revision: receipt.revision,
+            }),
+            instance_id: instance,
+            desired: Desired::Stopped as i32,
+        }))
+        .await
+        .unwrap();
+    wait_for(
+        &mut events,
+        |state| state == InstanceState::Stopped,
+        Duration::from_secs(20),
+    )
+    .await
+    .expect("the real kernel stopped");
+}
+
+/// Wait for an instance status `wanted`; a gave-up instance fails the test.
+async fn wait_for(
+    events: &mut tonic::Streaming<etd_contract::v1::Event>,
+    wanted: fn(InstanceState) -> bool,
+    within: Duration,
+) -> Result<(), tokio::time::error::Elapsed> {
+    tokio::time::timeout(within, async {
+        loop {
+            let event = events.message().await.unwrap().expect("event stream open");
+            if let Some(event::Payload::InstanceStatus(status)) = event.payload {
+                let state = status.state();
+                assert_ne!(state, InstanceState::GaveUp, "{status:?}");
+                if wanted(state) {
+                    break;
+                }
+            }
+        }
+    })
+    .await
 }
 
 /// `ReleaseLease(StopInstances)`. The pipe is up before the self-check
@@ -329,13 +492,18 @@ async fn elevated_session_host_end_to_end() {
     let reclaim = output(&["reclaim", "--mode", "elevated-session"]);
     assert!(reclaim.status.success(), "{}", text(&reclaim));
 
-    // 6. ReleaseLease(stop) ends a running host.
+    // 6. A real kernel (the bundled release, copied into <SID>\cores on
+    // the first start) runs and stops under the session host, fenced, with
+    // its profile in the session tree; then ReleaseLease(stop) ends the
+    // host. This client holds no lease, so all of it fits in the 30 s
+    // grace.
     let mut child = host(&["run", "--mode", "elevated-session"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
     let mut session = client(&endpoint).await;
+    run_a_real_kernel(&mut session).await;
     let released = release_stop(&mut session).await;
     assert!(released.host_exiting);
     let status = tokio::task::block_in_place(|| wait_exit(&mut child, Duration::from_secs(60)));
@@ -389,8 +557,9 @@ async fn elevated_session_host_end_to_end() {
     assert!(status.success(), "{status:?}");
     drop(session);
 
-    // 9. The app uninstaller's purge removes every session root.
-    let purge = output(&[
+    // 9. The app uninstaller's purge removes every session root. The MSI
+    // runs it as LocalSystem, whose token is not a session owner's.
+    let (code, log) = as_system(&[
         "reclaim",
         "--mode",
         "elevated-session",
@@ -398,8 +567,8 @@ async fn elevated_session_host_end_to_end() {
         "--all",
         "--purge",
     ]);
-    assert!(purge.status.success(), "{}", text(&purge));
-    assert!(!root.exists());
+    assert_eq!(code, 0, "{log}");
+    assert!(!root.exists(), "{log}");
 
     // 10. `etd-host install` drains leftover session ledgers first, then
     // installs; the service uninstall afterwards is clean.

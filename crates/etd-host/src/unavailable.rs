@@ -107,6 +107,47 @@ impl CoreDriver for BlockedDriver {
     }
 }
 
+/// Windows hosts whose firewall cleanup is not available (an unlisted build
+/// whose self-check failed, doc#17 v2, msg#1989): a launch whose plan has
+/// firewall rule effects is refused before any record is written, so no
+/// firewall record can be created that the host could not reclaim.
+pub struct FirewallGated<D> {
+    pub inner: D,
+    /// `Err(reason)` when firewall cleanup is unavailable on this host.
+    pub supported: fn() -> Result<(), String>,
+}
+#[async_trait::async_trait]
+impl<D: CoreDriver> CoreDriver for FirewallGated<D> {
+    async fn identify(&self, binary: &Path) -> Result<CoreDescriptor, CoreError> {
+        self.inner.identify(binary).await
+    }
+    fn profile(&self, descriptor: &CoreDescriptor) -> Option<AdapterProfile> {
+        self.inner.profile(descriptor)
+    }
+    fn plan_launch(&self, ctx: &LaunchContext) -> Result<LaunchPlan, CoreError> {
+        let plan = self.inner.plan_launch(ctx)?;
+        if plan
+            .effects
+            .iter()
+            .any(|e| e.kind == EffectKind::WinFirewallRule)
+            && let Err(reason) = (self.supported)()
+        {
+            return Err(CoreError::FeatureRejected {
+                feature: "firewall".into(),
+                reason,
+            });
+        }
+        Ok(plan)
+    }
+    async fn attach(
+        &self,
+        ep: &CoreEndpoint,
+        core: &CoreDescriptor,
+    ) -> Result<Box<dyn CoreSession>, CoreError> {
+        self.inner.attach(ep, core).await
+    }
+}
+
 /// Last line of defence: neither a newly committed generation nor a direct
 /// record/begin_epoch can reach the real ledger while native adapters are
 /// unavailable. Existing records still support transition/reclaim and

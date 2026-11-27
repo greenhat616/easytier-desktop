@@ -1,6 +1,6 @@
 //! Composition root: all OS work is performed by the adapters it assembles.
 use crate::storage::{self, FileIndex};
-use crate::unavailable::{BlockedDriver, MissingNative, NoNewEffects};
+use crate::unavailable::{BlockedDriver, FirewallGated, MissingNative, NoNewEffects};
 use anyhow::{Context, Result, bail, ensure};
 use etd_contract::{
     AllowEntry, HostMode, Role,
@@ -263,6 +263,13 @@ async fn dependencies(mode: HostMode, layout: &HostLayout) -> Result<Dependencie
     }
     let driver: Arc<dyn CoreDriver> = match &missing {
         Some(reason) => Arc::new(BlockedDriver(reason.clone())),
+        // Only privileged hosts own firewall rule records.
+        None if matches!(mode, HostMode::Service | HostMode::ElevatedSession) => {
+            Arc::new(FirewallGated {
+                inner: EasyTierDriver,
+                supported: firewall_cleanup_supported,
+            })
+        }
         None => Arc::new(EasyTierDriver),
     };
     let store = ManifestCoreStore::new(
@@ -363,6 +370,21 @@ impl HostExit {
             release(lock, quiescent);
         }
         self.result
+    }
+}
+
+/// Whether this host can clean up firewall rules (Windows: a listed build
+/// or a passed self-check; elsewhere there are none to clean up).
+fn firewall_cleanup_supported() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        etd_sysfx_os::windows::firewall_cleanup_supported()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(())
     }
 }
 

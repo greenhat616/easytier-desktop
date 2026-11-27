@@ -146,6 +146,13 @@ jobs:
       - name: Elevated session host on Windows (administrator runner)
         if: runner.os == 'Windows'
         run: cargo nextest run --locked --profile privileged -p etd-host --run-ignored only --test session_e2e --success-output immediate
+      # ES4: the UI's direct start from an elevated UI (the runner's token is
+      # elevated); the test runs target\debug\etd-host.exe, built above.
+      - name: Elevated session started by an elevated UI on Windows (administrator runner)
+        if: runner.os == 'Windows'
+        run: |
+          cargo build --locked -p etd-host
+          cargo nextest run --locked --profile privileged -p etd-ui --run-ignored only --test session_direct_start --success-output immediate
       - name: Install roundtrip on Unix (root on disposable runner)
         if: runner.os != 'Windows'
         shell: bash

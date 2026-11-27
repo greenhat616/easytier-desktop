@@ -15,8 +15,12 @@ mod logging;
 
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
+use etd_app::launcher_session::HostChoiceFile;
 use etd_app::{AppRuntime, BridgeConfig, window_tray::WindowInput};
-use etd_ui::{NativeTrayBackend, PlatformServiceInstaller, UiController, build_local_services};
+use etd_ui::{
+    NativeTrayBackend, PlatformServiceInstaller, PlatformSessionCleaner, UiController,
+    build_local_services, ui_elevation,
+};
 use gpui_kit::QuitMode;
 
 fn main() {
@@ -53,7 +57,13 @@ fn main() {
             is_elevated,
             cx,
         )
-        .expect("failed to start EasyTier Desktop UI");
+        .expect("failed to start EasyTier Desktop UI")
+        .with_session_support(
+            Arc::new(PlatformSessionCleaner::detect()),
+            HostChoiceFile::default_path().map(HostChoiceFile::new),
+            ui_elevation(),
+            cx,
+        );
         *controller_slot.borrow_mut() = Some(controller);
     });
 }

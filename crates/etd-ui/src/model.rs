@@ -3,7 +3,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use etd_app::{HostLink, InstanceCondition, LaunchFailure, LaunchFailureKind, StateStore};
+use etd_app::{
+    HostLink, InstanceCondition, LaunchFailure, LaunchFailureKind, StateStore,
+    launcher_session::{HostChoice, UiElevation},
+};
 use etd_contract::{
     CandidateDecision, HostMode, InstanceId, QueryKind, capability,
     v1::{CandidateAction, ReclaimStatus},
@@ -73,6 +76,12 @@ pub struct UiModel {
     pub candidate_decisions: BTreeMap<String, CandidateAction>,
     pub install_status: Option<InstallStatus>,
     pub install_command_preview: String,
+    /// This UI's token, where the elevated session form exists (Windows).
+    pub ui_elevation: Option<UiElevation>,
+    /// The first-run "install the service / ask each time" choice, once made.
+    pub host_choice: Option<HostChoice>,
+    /// Progress of "clean up leftovers" of the elevated session.
+    pub cleanup_status: Option<InstallStatus>,
 }
 
 impl UiModel {
@@ -88,6 +97,9 @@ impl UiModel {
             candidate_decisions: BTreeMap::new(),
             install_status: None,
             install_command_preview,
+            ui_elevation: None,
+            host_choice: None,
+            cleanup_status: None,
         }
     }
 
@@ -142,6 +154,15 @@ impl UiModel {
             .filter(|entry| entry.needs_stop_confirm())
             .map(|entry| (entry.id.clone(), entry.display_name().to_owned()))
             .collect()
+    }
+
+    /// The elevated session form can be offered: Windows, an administrator
+    /// account (elevated or not), no service in use.
+    pub fn session_form_available(&self) -> bool {
+        matches!(
+            self.ui_elevation,
+            Some(UiElevation::Limited | UiElevation::Elevated)
+        )
     }
 
     /// Whether the current launch failure indicates the system service is not installed.

@@ -16,8 +16,9 @@ pub mod tray;
 pub mod views;
 
 pub use composition::{
-    ElevatedAwareLauncher, LocalGrpcClientFactory, PlatformServiceInstaller, ServiceInstaller,
-    build_local_services, default_profile_store, is_process_elevated,
+    ElevatedAwareLauncher, LocalGrpcClientFactory, PlatformServiceInstaller,
+    PlatformSessionCleaner, ServiceInstaller, SessionCleaner, build_local_services,
+    default_profile_store, is_process_elevated, ui_elevation,
 };
 pub use controller::{ExitHook, UiController};
 pub use editor::{NetworkEditorState, SecretMode};

@@ -3,13 +3,16 @@
 //! - "Cut, unconfirmed · retry" banner with per-instance Retry Confirm action
 //! - `NotInstalled` → offer service install
 //! - Elevated user host refused → offer the service
+//! - Elevated session (Windows): first-run choice, the refusals with their
+//!   advice, "host exited" with Connect / Clean up (doc#13 #choose #ipc)
 //! - Upgrade required, unverified host, tray-unavailable keep-window notice, and operations bar
 //!
 //! Each banner is rendered in its own `#[inline(never)]` helper returning
 //! [`AnyElement`] so debug stack frames remain small on Windows' 1 MiB main stack.
 
 use etd_app::{
-    HostLink, LaunchFailure, Operation, OperationStatus, UserCommand, window_tray::ExitReason,
+    HostLink, LaunchFailure, LaunchFailureKind, Operation, OperationStatus, UserCommand,
+    window_tray::ExitReason,
 };
 use etd_contract::{HostMode, HostPhase, InstanceId};
 use gpui_kit::{
@@ -18,6 +21,8 @@ use gpui_kit::{
     component::{ActiveTheme as _, Size, button::ButtonVariant},
     div,
 };
+
+use etd_app::launcher_session::HostChoice;
 
 use crate::{
     model::InstallStatus,
@@ -34,7 +39,7 @@ pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
     let warn = cx.theme().warning;
     let title_bar = crate::theme::chrome_fill(cx, cx.theme().title_bar);
 
-    let (link_label, tray_available) = {
+    let (link_label, tray_available, session_available) = {
         let model = view.controller.model.read(cx);
         let mode_label = match model.store.negotiated.as_ref().map(|n| n.host_mode) {
             Some(HostMode::Service) => "System Service",
@@ -60,7 +65,11 @@ pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
             HostLink::UpgradeRequired { .. } => "Upgrade Required".to_owned(),
             HostLink::Closed => "Closed".to_owned(),
         };
-        (link_label, model.tray_available)
+        (
+            link_label,
+            model.tray_available,
+            model.session_form_available(),
+        )
     };
 
     let mut left = div().flex().flex_row().items_center().gap_3().child(
@@ -123,6 +132,19 @@ pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
                 .send_command(UserCommand::Connect(HostMode::User));
         }),
     );
+    let session_btn = session_available.then(|| {
+        action_button(
+            "btn-connect-session",
+            "Elevated Session",
+            BtnStyle::new(ButtonVariant::Default, Size::XSmall)
+                .outline()
+                .icon("fluent/shield.svg"),
+            cx.listener(|this, _, _, _| {
+                this.controller
+                    .send_command(UserCommand::Connect(HostMode::ElevatedSession));
+            }),
+        )
+    });
     let refresh_btn = action_button(
         "btn-refresh",
         "Refresh",
@@ -147,6 +169,7 @@ pub fn render_header(view: &MainView, cx: &mut Context<MainView>) -> AnyElement 
         .items_center()
         .gap_2()
         .child(svc_btn)
+        .children(session_btn)
         .child(user_btn)
         .child(refresh_btn)
         .child(exit_btn);
@@ -234,8 +257,38 @@ pub fn render_banners(view: &MainView, cx: &mut Context<MainView>) -> AnyElement
         )
     };
 
-    if let Some(attempt) = reconnecting_attempt {
+    let (session_available, host_choice, cleanup_status, session_exited) = {
+        let model = view.controller.model.read(cx);
+        (
+            model.session_form_available(),
+            model.host_choice,
+            model.cleanup_status.clone(),
+            model.store.session_host_exited,
+        )
+    };
+
+    if session_exited {
+        items.push(render_session_exited_banner(
+            matches!(cleanup_status, Some(InstallStatus::InProgress)),
+            cx,
+        ));
+    } else if let Some(attempt) = reconnecting_attempt {
         items.push(render_reconnecting_banner(attempt, cx));
+    }
+    match &cleanup_status {
+        Some(InstallStatus::Failed(error)) => items.push(render_simple_alert(
+            "banner-cleanup-failed",
+            format!("Clean-up failed: {error}"),
+            InfoSeverity::Error,
+            cx,
+        )),
+        Some(InstallStatus::Succeeded) => items.push(render_simple_alert(
+            "banner-cleanup-done",
+            "Leftovers cleaned up. Press Connect to start again.".to_owned(),
+            InfoSeverity::Success,
+            cx,
+        )),
+        _ => {}
     }
     if !cut_instances.is_empty() {
         items.push(render_cut_unconfirmed_banner(cut_instances, cx));
@@ -251,6 +304,8 @@ pub fn render_banners(view: &MainView, cx: &mut Context<MainView>) -> AnyElement
         ));
     } else if let Some(failure) = launch_failure {
         items.push(render_launch_failed_banner(&failure, cx));
+    } else if no_host && session_available {
+        items.push(render_host_choice_banner(host_choice, cx));
     } else if no_host {
         items.push(render_no_host_banner(is_elevated, cx));
     }
@@ -429,18 +484,140 @@ fn render_not_installed_banner(
 
 #[inline(never)]
 fn render_launch_failed_banner(failure: &LaunchFailure, cx: &mut Context<MainView>) -> AnyElement {
-    let msg = format!("{:?}: {}", failure.kind, failure.message);
-    let btn = action_button(
+    let msg = match failure.guidance() {
+        Some(advice) => format!("{advice} ({})", failure.message),
+        None => format!("{:?}: {}", failure.kind, failure.message),
+    };
+    let mut btns = Vec::new();
+    match failure.kind {
+        LaunchFailureKind::ElevationDenied | LaunchFailureKind::Spawn
+            if failure.mode == Some(HostMode::ElevatedSession) =>
+        {
+            btns.push(session_connect_button("btn-failed-session-connect", cx));
+        }
+        LaunchFailureKind::ServiceInstalled => btns.push(action_button(
+            "btn-failed-use-service",
+            "Connect Service",
+            BtnStyle::new(ButtonVariant::Primary, Size::XSmall),
+            cx.listener(|this, _, _, _| {
+                this.controller
+                    .send_command(UserCommand::Connect(HostMode::Service));
+            }),
+        )),
+        LaunchFailureKind::OtherUsersLeftovers => btns.push(action_button(
+            "btn-failed-cleanup-all",
+            "Clean Up",
+            BtnStyle::new(ButtonVariant::Primary, Size::XSmall),
+            cx.listener(|this, _, _, cx| {
+                this.controller.request_session_cleanup(true, cx);
+            }),
+        )),
+        _ => {}
+    }
+    btns.push(action_button(
         "btn-retry-autoconnect",
         "Retry Auto-Connect",
         BtnStyle::new(ButtonVariant::Default, Size::XSmall).outline(),
         cx.listener(|this, _, _, _| {
             this.controller.send_command(UserCommand::AutoConnect);
         }),
-    );
+    ));
+    let title = if failure.mode == Some(HostMode::ElevatedSession) {
+        "Could not start the elevated session"
+    } else {
+        "Host launch failed"
+    };
     FluentInfoBar::new("banner-launch-failed", InfoSeverity::Error, msg)
-        .title("Host launch failed")
-        .actions([btn])
+        .title(title)
+        .actions(btns)
+        .render(cx)
+}
+
+fn session_connect_button(id: &'static str, cx: &mut Context<MainView>) -> AnyElement {
+    action_button(
+        id,
+        "Connect (asks for administrator)",
+        BtnStyle::new(ButtonVariant::Primary, Size::XSmall),
+        cx.listener(|this, _, _, _| {
+            this.controller
+                .send_command(UserCommand::Connect(HostMode::ElevatedSession));
+        }),
+    )
+}
+
+/// doc#13 #sequence outcome 3: never restarted automatically.
+#[inline(never)]
+fn render_session_exited_banner(cleaning: bool, cx: &mut Context<MainView>) -> AnyElement {
+    let msg = "The elevated EasyTier host exited. Network changes it made may be left behind until you connect again or clean them up.";
+    let cleanup = action_button(
+        "btn-session-cleanup",
+        if cleaning {
+            "Cleaning Up..."
+        } else {
+            "Clean Up"
+        },
+        BtnStyle::new(ButtonVariant::Default, Size::XSmall)
+            .outline()
+            .loading(cleaning),
+        cx.listener(|this, _, _, cx| {
+            this.controller.request_session_cleanup(false, cx);
+        }),
+    );
+    FluentInfoBar::new("banner-session-exited", InfoSeverity::Warning, msg)
+        .title("Host exited, leftovers to clean up")
+        .actions([session_connect_button("btn-session-reconnect", cx), cleanup])
+        .render(cx)
+}
+
+/// First run on an administrator account without the service (doc#13
+/// #choose): install the service, or ask for administrator permission each
+/// time. Once chosen, the remembered way comes first.
+#[inline(never)]
+fn render_host_choice_banner(choice: Option<HostChoice>, cx: &mut Context<MainView>) -> AnyElement {
+    let session_first = choice == Some(HostChoice::ElevatedSession);
+    let variant = |primary: bool| {
+        if primary {
+            ButtonVariant::Primary
+        } else {
+            ButtonVariant::Default
+        }
+    };
+    let install = action_button(
+        "btn-choice-install-service",
+        "Install System Service",
+        BtnStyle::new(variant(!session_first), Size::XSmall),
+        cx.listener(|this, _, _, cx| {
+            this.controller.choose_host(HostChoice::Service, cx);
+        }),
+    );
+    let session = action_button(
+        "btn-choice-elevated-session",
+        "Ask For Administrator Each Time",
+        BtnStyle::new(variant(session_first), Size::XSmall),
+        cx.listener(|this, _, _, cx| {
+            this.controller.choose_host(HostChoice::ElevatedSession, cx);
+        }),
+    );
+    let (title, msg) = if session_first {
+        (
+            "Not connected",
+            "Connecting asks for administrator permission once; the network stops when you exit the app.",
+        )
+    } else {
+        (
+            "How should EasyTier get administrator rights?",
+            "Install the system service once (EasyTier then connects without asking), or ask for administrator permission each time you connect.",
+        )
+    };
+    let buttons = if session_first {
+        [session, install]
+    } else {
+        [install, session]
+    };
+    FluentInfoBar::new("banner-host-choice", InfoSeverity::Informational, msg)
+        .title(title)
+        .status()
+        .actions(buttons)
         .render(cx)
 }
 
@@ -547,7 +724,10 @@ fn render_operation_row(op: &Operation, cx: &mut Context<MainView>) -> Option<An
         OperationStatus::Unconfirmed(failure) => {
             (format!("{:?} unconfirmed: {}", op.kind, failure.0), true)
         }
-        OperationStatus::Failed(failure) => (format!("{:?} failed: {}", op.kind, failure.0), false),
+        OperationStatus::Failed(failure) => match failure.guidance() {
+            Some(advice) => (format!("{:?} failed: {advice}", op.kind), false),
+            None => (format!("{:?} failed: {}", op.kind, failure.0), false),
+        },
         _ => return None,
     };
     let mut btns = Vec::new();

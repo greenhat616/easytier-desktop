@@ -1,5 +1,6 @@
 //! Composition root helpers: real gRPC client factory (`GrpcHostClient` + `LocalConnector`),
-//! elevation-aware `LocalHostLauncher`, `TomlProfileStore`, and service installation command.
+//! elevation-aware `LocalHostLauncher` (with the elevated session form on Windows),
+//! `TomlProfileStore`, the service installation command and the session clean-up.
 
 use std::{
     io,
@@ -11,6 +12,7 @@ use std::{
 use async_trait::async_trait;
 use etd_app::{
     AppServices, HostClientFactory, HostLauncher, HostTarget, LaunchError, ProfileStore,
+    launcher_session::{ElevationStarter, UiElevation},
     launcher_user::{LocalHostLauncher, ServiceHostConfig, UserHostConfig},
     profiles_toml::TomlProfileStore,
 };
@@ -53,7 +55,8 @@ impl HostClientFactory for LocalGrpcClientFactory {
 
 /// Wraps a [`HostLauncher`] and refuses [`HostMode::User`] when the UI runs with
 /// elevated privileges, matching `etd-host`'s security boundary so the UI can
-/// immediately offer the system service instead.
+/// immediately offer the system service instead. The elevated session form
+/// stays available to an elevated UI (started directly, doc#13 #choose).
 pub struct ElevatedAwareLauncher {
     inner: Arc<dyn HostLauncher>,
     elevated: bool,
@@ -132,7 +135,11 @@ pub fn build_local_services() -> io::Result<(AppServices, bool)> {
     } else {
         sibling_host_binary().and_then(|program| UserHostConfig::standard(program).ok())
     };
-    let local_launcher = Arc::new(LocalHostLauncher::new(service, user));
+    let mut local_launcher = LocalHostLauncher::new(service, user);
+    if let Some(session) = session_parts() {
+        local_launcher = local_launcher.with_session(session);
+    }
+    let local_launcher = Arc::new(local_launcher);
     let launcher: Arc<dyn HostLauncher> =
         Arc::new(ElevatedAwareLauncher::new(local_launcher, elevated));
     let profiles = default_profile_store()?;
@@ -145,6 +152,138 @@ pub fn build_local_services() -> io::Result<(AppServices, bool)> {
         },
         elevated,
     ))
+}
+
+/// The elevated session form: Windows, with the sibling `etd-host`.
+fn session_parts() -> Option<etd_app::launcher_session::SessionParts> {
+    #[cfg(windows)]
+    {
+        let program = sibling_host_binary()?;
+        let config = etd_app::launcher_session::ElevatedSessionConfig::standard(program).ok()?;
+        Some(etd_app::launcher_session::SessionParts {
+            config,
+            starter: Arc::new(WindowsElevationStarter),
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// The elevation of this UI process, `None` where there is no session form.
+pub fn ui_elevation() -> Option<UiElevation> {
+    #[cfg(windows)]
+    {
+        WindowsElevationStarter.elevation().ok()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// [`ElevationStarter`] on `etd-sysfx-os`: `ShellExecuteEx runas` with
+/// `SW_HIDE`, or `CreateProcessW` without inherited handles from an elevated
+/// UI.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WindowsElevationStarter;
+
+#[cfg(windows)]
+struct StartedHost(etd_sysfx_os::windows::elevation::HostProcess);
+
+#[cfg(windows)]
+impl etd_app::launcher_session::StartedProcess for StartedHost {
+    fn exit_code(&mut self) -> io::Result<Option<u32>> {
+        self.0.exit_code()
+    }
+}
+
+#[cfg(windows)]
+impl ElevationStarter for WindowsElevationStarter {
+    fn elevation(&self) -> io::Result<UiElevation> {
+        use etd_sysfx_os::windows::elevation::{Elevation, elevation};
+        Ok(match elevation()? {
+            Elevation::Limited => UiElevation::Limited,
+            Elevation::Elevated => UiElevation::Elevated,
+            Elevation::Standard => UiElevation::Standard,
+        })
+    }
+
+    fn start_with_consent(
+        &self,
+        program: &Path,
+        args: &[&str],
+    ) -> Result<
+        Box<dyn etd_app::launcher_session::StartedProcess>,
+        etd_app::launcher_session::StartError,
+    > {
+        use etd_sysfx_os::windows::elevation::{ERROR_CANCELLED, start_with_consent};
+        start_with_consent(program, args)
+            .map(|process| Box::new(StartedHost(process)) as _)
+            .map_err(|error| {
+                if error.raw_os_error() == Some(ERROR_CANCELLED) {
+                    etd_app::launcher_session::StartError::Cancelled
+                } else {
+                    etd_app::launcher_session::StartError::Failed(error)
+                }
+            })
+    }
+
+    fn start_direct(
+        &self,
+        program: &Path,
+        args: &[&str],
+    ) -> Result<
+        Box<dyn etd_app::launcher_session::StartedProcess>,
+        etd_app::launcher_session::StartError,
+    > {
+        etd_sysfx_os::windows::elevation::start_direct(program, args)
+            .map(|process| Box::new(StartedHost(process)) as _)
+            .map_err(etd_app::launcher_session::StartError::Failed)
+    }
+}
+
+/// Cleans up what a crashed elevated session host left behind (doc#13
+/// #lifetime): `etd-host reclaim --mode elevated-session [--all-users]`,
+/// started like the session host (one UAC prompt when unelevated).
+pub trait SessionCleaner: Send + Sync {
+    /// Blocking; called on a background executor off the GPUI UI thread.
+    fn clean_up(&self, all_users: bool) -> Result<(), LaunchError>;
+}
+
+/// The sibling `etd-host`, Windows only.
+pub struct PlatformSessionCleaner {
+    starter: Option<Arc<dyn ElevationStarter>>,
+    program: Option<PathBuf>,
+}
+
+impl PlatformSessionCleaner {
+    pub fn detect() -> Self {
+        #[cfg(windows)]
+        let starter: Option<Arc<dyn ElevationStarter>> = Some(Arc::new(WindowsElevationStarter));
+        #[cfg(not(windows))]
+        let starter: Option<Arc<dyn ElevationStarter>> = None;
+        Self {
+            starter,
+            program: sibling_host_binary(),
+        }
+    }
+}
+
+impl SessionCleaner for PlatformSessionCleaner {
+    fn clean_up(&self, all_users: bool) -> Result<(), LaunchError> {
+        let (Some(starter), Some(program)) = (&self.starter, &self.program) else {
+            return Err(LaunchError::Unsupported(HostMode::ElevatedSession));
+        };
+        etd_app::launcher_session::reclaim_session_leftovers(
+            starter.as_ref(),
+            program,
+            all_users,
+            std::time::Duration::from_secs(300),
+        )
+    }
 }
 
 /// Injectable service installer invoked when the user accepts the UI's offer to

@@ -4,6 +4,7 @@
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
 use anyhow::Result;
+use etd_app::launcher_session::{HostChoice, HostChoiceFile, UiElevation};
 use etd_app::{
     AppBridge, AppRuntime, ExitDeadlines, ExitGate, ExitSteps, TrayBackend, UserCommand,
     window_tray::{
@@ -18,7 +19,7 @@ use gpui_kit::{
 };
 
 use crate::{
-    composition::ServiceInstaller,
+    composition::{ServiceInstaller, SessionCleaner},
     model::{DetailTab, InstallStatus, Section, UiModel},
     views::MainView,
 };
@@ -73,6 +74,8 @@ pub struct UiController {
     pub model: Entity<UiModel>,
     bridge: AppBridge,
     installer: Arc<dyn ServiceInstaller>,
+    cleaner: Rc<RefCell<Option<Arc<dyn SessionCleaner>>>>,
+    choice_file: Rc<RefCell<Option<HostChoiceFile>>>,
     runtime: Rc<RefCell<Option<AppRuntime>>>,
     window_tray: Rc<RefCell<WindowTray>>,
     tray_driver: Rc<RefCell<TrayDriver<BoxedTray>>>,
@@ -132,6 +135,8 @@ impl UiController {
             model,
             bridge: bridge.clone(),
             installer,
+            cleaner: Rc::new(RefCell::new(None)),
+            choice_file: Rc::new(RefCell::new(None)),
             runtime: Rc::new(RefCell::new(runtime)),
             window_tray: Rc::new(RefCell::new(window_tray)),
             tray_driver: Rc::new(RefCell::new(tray_driver)),
@@ -210,6 +215,8 @@ impl UiController {
             model,
             bridge,
             installer,
+            cleaner: Rc::new(RefCell::new(None)),
+            choice_file: Rc::new(RefCell::new(None)),
             runtime: Rc::new(RefCell::new(runtime)),
             window_tray: Rc::new(RefCell::new(window_tray)),
             tray_driver: Rc::new(RefCell::new(tray_driver)),
@@ -289,6 +296,86 @@ impl UiController {
             m.keep_window_notice = false;
             cx.notify();
         });
+    }
+
+    /// Enables the elevated session form (Windows): the clean-up, the
+    /// first-run choice and this UI's elevation.
+    pub fn with_session_support(
+        self,
+        cleaner: Arc<dyn SessionCleaner>,
+        choice_file: Option<HostChoiceFile>,
+        elevation: Option<UiElevation>,
+        cx: &mut App,
+    ) -> Self {
+        let choice = choice_file.as_ref().and_then(HostChoiceFile::load);
+        *self.cleaner.borrow_mut() = Some(cleaner);
+        *self.choice_file.borrow_mut() = choice_file;
+        self.model.update(cx, |m, cx| {
+            m.ui_elevation = elevation;
+            m.host_choice = choice;
+            cx.notify();
+        });
+        self
+    }
+
+    /// The first-run choice (doc#13 #choose): remembered, then acted on at
+    /// once. Choosing the session form connects, which shows the one UAC
+    /// prompt; nothing prompts later without a Connect.
+    pub fn choose_host(&self, choice: HostChoice, cx: &mut App) {
+        if let Some(file) = self.choice_file.borrow().as_ref()
+            && let Err(error) = file.save(choice)
+        {
+            tracing::warn!(%error, "could not save the host choice");
+        }
+        self.model.update(cx, |m, cx| {
+            m.host_choice = Some(choice);
+            cx.notify();
+        });
+        match choice {
+            HostChoice::Service => self.request_service_install(cx),
+            HostChoice::ElevatedSession => {
+                self.send_command(UserCommand::Connect(HostMode::ElevatedSession));
+            }
+        }
+    }
+
+    /// Runs the session clean-up off the UI thread (one UAC prompt when
+    /// unelevated). The user connects again afterwards.
+    pub fn request_session_cleanup(&self, all_users: bool, cx: &mut App) {
+        let Some(cleaner) = self.cleaner.borrow().clone() else {
+            return;
+        };
+        if matches!(
+            self.model.read(cx).cleanup_status,
+            Some(InstallStatus::InProgress)
+        ) {
+            return;
+        }
+        self.model.update(cx, |m, cx| {
+            m.cleanup_status = Some(InstallStatus::InProgress);
+            cx.notify();
+        });
+        let ctrl = self.clone();
+        cx.spawn(async move |cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { cleaner.clean_up(all_users) })
+                .await;
+            cx.update(|cx| {
+                ctrl.model.update(cx, |m, cx| {
+                    m.cleanup_status = Some(match result {
+                        Ok(()) => InstallStatus::Succeeded,
+                        Err(error) => InstallStatus::Failed(
+                            etd_app::LaunchFailure::new(Some(HostMode::ElevatedSession), &error)
+                                .guidance()
+                                .map_or_else(|| error.to_string(), str::to_owned),
+                        ),
+                    });
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
     }
 
     /// Invokes [`ServiceInstaller::install`] off the UI thread; on success connects

@@ -36,7 +36,7 @@ pub struct HostLayout {
     pub socket_dir: Option<PathBuf>,
     /// Stable protected directory never removed by install/uninstall.
     pub maintenance: PathBuf,
-    /// Elevated session only: the protected, empty directory the kernel's
+    /// Elevated session only: the protected directory the kernel's
     /// and the system workers' profile variables point at
     /// (`<state>\..\profile`).
     pub profile: Option<PathBuf>,
@@ -47,7 +47,10 @@ pub struct HostLayout {
 /// access control, reparse point, hard link). It is refused, never repaired
 /// or adopted. Carried inside the `io::Error` of the session operations.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("session directory not conforming: {} ({reason})", path.display())]
+#[error(
+    "session directory not conforming: {} ({reason}); nothing was changed. An administrator who has confirmed it holds nothing needed may delete it, then retry",
+    path.display()
+)]
 pub struct NotConforming {
     pub path: PathBuf,
     pub reason: String,
@@ -388,8 +391,8 @@ pub fn installed_host_dir() -> io::Result<PathBuf> {
 pub use unix::group_id as service_group_id;
 #[cfg(windows)]
 pub use windows::{
-    ProcessPin, SessionEnd, SessionToken, dispatch_service, elevated_session_token,
-    harden_dll_search, wait_uninstall_parent,
+    ProcessPin, SessionEnd, SessionToken, dispatch_service, driver_image_allowed,
+    elevated_session_token, harden_dll_search, path_inside, wait_uninstall_parent,
 };
 
 #[derive(Default)]

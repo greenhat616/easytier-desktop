@@ -867,6 +867,39 @@ fn referenced(dir: &Path) -> Result<Option<String>, WinError> {
 
 /// Read-only driver reference check. Never deletes/stops a driver. Any
 /// incomplete enumeration or ambiguous image path fails closed.
+/// Whether a driver service image path (as SCM reports it) lies in the
+/// system's driver directory or inside one of `dirs`, compared as the
+/// reference check compares them. Unparsable or ambiguous paths are not.
+pub(crate) fn driver_image_within(raw: &str, dirs: &[&Path]) -> Result<bool, OsError> {
+    let check = || -> Result<bool, WinError> {
+        let root = windows_dir()?;
+        let image = normalized(&image_path(raw, &root)?)?;
+        let drivers = normalized(&root.join("System32").join("drivers"))?;
+        if inside(&image, &drivers) {
+            return Ok(true);
+        }
+        for dir in dirs {
+            if inside(&image, &normalized(dir)?) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    check().map_err(|e| OsError::Os {
+        code: e.code,
+        message: e.message,
+    })
+}
+
+/// Whether the absolute `path` lies inside `dir`, compared as the
+/// reference check compares paths (prefix-free, case-insensitive).
+pub(crate) fn path_within(path: &Path, dir: &Path) -> bool {
+    match (normalized(path), normalized(dir)) {
+        (Ok(path), Ok(dir)) => path != dir && inside(&path, &dir),
+        _ => false,
+    }
+}
+
 pub fn driver_bundle_referenced(dir: &Path) -> Result<bool, OsError> {
     driver_bundle_reference(dir).map(|reference| reference.is_some())
 }

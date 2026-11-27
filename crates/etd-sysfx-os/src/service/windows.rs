@@ -42,7 +42,8 @@ use windows_service::{
 
 mod session;
 pub use session::{
-    ProcessPin, SessionEnd, SessionToken, elevated_session_token, harden_dll_search,
+    ProcessPin, SessionEnd, SessionToken, driver_image_allowed, elevated_session_token,
+    harden_dll_search, path_inside,
 };
 pub(super) use session::{
     prepare_session, remove_session_roots, service_registered, session_layout, session_layouts,

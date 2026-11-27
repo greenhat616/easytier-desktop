@@ -5,7 +5,7 @@
 use super::*;
 use ::windows::{
     Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{FILETIME, HWND, LPARAM, LRESULT, STILL_ACTIVE, WPARAM},
         Security::{
             GetSecurityDescriptorControl, GetSidSubAuthority, GetSidSubAuthorityCount,
             SE_DACL_PROTECTED, TOKEN_MANDATORY_LABEL, TokenIntegrityLevel, TokenSessionId,
@@ -15,8 +15,8 @@ use ::windows::{
             LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories},
             Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy},
             Threading::{
-                OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-                QueryFullProcessImageNameW,
+                GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32,
+                PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
             },
         },
         UI::WindowsAndMessaging::{
@@ -34,6 +34,7 @@ use std::{
         io::{AsRawHandle, FromRawHandle, OwnedHandle},
     },
     sync::{Arc, Condvar, Mutex, OnceLock},
+    time::SystemTime,
 };
 
 const SESSION_DIR: &str = "EasyTierDesk.session";
@@ -227,6 +228,12 @@ pub(in crate::service) fn prepare_session(layout: &HostLayout) -> io::Result<()>
         ));
     }
     ensure_protected(&root)?;
+    // An existing per-user tree is verified whole before anything is
+    // created in it: a non-conforming tree is refused unchanged.
+    if fs::symlink_metadata(user).is_ok() {
+        validate_protected(user)?;
+        verify_session_tree(user)?;
+    }
     ensure_protected(user)?;
     for dir in [&layout.state, &layout.run, &layout.cores] {
         ensure_protected(dir)?;
@@ -277,7 +284,35 @@ pub(in crate::service) fn remove_session_roots() -> io::Result<()> {
     }
     validate_protected(&root)?;
     verify_session_tree(&root)?;
-    fs::remove_dir_all(root)
+    guarded_session_removal(&root, crate::driver_bundle_reference, || {
+        fs::remove_dir_all(&root)
+    })
+}
+
+/// Remove the session roots only if no driver references any per-user
+/// kernel store, with the same complete check as the service's uninstall
+/// (a shared driver a purge leaves in place may load from there). On a
+/// reference, or if the check is inconclusive, everything stays.
+fn guarded_session_removal(
+    root: &Path,
+    mut query: impl FnMut(&Path) -> Result<Option<String>, crate::OsError>,
+    remove: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let mut users = fs::read_dir(root)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<io::Result<Vec<_>>>()?;
+    users.sort();
+    for user in users {
+        check_install_driver_references(&user.join("cores"), |cores| query(cores)).map_err(
+            |error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("session root {} retained: {error}", user.display()),
+                )
+            },
+        )?;
+    }
+    remove()
 }
 
 pub(in crate::service) fn service_registered() -> io::Result<bool> {
@@ -382,18 +417,68 @@ pub fn harden_dll_search() -> io::Result<()> {
     unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) }.map_err(other)
 }
 
+/// Machine-wide reconciliation: whether a shared driver service's image
+/// path, as SCM reported it, is in the system driver directory or inside
+/// one of the verified per-user kernel stores `session_cores`. Anything
+/// else, or a path that cannot be read unambiguously, is not.
+pub fn driver_image_allowed(raw: &str, session_cores: &[PathBuf]) -> bool {
+    let dirs: Vec<&Path> = session_cores.iter().map(PathBuf::as_path).collect();
+    crate::windows::driver_refs::driver_image_within(raw, &dirs).unwrap_or(false)
+}
+
+/// Whether the absolute `path` lies inside `dir` (strictly below it),
+/// compared case-insensitively without `\?\` prefixes, as the driver
+/// reference check compares paths.
+pub fn path_inside(path: &Path, dir: &Path) -> bool {
+    crate::windows::driver_refs::path_within(path, dir)
+}
+
 /// A handle on a client process, opened at accept and kept for the life of
 /// its connection so its pid cannot be reused meanwhile.
-pub struct ProcessPin(OwnedHandle);
+pub struct ProcessPin {
+    handle: OwnedHandle,
+    created: SystemTime,
+}
 
 impl ProcessPin {
     pub fn open(pid: u32) -> io::Result<Self> {
         // SAFETY: the returned handle is owned and closed on drop.
-        unsafe {
+        let handle = unsafe {
             let handle =
                 OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).map_err(other)?;
-            Ok(Self(OwnedHandle::from_raw_handle(handle.0)))
+            OwnedHandle::from_raw_handle(handle.0)
+        };
+        let (mut created, mut exited, mut kernel, mut user) = Default::default();
+        // SAFETY: a live process handle and owned output structures.
+        unsafe {
+            GetProcessTimes(
+                HANDLE(handle.as_raw_handle()),
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            )
         }
+        .map_err(other)?;
+        Ok(Self {
+            handle,
+            created: system_time(created),
+        })
+    }
+
+    /// When the pinned process was created. A process created after the
+    /// pipe connection was accepted cannot be its client (pid reuse).
+    pub fn created(&self) -> SystemTime {
+        self.created
+    }
+
+    /// The pinned process has not exited.
+    pub fn alive(&self) -> io::Result<bool> {
+        let mut code = 0u32;
+        // SAFETY: a live process handle and an owned output value.
+        unsafe { GetExitCodeProcess(HANDLE(self.handle.as_raw_handle()), &mut code) }
+            .map_err(other)?;
+        Ok(code == STILL_ACTIVE.0 as u32)
     }
 
     /// The pinned process's image. Not an authentication: any program the
@@ -404,7 +489,7 @@ impl ProcessPin {
         // SAFETY: a live process handle and a buffer of `len` UTF-16 units.
         unsafe {
             QueryFullProcessImageNameW(
-                HANDLE(self.0.as_raw_handle()),
+                HANDLE(self.handle.as_raw_handle()),
                 PROCESS_NAME_WIN32,
                 ::windows::core::PWSTR(path.as_mut_ptr()),
                 &mut len,
@@ -412,6 +497,17 @@ impl ProcessPin {
         }
         .map_err(other)?;
         Ok(PathBuf::from(OsString::from_wide(&path[..len as usize])))
+    }
+}
+
+/// A FILETIME (100 ns since 1601) as a system time.
+fn system_time(time: FILETIME) -> SystemTime {
+    let ticks = (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
+    // 1601-01-01 to 1970-01-01 in 100 ns ticks.
+    const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
+    match ticks.checked_sub(UNIX_EPOCH_TICKS) {
+        Some(since) => SystemTime::UNIX_EPOCH + Duration::from_nanos(since.saturating_mul(100)),
+        None => SystemTime::UNIX_EPOCH,
     }
 }
 
@@ -435,9 +531,10 @@ pub struct SessionEnd {
 }
 
 impl SessionEnd {
-    /// Start watching. `on_end` runs once the session starts ending; the
-    /// end is held until [`SessionEnd::finished`] or `budget`. One watcher
-    /// per process.
+    /// Start watching. `on_end` runs when the session ends
+    /// (`WM_ENDSESSION`), not when it is only asked to end, which another
+    /// program may still veto; the end is then held until
+    /// [`SessionEnd::finished`] or `budget`. One watcher per process.
     pub fn watch(on_end: Box<dyn Fn() + Send + Sync>, budget: Duration) -> io::Result<Self> {
         let state = Arc::new(EndState {
             on_end,
@@ -538,6 +635,45 @@ fn pump(created: std::sync::mpsc::Sender<io::Result<isize>>) {
     }
 }
 
+/// The session-end protocol, apart from the window. `WM_QUERYENDSESSION`
+/// only asks: the host keeps running (another program may still veto the
+/// logoff) and the end is marked as held. `WM_ENDSESSION(TRUE)` is the end:
+/// the host stops and the end is held until it has finished or the budget
+/// ran out. `WM_ENDSESSION(FALSE)`: the end was cancelled; the hold goes
+/// and nothing stops. `block(true)` / `block(false)` creates / destroys the
+/// shutdown block reason. `None`: not a session-end message.
+fn session_end_message(
+    state: &EndState,
+    message: u32,
+    wparam: usize,
+    block: impl Fn(bool),
+) -> Option<isize> {
+    match message {
+        WM_QUERYENDSESSION => {
+            block(true);
+            Some(1)
+        }
+        WM_ENDSESSION if wparam != 0 => {
+            block(true);
+            (state.on_end)();
+            let done = state
+                .done
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = state
+                .finished
+                .wait_timeout_while(done, state.budget, |done| !*done);
+            block(false);
+            Some(0)
+        }
+        WM_ENDSESSION => {
+            block(false);
+            Some(0)
+        }
+        _ => None,
+    }
+}
+
 unsafe extern "system" fn window_proc(
     window: HWND,
     message: u32,
@@ -555,29 +691,20 @@ unsafe extern "system" fn window_proc(
         // SAFETY: default handling of a message for our own window.
         return unsafe { CallWindowProcW(original, window, message, wparam, lparam) };
     };
-    match message {
-        WM_QUERYENDSESSION => {
-            // SAFETY: our own window; the reason string is static.
-            let _ = unsafe {
+    let block = |hold: bool| {
+        // SAFETY: our own window; the reason string is static.
+        let _ = unsafe {
+            if hold {
                 ShutdownBlockReasonCreate(window, w!("Removing EasyTier network changes"))
-            };
-            (state.on_end)();
-            LRESULT(1)
-        }
-        WM_ENDSESSION => {
-            if wparam.0 != 0 {
-                let done = state
-                    .done
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let _ = state
-                    .finished
-                    .wait_timeout_while(done, state.budget, |done| !*done);
+            } else {
+                ShutdownBlockReasonDestroy(window)
             }
-            // SAFETY: our own window.
-            let _ = unsafe { ShutdownBlockReasonDestroy(window) };
-            LRESULT(0)
-        }
+        };
+    };
+    if let Some(result) = session_end_message(state, message, wparam.0, block) {
+        return LRESULT(result);
+    }
+    match message {
         WM_CLOSE => {
             // SAFETY: our own window, destroyed on its own thread.
             let _ = unsafe { DestroyWindow(window) };
@@ -596,6 +723,112 @@ unsafe extern "system" fn window_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn end_state(ended: Arc<AtomicUsize>) -> EndState {
+        EndState {
+            on_end: Box::new(move || {
+                ended.fetch_add(1, Ordering::SeqCst);
+            }),
+            budget: Duration::from_secs(5),
+            done: Mutex::new(false),
+            finished: Condvar::new(),
+        }
+    }
+
+    /// Purging the session roots keeps them all while a driver references
+    /// any per-user kernel store, or while that cannot be determined. Only
+    /// a private fixture and a fake query: no driver is touched.
+    #[test]
+    fn a_driver_reference_in_any_session_store_keeps_every_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("EasyTierDesk.session");
+        for sid in ["S-1-5-21-1-2-3-1001", "S-1-5-21-1-2-3-1002"] {
+            fs::create_dir_all(root.join(sid).join("cores").join("bundle")).unwrap();
+        }
+        let image = root
+            .join("S-1-5-21-1-2-3-1002")
+            .join("cores")
+            .join("bundle")
+            .join("wintun.sys");
+        fs::write(&image, b"fixture").unwrap();
+        let remove = || fs::remove_dir_all(&root);
+        let referenced = |cores: &Path| {
+            Ok(cores
+                .starts_with(root.join("S-1-5-21-1-2-3-1002"))
+                .then(|| format!("driver service wintun references {}", image.display())))
+        };
+        let error = guarded_session_removal(&root, referenced, remove).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ResourceBusy);
+        assert!(error.to_string().contains("S-1-5-21-1-2-3-1002"), "{error}");
+        assert!(image.exists());
+        let error = guarded_session_removal(
+            &root,
+            |_| Err(crate::OsError::Unsupported("unavailable".into())),
+            remove,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot determine"), "{error}");
+        assert!(image.exists());
+        guarded_session_removal(&root, |_| Ok(None), remove).unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn a_cancelled_session_end_never_stops_the_host() {
+        let ended = Arc::new(AtomicUsize::new(0));
+        let state = end_state(ended.clone());
+        let holds = Mutex::new(Vec::new());
+        let block = |hold| holds.lock().unwrap().push(hold);
+        assert_eq!(
+            session_end_message(&state, WM_QUERYENDSESSION, 0, block),
+            Some(1)
+        );
+        assert_eq!(
+            session_end_message(&state, WM_ENDSESSION, 0, block),
+            Some(0)
+        );
+        assert_eq!(ended.load(Ordering::SeqCst), 0, "the logoff was vetoed");
+        assert_eq!(*holds.lock().unwrap(), [true, false]);
+        assert_eq!(session_end_message(&state, WM_CLOSE, 0, block), None);
+    }
+
+    #[test]
+    fn the_session_end_stops_the_host_and_holds_until_it_finished() {
+        let ended = Arc::new(AtomicUsize::new(0));
+        let state = Arc::new(end_state(ended.clone()));
+        let holds = Mutex::new(Vec::new());
+        let block = |hold| holds.lock().unwrap().push(hold);
+        assert_eq!(
+            session_end_message(&state, WM_QUERYENDSESSION, 0, block),
+            Some(1)
+        );
+        assert_eq!(ended.load(Ordering::SeqCst), 0, "asking does not stop");
+        let finisher = {
+            let state = state.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(200));
+                *state.done.lock().unwrap() = true;
+                state.finished.notify_all();
+            })
+        };
+        let started = std::time::Instant::now();
+        assert_eq!(
+            session_end_message(&state, WM_ENDSESSION, 1, block),
+            Some(0)
+        );
+        finisher.join().unwrap();
+        assert_eq!(ended.load(Ordering::SeqCst), 1);
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "held until finished"
+        );
+        assert!(
+            started.elapsed() < state.budget,
+            "released by the host, not the budget"
+        );
+        assert_eq!(*holds.lock().unwrap(), [true, true, false]);
+    }
 
     /// A restricted Medium copy of an elevated administrator token (what a
     /// non-elevated UI of the same admin looks like on the runner, where

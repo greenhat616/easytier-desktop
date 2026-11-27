@@ -113,8 +113,11 @@ cargo xtask dist --bin-dir target/debug --cores target/debug/cores/2.7.1 --out o
    payload paths, one component per kernel file, `packaging/assets/icons/app.ico` as the
    Add/Remove Programs icon) and, unless `--dry-run`, runs
    `wix build -acceptEula wix7 -arch x64 -ext WixToolset.Util.wixext` (WiX 7.0.1 required,
-   `CREATE_NO_WINDOW`) into `easytier-desktop-<version>-<arch>.msi`. Linux comes with PK4
-   (`dist/linux.rs`); other targets fail.
+   `CREATE_NO_WINDOW`) into `easytier-desktop-<version>-<arch>.msi`. On Linux
+   (`dist/linux.rs`) it renders the maintainer scripts and
+   `packaging/linux/nfpm.yaml.tmpl` into `<out>/<triple>/` and, unless `--dry-run`, runs
+   nfpm 2.49.0 once per format into a `.deb`, an `.rpm` and a `.pkg.tar.zst`. Other
+   targets fail.
 4. Runs the sign hook; `none`, the only one, leaves the package unsigned.
 
 | Option | Effect |

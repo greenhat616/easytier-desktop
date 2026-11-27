@@ -8,7 +8,7 @@
 //! explicitly with `-acceptEula wix7` (msg#1468); without it the build fails
 //! with WIX7015.
 
-use super::Payload;
+use super::{Payload, placeholders};
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -112,28 +112,6 @@ fn render(template: &str, payload: &Payload, payload_dir: &str, icon: &str) -> R
         text = text.replace(placeholder, &value);
     }
     Ok(text)
-}
-
-/// Every `@NAME@` token (capital letters and underscores) in `template`.
-fn placeholders(template: &str) -> BTreeSet<&str> {
-    let mut found = BTreeSet::new();
-    let mut rest = template;
-    while let Some(start) = rest.find('@') {
-        let after = &rest[start + 1..];
-        match after.find('@') {
-            Some(end)
-                if end > 0
-                    && after[..end]
-                        .bytes()
-                        .all(|b| b.is_ascii_uppercase() || b == b'_') =>
-            {
-                found.insert(&rest[start..start + end + 2]);
-                rest = &after[end + 1..];
-            }
-            _ => rest = after,
-        }
-    }
-    found
 }
 
 /// The PE optional header's Subsystem field: 2 is the Windows GUI, 3 the

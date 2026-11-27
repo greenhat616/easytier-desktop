@@ -1,0 +1,91 @@
+# EasyTier Desktop Linux packages (PK4, doc#16 v2). `cargo xtask dist`
+# renders this file into <out>/<triple>/nfpm.yaml: it fills in the at-sign
+# placeholders (version, architecture, payload folder, kernel files,
+# maintainer scripts) and runs nfpm once per format (deb, rpm, archlinux).
+#
+# The package owns only /usr/lib/easytier-desktop, the two /usr/bin links,
+# the desktop entry and the icons. The systemd unit, the protected folder
+# /usr/local/lib/easytier-desk, the easytier-desk group and the state belong
+# to etd-host, which the maintainer scripts run (scripts/maintainer.sh); no
+# unit file is packaged.
+name: easytier-desktop
+arch: @ARCH@
+platform: linux
+version: @VERSION@
+release: 1
+section: net
+priority: optional
+maintainer: EasyTier Desktop
+vendor: EasyTier Desktop
+homepage: https://github.com/greenhat616/easytier-desktop
+license: LGPL-3.0-or-later
+description: |-
+  Desktop client for EasyTier mesh networks.
+  A GUI (etd-ui), a command line client (etd-ctl) and a system service
+  (etd-host) that runs the pinned EasyTier kernel. Installing the package
+  installs and starts the service; removing it uninstalls the service.
+
+contents:
+  - src: "@PAYLOAD@/etd-ui"
+    dst: /usr/lib/easytier-desktop/etd-ui
+    file_info:
+      mode: 0755
+  - src: "@PAYLOAD@/etd-host"
+    dst: /usr/lib/easytier-desktop/etd-host
+    file_info:
+      mode: 0755
+  - src: "@PAYLOAD@/etd-ctl"
+    dst: /usr/lib/easytier-desktop/etd-ctl
+    file_info:
+      mode: 0755
+@CORE_CONTENTS@
+  - src: /usr/lib/easytier-desktop/etd-ui
+    dst: /usr/bin/easytier-desktop
+    type: symlink
+  - src: /usr/lib/easytier-desktop/etd-ctl
+    dst: /usr/bin/etd-ctl
+    type: symlink
+  - src: "@ROOT@/packaging/linux/easytier-desktop.desktop"
+    dst: /usr/share/applications/easytier-desktop.desktop
+    file_info:
+      mode: 0644
+@ICON_CONTENTS@
+
+overrides:
+  deb:
+    depends:
+@DEB_DEPENDS@
+    # etd-ui draws with Vulkan: the loader is a dependency, a driver (ICD)
+    # is recommended (vulkan-icd is Debian's virtual package for one).
+    recommends:
+      - "mesa-vulkan-drivers | vulkan-icd"
+    scripts:
+      preinstall: "@SCRIPTS@/deb-preinstall.sh"
+      postinstall: "@SCRIPTS@/deb-postinstall.sh"
+      preremove: "@SCRIPTS@/deb-preremove.sh"
+  rpm:
+    depends:
+@RPM_DEPENDS@
+    recommends:
+      - mesa-vulkan-drivers
+    scripts:
+      preinstall: "@SCRIPTS@/rpm-preinstall.sh"
+      postinstall: "@SCRIPTS@/rpm-postinstall.sh"
+      preremove: "@SCRIPTS@/rpm-preremove.sh"
+  archlinux:
+    depends:
+@ARCH_DEPENDS@
+    # nfpm writes these as optdepends.
+    recommends:
+      - "vulkan-driver: a Vulkan driver to draw the window"
+    scripts:
+      postinstall: "@SCRIPTS@/arch-postinstall.sh"
+      preremove: "@SCRIPTS@/arch-preremove.sh"
+
+archlinux:
+  packager: EasyTier Desktop
+  scripts:
+    postupgrade: "@SCRIPTS@/arch-postupgrade.sh"
+
+rpm:
+  summary: Desktop client for EasyTier mesh networks

@@ -84,7 +84,12 @@ enum Action {
     },
     /// Replace the installed service with this build, keeping its state
     /// (requires administrator privileges; run from the new payload).
-    Upgrade,
+    Upgrade {
+        /// Upgrade only an installation recorded with this owner; with none
+        /// or another owner, do nothing and succeed (a package's hook).
+        #[arg(long, value_name = "TAG", value_parser = owner_tag)]
+        only_owner: Option<String>,
+    },
     /// Stop, reclaim and remove the installed service.
     Uninstall {
         /// Report the durable uninstall phase and deferred worker outcome.
@@ -200,7 +205,9 @@ fn execute(cli: Cli) -> Result<()> {
         Action::Install { allow_user, owner } => {
             run_bounded(runtime, host::install(&allow_user, owner)).0
         }
-        Action::Upgrade => run_bounded(runtime, host::upgrade::upgrade()).0,
+        Action::Upgrade { only_owner } => {
+            run_bounded(runtime, host::upgrade::upgrade(only_owner.as_deref())).0
+        }
         Action::Uninstall {
             status,
             wait_parent,
@@ -344,5 +351,10 @@ mod tests {
             Cli::try_parse_from(["etd-host", "uninstall", "--only-owner", code, "--status"])
                 .is_err()
         );
+        let cli = Cli::try_parse_from(["etd-host", "upgrade", "--only-owner", code]).unwrap();
+        assert!(
+            matches!(cli.command, Some(Action::Upgrade { only_owner: Some(ref o) }) if o == code)
+        );
+        assert!(Cli::try_parse_from(["etd-host", "upgrade", "--only-owner", "a b"]).is_err());
     }
 }

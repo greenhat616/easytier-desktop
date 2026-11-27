@@ -1,0 +1,3 @@
+# Package scripts, the desktop entry and the nfpm definition are used on Linux
+# as they are checked out: keep LF line endings on every platform.
+packaging/linux/** text eol=lf

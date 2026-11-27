@@ -58,6 +58,8 @@ jobs:
           - os: windows-latest
             suite: msi
           - os: ubuntu-latest
+            suite: deb
+          - os: ubuntu-latest
             suite: takeover
           - os: macos-latest
             suite: takeover
@@ -102,6 +104,16 @@ jobs:
           filter = 'test(=installed_kernel_and_host_crash_recovery) | test(=installed_network_uninstall_restores_machine) | test(=service_stop_with_a_running_network_is_bounded) | test(=msi_installs_upgrades_rolls_back_and_uninstalls)'
           slow-timeout = { period = "120s", terminate-after = 15 }
           '@ | Add-Content -LiteralPath .config/nextest.toml
+      - name: Allow for the Debian package lifecycle
+        if: matrix.suite == 'deb'
+        shell: bash
+        run: |
+          cat >> .config/nextest.toml <<'EOF'
+
+          [[profile.privileged.overrides]]
+          filter = 'test(=deb_installs_upgrades_rolls_back_and_purges)'
+          slow-timeout = { period = "120s", terminate-after = 15 }
+          EOF
       - name: Allow for the takeover generations and native cleanup
         if: matrix.suite == 'takeover'
         shell: bash
@@ -163,6 +175,78 @@ jobs:
             cargo xtask dist --bin-dir $bin --cores target/debug/cores/2.7.1 --out $out --package-version $version --allow-test-fixtures
             "ETD_MSI_$name=$out/x86_64-pc-windows-msvc/easytier-desktop-$version-x86_64.msi" >> $env:GITHUB_ENV
           }
+      # Test packages only, as for the MSIs above.
+      - name: Build the test Debian packages (nfpm 2.49.0)
+        if: matrix.suite == 'deb'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # etd-ui's GUI build libraries, as in ci.yml.
+          bash .github/scripts/install-ubuntu-packages.sh build-essential clang cmake pkg-config \
+            libfontconfig1-dev libfreetype6-dev libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev libxcb-dri3-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libwayland-dev libvulkan-dev
+          cargo build --locked -p etd-host --features etd-sysfx-os/ci-test-fixtures
+          cargo build --locked -p etd-ui
+          curl -fsSL -o "$RUNNER_TEMP/nfpm.tar.gz" \
+            https://github.com/goreleaser/nfpm/releases/download/v2.49.0/nfpm_2.49.0_Linux_x86_64.tar.gz
+          echo "2afaa5ffb5e3493402e31e7c67a5a1fb42133e3f66fc315ca0051934125561c7  $RUNNER_TEMP/nfpm.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/nfpm" && tar -xzf "$RUNNER_TEMP/nfpm.tar.gz" -C "$RUNNER_TEMP/nfpm" nfpm
+          export PATH="$RUNNER_TEMP/nfpm:$PATH"
+          echo "$RUNNER_TEMP/nfpm" >> "$GITHUB_PATH"
+          # The libraries the binaries link and the packages that ship them,
+          # then the library names they hold for loading at run time (the
+          # Depends lists in xtask/src/dist/linux.rs come from this).
+          for bin in etd-ui etd-host etd-ctl; do
+            echo "== $bin linked"
+            ldd "target/debug/$bin" | awk '/=>/ {print $3}' | sort -u | while read -r lib; do
+              echo "$lib $(dpkg -S "$(readlink -f "$lib")" 2>/dev/null | cut -d: -f1 | head -n1)"
+            done
+            echo "== $bin loadable"
+            { grep -aoE 'lib[A-Za-z0-9_+-]+\.so(\.[0-9]+)*' "target/debug/$bin" || true; } | sort -u | tr '\n' ' '
+            echo
+          done
+          # The fixture build carries the marker: dist must refuse it unless allowed.
+          if refused=$(cargo xtask dist --dry-run --bin-dir target/debug --cores target/debug/cores/2.7.1 \
+                --out "$RUNNER_TEMP/deb-refused" 2>&1); then
+            echo "dist packaged a ci-test-fixtures etd-host: $refused"; exit 1
+          fi
+          grep -q 'built with ci-test-fixtures' <<<"$refused"
+          for package in A:0.1.0 B:0.1.1 C:0.1.2; do
+            name=${package%%:*} version=${package#*:}
+            bin="$RUNNER_TEMP/deb-bin-$name"
+            mkdir -p "$bin"
+            cp target/debug/etd-ui target/debug/etd-host target/debug/etd-ctl "$bin/"
+            # A distinct host image per package: bytes appended to the ELF.
+            printf '\0etd-deb-%s' "$name" >> "$bin/etd-host"
+            out="$RUNNER_TEMP/deb-$name"
+            cargo xtask dist --bin-dir "$bin" --cores target/debug/cores/2.7.1 --out "$out" \
+              --package-version "$version" --allow-test-fixtures
+            echo "ETD_DEB_$name=$out/x86_64-unknown-linux-gnu/easytier-desktop_${version}-1_amd64.deb" >> "$GITHUB_ENV"
+          done
+          deb="$RUNNER_TEMP/deb-A/x86_64-unknown-linux-gnu/easytier-desktop_0.1.0-1_amd64.deb"
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+          out="$RUNNER_TEMP/deb-A/x86_64-unknown-linux-gnu"
+          arch="$out/easytier-desktop-0.1.0-1-x86_64.pkg.tar.zst"
+          # Every packaged path is root's, and every folder is 0755 (the
+          # installed modes are checked by the deb suite).
+          check_listing() {
+            awk -v what="$1" '
+              $2 != "root/root" && $2 != "0/0" { print what ": not root-owned: " $0; bad = 1 }
+              /^d/ && $1 != "drwxr-xr-x" { print what ": folder mode: " $0; bad = 1 }
+              END { exit bad }'
+          }
+          dpkg-deb --contents "$deb" | check_listing deb
+          tar --zstd -tvf "$arch" | check_listing arch
+          # Every Debian dependency must resolve; install them now so the
+          # package's own install adds nothing else to the machine.
+          depends=$(dpkg-deb -f "$deb" Depends | sed -E 's/\([^)]*\)//g' | tr -d ' ' | tr ',' ' ')
+          bash .github/scripts/install-ubuntu-packages.sh $depends
+          # The other formats build and carry the expected hooks.
+          ls -l "$out"
+          tar --zstd -xOf "$arch" .INSTALL
+          tar --zstd -xOf "$arch" .PKGINFO
       - name: Compile runner as the build user
         run: cargo nextest list --locked --profile privileged --run-ignored only -p etd-testkit --test tier3
       - name: Installed service tests (administrator)
@@ -200,11 +284,12 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         env:
-          ETD_G2_FILTER: ${{ matrix.suite == 'takeover' && 'test(/^takeover_/)' || 'not test(/^takeover_/)' }}
+          ETD_G2_FILTER: ${{ matrix.suite == 'takeover' && 'test(/^takeover_/)' || matrix.suite == 'deb' && 'test(=deb_installs_upgrades_rolls_back_and_purges)' || 'not test(/^takeover_/) and not test(=deb_installs_upgrades_rolls_back_and_purges)' }}
         run: |
           cargo nextest archive --locked -p etd-testkit --test tier3 --archive-file "$RUNNER_TEMP/tier3.tar.zst"
           sudo env "PATH=$PATH" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}" "RUNNER_TEMP=$RUNNER_TEMP" "GITHUB_WORKSPACE=$GITHUB_WORKSPACE" \
             "ETD_G2_CI=$ETD_G2_CI" "GITHUB_ACTIONS=$GITHUB_ACTIONS" "RUNNER_ENVIRONMENT=$RUNNER_ENVIRONMENT" \
             "ETD_G2_PYTHON=$ETD_G2_PYTHON" "ETD_G2_BIN=$ETD_G2_BIN" "ETD_G2_SHA=$ETD_G2_SHA" \
+            "ETD_DEB_A=${ETD_DEB_A:-}" "ETD_DEB_B=${ETD_DEB_B:-}" "ETD_DEB_C=${ETD_DEB_C:-}" \
             "$(command -v cargo-nextest)" nextest run --profile privileged --run-ignored only --archive-file "$RUNNER_TEMP/tier3.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" -E "$ETD_G2_FILTER" --no-fail-fast --success-output immediate

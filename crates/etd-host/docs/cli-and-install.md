@@ -171,7 +171,11 @@ Administrator only. `--allow-user` takes account SIDs on Windows (`S-1-5-21-<dom
 with RID 1000 or above; groups and well-known SIDs are refused) or UIDs on Unix; each
 becomes an admin allow-list entry. `--owner <tag>` (1 to 64 letters, digits, braces,
 hyphens, underscores or dots) records who installed in the journal, with its first
-write; the MSI passes its ProductCode (see `uninstall --only-owner`).
+write; the MSI passes its ProductCode (see `uninstall --only-owner`). With `--owner`, a
+completed installation recorded with that same owner is resumed instead of refused: the
+command starts the service, waits for it to serve, and leaves the allow list as
+recorded. A package hook retried after its install registered the service converges
+this way. No owner, or another one, never takes an existing installation over.
 
 1. Take the maintenance lock. An existing journal must be in phase `Installing` (an
    interrupted install, which is rolled back first); anything else refuses.
@@ -218,6 +222,10 @@ Any failure before `Installed` rolls back the journaled resources; if the rollba
 itself fails the message says to retry `uninstall`.
 
 ## `upgrade`
+
+`upgrade --only-owner <tag>` upgrades only an installation whose journal records that
+owner; with no journal or another owner it changes nothing and succeeds. The Linux
+packages' hooks use it so that they never take over a service another installer made.
 
 Administrator only. Run it from the new installation payload (the new `etd-host`
 with its bundled `cores/` beside it), never from the installed image, which it

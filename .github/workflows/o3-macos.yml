@@ -9,6 +9,9 @@ on:
       - 'Cargo.lock'
       - 'packaging/cores.toml'
       - 'rust-toolchain.toml'
+      - 'mise.toml'
+      - 'mise.lock'
+      - '.github/actions/setup-tools/**'
       - '.cargo/**'
       - '.config/**'
       - '.github/scripts/**'
@@ -33,15 +36,12 @@ jobs:
       ETD_HOST_CI_INSTALL: '1'
     steps:
       - uses: actions/checkout@v7.0.1
-      - name: Install pinned protoc
-        shell: pwsh
-        run: ./.github/scripts/setup-protoc.ps1
+      - uses: ./.github/actions/setup-tools
+        with:
+          tools: protoc cargo-nextest
       - uses: Swatinem/rust-cache@v2.9.3
         with:
           save-if: 'false'
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@0.9.152
       - name: Fetch the release kernel beside the host image
         run: cargo xtask fetch-cores --target host --bundle target/debug/cores
       - name: Build tests as the runner

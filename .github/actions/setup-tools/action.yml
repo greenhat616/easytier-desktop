@@ -1,0 +1,37 @@
+name: Set up locked development tools
+description: Install the tools a job uses and expose their binary paths to subprocesses.
+inputs:
+  tools:
+    description: Space-separated tool names from mise.toml.
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: jdx/mise-action@924e7c586e33d7d4bae9c14e26c5d22e2beb6e78 # v5.3.0
+      with:
+        version: 2026.11.14
+        install_args: --locked ${{ inputs.tools }}
+        add_shims_to_path: false
+        cache: false
+    - name: Verify the lock and export real binary paths
+      shell: pwsh
+      env:
+        REQUESTED_TOOLS: ${{ inputs.tools }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $PSNativeCommandUseErrorActionPreference = $true
+        mise lock --check
+        $tools = $env:REQUESTED_TOOLS.Split(' ', [StringSplitOptions]::RemoveEmptyEntries)
+        mise bin-paths @tools >> $env:GITHUB_PATH
+        if ('protoc' -in $tools) {
+          $protoc = mise which protoc
+          $include = Join-Path (mise where protoc) 'include'
+          if (!(Test-Path -LiteralPath (Join-Path $include 'google/protobuf/descriptor.proto') -PathType Leaf)) {
+            throw 'Missing protobuf well-known types'
+          }
+          & $protoc --version
+          $descriptor = Join-Path $env:RUNNER_TEMP 'well-known-types.pb'
+          & $protoc "--proto_path=$include" "--descriptor_set_out=$descriptor" 'google/protobuf/descriptor.proto'
+          "PROTOC=$protoc" >> $env:GITHUB_ENV
+          "PROTOC_INCLUDE=$include" >> $env:GITHUB_ENV
+        }

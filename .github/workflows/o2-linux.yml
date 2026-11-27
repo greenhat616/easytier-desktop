@@ -9,6 +9,9 @@ on:
       - 'Cargo.lock'
       - 'packaging/cores.toml'
       - 'rust-toolchain.toml'
+      - 'mise.toml'
+      - 'mise.lock'
+      - '.github/actions/setup-tools/**'
       - '.cargo/**'
       - '.config/**'
       - '.github/scripts/**'
@@ -32,15 +35,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y nftables iproute2 libdbus-1-dev
-      - name: Install pinned protoc
-        shell: pwsh
-        run: ./.github/scripts/setup-protoc.ps1
+      - uses: ./.github/actions/setup-tools
+        with:
+          tools: protoc cargo-nextest
       - uses: Swatinem/rust-cache@v2.9.3
         with:
           save-if: 'false'
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@0.9.152
       - run: cargo nextest list --locked --profile privileged -p etd-sysfx-os --run-ignored only --test linux_reclaim --test linux_fence
       - name: Real links, resolved, and nftables
         shell: bash
@@ -77,9 +77,9 @@ jobs:
         image: ['debian:12', 'quay.io/fedora/fedora:44']
     steps:
       - uses: actions/checkout@v7.0.1
-      - name: Install pinned protoc
-        shell: pwsh
-        run: ./.github/scripts/setup-protoc.ps1
+      - uses: ./.github/actions/setup-tools
+        with:
+          tools: protoc
       - uses: Swatinem/rust-cache@v2.9.3
         with:
           save-if: 'false'

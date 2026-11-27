@@ -13,7 +13,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window,
     base::{
         Button as BaseButton, LayoutDirection, LogicalStyledExt as _, Switch as BaseSwitch,
-        SwitchThumb, SwitchTrack, spring,
+        SwitchThumb, SwitchTrack,
     },
     component::{
         ActiveTheme as _, Collapsible, Disableable as _, FocusableExt as _, Icon, Selectable as _,
@@ -36,6 +36,7 @@ pub struct BtnStyle {
     pub icon: Option<&'static str>,
     selected: bool,
     icon_only: bool,
+    full_width: bool,
 }
 
 impl BtnStyle {
@@ -49,7 +50,15 @@ impl BtnStyle {
             icon: None,
             selected: false,
             icon_only: false,
+            full_width: false,
         }
+    }
+
+    /// Stretches the button across its container, as ContentDialog's
+    /// equal-width buttons are.
+    pub const fn full_width(mut self) -> Self {
+        self.full_width = true;
+        self
     }
 
     pub const fn icon(mut self, asset: &'static str) -> Self {
@@ -111,6 +120,47 @@ fn action_button_inner(
         on_click,
     }
     .into_any_element()
+}
+
+type FocusBuilder = Box<dyn FnOnce(&FocusHandle) -> AnyElement>;
+
+/// Gives a control drawn from plain elements WinUI keyboard focus: a Tab
+/// stop that `build` attaches with `track_focus` (Enter and Space then fire
+/// the element's click handlers), and the focus visual around it while it
+/// has keyboard focus. The handle is kept per `key`.
+#[inline(never)]
+pub fn keyboard_focus(
+    key: impl Into<ElementId>,
+    build: impl FnOnce(&FocusHandle) -> AnyElement + 'static,
+) -> AnyElement {
+    KeyboardFocus {
+        key: key.into(),
+        build: Box::new(build),
+    }
+    .into_any_element()
+}
+
+#[derive(IntoElement)]
+struct KeyboardFocus {
+    key: ElementId,
+    build: FocusBuilder,
+}
+
+impl RenderOnce for KeyboardFocus {
+    #[inline(never)]
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let focus = window
+            .use_keyed_state((self.key, "fluent-tab-focus"), cx, |_, cx| {
+                cx.focus_handle().tab_stop(true)
+            })
+            .read(cx)
+            .clone();
+        let focused = focus.is_focused(window);
+        div()
+            .relative()
+            .child((self.build)(&focus))
+            .children(focus_visual(focused, window, cx))
+    }
 }
 
 /// App-owned, keyboard-only WinUI focus treatment. The outer 2px line
@@ -199,6 +249,21 @@ impl gpui::RenderOnce for FluentButton {
         if style.icon_only {
             btn = btn.w(height).min_w(height).px_0().py_0();
         }
+        if style.full_width {
+            btn = btn.w_full();
+        }
+        // WinUI AccentButtonBackgroundDisabled is AccentFillColorDisabled
+        // (#37000000 / #28FFFFFF) with TextOnAccentFillColorDisabled, a
+        // neutral fill, not the Kit's 15 % tint of the accent.
+        if style.disabled && !style.loading && style.variant == ButtonVariant::Primary {
+            btn = btn
+                .bg(crate::theme::accent_fill(
+                    crate::theme::ControlState::Disabled,
+                    cx,
+                ))
+                .border_color(cx.theme().transparent)
+                .text_color(crate::theme::text_on_accent_disabled(cx));
+        }
         if style.selected && style.variant == ButtonVariant::Ghost {
             btn = btn.bg(crate::theme::subtle_fill_secondary(cx));
         }
@@ -250,8 +315,11 @@ impl gpui::RenderOnce for FluentButton {
                 style.variant,
                 ButtonVariant::Ghost | ButtonVariant::Link | ButtonVariant::Text
             );
-        div()
-            .relative()
+        let mut frame = div().relative();
+        if style.full_width {
+            frame = frame.w_full();
+        }
+        frame
             .group(group)
             .child(btn)
             .children(elevate.then(|| button_elevation_line(cx)))
@@ -448,10 +516,13 @@ impl RenderOnce for FluentAlignedRow {
         } else {
             self.label.clone()
         };
+        // BodyTextBlockStyle 14/20: an explicit line box keeps descenders
+        // of Segoe UI Variable inside truncate()'s overflow clip.
         let label = div()
             .min_w_0()
             .truncate()
             .text_size(px(14.))
+            .line_height(px(20.))
             .child(self.label);
         let btn = BaseButton::new(self.id)
             .track_focus(&focus)
@@ -512,6 +583,21 @@ pub fn text_field(
     disabled: bool,
     cx: &App,
 ) -> AnyElement {
+    text_field_with_suffix(label, id, aria_label, state, disabled, None, cx)
+}
+
+/// [`text_field`] with `suffix` inside the box after the text; the text
+/// stops before it.
+#[inline(never)]
+pub fn text_field_with_suffix(
+    label: &str,
+    id: &'static str,
+    aria_label: &'static str,
+    state: &Entity<InputState>,
+    disabled: bool,
+    suffix: Option<AnyElement>,
+    cx: &App,
+) -> AnyElement {
     let fg = cx.theme().foreground;
     let input = FluentInput {
         id,
@@ -519,13 +605,21 @@ pub fn text_field(
         state: state.clone(),
         disabled,
         password: false,
+        suffix,
     }
     .into_any_element();
+    // TextBoxTopHeaderMargin 0,0,0,8; the header is BodyTextBlock 14/20.
     div()
         .flex()
         .flex_col()
-        .gap_1()
-        .child(div().text_sm().text_color(fg).child(label.to_owned()))
+        .gap(px(8.))
+        .child(
+            div()
+                .text_size(px(14.))
+                .line_height(px(20.))
+                .text_color(fg)
+                .child(label.to_owned()),
+        )
         .child(input)
         .into_any_element()
 }
@@ -544,6 +638,7 @@ pub fn password_input(
         state: state.clone(),
         disabled,
         password: true,
+        suffix: None,
     }
     .into_any_element()
 }
@@ -555,27 +650,77 @@ struct FluentInput {
     state: Entity<InputState>,
     disabled: bool,
     password: bool,
+    /// Content inside the box after the text, such as NumberBox's spin buttons.
+    suffix: Option<AnyElement>,
 }
 
 impl RenderOnce for FluentInput {
+    /// WinUI TextBox (TextBox_themeresources.xaml): 4 px corners, a 1 px
+    /// `ControlStrokeColorDefault` frame whose bottom edge is
+    /// `ControlStrongStrokeColorDefault` (`TextControlElevationBorderBrush`);
+    /// focused, the bottom becomes a 2 px accent line
+    /// (`TextControlBorderThemeThicknessFocused` 1,1,1,2). The accent line is
+    /// the keyboard focus indicator, as in WinUI; no extra focus rectangle.
     #[inline(never)]
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let focus = self.state.read(cx).focus_handle(cx);
         let focused = focus.is_focused(window);
+        let hover = window.use_keyed_state(
+            (ElementId::from(self.id), "fluent-textbox-hover"),
+            cx,
+            |_, _| false,
+        );
+        let hovered = *hover.read(cx);
+        let fill = crate::theme::text_control_fill(focused, hovered, self.disabled, cx);
         let mut input = Input::new(&self.state)
             .id(self.id)
             .aria_label(self.aria_label)
             .disabled(self.disabled)
             .focus_ring(false)
-            .bg(crate::theme::text_control_fill(focused, self.disabled, cx));
+            .rounded(px(4.))
+            .border_color(crate::theme::control_stroke(cx))
+            .bg(fill);
         if self.password {
             input = input.content_type(InputContentType::Password).mask_toggle();
         }
+        let underline = (!self.disabled).then(|| {
+            let (height, color) = if focused {
+                (px(2.), cx.theme().primary)
+            } else {
+                (px(1.), crate::theme::control_strong_stroke(cx))
+            };
+            // Full width: the frame's 4 px corners clip it, so it follows
+            // the bottom corner curve as WinUI's bottom border does.
+            div()
+                .id("fluent-textbox-underline")
+                .test_support()
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .h(height)
+                .bg(color)
+        });
+        if let Some(suffix) = self.suffix {
+            input = input.suffix(suffix);
+        }
         div()
+            .id(SharedString::from(format!("{}-frame", self.id)))
             .relative()
             .w_full()
+            .rounded(px(4.))
+            .overflow_hidden()
+            .on_hover(move |hovered, window, cx| {
+                hover.update(cx, |value, cx| {
+                    if *value != *hovered {
+                        *value = *hovered;
+                        cx.notify();
+                    }
+                });
+                window.refresh();
+            })
             .child(input)
-            .children(focus_visual(focused, window, cx))
+            .children(underline)
     }
 }
 
@@ -605,6 +750,29 @@ pub fn fluent_switch(
         label: label.into(),
         checked,
         disabled,
+        content_first: false,
+        on_change: Box::new(on_change),
+    }
+    .into_any_element()
+}
+
+/// ToggleSwitch as the Community Toolkit's SettingsCard shows it
+/// (RightAlignedCompactToggleSwitchStyle): the On/Off content sits before
+/// the switch, 12 px from it, and the whole control aligns to the end.
+#[inline(never)]
+pub fn settings_switch(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    checked: bool,
+    disabled: bool,
+    on_change: impl Fn(&bool, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    FluentSwitch {
+        id: id.into(),
+        label: label.into(),
+        checked,
+        disabled,
+        content_first: true,
         on_change: Box::new(on_change),
     }
     .into_any_element()
@@ -618,6 +786,8 @@ struct FluentSwitch {
     label: SharedString,
     checked: bool,
     disabled: bool,
+    /// Content before the switch, as in a SettingsCard.
+    content_first: bool,
     on_change: SwitchHandler,
 }
 
@@ -661,17 +831,18 @@ impl RenderOnce for FluentSwitch {
         let focus = focus_for(&id, window, cx);
         let paint = switch_paint(checked, disabled, cx);
         let thumb_size = px(12.);
-        let thumb_x = spring(
-            (id.clone(), "fluent-thumb"),
-            if checked {
-                px(40.) - thumb_size - px(6.)
-            } else {
-                px(0.)
-            },
-            cx.theme().motion_tokens().spring_move,
+        // WinUI slides the knob with RepositionThemeAnimation, whose timing
+        // comes from Windows' animation tables rather than the WinUI source;
+        // ControlNormalAnimationDuration on ControlFastOutSlowInKeySpline
+        // stands in for it. Reduced motion moves the knob at once.
+        let thumb_x = px(gpui_kit::base::transition(
+            SharedString::from(format!("{id:?}-fluent-thumb")),
+            if checked { 40. - 12. - 6. } else { 0. },
+            gpui_kit::base::Transition::new(crate::views::motion::NORMAL)
+                .ease(crate::views::motion::fast_out_slow_in),
             window,
             cx,
-        );
+        ));
         let group = SharedString::from(format!("fluent-switch:{id:?}"));
         let rtl = LayoutDirection::global(cx).is_rtl();
         let mut thumb = div()
@@ -738,9 +909,9 @@ impl RenderOnce for FluentSwitch {
             .flex()
             .flex_row()
             .items_center()
-            .gap_2()
+            .gap(px(if self.content_first { 12. } else { 8. }))
             .text_sm();
-        if rtl {
+        if rtl != self.content_first {
             switch = switch.flex_row_reverse();
         }
         switch
@@ -877,7 +1048,12 @@ impl SidebarItem for FluentNavItem {
                 }),
         );
         if !collapsed {
-            let label = div().min_w_0().truncate().child(self.label);
+            let label = div()
+                .min_w_0()
+                .truncate()
+                .text_size(px(14.))
+                .line_height(px(20.))
+                .child(self.label);
             btn = btn.child(if selected {
                 label.font_semibold()
             } else {

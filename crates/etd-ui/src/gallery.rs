@@ -1,6 +1,8 @@
 //! Interactive, host-free specimen view of the same Fluent wrappers used
 //! by the desktop. All activation is in-memory; no bridge, tray, services,
 //! network profiles or production preferences are opened.
+mod pages;
+
 use crate::{
     assets::FluentAssets,
     preferences::ThemePreference,
@@ -65,10 +67,23 @@ pub fn run() {
         });
 }
 
+/// Gallery pages, grouped like WinUI Gallery's navigation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Page {
+    Controls,
+    Settings,
+    BasicInput,
+    Menus,
+    Dialogs,
+    Navigation,
+    Layout,
+}
+
 struct Gallery {
     toggles: [bool; 2],
     inputs: [Entity<InputState>; 3],
-    nav_selected: usize,
+    page: Page,
+    demo: pages::DemoState,
     list_selected: usize,
     collapsed: bool,
     closed: [bool; 4],
@@ -89,7 +104,8 @@ impl Gallery {
         Self {
             toggles: [false, true],
             inputs: [normal, filled, secret],
-            nav_selected: 0,
+            page: Page::Controls,
+            demo: pages::DemoState::new(window, cx),
             list_selected: 1,
             collapsed: false,
             closed: [false; 4],
@@ -127,27 +143,79 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
                 .text_size(px(14.))
                 .child("Fluent gallery")
         }));
-    let first = FluentNavItem::new(
+    let nav = |page: Page,
+               id: &'static str,
+               label: &'static str,
+               icon: &'static str,
+               filled: &'static str,
+               cx: &mut Context<Gallery>| {
+        FluentNavItem::new(
+            id,
+            label,
+            icon,
+            filled,
+            view.page == page,
+            cx.listener(move |this, _, _, cx| {
+                this.page = page;
+                cx.notify();
+            }),
+        )
+    };
+    let first = nav(
+        Page::Controls,
         "gallery-nav-controls",
         "Controls",
         "fluent/globe.svg",
         "fluent/globe-filled.svg",
-        view.nav_selected == 0,
-        cx.listener(|this, _, _, cx| {
-            this.nav_selected = 0;
-            cx.notify();
-        }),
+        cx,
     );
-    let second = FluentNavItem::new(
-        "gallery-nav-other",
-        "Other item",
-        "fluent/shield.svg",
-        "fluent/shield-filled.svg",
-        view.nav_selected == 1,
-        cx.listener(|this, _, _, cx| {
-            this.nav_selected = 1;
-            cx.notify();
-        }),
+    let settings = nav(
+        Page::Settings,
+        "gallery-nav-settings",
+        "Settings",
+        "fluent/settings.svg",
+        "fluent/settings.svg",
+        cx,
+    );
+    let basic = nav(
+        Page::BasicInput,
+        "gallery-nav-basic-input",
+        "Basic input",
+        "fluent/checkmark-circle.svg",
+        "fluent/checkmark-circle-filled.svg",
+        cx,
+    );
+    let menus = nav(
+        Page::Menus,
+        "gallery-nav-menus",
+        "Menus & toolbars",
+        "fluent/more-horizontal.svg",
+        "fluent/more-horizontal.svg",
+        cx,
+    );
+    let dialogs = nav(
+        Page::Dialogs,
+        "gallery-nav-dialogs",
+        "Dialogs & flyouts",
+        "fluent/chat.svg",
+        "fluent/chat.svg",
+        cx,
+    );
+    let navigation = nav(
+        Page::Navigation,
+        "gallery-nav-navigation",
+        "Navigation",
+        "fluent/navigation.svg",
+        "fluent/navigation.svg",
+        cx,
+    );
+    let layout = nav(
+        Page::Layout,
+        "gallery-nav-layout",
+        "Layout",
+        "fluent/grid.svg",
+        "fluent/grid.svg",
+        cx,
     );
     let mut sidebar = Sidebar::new("gallery-sidebar")
         .w(px(220.))
@@ -157,7 +225,12 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
         .collapsed(view.collapsed)
         .header(header)
         .child(first)
-        .child(second);
+        .child(basic)
+        .child(menus)
+        .child(dialogs)
+        .child(navigation)
+        .child(layout)
+        .child(settings);
     if !view.collapsed {
         sidebar = sidebar.footer(div().w_full().child(theme_menu(cx)));
     }
@@ -484,24 +557,81 @@ fn gallery_notifications(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElemen
 }
 
 impl Render for Gallery {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let sidebar = gallery_sidebar(self, cx);
-        let buttons = gallery_buttons(cx);
-        let inputs = gallery_inputs(self, cx);
-        let lists = gallery_lists(self, cx);
-        let notifications = gallery_notifications(self, cx);
-        div().id("gallery-root").test_support().size_full().flex_row_dir(cx)
-            .bg(theme::chrome_fill(cx, cx.theme().background)).text_color(cx.theme().foreground)
+        let (title, body): (&str, Vec<AnyElement>) = match self.page {
+            Page::Controls => (
+                "Component gallery",
+                vec![
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Hover or hold an enabled sample, or press Tab then Space/Enter. Appearance is session-only. No host is used.")
+                        .into_any_element(),
+                    gallery_buttons(cx),
+                    gallery_inputs(self, cx),
+                    gallery_lists(self, cx),
+                    gallery_notifications(self, cx),
+                ],
+            ),
+            Page::Settings => ("Settings", pages::settings_page(self, cx)),
+            Page::BasicInput => ("Basic input", pages::basic_input_page(self, window, cx)),
+            Page::Menus => ("Menus & toolbars", pages::menus_page(self, cx)),
+            Page::Dialogs => ("Dialogs & flyouts", pages::dialogs_page(self, cx)),
+            Page::Navigation => ("Navigation", pages::navigation_page(self, cx)),
+            Page::Layout => ("Layout", pages::layout_page(self, window, cx)),
+        };
+        div()
+            .id("gallery-root")
+            .test_support()
+            .size_full()
+            .flex_row_dir(cx)
+            .bg(theme::chrome_fill(cx, cx.theme().background))
+            .text_color(cx.theme().foreground)
             .child(sidebar)
-            .child(div().flex_1().min_w_0().min_h_0().flex().flex_col()
-                .child(div().h(px(52.)).flex_shrink_0().flex_row_dir(cx).items_center().justify_between().px(px(24.))
-                    .child(div().font_semibold().text_size(px(24.)).child("Component gallery"))
-                    .child(div().text_sm().text_color(cx.theme().muted_foreground).child(format!("Local actions: {}", self.clicks))))
-                .child(div().id("gallery-scroll").test_support().flex_1().min_h_0().overflow_y_scroll()
-                    .bg(theme::content_layer(cx)).rounded_tl(px(8.)).border_t_1().border_l_1().border_color(theme::card_stroke(cx)).px(px(24.)).py_4().flex().flex_col().gap_4()
-                    .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                        .child("Hover or hold an enabled sample, or press Tab then Space/Enter. Appearance is session-only. No host is used."))
-                    .child(buttons).child(inputs).child(lists).child(notifications)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .h(px(52.))
+                            .flex_shrink_0()
+                            .flex_row_dir(cx)
+                            .items_center()
+                            .justify_between()
+                            .px(px(24.))
+                            .child(div().font_semibold().text_size(px(24.)).child(title))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("Local actions: {}", self.clicks)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("gallery-scroll")
+                            .test_support()
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .bg(theme::content_layer(cx))
+                            .rounded_tl(px(8.))
+                            .border_t_1()
+                            .border_l_1()
+                            .border_color(theme::card_stroke(cx))
+                            .px(px(24.))
+                            .py_4()
+                            .flex()
+                            .flex_col()
+                            .gap_4()
+                            .children(body),
+                    ),
+            )
     }
 }
 
@@ -510,11 +640,167 @@ mod tests {
     use super::*;
     use gpui_kit::{TestAppContext, test::TestWindowExt as _};
 
+    /// With motion allowed, popups and expanders linger for WinUI's exit
+    /// timings: a MenuFlyout fades for 83 ms, a ContentDialog for 83 ms and
+    /// an Expander's content slides up for 167 ms. An Expander that is open
+    /// when it first appears does not slide in.
+    #[gpui_kit::test]
+    fn gallery_motion_follows_winui_timing(cx: &mut TestAppContext) {
+        use std::time::Duration;
+        let (handle, _view) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            theme::install_palette(cx);
+            cx.set_reduce_motion(false);
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Default::default(),
+                        size: size(px(1440.), px(1300.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| Gallery::new(window, cx)),
+            )
+            .unwrap()
+        });
+        let step = |cx: &mut TestAppContext, ms: u64| {
+            cx.executor().advance_clock(Duration::from_millis(ms));
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        };
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("gallery-nav-menus", cx);
+            window.render_frame(cx);
+            window.click("menu-button", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        // The menu slides in over 250 ms.
+        step(cx, 300);
+        cx.update_window(handle, |_, window, cx| {
+            assert!(window.find("menu-flyout").visible());
+            window.press("escape", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 40);
+        cx.update_window(handle, |_, window, _| {
+            assert!(window.try_find("menu-flyout").is_some(), "menu fading out");
+        })
+        .unwrap();
+        step(cx, 60);
+        cx.update_window(handle, |_, window, _| {
+            assert!(
+                window.try_find("menu-flyout").is_none(),
+                "menu gone after 83 ms"
+            );
+        })
+        .unwrap();
+
+        cx.update_window(handle, |_, window, cx| {
+            window.click("gallery-nav-dialogs", cx);
+            window.render_frame(cx);
+            window.click("dialog-open", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 300);
+        cx.update_window(handle, |_, window, cx| {
+            window.click("dialog-secondary", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 40);
+        cx.update_window(handle, |_, window, _| {
+            assert!(
+                window.try_find("dialog-smoke").is_some(),
+                "dialog fading out"
+            );
+        })
+        .unwrap();
+        step(cx, 60);
+        cx.update_window(handle, |_, window, _| {
+            assert!(
+                window.try_find("dialog-smoke").is_none(),
+                "dialog gone after 83 ms"
+            );
+        })
+        .unwrap();
+
+        cx.update_window(handle, |_, window, cx| {
+            window.click("gallery-nav-layout", cx);
+            window.render_frame(cx);
+            // Open on arrival, so already in place.
+            let header = window.find("layout-expander-header").bounds();
+            let content = window.find("layout-expander-content").bounds();
+            assert_eq!(content.top(), header.bottom());
+            window.click("layout-expander-header", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 100);
+        cx.update_window(handle, |_, window, _| {
+            assert!(
+                window.try_find("layout-expander-content").is_some(),
+                "content sliding up"
+            );
+        })
+        .unwrap();
+        step(cx, 100);
+        cx.update_window(handle, |_, window, _| {
+            assert!(
+                window.try_find("layout-expander-content").is_none(),
+                "content gone after 167 ms"
+            );
+        })
+        .unwrap();
+        // The NavigationView indicator stretches towards the new item for
+        // 200 ms, then settles on it by 600 ms.
+        cx.update_window(handle, |_, window, cx| {
+            window.click("gallery-nav-navigation", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("nav-indicator").bounds().size.height, px(16.));
+            window.click("nav-item-4", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 200);
+        cx.update_window(handle, |_, window, _| {
+            // Items 0 to 4 are 160 px apart: the pill spans both.
+            assert!(window.find("nav-indicator").bounds().size.height > px(150.));
+        })
+        .unwrap();
+        step(cx, 450);
+        cx.update_window(handle, |_, window, _| {
+            let pill = window.find("nav-indicator").bounds();
+            let item = window.find("nav-item-4").bounds();
+            assert_eq!(pill.size.height, px(16.));
+            assert_eq!(pill.top(), item.top() + px(10.));
+        })
+        .unwrap();
+    }
+
     #[gpui_kit::test]
     fn gallery_exercises_controls_without_host(cx: &mut TestAppContext) {
+        fn tab_to(window: &mut gpui_kit::Window, id: &'static str, cx: &mut gpui_kit::App) {
+            for _ in 0..60 {
+                window.press("tab", cx);
+                window.render_frame(cx);
+                if window.find(id).focused() == Some(true) {
+                    return;
+                }
+            }
+            panic!("Tab never reached {id}");
+        }
         let (handle, view) = cx.update(|cx| {
             gpui_kit::init(cx);
             theme::install_palette(cx);
+            // Popups and expanders settle at once, as with Windows' animation
+            // effects off; `gallery_motion_follows_winui_timing` covers motion.
+            cx.set_reduce_motion(true);
             gpui_kit::open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds {
@@ -551,6 +837,317 @@ mod tests {
             assert!(window.try_find("gallery-info-actionbar-0").is_none());
             window.click("gallery-info-reopen-0", cx);
             assert!(window.find("gallery-info-actionbar-0").visible());
+            window.click("gallery-nav-settings", cx);
+            window.render_frame(cx);
+            assert!(window.find("settings-spatial").visible());
+            // SettingsCardMinHeight 68; a title plus description is taller.
+            assert!(window.find("settings-nav-style-card").bounds().size.height >= px(68.));
+            window.click("settings-sound-chevron", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("settings-spatial").is_none());
+            window.click("settings-app-theme", cx);
+            window.render_frame(cx);
+            window.click("settings-app-theme-item-2", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_app_theme(), 2);
+            assert!(window.try_find("settings-app-theme-popup").is_none());
+            window.click("gallery-nav-basic-input", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("basic-check-two").checked(), Some(true));
+            window.click("basic-check-two", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("basic-check-two").checked(), Some(false));
+            assert_eq!(window.find("basic-check-d1").disabled(), Some(true));
+            window.click("basic-radio-1", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("basic-radio-1").checked(), Some(true));
+            window.click("basic-number-Increase", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_number(cx).as_ref(), "13");
+            window.click("gallery-nav-menus", cx);
+            window.render_frame(cx);
+            window.click("menu-button", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("menu-hidden").checked(), Some(true));
+            window.click("menu-sort", cx);
+            window.render_frame(cx);
+            window.click("menu-sort-2", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("menu-flyout").is_none());
+            assert_eq!(view.read(cx).demo_last().as_ref(), "Sort by Size");
+            window.click("bar-preview", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("bar-preview").checked(), Some(true));
+            window.click("command-bar-more", cx);
+            window.render_frame(cx);
+            window.click("bar-refresh", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_last().as_ref(), "Refresh");
+        })
+        .unwrap();
+        // Closing the overflow menu gave focus back to its More button.
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("command-bar-more").focused(), Some(true));
+
+            // Keyboard: every control is a Tab stop that Enter or Space
+            // activates, and open flyouts take Up, Down and Escape.
+            tab_to(window, "menu-button", cx);
+            assert!(window.find("fluent-focus-visual").visible());
+            window.press("enter", cx);
+            window.render_frame(cx);
+            assert!(window.find("menu-flyout").visible());
+        })
+        .unwrap();
+        // The open menu took focus; Down reaches its first item, Escape
+        // closes it and focus goes back to the button.
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.press("down", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("menu-open").focused(), Some(true));
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("menu-flyout").is_none());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("menu-button").focused(), Some(true));
+            // Escape also closes a menu whose submenu is open.
+            window.click("menu-button", cx);
+            window.render_frame(cx);
+            window.click("menu-sort", cx);
+            window.render_frame(cx);
+            assert!(window.find("menu-sort-submenu").visible());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("menu-flyout").is_none());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            tab_to(window, "bar-add", cx);
+            window.press("space", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_last().as_ref(), "Add");
+
+            window.click("gallery-nav-settings", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("settings-spatial").is_none());
+            tab_to(window, "settings-sound-header", cx);
+            window.press("enter", cx);
+            window.render_frame(cx);
+            assert!(window.find("settings-spatial").visible());
+            // Pressing a control in the header leaves the expander alone.
+            window.click("settings-sound-switch", cx);
+            window.render_frame(cx);
+            assert!(window.find("settings-spatial").visible());
+
+            window.click("gallery-nav-basic-input", cx);
+            window.render_frame(cx);
+            tab_to(window, "basic-combo", cx);
+            window.press("enter", cx);
+            window.render_frame(cx);
+            assert!(window.find("basic-combo-popup").visible());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("basic-combo-popup").is_none());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("basic-combo").focused(), Some(true));
+            tab_to(window, "basic-check-two", cx);
+            window.press("space", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("basic-check-two").checked(), Some(true));
+            window.click("basic-number", cx);
+            window.render_frame(cx);
+            window.press("up", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_number(cx).as_ref(), "14");
+
+            // Dialogs & flyouts.
+            window.click("gallery-nav-dialogs", cx);
+            window.render_frame(cx);
+            window.click("dialog-open", cx);
+            window.render_frame(cx);
+            assert!(window.find("dialog").visible());
+            assert!(window.find("dialog").bounds().size.width >= px(320.));
+            assert!(window.find("dialog").bounds().size.width <= px(548.));
+            // The smoke layer takes presses outside the dialog.
+            window.click("gallery-nav-controls", cx);
+            window.render_frame(cx);
+            assert!(window.find("dialog").visible());
+            window.click("dialog-secondary", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("dialog").is_none());
+            assert_eq!(view.read(cx).demo_dialog_result().as_ref(), "Don't save");
+            window.click("tip-target", cx);
+            window.render_frame(cx);
+            assert!(window.find("tip").visible());
+            // The tip opens below its target, its tail in the 12 px gap.
+            assert!(
+                window.find("tip").bounds().top() >= window.find("tip-target").bounds().bottom()
+            );
+            // A TeachingTip is not light-dismissed.
+            window.click("flyout-open", cx);
+            window.render_frame(cx);
+            assert!(window.find("tip").visible());
+            assert!(window.find("flyout").visible());
+            window.click("flyout-confirm", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("flyout").is_none());
+            window.click("tip-close", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("tip").is_none());
+            window.click("dialog-open", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        // The open dialog takes focus: Enter answers the default button.
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.press("enter", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("dialog").is_none());
+            assert_eq!(view.read(cx).demo_dialog_result().as_ref(), "Save");
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            tab_to(window, "dialog-open", cx);
+            window.press("enter", cx);
+            window.render_frame(cx);
+            assert!(window.find("dialog").visible());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            // Tab stays inside the dialog.
+            for _ in 0..8 {
+                window.press("tab", cx);
+                window.render_frame(cx);
+                assert_ne!(window.find("dialog-open").focused(), Some(true));
+            }
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("dialog").is_none());
+            assert_eq!(view.read(cx).demo_dialog_result().as_ref(), "Cancel");
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("dialog-open").focused(), Some(true));
+            // The TeachingTip's close button answers Enter.
+            window.click("tip-target", cx);
+            window.render_frame(cx);
+            tab_to(window, "tip-close", cx);
+            window.press("enter", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("tip").is_none());
+
+            // Navigation.
+            window.click("gallery-nav-navigation", cx);
+            window.render_frame(cx);
+            assert!(window.find("nav-item-2").visible());
+            assert_eq!(window.find("nav-item-0").bounds().size.height, px(36.));
+            // Children keep the pane's margins; their content indents 31 px.
+            assert_eq!(
+                window.find("nav-item-2").bounds().left()
+                    - window.find("nav-item-0").bounds().left(),
+                px(0.)
+            );
+            window.click("nav-item-3", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_nav().0, 3);
+            window.click("nav-item-1", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("nav-item-2").is_none());
+            window.click("crumbs-1", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_nav().1, 2);
+            assert!(window.try_find("crumbs-2").is_none());
+            window.click("selector-2", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_nav().2, 2);
+            assert_eq!(window.find("selector-2").selected(), Some(true));
+            window.click("tabs-add", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_nav().3, 4);
+            window.click("tabs-0-close", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_nav().3, 3);
+            tab_to(window, "tabs-1", cx);
+            window.press("space", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("tabs-1").selected(), Some(true));
+
+            window.click("gallery-nav-dialogs", cx);
+            window.render_frame(cx);
+            window.click("flyout-open", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        // A popup opened while an older one closes keeps the focus it took.
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.press("escape", cx);
+            window.render_frame(cx);
+            window.click("dialog-open", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("dialog").is_none());
+
+            // Layout: the Expander header toggles by click and by keyboard.
+            window.click("gallery-nav-layout", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_layout(), [true, false]);
+            assert!(window.find("layout-expander-content").visible());
+            assert_eq!(
+                window.find("layout-expander-header").bounds().size.height,
+                px(48.)
+            );
+            window.click("layout-expander-header", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("layout-expander-content").is_none());
+            tab_to(window, "layout-expander-2-header", cx);
+            window.press("enter", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_layout(), [false, true]);
+            assert_eq!(
+                window.find("layout-expander-2-header").expanded(),
+                Some(true)
+            );
+            // StackPanel: 40 px squares 8 apart, then laid out in a row.
+            let stack = window.find("layout-stack").bounds();
+            assert_eq!(stack.size.height, px(4. * 40. + 3. * 8.));
+            window.click("layout-orientation-0", cx);
+            window.render_frame(cx);
+            let stack = window.find("layout-stack").bounds();
+            assert_eq!(stack.size.height, px(40.));
+            // ScrollViewer: the area is 200 tall and its content overflows.
+            assert_eq!(window.find("layout-scroll").bounds().size.height, px(200.));
         })
         .unwrap();
     }
@@ -582,6 +1179,9 @@ mod tests {
             let (handle, _) = cx.update(|cx| {
                 gpui_kit::init(cx);
                 theme::install_palette(cx);
+                // Popups and expanders settle at once, as with Windows' animation
+                // effects off; `gallery_motion_follows_winui_timing` covers motion.
+                cx.set_reduce_motion(true);
                 gpui_kit::open_window(
                     WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(Bounds {
@@ -643,6 +1243,180 @@ mod tests {
             cx.capture_screenshot(handle)
                 .unwrap()
                 .save(output.join(format!("gallery-{name}-focus.png")))
+                .unwrap();
+            // A focused text box shows WinUI's 2 px accent bottom line.
+            cx.update_window(handle, |_, window, cx| {
+                window.click("gallery-input", cx);
+                window.render_frame(cx);
+                assert!(
+                    window
+                        .within("gallery-input-frame")
+                        .find("fluent-textbox-underline")
+                        .visible()
+                );
+            })
+            .unwrap();
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(format!("gallery-{name}-textbox-focus.png")))
+                .unwrap();
+            for (page, nav) in [
+                ("settings", "gallery-nav-settings"),
+                ("basic-input", "gallery-nav-basic-input"),
+            ] {
+                cx.update_window(handle, |_, window, cx| {
+                    window.click(nav, cx);
+                    window.render_frame(cx);
+                })
+                .unwrap();
+                cx.advance_clock(Duration::from_millis(350));
+                cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                    .unwrap();
+                cx.capture_screenshot(handle)
+                    .unwrap()
+                    .save(output.join(format!("gallery-{page}-{name}.png")))
+                    .unwrap();
+            }
+            // Open drop-down and a hovered CheckBox on the Basic input page.
+            cx.update_window(handle, |_, window, cx| {
+                window.click("basic-combo", cx);
+                window.render_frame(cx);
+                assert!(window.find("basic-combo-popup").visible());
+                let center = window.find("basic-check-two").bounds().center();
+                window.pointer_move(center, None, cx);
+                window.render_frame(cx);
+            })
+            .unwrap();
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(format!("gallery-basic-input-{name}-open.png")))
+                .unwrap();
+            // Menus page: the MenuFlyout with its submenu open, and the
+            // Preview AppBarToggleButton checked.
+            cx.update_window(handle, |_, window, cx| {
+                window.click("basic-combo", cx);
+                window.render_frame(cx);
+                window.click("gallery-nav-menus", cx);
+                window.render_frame(cx);
+                window.click("bar-preview", cx);
+                window.render_frame(cx);
+                window.click("menu-button", cx);
+                window.render_frame(cx);
+                window.click("menu-sort", cx);
+                window.render_frame(cx);
+                assert!(window.find("menu-sort-submenu").visible());
+            })
+            .unwrap();
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(format!("gallery-menus-{name}.png")))
+                .unwrap();
+            // Keyboard focus on the Settings page: the first press outside
+            // the open menu only light-dismisses it, the second navigates;
+            // then Tab reaches the Sound expander header.
+            for _ in 0..2 {
+                cx.update_window(handle, |_, window, cx| {
+                    window.click("gallery-nav-settings", cx);
+                    window.render_frame(cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+            }
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                for _ in 0..60 {
+                    window.press("tab", cx);
+                    window.render_frame(cx);
+                    if window.find("settings-sound-header").focused() == Some(true) {
+                        break;
+                    }
+                }
+                assert!(window.find("fluent-focus-visual").visible());
+            })
+            .unwrap();
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(format!("gallery-settings-{name}-focus.png")))
+                .unwrap();
+            // Dialogs page: a TeachingTip and a Flyout open together, then
+            // the ContentDialog over its smoke layer.
+            cx.update_window(handle, |_, window, cx| {
+                window.click("gallery-nav-dialogs", cx);
+                window.render_frame(cx);
+                window.click("tip-target", cx);
+                window.render_frame(cx);
+                assert!(window.find("tip").visible());
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(format!("gallery-dialogs-{name}.png")))
+                .unwrap();
+            cx.update_window(handle, |_, window, cx| {
+                window.click("tip-close", cx);
+                window.render_frame(cx);
+                window.click("flyout-open", cx);
+                window.render_frame(cx);
+                assert!(window.find("flyout").visible());
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(format!("gallery-dialogs-{name}-flyout.png")))
+                .unwrap();
+            cx.update_window(handle, |_, window, cx| {
+                window.press("escape", cx);
+                window.render_frame(cx);
+                window.click("dialog-open", cx);
+                window.render_frame(cx);
+                assert!(window.find("dialog").visible());
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(format!("gallery-dialogs-{name}-dialog.png")))
+                .unwrap();
+            // Layout page, once the dialog above is closed.
+            cx.update_window(handle, |_, window, cx| {
+                window.press("escape", cx);
+                window.render_frame(cx);
+                window.click("gallery-nav-layout", cx);
+                window.render_frame(cx);
+                assert!(window.find("layout-grid").visible());
+                // Scroll the ScrollViewer so its scroll bar shows.
+                window.scroll(
+                    "layout-scroll-area",
+                    gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-60.))),
+                    cx,
+                );
+                window.render_frame(cx);
+                window.hover("layout-scroll", cx);
+                window.render_frame(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(format!("gallery-layout-{name}.png")))
+                .unwrap();
+            // Navigation page.
+            cx.update_window(handle, |_, window, cx| {
+                window.click("gallery-nav-navigation", cx);
+                window.render_frame(cx);
+                window.click("nav-item-3", cx);
+                window.render_frame(cx);
+                window.click("selector-1", cx);
+                window.render_frame(cx);
+                assert!(window.find("tabs").visible());
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(format!("gallery-navigation-{name}.png")))
                 .unwrap();
         }
     }

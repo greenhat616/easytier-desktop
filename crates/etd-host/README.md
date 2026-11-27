@@ -114,6 +114,9 @@ cargo nextest run -p etd-host
   `ReleaseLease`; a file in place of `profile`; another user's leftover blocking until
   `reclaim --all-users`; the uninstaller purge run as LocalSystem; `install` draining
   a session root.
+  `elevated_session_kernel_with_tun` (only with `ETD_KCOM_REPRO=1`, from the manual
+  `kernel-com-repro.yml`): a kernel with TUN under the session host, for the accepted
+  kernel COM risk record.
 - `core_lock.rs`: `cores.lock` parser (row forms, invalid names, duplicates, targets).
 - `singleton.rs`: a second process cannot take the host lock until it is released.
 - `user_mode_e2e.rs`: native IPC, the production composition and lease loop, real

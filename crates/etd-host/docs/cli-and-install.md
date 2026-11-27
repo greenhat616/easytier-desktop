@@ -150,6 +150,37 @@ the same user at that path counts; protecting the path is the installer's job
 (accepted risk, issue #2). The CLI and other clients can operate the host but do not
 keep it alive.
 
+### Accepted risk: the kernel's own COM activation
+
+Accepted by the project owner (topic#51 msg#2182); documented here, not fixed.
+Upstream easytier-core adds and removes its Windows Firewall rules itself when it
+creates a TUN interface: `arch/windows.rs` activates `NetFwPolicy2` / `NetFwRule`
+through COM, called unconditionally from `virtual_nic.rs` (no switch in v2.7.1 or
+upstream main). In the session form the kernel runs with the host's elevated token,
+so its user and HKCU are the user's own, and Windows honours per-user in-process COM
+registrations for elevated processes too. A program of the same user at Medium
+integrity that writes `HKCU\Software\Classes\CLSID\{E2B3C97F-6AE1-41AC-817A-F6F92166D7DD}`
+(or `{2C5BC43E-3369-4C33-AB0C-BE9469677AF4}`) gets its DLL loaded into the elevated
+kernel the next time a network with TUN starts. Reproduced on the CI images by the
+manual workflow `kernel-com-repro.yml` (marker DLL loaded by `easytier-core.exe` at
+High integrity).
+
+Not affected: the service form (the kernel runs as LocalSystem, whose HKCU users cannot
+write); the hosts themselves (no COM; the native gate checks every run); the kernel
+files (copied into the protected `<SID>\cores` and verified); networks without TUN
+(no firewall calls). It is the only COM path in the kernel. The workflow stays as a
+manual regression record: it reports whether the kernel still loads the plant and
+passes either way.
+
+Under the same acceptance, rated low: CreateProcess reads the user's
+`HKCU\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers` value for the
+kernel's image path, so the user can attach a compatibility layer to the elevated kernel.
+Only Windows' built-in shims apply (custom shim databases need administrator rights) and
+the image itself stays in the protected store. An empty `__COMPAT_LAYER` in the kernel's
+environment does not override it (probe run 46069613257 on Server 2022 and 2025: the
+layer's AcLayers.dll still loads with it unset, empty, blank or `RunAsInvoker`), so the
+host sets nothing.
+
 Refusals exit with their own codes so the UI can tell them apart:
 
 | Exit code | Meaning |

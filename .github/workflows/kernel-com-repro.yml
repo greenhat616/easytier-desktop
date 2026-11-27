@@ -1,0 +1,120 @@
+# Kernel COM regression record (topic#51 msg#2114, accepted risk msg#2182):
+# does the elevated session form's kernel (easytier-core, started by the
+# session host with the user's elevated token) still activate COM classes
+# from the user's own HKCU when it sets up TUN firewall rules? A marker DLL
+# registered for NetFwPolicy2/NetFwRule records every process that loads it,
+# then refuses to load. Manual only; it records the result and passes either
+# way (it fails only if the session run itself cannot be driven). See
+# crates/etd-host/docs/cli-and-install.md, "Accepted risk: the kernel's own COM
+# activation".
+name: Kernel COM regression record
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+env:
+  CARGO_BUILD_JOBS: '4'
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+
+jobs:
+  repro:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      PM_OUT: C:\pm\out
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-tools
+        with:
+          tools: protoc cargo-nextest
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          save-if: false
+      - name: Build the marker DLL and check it records a load
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force C:\etd-kcom, $env:PM_OUT | Out-Null
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $here = Get-Location
+          Import-Module "$vs\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+          Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64' | Out-Null
+          Set-Location $here
+          cl /nologo /LD /W4 .github\scripts\kcom-marker.c advapi32.lib /Fe:C:\etd-kcom\marker.dll /Fo:C:\etd-kcom\
+          if ($LASTEXITCODE -ne 0) { throw 'marker build failed' }
+          Add-Type -Namespace Kcom -Name Native -MemberDefinition '[DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)] public static extern System.IntPtr LoadLibraryW(string name);'
+          $loaded = [Kcom.Native]::LoadLibraryW('C:\etd-kcom\marker.dll')
+          $hits = @(Get-ChildItem C:\etd-kcom\hit-*.txt)
+          if ($loaded -ne [IntPtr]::Zero -or $hits.Count -ne 1) { throw "marker self-check: handle $loaded, $($hits.Count) hits" }
+          Get-Content $hits[0] | Write-Host
+          Remove-Item C:\etd-kcom\hit-*.txt
+      - name: Build the session test and fetch the kernel
+        run: |
+          cargo xtask fetch-cores --target host --bundle target/debug/cores
+          cargo nextest list --locked --profile privileged -p etd-host --run-ignored only --test session_e2e
+      - name: Fetch Process Monitor
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path C:\pm -Force | Out-Null
+          Invoke-WebRequest https://download.sysinternals.com/files/ProcessMonitor.zip -OutFile C:\pm\pm.zip
+          Expand-Archive C:\pm\pm.zip -DestinationPath C:\pm
+          $sig = Get-AuthenticodeSignature C:\pm\Procmon64.exe
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') { throw "Procmon signature: $($sig.Status) $($sig.SignerCertificate.Subject)" }
+      - name: A TUN network in the session form under the HKCU plant
+        # Not under Process Monitor: it breaks the host's pipe handshake (the
+        # ES2N gate sees the same with the service form). The marker decides.
+        shell: pwsh
+        env:
+          CI: 'true'
+          ETD_HOST_CI_INSTALL: '1'
+          ETD_KCOM_REPRO: '1'
+        run: |
+          & .github/scripts/kcom-plant.ps1
+          # Control: an elevated process of the same user activating the
+          # class by ProgID gets the planted server.
+          try { New-Object -ComObject HNetCfg.FwPolicy2 | Out-Null; Write-Host 'control: activation succeeded' } catch { Write-Host "control: activation failed: $($_.Exception.Message)" }
+          & .github/scripts/kcom-hits.ps1 -Name control -Out $env:PM_OUT
+          try {
+            cargo nextest run --locked --profile privileged -p etd-host --run-ignored only --test session_e2e -E 'test(elevated_session_kernel_with_tun)' --success-output immediate --failure-output immediate
+            $code = $LASTEXITCODE
+          } finally {
+            & .github/scripts/kcom-plant.ps1 -Remove
+          }
+          & .github/scripts/kcom-hits.ps1 -Name session -Out $env:PM_OUT
+          Write-Host "session test: exit $code"
+          exit $code
+      - name: The same kernel run directly with TUN under the plant, captured (report only)
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $core = (Get-ChildItem target\debug\cores -Recurse -Filter easytier-core.exe | Select-Object -First 1).FullName
+          Write-Host "kernel: $core"
+          & .github/scripts/kcom-plant.ps1
+          Start-Process C:\pm\Procmon64.exe -ArgumentList '/AcceptEula','/Quiet','/Minimized','/BackingFile','C:\pm\kcom.pml'
+          Start-Sleep -Seconds 10
+          try {
+            $p = Start-Process $core -ArgumentList '--network-name','etd-kcom-direct','--ipv4','10.144.234.1/24','--no-listener' -RedirectStandardOutput "$env:PM_OUT\direct-kernel.log" -RedirectStandardError "$env:PM_OUT\direct-kernel.err" -WindowStyle Hidden -PassThru
+            Start-Sleep -Seconds 30
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+          } finally {
+            & .github/scripts/kcom-plant.ps1 -Remove
+            & .github/scripts/es2n-capture.ps1 -Name kcom -Processes '^easytier-core\.exe$' -Product '^easytier-core\.exe$' -Allowed (Split-Path $core) -Out $env:PM_OUT
+            Write-Host "capture verdict (report only): exit $LASTEXITCODE"
+          }
+          & .github/scripts/kcom-hits.ps1 -Name direct -Out $env:PM_OUT
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kernel-com-${{ matrix.os }}
+          path: |
+            C:\pm\out
+            C:\ProgramData\EasyTierDesk.session\**\*.log

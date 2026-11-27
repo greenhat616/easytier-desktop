@@ -184,7 +184,11 @@ fn request<T>(body: T) -> tonic::Request<T> {
 
 /// Apply a TUN-less instance, wait until the real kernel is ready, stop it
 /// and wait until it stopped.
-async fn run_a_real_kernel(session: &mut HostServiceClient<tonic::transport::Channel>) {
+async fn run_a_real_kernel(
+    session: &mut HostServiceClient<tonic::transport::Channel>,
+    spec: NetworkSpec,
+    within: Duration,
+) {
     let snapshot = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let snapshot = session
@@ -215,11 +219,7 @@ async fn run_a_real_kernel(session: &mut HostServiceClient<tonic::transport::Cha
                 expected_revision: snapshot.revision,
             }),
             instance_id: instance.clone(),
-            spec: Some(NetworkSpec {
-                network_name: "etd-es3-ci".into(),
-                no_tun: true,
-                ..Default::default()
-            }),
+            spec: Some(spec),
             desired: Desired::Running as i32,
         }))
         .await
@@ -230,7 +230,7 @@ async fn run_a_real_kernel(session: &mut HostServiceClient<tonic::transport::Cha
     wait_for(
         &mut events,
         |state| matches!(state, InstanceState::ReadyBasic | InstanceState::ReadyFull),
-        Duration::from_secs(20),
+        within,
     )
     .await
     .expect("the real kernel became ready");
@@ -517,7 +517,12 @@ async fn elevated_session_host_end_to_end() {
         .spawn()
         .unwrap();
     let mut session = client(&endpoint).await;
-    run_a_real_kernel(&mut session).await;
+    let no_tun = NetworkSpec {
+        network_name: "etd-es3-ci".into(),
+        no_tun: true,
+        ..Default::default()
+    };
+    run_a_real_kernel(&mut session, no_tun, Duration::from_secs(20)).await;
     let released = release_stop(&mut session).await;
     assert!(released.host_exiting);
     let status = tokio::task::block_in_place(|| wait_exit(&mut child, Duration::from_secs(60)));
@@ -624,4 +629,40 @@ async fn elevated_session_host_end_to_end() {
     assert!(!root.exists(), "install removed the drained session roots");
     let uninstalled = output(&["uninstall"]);
     assert!(uninstalled.status.success(), "{}", text(&uninstalled));
+}
+
+/// Investigation only (topic#51 msg#2114), run by the kernel COM workflow
+/// with HKCU plants in place: a real kernel **with TUN** under the session
+/// host, so the kernel's own firewall setup runs with the host's elevated
+/// token. The workflow judges what the kernel loaded; this test only drives
+/// the session to a ready TUN network and back.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "privileged: elevated Windows CI runner with ETD_KCOM_REPRO=1"]
+async fn elevated_session_kernel_with_tun() {
+    if std::env::var("ETD_KCOM_REPRO").as_deref() != Ok("1")
+        || std::env::var("CI").as_deref() != Ok("true")
+    {
+        eprintln!("skipped: the kernel COM investigation runs in its own workflow");
+        return;
+    }
+    let mut child = host(&["run", "--mode", "elevated-session"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let endpoint = Endpoint::NamedPipe(format!(r"\\.\pipe\easytier-desk-session-{}", sid()));
+    let mut session = client(&endpoint).await;
+    let tun = NetworkSpec {
+        network_name: "etd-kcom-ci".into(),
+        ipv4: Some(etd_contract::v1::network_spec::Ipv4::Ipv4Cidr(
+            "10.144.233.1/24".into(),
+        )),
+        no_listener: true,
+        ..Default::default()
+    };
+    run_a_real_kernel(&mut session, tun, Duration::from_secs(60)).await;
+    let released = release_stop(&mut session).await;
+    assert!(released.host_exiting);
+    let status = tokio::task::block_in_place(|| wait_exit(&mut child, Duration::from_secs(60)));
+    assert!(status.success(), "{status:?}");
 }

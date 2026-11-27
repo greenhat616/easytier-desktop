@@ -223,3 +223,9 @@ protected `%ProgramData%` directory whose owner and ACL are verified on every st
 fence (session form in progress) admits SYSTEM or elevated administrators and does not
 persist across reboots; it exits when the UI releases its lease or after the lease
 grace. The contract already has the `HOST_MODE_ELEVATED_SESSION` value.
+
+Accepted risk (topic#51 msg#2182): upstream easytier-core activates the firewall COM
+classes itself when it creates a TUN interface, and in the session form it runs with
+the user's elevated token, so a same-user per-user COM registration (HKCU) gets code
+into the elevated kernel. The service form, the hosts and the kernel files are not
+affected; details in the [etd-host CLI](../../crates/etd-host/docs/cli-and-install.md#accepted-risk-the-kernels-own-com-activation).

@@ -337,10 +337,20 @@ async fn fixture_host() {
         core_store: store,
         authorizer: auth,
     });
-    serve_with_deps(mode, guard, deps, None, None)
+    let stopped = serve_with_deps(mode, guard, deps, None, None)
         .await
         .unwrap();
     observations.abort();
+    // As in etd-host: the singleton lock goes now only if the host's
+    // wind-down is confirmed; otherwise the process exit releases it.
+    if stopped.quiescent {
+        drop(stopped.lock);
+    } else {
+        std::mem::forget(stopped.lock);
+    }
+    if let Err(error) = &stopped.result {
+        eprintln!("fixture host stopped with an error: {error:#}");
+    }
 }
 
 #[cfg(unix)]

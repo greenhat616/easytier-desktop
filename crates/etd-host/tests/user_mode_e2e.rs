@@ -214,11 +214,12 @@ async fn apply_ready_stop_and_reclaim_over_real_transport() {
         authorizer: auth,
     });
     let (stop, stop_rx) = tokio::sync::watch::channel(false);
-    let server = tokio::spawn(host::serve_with_deps(
+    let server = tokio::spawn(host::serve_with_deps_and(
         HostMode::User,
         guard,
         deps,
         Some(stop_rx),
+        None,
         None,
     ));
     let connector = Arc::new(LocalConnector {

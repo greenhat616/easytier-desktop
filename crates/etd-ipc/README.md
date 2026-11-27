@@ -221,7 +221,10 @@ tests in `unix_service.rs`. They need root, and some also need a second local ac
 The `session_*.rs` tests are also ignored; `ci.yml` (`privileged-install`, Windows)
 runs them on the administrator runner with restricted and low-box copies of the
 runner's token. Run the Unix ones only as root in a disposable VM, with
-`--profile privileged --run-ignored only`; no CI workflow runs those yet.
+`--profile privileged --run-ignored only`. CI runs them as root in the
+`privileged-install` job of `ci.yml` on Linux; on macOS only `stale_endpoint`, because
+the macOS case in `unix_service.rs` binds below `/private/var/run`, which is
+group-writable there and refused by the listener.
 
 `pipe_acl::second_account_denied_allowed_and_revoked_on_real_pipe` creates a temporary
 local Windows account. It runs only with `ETD_IPC_CI_ACCOUNTS=1` and an elevated token,

@@ -41,7 +41,8 @@ writes are not simulated as proof of clean native system state in this suite.
   root on Unix or LocalSystem on Windows and `ETD_G1_SERVICE_RUNTIME` pointing
   to an existing private, protected directory (not `/tmp` on Unix). It does not
   install a system service. The service host and core must survive past lease
-  grace. This case is ignored by the default suite.
+  grace. This case is ignored by the default suite; CI's `privileged-install` job
+  runs it as root on Linux and macOS (not on Windows, which needs LocalSystem).
 - `cargo nextest run --profile privileged -p etd-core-easytier --test session_real --run-ignored only`
   is the ignored native-kernel smoke test of `etd-core-easytier`; supply `ETD_EASYTIER_CORE`
   as the absolute path to the bundled release kernel (`cargo xtask fetch-cores
@@ -52,6 +53,6 @@ writes are not simulated as proof of clean native system state in this suite.
   `etd-ipc --test pipe_acl` Windows second-account test runs with
   `ETD_IPC_CI_ACCOUNTS=1` in Windows CI. The existing
   `etd-ipc --test unix_service` ignored second-account tests require a root
-  runner; use the privileged nextest profile. `etd-host-core`'s `service_allow_list_sink`
+  runner; `privileged-install` runs them on Linux and macOS. `etd-host-core`'s `service_allow_list_sink`
   covers injected ACL-update failures; actual native ACL failure injection is
   not covered by this fixture.

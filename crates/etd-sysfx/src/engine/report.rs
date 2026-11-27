@@ -108,6 +108,12 @@ fn same_key(a: &ObjectKey, b: &ObjectKey) -> bool {
             let eq = |x: &Option<String>, y: &Option<String>| matches!((x, y), (Some(x), Some(y)) if x.eq_ignore_ascii_case(y));
             eq(name, bn) || eq(guid, bg)
         }
+        // Windows service names are case-insensitive: the service control
+        // manager may report a registered name in another case than the
+        // planned key (`windivert` for `WinDivert`).
+        (ObjectKey::Service { name }, ObjectKey::Service { name: bn }) if cfg!(windows) => {
+            name.eq_ignore_ascii_case(bn)
+        }
         _ => a == b,
     }
 }
@@ -321,5 +327,71 @@ pub(super) fn build(
         candidates,
         conflicts,
         notes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn service(name: &str) -> ObjectKey {
+        ObjectKey::Service { name: name.into() }
+    }
+
+    fn driver_record(name: &str) -> Effect {
+        Effect {
+            id: EffectId("driver".into()),
+            scope: EffectScope::Product,
+            kind: EffectKind::Driver,
+            key: service(name),
+            undo: Undo::EnsureAbsent,
+            persistence: Persistence::Persistent,
+            state: EffectState::Applied,
+            boot: BootId(String::new()),
+            observation: None,
+            failures: 0,
+            last_error: None,
+            recorded_at: jiff::Timestamp::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn service_keys_match_case_insensitively_only_on_windows() {
+        let record = driver_record("WinDivert");
+        assert!(locates_record(
+            &record,
+            EffectKind::Driver,
+            &service("WinDivert")
+        ));
+        assert_eq!(
+            locates_record(&record, EffectKind::Driver, &service("windivert")),
+            cfg!(windows)
+        );
+        assert!(!locates_record(
+            &record,
+            EffectKind::Driver,
+            &service("wintun")
+        ));
+        assert!(!locates_record(
+            &record,
+            EffectKind::ServiceRegistration,
+            &service("windivert")
+        ));
+    }
+
+    #[test]
+    fn other_keys_stay_exact() {
+        let rule = |name: &str| ObjectKey::Rule {
+            name: name.into(),
+            group: Some("EasyTier".into()),
+        };
+        let mut record = driver_record("unused");
+        record.kind = EffectKind::WinFirewallRule;
+        record.key = rule("EasyTier etd-1 (in)");
+        assert!(!locates_record(
+            &record,
+            EffectKind::WinFirewallRule,
+            &rule("easytier ETD-1 (in)")
+        ));
     }
 }

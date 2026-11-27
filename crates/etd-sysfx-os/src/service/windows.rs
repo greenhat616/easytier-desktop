@@ -364,7 +364,8 @@ pub(super) fn prepare_install(
 ) -> io::Result<()> {
     preflight_install(layout)?;
     let install = layout.executable.parent().ok_or_else(denied)?;
-    let mut source = File::open(super::current_exe()?)?;
+    // Held open from here: the payload cannot be renamed or rewritten.
+    let mut source = super::running::RunningImage::open()?;
     journal.create(Resource::InstallDir, || create_protected(install, true))?;
     journal.create(Resource::StateDir, || {
         create_protected(&layout.state, false)
@@ -378,8 +379,16 @@ pub(super) fn prepare_install(
             .write(true)
             .create_new(true)
             .open(&layout.executable)?;
-        io::copy(&mut source, &mut destination)?;
-        destination.sync_all()
+        let digest = source.copy_to(&mut destination)?;
+        destination.sync_all()?;
+        drop(destination);
+        if super::running::sha256_file(&layout.executable)? != digest {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the installed host image differs from the bytes copied",
+            ));
+        }
+        Ok(())
     })?;
     validate_service(layout)
 }
@@ -627,6 +636,39 @@ pub(super) fn remove_install(layout: &HostLayout) -> io::Result<()> {
     guarded_install_removal(&layout.cores, crate::driver_bundle_reference, || {
         fs::remove_dir_all(install)
     })
+}
+
+// Upgrade (PK1). Files created in the install directory inherit its
+// protected DACL; accept exactly what `validate_service` accepts there.
+fn image_acl(path: &Path) -> io::Result<()> {
+    validate_acl(path, true, false)
+}
+fn image_paths(layout: &HostLayout) -> io::Result<super::image::ImagePaths> {
+    validate_acl(layout.executable.parent().ok_or_else(denied)?, true, true)?;
+    Ok(super::image::ImagePaths::of(&layout.executable))
+}
+pub(super) fn replace_host_image(layout: &HostLayout) -> io::Result<()> {
+    validate_service(layout)?;
+    let mut source = super::running::RunningImage::open()?;
+    super::image::replace(
+        &image_paths(layout)?,
+        |out| source.copy_to(out),
+        image_acl,
+        image_acl,
+    )?;
+    validate_service(layout)
+}
+pub(super) fn restore_host_image(layout: &HostLayout) -> io::Result<bool> {
+    super::image::restore(&image_paths(layout)?, image_acl)
+}
+pub(super) fn discard_host_backup(layout: &HostLayout) -> io::Result<()> {
+    super::image::discard(&image_paths(layout)?, image_acl)
+}
+pub(super) fn refresh_registration(_: &HostLayout, _: &mut LifecycleJournal) -> io::Result<()> {
+    Ok(())
+}
+pub(super) fn restore_registration(_: &HostLayout, _: &LifecycleJournal) -> io::Result<bool> {
+    Ok(false)
 }
 
 pub(super) fn defer_install_removal(

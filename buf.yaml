@@ -11,3 +11,10 @@ lint:
 breaking:
   use:
     - FILE
+  # 3dcf200 gave NetworkFlags.multi_thread and bind_device explicit presence
+  # (`optional`): wire compatible and approved, but a FILE-category break
+  # against freeze-v1. buf ignores per file, not per field, so this covers
+  # FIELD_SAME_CARDINALITY in host.proto only.
+  ignore_only:
+    FIELD_SAME_CARDINALITY:
+      - crates/etd-contract/proto/etd/v1/host.proto

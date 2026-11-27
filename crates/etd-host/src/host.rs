@@ -1067,6 +1067,11 @@ pub async fn reclaim(mode: HostMode, _all: bool, purge: bool, all_users: bool) -
         !all_users || mode == HostMode::ElevatedSession,
         "--all-users applies only to --mode elevated-session"
     );
+    #[cfg(unix)]
+    ensure!(
+        mode != HostMode::ElevatedSession,
+        "the elevated session host is Windows-only"
+    );
     if all_users {
         // Every user's sessions, independent of the caller's token: the
         // app uninstaller runs this as LocalSystem. Only the shared

@@ -412,8 +412,10 @@ pub(super) async fn drain(purge: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
     use etd_sysfx::{EffectId, Undo};
 
+    #[cfg(windows)]
     fn effect(persistence: Persistence, boot: &str) -> Effect {
         Effect {
             id: EffectId("e".into()),

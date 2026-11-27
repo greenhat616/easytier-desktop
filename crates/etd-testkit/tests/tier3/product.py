@@ -269,6 +269,9 @@ def verify_shared_driver_purge(service, baseline, stopped, inventory, foreign_ke
     names = {name for name in ("wintun", "windivert")
              if ("service", name) not in baseline.rows and ("service", name) in stopped.rows}
     assert "wintun" in names, "the real kernel did not load its TUN driver"
+    # Shared drivers stay installed by design; record them before any check
+    # below can fail, so the uninstall comparison never reports them instead.
+    service.retained_drivers = {name: stopped.rows["service", name] for name in names}
     interfaces = {name: native_interface_guid(stopped.rows[kind, name]["index"])
                   for kind, name in foreign_keys if kind == "interface"}
     prior = service.ctl("reclaim-report")
@@ -284,7 +287,6 @@ def verify_shared_driver_purge(service, baseline, stopped, inventory, foreign_ke
     assert swept == interfaces, "swept candidates differ from the native foreign interface identities"
     service.stop()
     result = command(service.installer, "reclaim", "--all", "--purge", check=False, timeout=240)
-    service.retained_drivers = {name: stopped.rows["service", name] for name in names}
     report = re.search(r"^Reclaim: (\d+) generations, (\d+) candidates, (\d+) conflicts\s*$",
                        result.stdout, re.M)
     print(f"standalone purge exit={result.returncode}, "

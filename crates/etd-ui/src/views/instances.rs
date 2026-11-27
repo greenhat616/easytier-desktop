@@ -219,13 +219,13 @@ fn render_instance_card(
 
     let (badge_bg, badge_fg) = match condition {
         InstanceCondition::Running | InstanceCondition::RunningBasic => {
-            (success.opacity(0.2), success)
+            (success.opacity(0.15), success)
         }
         InstanceCondition::GaveUp
         | InstanceCondition::Quarantined
-        | InstanceCondition::CutUnconfirmed => (danger.opacity(0.2), danger),
+        | InstanceCondition::CutUnconfirmed => (danger.opacity(0.15), danger),
         InstanceCondition::Waiting | InstanceCondition::Backoff | InstanceCondition::Unknown => {
-            (warning.opacity(0.2), warning)
+            (warning.opacity(0.15), warning)
         }
         _ => (secondary, secondary_fg),
     };

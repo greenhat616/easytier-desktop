@@ -604,11 +604,11 @@ mod tests {
                 let t = Theme::global(cx);
                 let surface = content_layer(cx).to_rgb();
                 let normal_card = surface.blend(card_fill(cx).to_rgb());
-                let selected_card = surface.blend(t.primary.opacity(0.08).to_rgb());
+                let selected_card = normal_card.blend(t.primary.opacity(0.08).to_rgb());
                 // The selected card may use any readable OS accent. Include
                 // the worst luminance extreme, not just the default blue.
                 let extreme: Hsla = rgb(if t.is_dark() { 0xFFFFFF } else { 0x000000 }).into();
-                let extreme_card = surface.blend(extreme.opacity(0.08).to_rgb());
+                let extreme_card = normal_card.blend(extreme.opacity(0.08).to_rgb());
                 let base = t.background.to_rgb();
                 let parents = [
                     base,
@@ -625,6 +625,12 @@ mod tests {
                     t.secondary_foreground,
                     t.secondary.to_rgb(),
                 );
+                // The header's no-tray pill is opaque: popover plus 20% warning.
+                assert_readable(
+                    "no-tray badge",
+                    t.warning,
+                    t.popover.to_rgb().blend(t.warning.opacity(0.2).to_rgb()),
+                );
                 for parent in parents {
                     for (name, semantic) in [
                         ("success badge", t.success),
@@ -634,7 +640,7 @@ mod tests {
                         assert_readable(
                             name,
                             semantic,
-                            parent.blend(semantic.opacity(0.2).to_rgb()),
+                            parent.blend(semantic.opacity(0.15).to_rgb()),
                         );
                     }
                     // FluentInput paints the WinUI TextControlBackground

@@ -900,7 +900,14 @@ impl SidebarItem for FluentNavItem {
 pub fn list_selection_surface(selected: bool, cx: &App) -> (Hsla, Hsla) {
     let t = cx.theme();
     if selected {
-        (t.primary.opacity(0.08), t.primary)
+        // Still a card: the accent tint goes over the card fill, not the layer.
+        let card = crate::theme::content_layer(cx)
+            .to_rgb()
+            .blend(crate::theme::card_fill(cx).to_rgb());
+        (
+            Hsla::from(card.blend(t.primary.opacity(0.08).to_rgb())),
+            t.primary,
+        )
     } else {
         (crate::theme::card_fill(cx), crate::theme::card_stroke(cx))
     }

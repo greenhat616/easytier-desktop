@@ -5,6 +5,11 @@
 //! and `TomlProfileStore`, then runs GPUI with [`QuitMode::Explicit`],
 //! [`etd_ui::assets::FluentAssets`], and [`etd_ui::NativeTrayBackend`]. Every exit
 //! funnels through [`etd_app::ExitGate`] before `cx.quit()`.
+//!
+//! Release builds use the Windows GUI subsystem, so launching the app opens
+//! no console window; its log output and panic messages then have nowhere
+//! to go until the app has a log file.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 

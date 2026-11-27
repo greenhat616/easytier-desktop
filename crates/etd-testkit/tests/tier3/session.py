@@ -282,11 +282,20 @@ def recovery():
 
 
 def exclusion():
-    """The service and the session exclude each other, and install drains a
-    crashed session's ledger before it registers the service."""
+    """A squatted session directory is refused; the service and the session
+    exclude each other, and install drains a crashed session's ledger before
+    it registers the service."""
     with ExitStack() as stack:
         session = Session(stack)
         before = session.inventory()
+        # Squatting: EasyTierDesk.session made by someone else (inherited
+        # ProgramData access, so users may write) is refused, untouched.
+        squatted = session.root.parent
+        squatted.mkdir()
+        refused = session.run("run", "--mode", "elevated-session")
+        assert refused.returncode == EXIT_NOT_CONFORMING, f"squatted root: exit {refused.returncode}"
+        assert squatted.is_dir() and not any(squatted.iterdir()), "a refused start changes nothing"
+        squatted.rmdir()
         status = session.start()
         instance, request = str(uuid.uuid4()), str(uuid.uuid4())
         session.apply(spec(), instance, request, str(status["revision"]))
@@ -384,25 +393,49 @@ public static class Es5Probe {
   static extern bool SetTokenInformation(IntPtr token, int kind, ref Label label, int length);
   [DllImport("kernel32")]
   static extern bool CloseHandle(IntPtr handle);
+  [DllImport("kernel32")]
+  static extern IntPtr GetCurrentProcess();
+  [DllImport("advapi32", SetLastError = true)]
+  static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+  [DllImport("advapi32", SetLastError = true)]
+  static extern bool CreateRestrictedToken(IntPtr token, uint flags, uint disableCount, Label[] disable,
+    uint deleteCount, IntPtr delete, uint restrictCount, IntPtr restrict, out IntPtr restricted);
   [StructLayout(LayoutKind.Sequential)]
   public struct Label { public IntPtr Sid; public uint Attributes; }
+  // The user's own token with Administrators deny-only and the fewest
+  // privileges, at Medium: what a non-elevated process of the user has.
+  public static string Own(int port) {
+    IntPtr own;
+    if (!OpenProcessToken(GetCurrentProcess(), 0xF01FF, out own)) return "open failed " + Marshal.GetLastWin32Error();
+    IntPtr admins;
+    ConvertStringSidToSidW("S-1-5-32-544", out admins);
+    IntPtr restricted;
+    bool made = CreateRestrictedToken(own, 0x1, 1, new[] { new Label { Sid = admins } }, 0, IntPtr.Zero, 0, IntPtr.Zero,
+      out restricted);
+    CloseHandle(own);
+    if (!made) return "restrict failed " + Marshal.GetLastWin32Error();
+    return Probe(restricted, "S-1-16-8192", "Medium", port);
+  }
   public static string Connect(string user, string password, int port, bool low) {
     IntPtr logon;
     // Interactive, else network logon: either gives the account's own token.
     if (!LogonUserW(user, ".", password, 2, 0, out logon) && !LogonUserW(user, ".", password, 3, 0, out logon))
       return "logon failed " + Marshal.GetLastWin32Error();
+    return low ? Probe(logon, "S-1-16-4096", "Low", port) : Probe(logon, null, "Medium", port);
+  }
+  // Impersonate a copy of `token` (closed here), lowered to `labelSid` if
+  // given, and connect once from that thread.
+  static string Probe(IntPtr token, string labelSid, string level, int port) {
     IntPtr copy;
-    bool duplicated = DuplicateTokenEx(logon, 0x02000000, IntPtr.Zero, 2, 2, out copy);
-    CloseHandle(logon);
+    bool duplicated = DuplicateTokenEx(token, 0x02000000, IntPtr.Zero, 2, 2, out copy);
+    CloseHandle(token);
     if (!duplicated) return "duplicate failed " + Marshal.GetLastWin32Error();
-    string level = "Medium";
-    if (low) {
+    if (labelSid != null) {
       IntPtr sid;
-      ConvertStringSidToSidW("S-1-16-4096", out sid);
+      ConvertStringSidToSidW(labelSid, out sid);
       var label = new Label { Sid = sid, Attributes = 0x20 };
       if (!SetTokenInformation(copy, 25, ref label, Marshal.SizeOf(label) + GetLengthSid(sid)))
         return "label failed " + Marshal.GetLastWin32Error();
-      level = "Low";
     }
     using (var handle = new SafeAccessTokenHandle(copy)) {
       return WindowsIdentity.RunImpersonated(handle, () => {
@@ -416,6 +449,7 @@ public static class Es5Probe {
   }
 }
 '@
+[Es5Probe]::Own(__PORT__)
 foreach ($low in $false, $true) { [Es5Probe]::Connect('__NAME__', $env:ES5_PROBE_SECRET, __PORT__, $low) }
 """
 
@@ -440,17 +474,17 @@ def second_account_connects(port):
     finally:
         command("net", "user", name, "/delete", check=False)
     lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    if len(lines) != 2:
-        raise AssertionError(f"second account probe: {result.stdout} {result.stderr}")
-    return {"Medium": lines[0], "Low": lines[1]}
+    if len(lines) != 3:
+        raise AssertionError(f"identity probes: {result.stdout} {result.stderr}")
+    return lines
 
 
 def identities():
     """The real kernel's management port under the session fence refuses a
-    second standard account at Medium and at Low integrity, while the
-    elevated user connects (a non-elevated copy of the user's own token is
-    refused by the host's own probe on every kernel start, ES2); DLLs planted beside the portable host are
-    not loaded, and the kernel loads only from its store and Windows
+    non-elevated copy of the user's own token and a second standard account
+    at Medium and at Low integrity, while the elevated user connects; DLLs
+    planted beside the portable host are not loaded, and the kernel loads
+    only from its store and Windows
     (doc#13#wbs ES5)."""
     import psutil
     import socket
@@ -466,10 +500,13 @@ def identities():
         port = kernel_port(session)
         with socket.create_connection(("127.0.0.1", port), timeout=5):
             print(f"elevated user: connected to the kernel port {port}", flush=True)
-        others = second_account_connects(port)
-        for level, verdict in others.items():
-            print(f"second account at {level}: {verdict}", flush=True)
-            assert f"es5probe | {level} | " in verdict, verdict
+        own, medium, low = second_account_connects(port)
+        print(f"own token, not elevated: {own}", flush=True)
+        print(f"second account at Medium: {medium}", flush=True)
+        print(f"second account at Low: {low}", flush=True)
+        for verdict, who, level in ((own, os.environ["USERNAME"].lower(), "Medium"),
+                                    (medium, "es5probe", "Medium"), (low, "es5probe", "Low")):
+            assert f"\\{who} | {level} | ".lower() in verdict.lower(), verdict
             assert verdict.endswith("error 10013 AccessDenied"), verdict
         # Reported, not judged: a Low copy of the elevated token keeps
         # Administrators enabled, and the fence admits elevated

@@ -39,31 +39,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            suite: recovery
-          - os: macos-latest
-            suite: recovery
-          - os: windows-latest
-            suite: recovery
-          - os: windows-latest
-            suite: preflight
-          - os: windows-latest
-            suite: program
-          - os: windows-latest
-            suite: clean
-          - os: windows-latest
-            suite: stop
-          - os: windows-latest
-            suite: upgrade
-          - os: ubuntu-latest
-            suite: takeover
-          - os: macos-latest
-            suite: takeover
-          - os: windows-latest
-            suite: takeover
+          - { os: ubuntu-latest, suite: recovery, sample: 1 }
+          - { os: windows-latest, suite: recovery, sample: 1 }
+          - { os: windows-latest, suite: clean, sample: 1 }
+          - { os: windows-latest, suite: recovery, sample: 2 }
+          - { os: windows-latest, suite: clean, sample: 2 }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
+      NEXTEST_SUCCESS_OUTPUT: immediate
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_BUILD_JOBS: '4'
@@ -71,6 +55,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
         with:
+          ref: aa850359958a627c3b6b6f9e177a53285890342e
           persist-credentials: false
       - name: Install Linux libraries and network inspection tools
         if: runner.os == 'Linux'

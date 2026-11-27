@@ -179,9 +179,13 @@ impl Environment {
                 .clone();
             if let Some(profile) = profile {
                 match std::fs::symlink_metadata(&profile) {
-                    // No session tree: an administrator's command over the
-                    // service layout. No profile variables at all, as
-                    // before; never the user's own profile.
+                    // No session tree. Meant only for an elevated
+                    // administrator's command over the service layout (for
+                    // example `etd-host uninstall`): no profile variables
+                    // at all, as before; never the user's own profile. The
+                    // elevated session host never gets here: it refuses to
+                    // start, before adapters(), unless <SID>\profile exists
+                    // and passes verify_tree (ES3, topic#51 msg#1722).
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     // Present: it must be the protected directory, or fail
                     // closed. A non-elevated process cannot make a

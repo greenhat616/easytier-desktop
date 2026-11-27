@@ -69,14 +69,20 @@ def products():
     return sorted(found)
 
 
-def display_icon(code):
-    """The Add/Remove Programs icon Windows Installer registered (ARPPRODUCTICON)."""
-    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, rf"{UNINSTALL}\{code}", 0,
-                        winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
-        try:
-            return winreg.QueryValueEx(key, "DisplayIcon")[0]
-        except FileNotFoundError:
-            return None
+def product_icon(code):
+    """The icon Windows Installer published for the product (ARPPRODUCTICON):
+    MsiGetProductInfoW's ProductIcon, the cached icon file."""
+    import ctypes
+    from ctypes import wintypes
+    info = ctypes.WinDLL("msi").MsiGetProductInfoW
+    info.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPWSTR,
+                     ctypes.POINTER(wintypes.DWORD)]
+    info.restype = wintypes.UINT
+    size = wintypes.DWORD(1024)
+    buffer = ctypes.create_unicode_buffer(size.value)
+    code_ = info(code, "ProductIcon", buffer, ctypes.byref(size))
+    assert code_ == 0, f"MsiGetProductInfoW(ProductIcon) failed: {code_}"
+    return buffer.value
 
 
 def app_path():
@@ -267,8 +273,9 @@ def msi_lifecycle():
             assert (PAYLOAD / name).is_file(), f"payload misses {name}"
         assert (MENU / "EasyTier Desktop.lnk").is_file(), "no Start menu shortcut"
         assert app_path() == (str(PAYLOAD / "etd-ctl.exe"), str(PAYLOAD) + "\\"), app_path()
-        icon = display_icon(code_a)
-        assert icon and Path(icon).is_file() and Path(icon).read_bytes()[:4] == b"\0\0\1\0", icon
+        icon = Path(product_icon(code_a))
+        assert icon.is_file() and icon.read_bytes()[:4] == b"\0\0\1\0", f"product icon {icon}"
+        print(f"product icon: {icon}", flush=True)
         assert digest(service.host) == images[a], "the service image is not the payload's"
         assert ALLOWED.encode() in settings(service), "ETD_ALLOW_USER did not reach the allow list"
         record = journal()

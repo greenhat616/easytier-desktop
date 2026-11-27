@@ -306,7 +306,7 @@ impl gpui::RenderOnce for FluentButton {
                             0.86
                         })
                     })
-                    .child(self.label),
+                    .child(crate::views::pseudo::t(self.label)),
             );
         }
         let elevate = !style.disabled
@@ -523,7 +523,7 @@ impl RenderOnce for FluentAlignedRow {
             .truncate()
             .text_size(px(14.))
             .line_height(px(20.))
-            .child(self.label);
+            .child(crate::views::pseudo::t(self.label));
         let btn = BaseButton::new(self.id)
             .track_focus(&focus)
             .selected(selected)
@@ -618,7 +618,7 @@ pub fn text_field_with_suffix(
                 .text_size(px(14.))
                 .line_height(px(20.))
                 .text_color(fg)
-                .child(label.to_owned()),
+                .child(crate::views::pseudo::t(label.to_owned())),
         )
         .child(input)
         .into_any_element()
@@ -931,7 +931,7 @@ impl RenderOnce for FluentSwitch {
                     } else {
                         cx.theme().foreground
                     })
-                    .child(label),
+                    .child(crate::views::pseudo::t(label)),
             )
     }
 }
@@ -1053,7 +1053,7 @@ impl SidebarItem for FluentNavItem {
                 .truncate()
                 .text_size(px(14.))
                 .line_height(px(20.))
-                .child(self.label);
+                .child(crate::views::pseudo::t(self.label));
             btn = btn.child(if selected {
                 label.font_semibold()
             } else {

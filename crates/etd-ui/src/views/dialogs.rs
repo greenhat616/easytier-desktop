@@ -214,7 +214,7 @@ impl RenderOnce for ContentDialog {
                             .text_size(px(20.))
                             .line_height(px(28.))
                             .font_semibold()
-                            .child(self.title),
+                            .child(crate::views::pseudo::t(self.title)),
                     )
                     .child(
                         div()
@@ -441,7 +441,7 @@ pub fn teaching_tip(
                 .me(px(28.), cx)
                 .flex()
                 .flex_col()
-                .child(div().font_semibold().child(title))
+                .child(div().font_semibold().child(crate::views::pseudo::t(title)))
                 .child(div().child(subtitle)),
         )
         .children(action.map(|a| div().mt(px(12.)).child(a)));

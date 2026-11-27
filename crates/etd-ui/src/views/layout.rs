@@ -101,7 +101,12 @@ pub fn expander(
         .text_size(px(14.))
         .line_height(px(20.))
         .text_color(fg)
-        .child(div().flex_1().min_w_0().child(header))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(crate::views::pseudo::t(header)),
+        )
         .child(chevron);
     head = if expanded {
         head.rounded_t(px(4.))

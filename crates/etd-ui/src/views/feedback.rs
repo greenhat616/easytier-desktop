@@ -118,7 +118,12 @@ pub fn status_badge(
         .line_height(px(16.))
         .text_color(cx.theme().foreground)
         .child(div().flex_shrink_0().size(px(8.)).rounded_full().bg(dot))
-        .child(div().min_w_0().truncate().child(text))
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .child(crate::views::pseudo::t(text)),
+        )
         .into_any_element()
 }
 
@@ -239,7 +244,7 @@ impl RenderOnce for CopyButton {
                         .text_size(px(12.))
                         .line_height(px(16.))
                         .text_color(fg)
-                        .child(self.copied.clone()),
+                        .child(crate::views::pseudo::t(self.copied.clone())),
                 ),
             )
             .with_priority(3)

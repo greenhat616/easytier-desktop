@@ -89,6 +89,7 @@ struct Gallery {
     collapsed: bool,
     closed: [bool; 4],
     clicks: usize,
+    pseudo: bool,
 }
 
 impl Gallery {
@@ -111,6 +112,7 @@ impl Gallery {
             collapsed: false,
             closed: [false; 4],
             clicks: 0,
+            pseudo: false,
         }
     }
 }
@@ -257,7 +259,12 @@ fn section(
         .flex()
         .flex_col()
         .gap_3()
-        .child(div().font_semibold().text_size(px(20.)).child(title))
+        .child(
+            div()
+                .font_semibold()
+                .text_size(px(20.))
+                .child(crate::views::pseudo::t(title)),
+        )
         .child(
             div()
                 .flex()
@@ -318,7 +325,12 @@ fn gallery_buttons(cx: &mut Context<Gallery>) -> AnyElement {
                 .items_start()
                 .flex_1()
                 .gap_2()
-                .child(div().text_sm().font_semibold().child(label))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .child(crate::views::pseudo::t(label)),
+                )
                 .children(cells)
                 .into_any_element(),
         );
@@ -615,12 +627,36 @@ impl Render for Gallery {
                             .items_center()
                             .justify_between()
                             .px(px(24.))
-                            .child(div().font_semibold().text_size(px(24.)).child(title))
                             .child(
                                 div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!("Local actions: {}", self.clicks)),
+                                    .font_semibold()
+                                    .text_size(px(24.))
+                                    .child(crate::views::pseudo::t(title)),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(24.))
+                                    // Doc#24's +40 % pseudo-locale check.
+                                    .child(crate::views::ui::fluent_switch(
+                                        "gallery-pseudo",
+                                        "Pseudo-locale",
+                                        self.pseudo,
+                                        false,
+                                        cx.listener(|this, on: &bool, _, cx| {
+                                            this.pseudo = *on;
+                                            crate::views::pseudo::set(*on);
+                                            cx.notify();
+                                        }),
+                                    ))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!("Local actions: {}", self.clicks)),
+                                    ),
                             ),
                     )
                     .child(
@@ -1502,6 +1538,43 @@ mod tests {
                 .unwrap()
                 .save(output.join(format!("gallery-navigation-{name}.png")))
                 .unwrap();
+
+            // Doc#24's pseudo-locale check: every page once with labels
+            // 40 % longer, in the light theme.
+            if name != "light" {
+                continue;
+            }
+            cx.update_window(handle, |_, window, cx| {
+                window.click("gallery-pseudo", cx);
+                window.render_frame(cx);
+            })
+            .unwrap();
+            for page in [
+                "controls",
+                "basic-input",
+                "menus",
+                "dialogs",
+                "navigation",
+                "layout",
+                "feedback",
+                "settings",
+            ] {
+                cx.update_window(handle, |_, window, cx| {
+                    window.click(SharedString::from(format!("gallery-nav-{page}")), cx);
+                    window.render_frame(cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.capture_screenshot(handle)
+                    .unwrap()
+                    .save(output.join(format!("gallery-pseudo-{page}.png")))
+                    .unwrap();
+            }
+            cx.update_window(handle, |_, window, cx| {
+                window.click("gallery-pseudo", cx);
+                window.render_frame(cx);
+            })
+            .unwrap();
         }
     }
 }

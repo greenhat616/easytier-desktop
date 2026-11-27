@@ -269,11 +269,10 @@ fn wfp_container() -> (u32, u32, Vec<u32>) {
     }
 }
 
-/// A connection attempt from a child process started with a restricted
-/// copy of this token: BUILTIN\Administrators deny-only, Medium integrity,
-/// owner and default DACL the user's. Built here independently of the
-/// product's probe. Returns "connected", "refused" or what went wrong.
-fn restricted_connect(address: std::net::SocketAddr) -> String {
+/// A restricted primary copy of this token: BUILTIN\Administrators
+/// deny-only, Medium integrity, owner and default DACL the user's. Built
+/// here independently of the product's probe; the caller closes it.
+fn restricted_token(user: &str) -> ::windows::Win32::Foundation::HANDLE {
     use ::windows::{
         Win32::{
             Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree},
@@ -289,16 +288,11 @@ fn restricted_connect(address: std::net::SocketAddr) -> String {
             },
             System::{
                 SystemServices::SE_GROUP_INTEGRITY,
-                Threading::{
-                    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
-                    GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, PROCESS_INFORMATION,
-                    STARTUPINFOW, WaitForSingleObject,
-                },
+                Threading::{GetCurrentProcess, OpenProcessToken},
             },
         },
-        core::{HSTRING, PCWSTR, PWSTR},
+        core::HSTRING,
     };
-    let user = ps("[Security.Principal.WindowsIdentity]::GetCurrent().User.Value");
     let sid = |text: &str| {
         let mut sid = PSID::default();
         unsafe { ConvertStringSidToSidW(&HSTRING::from(text), &mut sid).unwrap() };
@@ -336,7 +330,7 @@ fn restricted_connect(address: std::net::SocketAddr) -> String {
             size_of_val(&label) as u32,
         )
         .unwrap();
-        let user_sid = sid(&user);
+        let user_sid = sid(user);
         let owner = TOKEN_OWNER { Owner: user_sid };
         SetTokenInformation(
             token,
@@ -365,6 +359,120 @@ fn restricted_connect(address: std::net::SocketAddr) -> String {
             size_of_val(&default) as u32,
         )
         .unwrap();
+        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+        for s in [admins, medium, user_sid] {
+            let _ = LocalFree(Some(HLOCAL(s.0)));
+        }
+        let _ = CloseHandle(own);
+        token
+    }
+}
+
+/// On a thread impersonating the restricted copy: open the filter engine
+/// and add a block filter for `address`'s port in `sublayer` (in a dynamic
+/// session, so nothing outlives the attempt). Returns the first non-zero
+/// status, or 0 if the filter was added.
+fn restricted_wfp_add(address: std::net::SocketAddr, sublayer: u128) -> u32 {
+    let user = ps("[Security.Principal.WindowsIdentity]::GetCurrent().User.Value");
+    std::thread::spawn(move || {
+        use ::windows::{
+            Win32::{
+                Foundation::{CloseHandle, HANDLE},
+                NetworkManagement::WindowsFilteringPlatform::*,
+                Security::{
+                    DuplicateTokenEx, RevertToSelf, SecurityImpersonation, TOKEN_ALL_ACCESS,
+                    TokenImpersonation,
+                },
+                System::Threading::SetThreadToken,
+            },
+            core::{GUID, PCWSTR, PWSTR},
+        };
+        unsafe {
+            let primary = restricted_token(&user);
+            let mut token = HANDLE::default();
+            DuplicateTokenEx(
+                primary,
+                TOKEN_ALL_ACCESS,
+                None,
+                SecurityImpersonation,
+                TokenImpersonation,
+                &mut token,
+            )
+            .unwrap();
+            let _ = CloseHandle(primary);
+            SetThreadToken(None, Some(token)).unwrap();
+            let session = FWPM_SESSION0 {
+                flags: FWPM_SESSION_FLAG_DYNAMIC,
+                ..Default::default()
+            };
+            let mut engine = HANDLE::default();
+            let mut status = FwpmEngineOpen0(PCWSTR::null(), 10, None, Some(&session), &mut engine);
+            if status == 0 {
+                let mut conditions = [FWPM_FILTER_CONDITION0 {
+                    fieldKey: FWPM_CONDITION_IP_REMOTE_PORT,
+                    matchType: FWP_MATCH_EQUAL,
+                    conditionValue: FWP_CONDITION_VALUE0 {
+                        r#type: FWP_UINT16,
+                        Anonymous: FWP_CONDITION_VALUE0_0 {
+                            uint16: address.port(),
+                        },
+                    },
+                }];
+                let mut name: Vec<u16> = "etd-test-restricted-add"
+                    .encode_utf16()
+                    .chain([0])
+                    .collect();
+                let filter = FWPM_FILTER0 {
+                    displayData: FWPM_DISPLAY_DATA0 {
+                        name: PWSTR(name.as_mut_ptr()),
+                        ..Default::default()
+                    },
+                    subLayerKey: GUID::from_u128(sublayer),
+                    layerKey: if address.is_ipv6() {
+                        FWPM_LAYER_ALE_AUTH_CONNECT_V6
+                    } else {
+                        FWPM_LAYER_ALE_AUTH_CONNECT_V4
+                    },
+                    weight: FWP_VALUE0 {
+                        r#type: FWP_UINT8,
+                        Anonymous: FWP_VALUE0_0 { uint8: 15 },
+                    },
+                    numFilterConditions: conditions.len() as u32,
+                    filterCondition: conditions.as_mut_ptr(),
+                    action: FWPM_ACTION0 {
+                        r#type: FWP_ACTION_BLOCK,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                status = FwpmFilterAdd0(engine, &filter, None, None);
+                FwpmEngineClose0(engine);
+            }
+            RevertToSelf().unwrap();
+            let _ = CloseHandle(token);
+            status
+        }
+    })
+    .join()
+    .unwrap()
+}
+
+/// A connection attempt from a child process started with
+/// [`restricted_token`]. Returns "connected", "refused" or what went wrong.
+fn restricted_connect(address: std::net::SocketAddr) -> String {
+    use ::windows::{
+        Win32::{
+            Foundation::CloseHandle,
+            System::Threading::{
+                CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
+                GetExitCodeProcess, PROCESS_INFORMATION, STARTUPINFOW, WaitForSingleObject,
+            },
+        },
+        core::{HSTRING, PCWSTR, PWSTR},
+    };
+    let user = ps("[Security.Principal.WindowsIdentity]::GetCurrent().User.Value");
+    let token = restricted_token(&user);
+    unsafe {
         let family = if address.is_ipv6() {
             "InterNetworkV6"
         } else {
@@ -422,12 +530,7 @@ fn restricted_connect(address: std::net::SocketAddr) -> String {
             &startup,
             &mut process,
         );
-        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
-        for s in [admins, medium, user_sid] {
-            let _ = LocalFree(Some(HLOCAL(s.0)));
-        }
         let _ = CloseHandle(token);
-        let _ = CloseHandle(own);
         if let Err(e) = created {
             return format!("CreateProcessAsUserW failed: {e}");
         }
@@ -664,6 +767,17 @@ async fn session_fence() {
         );
         drop(breaker);
         assert_eq!(restricted_connect(addr), "refused");
+
+        // The restricted identity cannot add a filter of its own (one that
+        // blocks itself would forge a refusal), in our sublayer or the
+        // universal one; this elevated process could (the breaker above).
+        for sublayer in [SUBLAYER, 0] {
+            let status = restricted_wfp_add(addr, sublayer);
+            assert!(
+                [5, 0x8007_0005].contains(&status),
+                "restricted FwpmFilterAdd0 in {sublayer:#x}: {status:#x}"
+            );
+        }
 
         let effect = Effect {
             id: EffectId("session-fence".into()),

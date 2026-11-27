@@ -551,7 +551,16 @@ fn replace_empty_other_form(e: &Engine, form: FenceForm) -> Result<(), WinError>
         let rc = FwpmSubLayerGetByKey0(e.0, &SUBLAYER, &mut s);
         if rc != FWP_E_SUBLAYER_NOT_FOUND.0 as u32 {
             check(rc, "lookup WFP sublayer")?;
+            // The same identity ensure_container requires, with the other
+            // form's persistence; anything else is not ours to delete.
+            let ours = ((*s).flags & FWPM_SUBLAYER_FLAG_PERSISTENT != 0) != persistent(form)
+                && !(*s).providerKey.is_null()
+                && *(*s).providerKey == PROVIDER
+                && display_name((*s).displayData.name) == "EasyTier Desktop fence sublayer";
             FwpmFreeMemory0((&mut s as *mut *mut FWPM_SUBLAYER0).cast());
+            if !ours {
+                return Err(WinError::invalid("WFP sublayer identity mismatch"));
+            }
             check_acl(e, SUBLAYER, "sublayer")?;
             check(
                 FwpmSubLayerDeleteByKey0(e.0, &SUBLAYER),

@@ -8,7 +8,7 @@ How to build, check, change frozen interfaces and commit. Code style is in the
 | Tool | Version | Notes |
 | --- | --- | --- |
 | Rust | 1.100.0 | Installed by `rustup` from `rust-toolchain.toml`, with rustfmt and Clippy. MSVC toolchain on Windows. |
-| protoc | 36.2 | Must be on `PATH`. CI installs it with `.github/scripts/setup-protoc.ps1`. |
+| protoc | 36.2 | Must be on `PATH`. CI exports its real executable and include directory from the locked mise installation. |
 | cargo-nextest | 0.9.x | Test runner used by CI (`0.9.152` there) and by the `.config/nextest.toml` profiles. |
 | cargo-deny | 0.22.x | Dependency policy check (`deny.toml`). |
 | buf | 1.75.0 | Contract lint and breaking-change check (`buf.yaml`). |

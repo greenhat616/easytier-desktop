@@ -12,6 +12,8 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
       - '.github/scripts/es2n-*.ps1'
+      - '.github/actions/setup-tools/**'
+      - 'mise.toml'
       - '.github/workflows/windows-native-gate.yml'
   workflow_dispatch:
 
@@ -34,15 +36,12 @@ jobs:
       PM_OUT: C:\pm\out
     steps:
       - uses: actions/checkout@v7.0.1
-      - name: Install pinned protoc
-        shell: pwsh
-        run: ./.github/scripts/setup-protoc.ps1
+      - uses: ./.github/actions/setup-tools
+        with:
+          tools: protoc cargo-nextest
       - uses: Swatinem/rust-cache@v2.9.3
         with:
           save-if: false
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@0.9.152
       - name: Windows build
         shell: pwsh
         run: |

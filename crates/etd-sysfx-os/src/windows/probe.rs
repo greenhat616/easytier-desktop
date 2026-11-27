@@ -1,23 +1,34 @@
-//! Probe a live listener from an identity the fence must refuse: LocalService
-//! under the system service, a restricted Medium copy of the host's own token
-//! under the elevated session. No saved account password, arbitrary
-//! executable, or caller-provided script.
+//! Probe a live listener from an identity the fence must refuse. No saved
+//! account password, arbitrary executable, or caller-provided script.
+//!
+//! - System service: a PowerShell probe logged on as LocalService.
+//! - Elevated session: no child process at all. A dedicated host thread
+//!   impersonates a restricted Medium copy of the host token
+//!   (Administrators deny-only), checks that its effective token is that
+//!   identity, and connects. A child process of the same user could be
+//!   ended by any of the user's processes with the "refused" exit code, and
+//!   a PowerShell child reads the user's profile and HKCU; neither applies
+//!   to a thread of the host. Only an explicit refusal counts.
 use super::{
     FenceForm, WinError, encoded_command, execution::Environment, registry::Handle, token,
 };
 use ::windows::{
     Win32::{
         Foundation::{HANDLE, WAIT_OBJECT_0},
-        Security::{LOGON32_LOGON_SERVICE, LOGON32_PROVIDER_DEFAULT, LogonUserW},
+        Security::{LOGON32_LOGON_SERVICE, LOGON32_PROVIDER_DEFAULT, LogonUserW, RevertToSelf},
         System::Threading::{
             CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetExitCodeProcess,
-            PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+            PROCESS_INFORMATION, STARTUPINFOW, SetThreadToken, TerminateProcess,
+            WaitForSingleObject,
         },
     },
     core::{HSTRING, PCWSTR, PWSTR},
 };
 use etd_sysfx::{DirectionResult, FenceError};
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::Path, time::Duration};
+
+/// WSAEACCES: the connection was refused by a filter, not by the listener.
+const ACCESS_DENIED: i32 = 10013;
 
 pub fn unprivileged_connect(
     address: SocketAddr,
@@ -40,82 +51,127 @@ pub fn unprivileged_connect(
     }
 }
 
-/// The probe identity and the script line that exits 3 unless the probe
-/// really runs as that identity.
-fn identity(form: FenceForm) -> Result<(Handle, String), FenceError> {
-    let error = |e: ::windows::core::Error| FenceError::Probe(e.to_string());
+fn connect_once(address: SocketAddr, form: FenceForm) -> Result<DirectionResult, FenceError> {
     match form {
-        FenceForm::Service => {
-            let mut token = HANDLE::default();
-            // LogonUserW documents this exact built-in LocalService logon, which
-            // provides an identity distinct from SYSTEM without storing credentials.
-            // https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-logonuserw
-            unsafe {
-                LogonUserW(
-                    &HSTRING::from("LocalService"),
-                    &HSTRING::from("NT AUTHORITY"),
-                    PCWSTR::null(),
-                    LOGON32_LOGON_SERVICE,
-                    LOGON32_PROVIDER_DEFAULT,
-                    &mut token,
-                )
-                .map_err(error)?;
-            }
-            Ok((
-                Handle(token),
-                "if ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -ne 'S-1-5-19') { exit 3 }".into(),
-            ))
-        }
-        FenceForm::Session => {
-            let probe = |e: WinError| FenceError::Probe(e.to_string());
-            let token = token::restricted_copy().map_err(probe)?;
-            let user = token::host_user().map_err(probe)?;
-            // The SID comes from our own token; refuse anything else before
-            // it reaches script text.
-            if !user.starts_with("S-1-")
-                || !user[4..].chars().all(|c| c.is_ascii_digit() || c == '-')
-            {
-                return Err(FenceError::Probe(format!("unexpected host SID {user}")));
-            }
-            // Same user, and BUILTIN\Administrators not usable: the identity a
-            // non-elevated process of this user has at the fence.
-            Ok((
-                token,
-                format!(
-                    "$i=[System.Security.Principal.WindowsIdentity]::GetCurrent(); if ($i.User.Value -ne '{user}' -or ([System.Security.Principal.WindowsPrincipal]$i).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {{ exit 3 }}"
-                ),
-            ))
-        }
+        FenceForm::Service => service_probe(address),
+        FenceForm::Session => session_probe(address),
     }
 }
 
-fn connect_once(address: SocketAddr, form: FenceForm) -> Result<DirectionResult, FenceError> {
+fn service_probe(address: SocketAddr) -> Result<DirectionResult, FenceError> {
     let error = |e: ::windows::core::Error| FenceError::Probe(e.to_string());
-    let (token, check) = identity(form)?;
+    let mut token = HANDLE::default();
+    // LogonUserW documents this exact built-in LocalService logon, which
+    // provides an identity distinct from SYSTEM without storing credentials.
+    // https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-logonuserw
+    unsafe {
+        LogonUserW(
+            &HSTRING::from("LocalService"),
+            &HSTRING::from("NT AUTHORITY"),
+            PCWSTR::null(),
+            LOGON32_LOGON_SERVICE,
+            LOGON32_PROVIDER_DEFAULT,
+            &mut token,
+        )
+        .map_err(error)?;
+    }
+    let token = Handle(token);
     let environment = Environment::new().map_err(WinError::fence)?;
-    let exe = &environment.exe;
     let family = if address.is_ipv6() {
         "InterNetworkV6"
     } else {
         "InterNetwork"
     };
     let code = format!(
-        "$ErrorActionPreference='Stop'; {check}; $s=$null; try {{ $s=[Net.Sockets.Socket]::new([Net.Sockets.AddressFamily]::{family},[Net.Sockets.SocketType]::Stream,[Net.Sockets.ProtocolType]::Tcp); $s.Connect([ipaddress]'{}',{}); exit 0 }} catch {{ $e=$_.Exception; while ($e -and $e -isnot [Net.Sockets.SocketException]) {{ $e=$e.InnerException }}; if ($e) {{ exit ([int]$e.NativeErrorCode) }}; exit 2 }} finally {{ if ($s) {{ $s.Dispose() }} }}",
+        "$ErrorActionPreference='Stop'; if ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -ne 'S-1-5-19') {{ exit 3 }}; $s=$null; try {{ $s=[Net.Sockets.Socket]::new([Net.Sockets.AddressFamily]::{family},[Net.Sockets.SocketType]::Stream,[Net.Sockets.ProtocolType]::Tcp); $s.Connect([ipaddress]'{}',{}); exit 0 }} catch {{ $e=$_.Exception; while ($e -and $e -isnot [Net.Sockets.SocketException]) {{ $e=$e.InnerException }}; if ($e) {{ exit ([int]$e.NativeErrorCode) }}; exit 2 }} finally {{ if ($s) {{ $s.Dispose() }} }}",
         address.ip(),
         address.port()
     );
     let command = format!(
         "\"{}\" -NoProfile -NonInteractive -EncodedCommand {}",
-        exe.display(),
+        environment.exe.display(),
         encoded_command(&code)
     );
+    let rc = run(
+        &token,
+        &environment.exe,
+        &command,
+        &environment.block(),
+        &environment.cwd,
+    )?;
+    Ok(match rc {
+        0 => DirectionResult::Connected,
+        10013 => DirectionResult::Refused,
+        _ => DirectionResult::Error(format!("unprivileged probe exit {rc}")),
+    })
+}
+
+fn session_probe(address: SocketAddr) -> Result<DirectionResult, FenceError> {
+    // A fresh thread: impersonation never leaks into a pooled one. The
+    // token is made on it, so no handle crosses threads.
+    std::thread::Builder::new()
+        .name("etd-fence-probe".into())
+        .spawn(move || {
+            let probe = |e: WinError| FenceError::Probe(e.to_string());
+            let token = token::restricted_impersonation().map_err(probe)?;
+            let user = token::host_user().map_err(probe)?;
+            impersonated_connect(address, &token, &user)
+        })
+        .map_err(|e| FenceError::Probe(e.to_string()))?
+        .join()
+        .map_err(|_| FenceError::Probe("probe thread panicked".into()))?
+}
+
+/// On the calling thread: impersonate `token`, confirm the effective
+/// identity, connect once, revert.
+fn impersonated_connect(
+    address: SocketAddr,
+    token: &Handle,
+    user: &str,
+) -> Result<DirectionResult, FenceError> {
+    // SAFETY: `token` is an impersonation token with TOKEN_IMPERSONATE.
+    unsafe { SetThreadToken(None, Some(token.0)) }
+        .map_err(|e| FenceError::Probe(format!("impersonate the probe identity: {e}")))?;
+    let verdict = match token::thread_identity() {
+        Ok(identity) if identity.is_non_elevated(user) => {
+            match std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5)) {
+                Ok(_) => DirectionResult::Connected,
+                Err(e) if e.raw_os_error() == Some(ACCESS_DENIED) => DirectionResult::Refused,
+                Err(e) => DirectionResult::Error(format!("probe connection: {e}")),
+            }
+        }
+        Ok(identity) => DirectionResult::Error(format!(
+            "probe thread is not the restricted identity: {identity:?}"
+        )),
+        Err(e) => DirectionResult::Error(format!("probe thread identity: {e}")),
+    };
+    // SAFETY: ends this thread's impersonation.
+    if let Err(e) = unsafe { RevertToSelf() } {
+        // The thread ends right after; still, never report a verdict from a
+        // thread whose identity is unknown.
+        return Err(FenceError::Probe(format!("revert the probe identity: {e}")));
+    }
+    Ok(verdict)
+}
+
+/// Start `exe` with `token`, wait for it and return its exit code.
+fn run(
+    token: &Handle,
+    exe: &Path,
+    command: &str,
+    block: &[u16],
+    cwd: &Path,
+) -> Result<u32, FenceError> {
+    let error = |e: ::windows::core::Error| FenceError::Probe(e.to_string());
     let mut command: Vec<u16> = command.encode_utf16().chain(Some(0)).collect();
-    let block = environment.block();
     let startup = STARTUPINFOW {
         cb: size_of::<STARTUPINFOW>() as u32,
         ..Default::default()
     };
     let mut process = PROCESS_INFORMATION::default();
+    // SAFETY: every pointer refers to a live, NUL-terminated buffer of this
+    // frame; the block is a double-NUL-terminated Unicode environment; the
+    // returned handles are owned by `Handle` below.
     unsafe {
         CreateProcessAsUserW(
             Some(token.0),
@@ -126,7 +182,7 @@ fn connect_once(address: SocketAddr, form: FenceForm) -> Result<DirectionResult,
             false,
             CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
             Some(block.as_ptr().cast()),
-            &HSTRING::from(environment.cwd.as_os_str()),
+            &HSTRING::from(cwd.as_os_str()),
             &startup,
             &mut process,
         )
@@ -148,12 +204,6 @@ fn connect_once(address: SocketAddr, form: FenceForm) -> Result<DirectionResult,
         }
         let mut rc = 0;
         GetExitCodeProcess(process_handle.0, &mut rc).map_err(error)?;
-        match rc {
-            0 => Ok(DirectionResult::Connected),
-            10013 => Ok(DirectionResult::Refused),
-            _ => Ok(DirectionResult::Error(format!(
-                "unprivileged probe exit {rc}"
-            ))),
-        }
+        Ok(rc)
     }
 }

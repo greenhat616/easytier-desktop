@@ -1120,8 +1120,9 @@ impl PortFence for WindowsFence {
         listener_pid: u32,
     ) -> Result<FenceVerification, FenceError> {
         let key = wfp::key(spec);
+        let form = self.form;
         fence_presence(
-            blocking(move || wfp::complete(&key))
+            blocking(move || wfp::complete(&key, form))
                 .await
                 .map_err(WinError::fence)?,
         )?;
@@ -1135,21 +1136,18 @@ impl PortFence for WindowsFence {
         }
         let mut host = host_connect(spec.address).await;
         let address = spec.address;
-        let form = self.form;
         let unprivileged =
             tokio::task::spawn_blocking(move || probe::unprivileged_connect(address, form))
                 .await
                 .map_err(|e| FenceError::Probe(e.to_string()))??;
         let check = listener_check(spec.address, listener_pid).await;
         let key = wfp::key(spec);
-        if !blocking(move || wfp::complete(&key))
-            .await
-            .map_err(WinError::fence)?
-        {
-            return Err(FenceError::Probe(
-                "fence changed during verification".into(),
-            ));
-        }
+        // Positively absent after the probe is as missing as before it.
+        fence_presence(
+            blocking(move || wfp::complete(&key, form))
+                .await
+                .map_err(WinError::fence)?,
+        )?;
         if host == DirectionResult::Connected && check == ListenerCheck::Expected {
             host = host_connect(spec.address).await;
         }

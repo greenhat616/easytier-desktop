@@ -1,6 +1,7 @@
 //! The host process's own token: which host form it is (decides the fence
-//! and the worker environment), and the restricted copy the session fence
-//! probe runs with. Nothing here is configured: it is read from the token.
+//! and the worker environment), the restricted copy the session fence probe
+//! impersonates, and the identity the probing thread checks it really has.
+//! Nothing here is configured: it is read from the token.
 use super::{WinError, registry::Handle};
 use ::windows::{
     Win32::{
@@ -10,17 +11,20 @@ use ::windows::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
                 SDDL_REVISION_1,
             },
-            CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE,
-            GetSecurityDescriptorDacl, GetTokenInformation, IsWellKnownSid, PSECURITY_DESCRIPTOR,
-            PSID, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, SetTokenInformation,
-            TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DEFAULT_DACL, TOKEN_DUPLICATE,
-            TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
-            TokenDefaultDacl, TokenElevation, TokenIntegrityLevel, TokenOwner, TokenUser,
+            CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE, DuplicateTokenEx,
+            GetSecurityDescriptorDacl, GetSidSubAuthority, GetSidSubAuthorityCount,
+            GetTokenInformation, IsWellKnownSid, PSECURITY_DESCRIPTOR, PSID,
+            SECURITY_IMPERSONATION_LEVEL, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
+            SecurityImpersonation, SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY,
+            TOKEN_DEFAULT_DACL, TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_IMPERSONATE,
+            TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
+            TokenDefaultDacl, TokenElevation, TokenGroups, TokenImpersonation,
+            TokenImpersonationLevel, TokenIntegrityLevel, TokenOwner, TokenUser,
             WELL_KNOWN_SID_TYPE, WinBuiltinAdministratorsSid, WinLocalSystemSid, WinMediumLabelSid,
         },
         System::{
-            SystemServices::SE_GROUP_INTEGRITY,
-            Threading::{GetCurrentProcess, OpenProcessToken},
+            SystemServices::{SE_GROUP_ENABLED, SE_GROUP_INTEGRITY, SE_GROUP_USE_FOR_DENY_ONLY},
+            Threading::{GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken},
         },
     },
     core::{HSTRING, PWSTR},
@@ -47,31 +51,36 @@ fn own_token(access: ::windows::Win32::Security::TOKEN_ACCESS_MASK) -> Result<Ha
     Ok(Handle(raw))
 }
 
+/// A variable-size token information class, in u64 elements so that the
+/// structure and the SIDs after it stay aligned.
+fn token_info(token: &Handle, class: TOKEN_INFORMATION_CLASS) -> Result<Vec<u64>, WinError> {
+    let mut size = 0;
+    // SAFETY: a size query with no buffer; the expected error is
+    // ERROR_INSUFFICIENT_BUFFER, and `size` receives the needed length.
+    let _ = unsafe { GetTokenInformation(token.0, class, None, 0, &mut size) };
+    if size == 0 {
+        return Err(WinError::invalid("token information size query failed"));
+    }
+    let mut buffer = vec![0u64; (size as usize).div_ceil(8)];
+    // SAFETY: the buffer is at least `size` bytes and writable.
+    unsafe {
+        GetTokenInformation(
+            token.0,
+            class,
+            Some(buffer.as_mut_ptr().cast()),
+            size,
+            &mut size,
+        )
+    }
+    .map_err(WinError::windows)?;
+    Ok(buffer)
+}
+
 /// The token user, kept in the buffer `GetTokenInformation` filled.
 struct TokenUserBuffer(Vec<u64>);
 impl TokenUserBuffer {
     fn read(token: &Handle) -> Result<Self, WinError> {
-        let mut size = 0;
-        // SAFETY: a size query with no buffer; the expected error is
-        // ERROR_INSUFFICIENT_BUFFER, and `size` receives the needed length.
-        let _ = unsafe { GetTokenInformation(token.0, TokenUser, None, 0, &mut size) };
-        if size == 0 {
-            return Err(WinError::invalid("TokenUser size query failed"));
-        }
-        // u64 elements keep TOKEN_USER and the SID after it aligned.
-        let mut buffer = vec![0u64; (size as usize).div_ceil(8)];
-        // SAFETY: the buffer is at least `size` bytes and writable.
-        unsafe {
-            GetTokenInformation(
-                token.0,
-                TokenUser,
-                Some(buffer.as_mut_ptr().cast()),
-                size,
-                &mut size,
-            )
-        }
-        .map_err(WinError::windows)?;
-        Ok(Self(buffer))
+        Ok(Self(token_info(token, TokenUser)?))
     }
     fn sid(&self) -> PSID {
         // SAFETY: the buffer was filled with a TOKEN_USER by `read`; its SID
@@ -238,4 +247,104 @@ pub(super) fn restricted_copy() -> Result<Handle, WinError> {
         result.map_err(WinError::windows)?;
     }
     Ok(copy)
+}
+
+/// An impersonation token of [`restricted_copy`], for the session probe
+/// thread. Same user as the host and a lower integrity level, so the host
+/// impersonates it fully without SeImpersonatePrivilege.
+pub(super) fn restricted_impersonation() -> Result<Handle, WinError> {
+    let primary = restricted_copy()?;
+    let mut raw = HANDLE::default();
+    // SAFETY: `primary` carries TOKEN_DUPLICATE; `raw` receives a token
+    // handle that `Handle` closes.
+    unsafe {
+        DuplicateTokenEx(
+            primary.0,
+            TOKEN_IMPERSONATE | TOKEN_QUERY,
+            None,
+            SecurityImpersonation,
+            TokenImpersonation,
+            &mut raw,
+        )
+    }
+    .map_err(WinError::windows)?;
+    Ok(Handle(raw))
+}
+
+/// What the probing thread sees in its effective token: whether it is the
+/// identity a non-elevated process of the host's user has at the fence.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ProbeIdentity {
+    pub user: String,
+    /// BUILTIN\Administrators is present, deny-only and not enabled.
+    pub admins_deny_only: bool,
+    /// The mandatory integrity level RID.
+    pub integrity: u32,
+    /// The thread impersonates at SecurityImpersonation (not merely
+    /// identification, which the network stack would not act as).
+    pub impersonating: bool,
+}
+impl ProbeIdentity {
+    /// SECURITY_MANDATORY_MEDIUM_RID.
+    pub const MEDIUM: u32 = 0x2000;
+    pub fn is_non_elevated(&self, user: &str) -> bool {
+        self.impersonating
+            && self.user == user
+            && self.admins_deny_only
+            && self.integrity == Self::MEDIUM
+    }
+}
+
+/// The current thread's impersonation token, as the probe sees it.
+pub(super) fn thread_identity() -> Result<ProbeIdentity, WinError> {
+    let mut raw = HANDLE::default();
+    // SAFETY: the pseudo handle of the current thread is valid; opened as
+    // self so the query does not depend on the impersonated identity.
+    unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, true, &mut raw) }
+        .map_err(WinError::windows)?;
+    let token = Handle(raw);
+    let user = sid_string(TokenUserBuffer::read(&token)?.sid())?;
+    let groups = token_info(&token, TokenGroups)?;
+    // SAFETY: the buffer holds a TOKEN_GROUPS with GroupCount entries; the
+    // SIDs point into the same buffer.
+    let admins_deny_only = unsafe {
+        let groups = &*groups.as_ptr().cast::<TOKEN_GROUPS>();
+        std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize)
+            .iter()
+            .filter(|g| IsWellKnownSid(g.Sid, WinBuiltinAdministratorsSid).as_bool())
+            .any(|g| {
+                g.Attributes & SE_GROUP_USE_FOR_DENY_ONLY as u32 != 0
+                    && g.Attributes & SE_GROUP_ENABLED as u32 == 0
+            })
+    };
+    let label = token_info(&token, TokenIntegrityLevel)?;
+    // SAFETY: the buffer holds a TOKEN_MANDATORY_LABEL whose SID points into
+    // it; the last sub-authority is the integrity RID.
+    let integrity = unsafe {
+        let sid = (*label.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()).Label.Sid;
+        let count = *GetSidSubAuthorityCount(sid);
+        if count == 0 {
+            return Err(WinError::invalid("integrity label without a RID"));
+        }
+        *GetSidSubAuthority(sid, u32::from(count) - 1)
+    };
+    let mut level = SECURITY_IMPERSONATION_LEVEL::default();
+    let mut size = 0;
+    // SAFETY: the output is a SECURITY_IMPERSONATION_LEVEL of the stated size.
+    unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenImpersonationLevel,
+            Some((&raw mut level).cast()),
+            size_of::<SECURITY_IMPERSONATION_LEVEL>() as u32,
+            &mut size,
+        )
+    }
+    .map_err(WinError::windows)?;
+    Ok(ProbeIdentity {
+        user,
+        admins_deny_only,
+        integrity,
+        impersonating: level == SecurityImpersonation,
+    })
 }

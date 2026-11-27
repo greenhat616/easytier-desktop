@@ -46,43 +46,141 @@ pub(super) fn set_worker_profile(profile: Option<PathBuf>) {
 /// FILE_ATTRIBUTE_REPARSE_POINT.
 const REPARSE_POINT: u32 = 0x400;
 
-/// Whether `path` is owned by SYSTEM or Administrators, which a
-/// non-elevated process cannot arrange.
-fn privileged_owner(path: &Path) -> Result<bool, WinError> {
+/// Access rights that let a principal change a directory, its security or
+/// its entries: FILE_WRITE_DATA (add file), FILE_APPEND_DATA (add
+/// subdirectory), FILE_WRITE_EA, FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES,
+/// DELETE, WRITE_DAC, WRITE_OWNER, GENERIC_ALL, GENERIC_WRITE.
+const WRITE_RIGHTS: u32 = 0x0002
+    | 0x0004
+    | 0x0010
+    | 0x0040
+    | 0x0100
+    | 0x0001_0000
+    | 0x0004_0000
+    | 0x0008_0000
+    | 0x1000_0000
+    | 0x4000_0000;
+
+/// The protection of `path`: whether its owner is SYSTEM or Administrators
+/// (a non-elevated process cannot arrange that), and whether its DACL lets
+/// only SYSTEM and Administrators write. Any allow entry with a write right
+/// for another principal, a null DACL or an entry of another type refuses.
+fn protection(path: &Path) -> Result<(bool, bool), WinError> {
     use ::windows::{
         Win32::{
             Foundation::{HLOCAL, LocalFree},
             Security::{
+                ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
                 Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
-                IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+                DACL_SECURITY_INFORMATION, GetAce, IsValidSid, IsWellKnownSid,
+                OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
                 WinBuiltinAdministratorsSid, WinLocalSystemSid,
             },
         },
         core::HSTRING,
     };
     let mut owner = PSID::default();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: the out pointers are valid; the descriptor the call allocates
-    // holds the owner SID and is freed after its last use.
+    // SAFETY: the out pointers are valid; the owner SID and the DACL point
+    // into the descriptor the call allocates, freed after their last use.
     unsafe {
         GetNamedSecurityInfoW(
             &HSTRING::from(path.as_os_str()),
             SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             Some(&mut owner),
             None,
-            None,
+            Some(&mut dacl),
             None,
             &mut descriptor,
         )
         .ok()
         .map_err(WinError::windows)?;
-        let privileged = !owner.0.is_null()
-            && (IsWellKnownSid(owner, WinLocalSystemSid).as_bool()
-                || IsWellKnownSid(owner, WinBuiltinAdministratorsSid).as_bool());
+        let privileged = |sid: PSID| {
+            IsWellKnownSid(sid, WinLocalSystemSid).as_bool()
+                || IsWellKnownSid(sid, WinBuiltinAdministratorsSid).as_bool()
+        };
+        let owner_privileged = !owner.0.is_null() && privileged(owner);
+        let mut admin_writes = !dacl.is_null();
+        if admin_writes {
+            for index in 0..(*dacl).AceCount as u32 {
+                let mut ace = std::ptr::null_mut();
+                if GetAce(dacl, index, &mut ace).is_err() {
+                    admin_writes = false;
+                    break;
+                }
+                let header = ace.cast::<ACE_HEADER>().read_unaligned();
+                match header.AceType {
+                    // ACCESS_DENIED: never grants anything.
+                    1 => {}
+                    // ACCESS_ALLOWED: write rights only for SYSTEM and
+                    // Administrators.
+                    0 if usize::from(header.AceSize) >= size_of::<ACCESS_ALLOWED_ACE>() => {
+                        let allowed = ace.cast::<ACCESS_ALLOWED_ACE>().read_unaligned();
+                        let sid = PSID(
+                            ace.cast::<u8>()
+                                .add(std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart))
+                                .cast(),
+                        );
+                        if !IsValidSid(sid).as_bool()
+                            || (allowed.Mask & WRITE_RIGHTS != 0 && !privileged(sid))
+                        {
+                            admin_writes = false;
+                            break;
+                        }
+                    }
+                    _ => {
+                        admin_writes = false;
+                        break;
+                    }
+                }
+            }
+        }
         let _ = LocalFree(Some(HLOCAL(descriptor.0)));
-        Ok(privileged)
+        Ok((owner_privileged, admin_writes))
     }
+}
+
+/// Whether `path` is owned by SYSTEM or Administrators.
+#[cfg(test)]
+fn privileged_owner(path: &Path) -> Result<bool, WinError> {
+    Ok(protection(path)?.0)
+}
+
+/// `path` without a `\\?\` prefix, for comparing paths.
+fn plain(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned()
+}
+
+/// The protected profile directory, or why it is refused: a plain
+/// directory owned by SYSTEM or Administrators whose DACL lets no one else
+/// write, and whose final path (all links and junctions resolved) is the
+/// path itself, so no ancestor redirects it.
+fn protected_profile_vars(profile: &Path) -> Result<Vec<(OsString, OsString)>, WinError> {
+    let vars = profile_vars(profile)?;
+    let refused = |why: &str| {
+        WinError::invalid(format!(
+            "worker profile directory {}: {why}",
+            profile.display()
+        ))
+    };
+    let (owner, writes) = protection(profile)?;
+    if !owner {
+        return Err(refused("not owned by SYSTEM or Administrators"));
+    }
+    if !writes {
+        return Err(refused("writable by others than SYSTEM and Administrators"));
+    }
+    let resolved = std::fs::canonicalize(profile).map_err(|e| refused(&e.to_string()))?;
+    if !plain(&resolved).eq_ignore_ascii_case(&plain(profile)) {
+        return Err(refused(&format!(
+            "resolves to {} (a link or junction on the path)",
+            resolved.display()
+        )));
+    }
+    Ok(vars)
 }
 
 /// The profile variables pointing at `profile`, which must be an existing
@@ -191,14 +289,7 @@ impl Environment {
                     // closed. A non-elevated process cannot make a
                     // directory owned by SYSTEM or Administrators.
                     _ => {
-                        let profile_vars = profile_vars(&profile)?;
-                        if !privileged_owner(&profile)? {
-                            return Err(WinError::invalid(format!(
-                                "worker profile directory {}: not owned by SYSTEM or Administrators",
-                                profile.display()
-                            )));
-                        }
-                        vars.extend(profile_vars);
+                        vars.extend(protected_profile_vars(&profile)?);
                     }
                 }
             }
@@ -748,6 +839,12 @@ fn checkin(worker: Option<Worker>) {
 }
 
 pub fn run(request: Value) -> Result<Vec<Value>, WinError> {
+    // The script's diagnostics report exists for the CI fixtures only.
+    if !cfg!(feature = "ci-test-fixtures") && request["op"] == "diagnostics" {
+        return Err(WinError::invalid(
+            "the diagnostics request is only for CI fixtures",
+        ));
+    }
     // One retry, only for a request that never reached a reused worker
     // (it died while idle): delivering it to a fresh one is safe.
     let mut retried = false;
@@ -864,9 +961,61 @@ mod tests {
     /// Workers of an elevated test process (the CI runner) need a profile
     /// directory, as under the elevated session host.
     fn test_profile() {
-        static PROFILE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-        let dir = PROFILE.get_or_init(|| tempfile::tempdir().unwrap());
-        set_worker_profile(Some(dir.path().to_owned()));
+        static PROFILE: std::sync::OnceLock<(tempfile::TempDir, PathBuf)> =
+            std::sync::OnceLock::new();
+        let (_, path) = PROFILE.get_or_init(protected_dir);
+        set_worker_profile(Some(path.clone()));
+    }
+
+    /// A temporary directory under its final path, with the session tree's
+    /// DACL (SYSTEM and Administrators only) when this process is elevated:
+    /// only then is it owned by Administrators and can keep access.
+    fn protected_dir() -> (tempfile::TempDir, PathBuf) {
+        use ::windows::{
+            Win32::{
+                Foundation::{HLOCAL, LocalFree},
+                Security::{
+                    Authorization::{
+                        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+                        SE_FILE_OBJECT, SetNamedSecurityInfoW,
+                    },
+                    DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
+                    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+                },
+            },
+            core::HSTRING,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = PathBuf::from(plain(&std::fs::canonicalize(dir.path()).unwrap()));
+        if privileged_owner(&path).unwrap() {
+            unsafe {
+                let mut sd = PSECURITY_DESCRIPTOR::default();
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    &HSTRING::from("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"),
+                    SDDL_REVISION_1,
+                    &mut sd,
+                    None,
+                )
+                .unwrap();
+                let mut present = false.into();
+                let mut defaulted = false.into();
+                let mut dacl = std::ptr::null_mut();
+                GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted).unwrap();
+                SetNamedSecurityInfoW(
+                    &HSTRING::from(path.as_os_str()),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    None,
+                    None,
+                    Some(dacl),
+                    None,
+                )
+                .ok()
+                .unwrap();
+                let _ = LocalFree(Some(HLOCAL(sd.0)));
+            }
+        }
+        (dir, path)
     }
 
     fn fresh() -> Worker {
@@ -1093,10 +1242,16 @@ mod tests {
         // Administrators; a standard user's is not, and is refused.
         let result = Environment::for_host(HostToken::Elevated);
         if privileged_owner(dir.path()).unwrap() {
-            let environment = result.unwrap();
+            // Owned by Administrators but writable by the user (the
+            // inherited temp DACL): refused.
+            let refused = result.err().unwrap();
+            assert!(refused.message.contains("writable"), "{}", refused.message);
+            let (_protected, path) = protected_dir();
+            set_worker_profile(Some(path.clone()));
+            let environment = Environment::for_host(HostToken::Elevated).unwrap();
             assert_eq!(
                 Path::new(value(&environment.vars, "USERPROFILE").unwrap()),
-                dir.path()
+                path
             );
             let names: Vec<_> = environment
                 .vars
@@ -1119,6 +1274,17 @@ mod tests {
         let encoded = encoded_command(&script()).len();
         assert!(encoded < 30_000, "{encoded}");
         assert!(script().starts_with("$PSModuleAutoLoadingPreference = 'None'"));
+    }
+
+    #[cfg(not(feature = "ci-test-fixtures"))]
+    #[test]
+    fn the_diagnostics_request_is_refused_without_the_ci_fixtures() {
+        let refused = run(serde_json::json!({"op": "diagnostics"})).unwrap_err();
+        assert!(
+            refused.message.contains("CI fixtures"),
+            "{}",
+            refused.message
+        );
     }
 
     #[test]

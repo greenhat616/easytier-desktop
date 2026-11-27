@@ -28,7 +28,8 @@ reclaimed, privileged tests) are in [docs/platforms.md](docs/platforms.md).
 
 Feature `ci-test-fixtures` compiles the Windows identity fixture `service::ci_fixture`
 and `windows::worker_diagnostics`. Only `etd-host`'s dev-dependency and the privileged
-`windows_session_inputs` run enable it, on disposable CI runners.
+`windows_session_inputs` run enable it, on disposable CI runners; without it the worker
+refuses the script's `diagnostics` request.
 
 ## What each platform provides
 
@@ -68,7 +69,7 @@ Default host directories (`service`):
 | --- | --- |
 | `lib.rs` | `OsConfig`, `OsAdapters`, dispatch to the platform module |
 | `windows/mod.rs` | Reclaimers, observer, sweeper, fence wiring |
-| `windows/wfp.rs`, `probe.rs`, `token.rs` | WFP fence of the host's form (persistent for the service, non-persistent for the elevated session); LocalService or restricted-token connection probe; host form from the process token |
+| `windows/wfp.rs`, `probe.rs`, `token.rs` | WFP fence of the host's form (persistent for the service, non-persistent for the elevated session); LocalService probe (service) or a host thread impersonating a restricted Medium token (session); host form from the process token |
 | `windows/interfaces.rs`, `registry.rs`, `magic.rs` | wintun identity, registry and boot marker, Magic DNS recovery replay |
 | `windows/execution.rs`, `system.ps1` | Constant PowerShell script for firewall, NRPT, profiles, registry and listener queries; no module autoloading, absolute imports, explicit environment (under an elevated host that is not SYSTEM: profile variables in the session tree, and the CLR profiler off as defence in depth against HKCU runtime settings) |
 | `windows/driver_refs.rs`, `appearance.rs` | Driver references into the kernel store; DWM / appearance |

@@ -444,6 +444,101 @@ fn restricted_connect(address: std::net::SocketAddr) -> String {
     }
 }
 
+/// A permit-everyone filter for one loopback port inside our sublayer, at
+/// a higher weight than the fence's block: the fence's four filters stay
+/// complete, but anyone can connect. Added in a dynamic engine session, so
+/// it is gone when this value drops.
+struct Breaker(::windows::Win32::Foundation::HANDLE);
+impl Breaker {
+    fn add(address: std::net::SocketAddr) -> Self {
+        use ::windows::{
+            Win32::{Foundation::HANDLE, NetworkManagement::WindowsFilteringPlatform::*},
+            core::{GUID, PCWSTR, PWSTR},
+        };
+        unsafe {
+            let session = FWPM_SESSION0 {
+                flags: FWPM_SESSION_FLAG_DYNAMIC,
+                ..Default::default()
+            };
+            let mut engine = HANDLE::default();
+            assert_eq!(
+                FwpmEngineOpen0(PCWSTR::null(), 10, None, Some(&session), &mut engine),
+                0
+            );
+            let mut addr6 = FWP_BYTE_ARRAY16 {
+                byteArray16: std::net::Ipv6Addr::LOCALHOST.octets(),
+            };
+            let remote = if address.is_ipv6() {
+                FWPM_FILTER_CONDITION0 {
+                    fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                    matchType: FWP_MATCH_EQUAL,
+                    conditionValue: FWP_CONDITION_VALUE0 {
+                        r#type: FWP_BYTE_ARRAY16_TYPE,
+                        Anonymous: FWP_CONDITION_VALUE0_0 {
+                            byteArray16: &mut addr6,
+                        },
+                    },
+                }
+            } else {
+                FWPM_FILTER_CONDITION0 {
+                    fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                    matchType: FWP_MATCH_EQUAL,
+                    conditionValue: FWP_CONDITION_VALUE0 {
+                        r#type: FWP_UINT32,
+                        Anonymous: FWP_CONDITION_VALUE0_0 { uint32: 0x7f000001 },
+                    },
+                }
+            };
+            let mut conditions = [
+                remote,
+                FWPM_FILTER_CONDITION0 {
+                    fieldKey: FWPM_CONDITION_IP_REMOTE_PORT,
+                    matchType: FWP_MATCH_EQUAL,
+                    conditionValue: FWP_CONDITION_VALUE0 {
+                        r#type: FWP_UINT16,
+                        Anonymous: FWP_CONDITION_VALUE0_0 {
+                            uint16: address.port(),
+                        },
+                    },
+                },
+            ];
+            let mut name: Vec<u16> = "etd-test-fence-breaker".encode_utf16().chain([0]).collect();
+            let filter = FWPM_FILTER0 {
+                displayData: FWPM_DISPLAY_DATA0 {
+                    name: PWSTR(name.as_mut_ptr()),
+                    ..Default::default()
+                },
+                subLayerKey: GUID::from_u128(SUBLAYER),
+                layerKey: if address.is_ipv6() {
+                    FWPM_LAYER_ALE_AUTH_CONNECT_V6
+                } else {
+                    FWPM_LAYER_ALE_AUTH_CONNECT_V4
+                },
+                weight: FWP_VALUE0 {
+                    r#type: FWP_UINT8,
+                    Anonymous: FWP_VALUE0_0 { uint8: 15 },
+                },
+                numFilterConditions: conditions.len() as u32,
+                filterCondition: conditions.as_mut_ptr(),
+                action: FWPM_ACTION0 {
+                    r#type: FWP_ACTION_PERMIT,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert_eq!(FwpmFilterAdd0(engine, &filter, None, None), 0);
+            Self(engine)
+        }
+    }
+}
+impl Drop for Breaker {
+    fn drop(&mut self) {
+        unsafe {
+            ::windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmEngineClose0(self.0);
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires an elevated administrator that is not SYSTEM on a disposable Windows CI runner"]
 async fn session_fence() {
@@ -500,12 +595,28 @@ async fn session_fence() {
         assert_eq!(filters.len(), 4, "{filters:?}");
         assert!(filters.iter().all(|f| f & 1 == 0), "{filters:?}");
 
+        // The product probe runs on a host thread impersonating the
+        // restricted Medium copy: its refusal is this verification passing.
         let verification = fence.verify(&spec, std::process::id()).await.unwrap();
         assert!(verification.passed(), "{verification:?}");
-        // Independently, while the listener is up: refused for the
-        // restricted copy, admitted for this elevated process.
+        // Independently, while the listener is up: refused for a child with
+        // the restricted copy, admitted for this elevated process (the
+        // unimpersonated positive control).
         assert_eq!(restricted_connect(addr), "refused");
         tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // A broken fence (complete, but anyone gets through) is never
+        // verified: the impersonated probe connects. There is no probe child
+        // a same-user process could end with a forged exit code.
+        let breaker = Breaker::add(addr);
+        assert_eq!(restricted_connect(addr), "connected", "the breaker works");
+        let broken = fence.verify(&spec, std::process::id()).await;
+        assert!(
+            matches!(&broken, Ok(v) if !v.passed() && v.unprivileged == DirectionResult::Connected),
+            "{broken:?}"
+        );
+        drop(breaker);
+        assert_eq!(restricted_connect(addr), "refused");
 
         let effect = Effect {
             id: EffectId("session-fence".into()),

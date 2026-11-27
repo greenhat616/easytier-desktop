@@ -528,9 +528,49 @@ fn matching(e: &Engine, id: Uuid, port: u16) -> Result<Vec<Filter>, WinError> {
     Ok(out)
 }
 
+/// Delete our provider and sublayer if they have the other form's
+/// persistence and hold no filter at all: an empty container another form
+/// left (it holds no fence, so nothing depends on it). One with filters is
+/// left alone and fails the identity check that follows.
+fn replace_empty_other_form(e: &Engine, form: FenceForm) -> Result<(), WinError> {
+    unsafe {
+        let mut p = null_mut();
+        let rc = FwpmProviderGetByKey0(e.0, &PROVIDER, &mut p);
+        if rc == FWP_E_PROVIDER_NOT_FOUND.0 as u32 {
+            return Ok(());
+        }
+        check(rc, "lookup WFP provider")?;
+        let other = ((*p).flags & FWPM_PROVIDER_FLAG_PERSISTENT != 0) != persistent(form)
+            && display_name((*p).displayData.name) == "EasyTier Desktop fence provider";
+        FwpmFreeMemory0((&mut p as *mut *mut FWPM_PROVIDER0).cast());
+        if !other || !filters(e)?.is_empty() {
+            return Ok(());
+        }
+        check_acl(e, PROVIDER, "provider")?;
+        let mut s = null_mut();
+        let rc = FwpmSubLayerGetByKey0(e.0, &SUBLAYER, &mut s);
+        if rc != FWP_E_SUBLAYER_NOT_FOUND.0 as u32 {
+            check(rc, "lookup WFP sublayer")?;
+            FwpmFreeMemory0((&mut s as *mut *mut FWPM_SUBLAYER0).cast());
+            check_acl(e, SUBLAYER, "sublayer")?;
+            check(
+                FwpmSubLayerDeleteByKey0(e.0, &SUBLAYER),
+                "delete the empty WFP sublayer of the other form",
+            )?;
+        }
+        check(
+            FwpmProviderDeleteByKey0(e.0, &PROVIDER),
+            "delete the empty WFP provider of the other form",
+        )?;
+    }
+    Ok(())
+}
+
 /// Add our provider and sublayer for `form` if absent; an existing one must
-/// have our identity and the form's persistence.
+/// have our identity and the form's persistence (an empty one of the other
+/// form is replaced).
 fn ensure_container(e: &Engine, form: FenceForm, sd: &Sd) -> Result<(), WinError> {
+    replace_empty_other_form(e, form)?;
     unsafe {
         let mut p = null_mut();
         let rc = FwpmProviderGetByKey0(e.0, &PROVIDER, &mut p);
@@ -752,9 +792,15 @@ fn observe_on(e: &Engine, key: &ObjectKey) -> Result<Option<Observation>, WinErr
     )))
 }
 
-pub fn complete(key: &ObjectKey) -> Result<bool, WinError> {
+/// Whether all four filters of `key` are present with `form`, the form of
+/// the generation being verified. A fence of the other form is ours and can
+/// be reclaimed, but it is not this generation's fence.
+pub fn complete(key: &ObjectKey, form: FenceForm) -> Result<bool, WinError> {
     let (id, port) = parts(key)?;
-    Ok(matching(&Engine::open()?, id, port)?.len() == 4)
+    Ok(complete_as(&matching(&Engine::open()?, id, port)?, form))
+}
+fn complete_as(filters: &[Filter], form: FenceForm) -> bool {
+    filters.len() == 4 && filters.iter().all(|f| f.form() == form)
 }
 
 pub fn remove(key: &ObjectKey) -> Result<Reclaimed, WinError> {
@@ -950,6 +996,26 @@ mod tests {
         assert!(!trusted(
             "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;S-1-5-21-1-2-3-1001)"
         ));
+    }
+
+    #[test]
+    fn only_four_filters_of_the_expected_form_are_complete() {
+        let filters = |persistent: bool, n: usize| -> Vec<Filter> {
+            (0..n)
+                .map(|_| Filter {
+                    key: GUID::zeroed(),
+                    label: String::new(),
+                    persistent,
+                    owned: true,
+                })
+                .collect()
+        };
+        assert!(complete_as(&filters(true, 4), FenceForm::Service));
+        assert!(complete_as(&filters(false, 4), FenceForm::Session));
+        // A fence of the other form is not this generation's fence.
+        assert!(!complete_as(&filters(true, 4), FenceForm::Session));
+        assert!(!complete_as(&filters(false, 4), FenceForm::Service));
+        assert!(!complete_as(&filters(false, 3), FenceForm::Session));
     }
 
     #[test]

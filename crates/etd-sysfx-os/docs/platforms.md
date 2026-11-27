@@ -47,8 +47,9 @@ at `<state_dir>\..\profile`, the protected empty directory of the session tree, 
 `PSModuleAnalysisCachePath=NUL`. It is never created here: when it is absent (an
 administrator's command over the service layout) the worker gets no profile variables
 at all, as before; when it is present it must be a plain directory owned by SYSTEM or
-Administrators, or the worker fails closed. There is never a fallback to the user's
-profile.
+Administrators, with no allow entry that gives anyone else a write right, whose final
+path (links and junctions resolved) is the path itself, or the worker fails closed.
+There is never a fallback to the user's profile.
 
 The .NET Framework runtime also reads its settings from the user's
 `HKCU\Software\Microsoft\.NETFramework`. On the CI runner, profiler settings there
@@ -84,22 +85,24 @@ TCP to `127.0.0.1` / `::1` on the port: permit when the connecting token matches
 form's `ALE_USER_ID` descriptor, block otherwise. Filters and containers carry a
 SYSTEM/Administrators security descriptor, and a container whose ACL admits an
 ordinary user is never treated as exclusive. A port that is already fenced is refused.
-`verify` requires all four filters before and after, exactly one listener on the exact
-address owned by the expected pid (a wildcard listener is rejected), a successful host
-connection, and a refusal (`WSAEACCES`) from a PowerShell probe of the form's
-unprivileged identity.
+`verify` requires all four filters, of the verifying host's own form, before and after
+(absent either time is `Missing`), exactly one listener on the exact address owned by
+the expected pid (a wildcard listener is rejected), a successful host connection, and a
+refusal (`WSAEACCES`) seen by a probe of the form's unprivileged identity.
 
 | | System service (SYSTEM token) | Elevated session (other elevated token) |
 | --- | --- | --- |
 | Permit descriptor | `D:P(A;;0x1;;;SY)` | `D:P(A;;0x1;;;SY)(A;;0x1;;;BA)`: Administrators matches only where the group is enabled, so SYSTEM and elevated administrators; never the user SID or a group a non-elevated token has enabled |
 | Filters, provider, sublayer | persistent; owner SYSTEM | non-persistent, in a non-dynamic engine session: they outlive the host until BFE stops; owner Administrators |
 | Ledger persistence | `Persistent` | `UntilReboot`: the next start closes the record by boot id; a BFE restart while running is caught by the runtime fence re-verification (all filters missing) |
-| Negative probe | `LogonUserW` as LocalService (no stored password); the script exits unless it runs as `S-1-5-19` | `CreateProcessAsUserW` with a restricted copy of the host token: Administrators deny-only, minimal privileges, Medium integrity, owner and default DACL the user's; the script exits unless it runs as the host's user without Administrators |
+| Negative probe | PowerShell started with `LogonUserW` as LocalService (no stored password); the script exits unless it runs as `S-1-5-19` | No child process: a dedicated host thread impersonates (`SetThreadToken`, `SecurityImpersonation`) a restricted copy of the host token (Administrators deny-only, minimal privileges, Medium integrity), checks that its effective token is that user with Administrators deny-only at Medium, connects, and reverts. A child of the same user could be ended by any of the user's processes with the "refused" exit code; a thread of the elevated host cannot be reached that way |
 
 An existing fence is read back as exactly one of the two shapes (persistence flag and
 permit descriptor must agree, and all four filters must have the same form), whichever
-form installed it, so either host can reclaim the other's records; installing requires
-the container to have the installing form's persistence.
+form installed it, so either host can reclaim the other's records, but only a fence of
+the verifying host's form verifies. Installing requires the container to have the
+installing form's persistence; an empty container of the other form (no filter at all
+in the sublayer) is deleted and recreated.
 
 **Boot id.** A random UUID stored as `BootId` in the volatile key
 `HKLM\SOFTWARE\EasyTierDesk\Volatile` (proven volatile, ACL SYSTEM + Administrators)

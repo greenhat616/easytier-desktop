@@ -805,6 +805,90 @@ fn assert_runtime_dirs_gone(records: &[etd_sysfx::Effect]) {
         }
     }
 }
+/// Sends request bodies as given bytes, so a test can send one that is not
+/// a valid protobuf message.
+#[derive(Clone, Copy, Default)]
+struct RawCodec;
+impl tonic::codec::Codec for RawCodec {
+    type Encode = Vec<u8>;
+    type Decode = Vec<u8>;
+    type Encoder = RawCodec;
+    type Decoder = RawCodec;
+    fn encoder(&mut self) -> Self::Encoder {
+        RawCodec
+    }
+    fn decoder(&mut self) -> Self::Decoder {
+        RawCodec
+    }
+}
+impl tonic::codec::Encoder for RawCodec {
+    type Item = Vec<u8>;
+    type Error = tonic::Status;
+    fn encode(
+        &mut self,
+        item: Vec<u8>,
+        dst: &mut tonic::codec::EncodeBuf<'_>,
+    ) -> Result<(), tonic::Status> {
+        prost::bytes::BufMut::put_slice(dst, &item);
+        Ok(())
+    }
+}
+impl tonic::codec::Decoder for RawCodec {
+    type Item = Vec<u8>;
+    type Error = tonic::Status;
+    fn decode(
+        &mut self,
+        src: &mut tonic::codec::DecodeBuf<'_>,
+    ) -> Result<Option<Vec<u8>>, tonic::Status> {
+        let n = prost::bytes::Buf::remaining(src);
+        Ok(Some(prost::bytes::Buf::copy_to_bytes(src, n).to_vec()))
+    }
+}
+
+#[tokio::test]
+async fn incompatible_version_metadata_is_refused_before_decoding() {
+    #[cfg(unix)]
+    if isolated_unix("host_process::incompatible_version_metadata_is_refused_before_decoding") {
+        return;
+    }
+    let mut f = Fixture::new();
+    let mut client = f.connect().await;
+    let connector = Arc::new(LocalConnector {
+        expectation: ServerExpectation {
+            exe_dir: f.root.path().to_owned(),
+            requirement: ServerRequirement::CurrentUser,
+        },
+    });
+    let channel = tonic::transport::Endpoint::from_static("http://localhost")
+        .connect_with_connector(ClientIo::new(connector, endpoint(f.root.path())))
+        .await
+        .unwrap();
+    let mut grpc = tonic::client::Grpc::new(channel);
+    grpc.ready().await.unwrap();
+    // Not a protobuf message: a handler would fail to decode it first.
+    let mut body = tonic::Request::new(vec![0xff; 8]);
+    body.metadata_mut().insert(
+        VERSION_METADATA_KEY,
+        format!("{}.0", VERSION_MAJOR + 1).parse().unwrap(),
+    );
+    let status = grpc
+        .unary::<Vec<u8>, Vec<u8>, _>(
+            body,
+            tonic::codegen::http::uri::PathAndQuery::from_static("/etd.v1.HostService/Snapshot"),
+            RawCodec,
+        )
+        .await
+        .unwrap_err();
+    let detail = <etd_contract::ErrorDetail as prost::Message>::decode(status.details())
+        .unwrap_or_else(|_| panic!("no contract error detail: {status:?}"));
+    assert_eq!(
+        detail.code(),
+        etd_contract::ErrorCode::VersionMismatch,
+        "{status:?}"
+    );
+    finish_user(&mut f, &mut client).await;
+}
+
 async fn finish_user(f: &mut Fixture, client: &mut Client) {
     client
         .release_lease(request(ReleaseLeaseRequest {

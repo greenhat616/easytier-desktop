@@ -38,8 +38,9 @@ Frozen items (see `src/lib.rs`) are marked (F).
   authorizer. A service host maps peers through the ledger allow list; an admin
   entry counts only for an elevated peer, otherwise it acts as control and admin
   methods answer `ELEVATION_REQUIRED`. A user host grants admin to its owning user
-  only. The elevated-session form is rejected
-  ("not available in this version"). Mutations are idempotent by request ID and
+  only. An elevated session host grants control to its owning user in its own Windows
+  session and admin only when that peer is elevated (otherwise admin methods answer
+  `ELEVATION_REQUIRED`); it has no allow list. Mutations are idempotent by request ID and
   content digest (the network secret enters the digest only as a keyed MAC): a known
   request returns its original receipt without planning again.
 - **Plan, commit, execute.** The service asks the orchestrator to plan
@@ -63,7 +64,7 @@ Frozen items (see `src/lib.rs`) are marked (F).
   host requires an adapter profile for the version; a user host without one runs the
   kernel lifecycle-only (start, stop, logs, no RPC). Clients can name a version, never
   a path.
-- **Host lifetime.** A user host (and the planned elevated session) stops its
+- **Host lifetime.** A user host (and an elevated session host) stops its
   instances and exits after 30 s with no lease holder, or when a client releases its
   lease with "stop instances". A service host ignores leases.
 

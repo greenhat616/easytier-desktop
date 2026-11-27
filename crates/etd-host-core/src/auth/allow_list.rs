@@ -10,6 +10,8 @@ use tokio::sync::watch;
 pub struct AllowListAuthorizer {
     mode: HostMode,
     owner: Option<OsUserId>,
+    /// The elevated session host's own Windows session.
+    session: Option<u32>,
     entries: watch::Sender<Option<Vec<AllowEntry>>>,
 }
 impl AllowListAuthorizer {
@@ -17,7 +19,21 @@ impl AllowListAuthorizer {
         Self {
             mode,
             owner,
+            session: None,
             entries: watch::channel(None).0,
+        }
+    }
+    /// The Windows session the elevated session host runs in. Its peers
+    /// must be in the same one; without it no peer is authorized.
+    pub fn with_session(mut self, session: Option<u32>) -> Self {
+        self.session = session;
+        self
+    }
+    fn is_owner(&self, peer: &PeerIdentity) -> bool {
+        match (&self.owner, &peer.user) {
+            (Some(OsUserId::WindowsSid(a)), OsUserId::WindowsSid(b)) => a.eq_ignore_ascii_case(b),
+            (Some(OsUserId::UnixUid(a)), OsUserId::UnixUid(b)) => a == b,
+            _ => false,
         }
     }
     pub async fn load(&self, ledger: &dyn Ledger) -> Result<(), LedgerError> {
@@ -50,18 +66,23 @@ impl Authorizer for AllowListAuthorizer {
     fn role_of(&self, peer: &PeerIdentity) -> Option<Role> {
         let guard = self.entries.borrow();
         let entries = guard.as_ref()?;
-        if self.mode == HostMode::User {
-            let owner = match (&self.owner, &peer.user) {
-                (Some(OsUserId::WindowsSid(a)), OsUserId::WindowsSid(b)) => {
-                    a.eq_ignore_ascii_case(b)
+        match self.mode {
+            HostMode::User => return self.is_owner(peer).then_some(Role::Admin),
+            // The owner in the host's own Windows session controls it;
+            // only an elevated owner administers it (doc#13).
+            HostMode::ElevatedSession => {
+                let same_session = self.session.is_some() && peer.session == self.session;
+                if !(self.is_owner(peer) && same_session) {
+                    return None;
                 }
-                (Some(OsUserId::UnixUid(a)), OsUserId::UnixUid(b)) => a == b,
-                _ => false,
-            };
-            return owner.then_some(Role::Admin);
-        }
-        if self.mode != HostMode::Service {
-            return None;
+                return Some(if peer.elevated {
+                    Role::Admin
+                } else {
+                    Role::Control
+                });
+            }
+            HostMode::Service => (),
+            HostMode::Unspecified => return None,
         }
         let mut role = Role::Unspecified;
         for entry in entries {

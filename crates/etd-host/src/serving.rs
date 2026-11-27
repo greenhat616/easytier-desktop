@@ -622,7 +622,10 @@ impl LeaseRule {
             // exiting and its pid being reused, by a process at the UI path,
             // between the IPC layer reading the pid and this open, before
             // the accept returned. That miscounts a lease (not an
-            // authorization; issue #2).
+            // authorization; issue #2). Both times are wall-clock (process
+            // creation times are): a clock set back by more than the UI's
+            // age makes the UI look newer than the accept, so it holds no
+            // lease and the host stops after the grace; fail-safe, rare.
             Self::UiImage(Some(ui)) => match etd_sysfx_os::service::ProcessPin::open(peer.pid) {
                 Ok(pin) => {
                     let holds = pin.created() <= accepted

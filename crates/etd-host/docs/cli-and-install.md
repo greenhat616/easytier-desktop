@@ -122,9 +122,18 @@ blocks; its self-check reclaims it.
      a `Conflict` one (another program's) is ignored;
   2. kernel-binary `WinProgramFirewallRule` records in our firewall group whose
      program path lies inside that root's own `<SID>\cores`.
+  For a program rule that was observed, the read-back key and the credential's
+  actual program must name such a path too; evidence that exists but cannot be read
+  blocks.
+- Paths count as inside a store only if both are plain local-drive paths (no `..`,
+  `.`, doubled separators, streams, device or UNC forms) and, canonicalised (case,
+  short names), the store is an ancestor by components and by file identity.
 - Everything else blocks: other kinds, names, groups or paths, scopes this build does
   not know, a ledger that cannot be read, and a root with no ledger whose `state\` or
-  `run\` is not empty (a host got that far; ownership unknown).
+  `run\` is not empty (a host got that far; ownership unknown). `reclaim --all-users`
+  (with or without `--purge`) and `install` refuse such a root too, name it and leave
+  it untouched; an administrator who has confirmed it holds nothing needed deletes
+  it.
 
 Lease holders are only connections whose client process image, read from a handle
 opened on the client pid at accept and kept for the connection's life, is the

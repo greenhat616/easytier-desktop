@@ -119,8 +119,8 @@ fn enter(layout: &HostLayout) -> Result<MaintenanceLock> {
 }
 
 /// Whether an open record of another user's session root blocks this
-/// session (doc#13 #ownership). `root`: that root; `stores`: the kernel
-/// stores of every verified session root.
+/// session (doc#13 #ownership). `cores`: that root's kernel store;
+/// `stores`: the kernel stores of every verified session root.
 ///
 /// - Any scope: a record that ended with a reboot since never blocks
 ///   (`UntilReboot` and `WithProcess` written in another boot).
@@ -142,7 +142,7 @@ fn enter(layout: &HostLayout) -> Result<MaintenanceLock> {
 ///
 ///   Anything else blocks: other kinds or names, other paths, unknown or
 ///   unreadable values.
-fn blocks(effect: &Effect, boot: &BootId, root: &HostLayout, stores: &[PathBuf]) -> bool {
+fn blocks(effect: &Effect, boot: &BootId, cores: &Path, stores: &[PathBuf]) -> bool {
     let ended_with_reboot = matches!(
         effect.persistence,
         Persistence::UntilReboot | Persistence::WithProcess
@@ -153,7 +153,7 @@ fn blocks(effect: &Effect, boot: &BootId, root: &HostLayout, stores: &[PathBuf])
     match &effect.scope {
         EffectScope::Instance { .. } => true,
         EffectScope::Product => !shared_driver_elsewhere(effect, stores),
-        EffectScope::CoreBinary { .. } => !program_rule_of(effect, root),
+        EffectScope::CoreBinary { .. } => !program_rule_of(effect, cores),
         // A scope this build does not know: unknown ownership.
         _ => true,
     }
@@ -176,44 +176,71 @@ fn shared_driver_elsewhere(effect: &Effect, stores: &[PathBuf]) -> bool {
     }
 }
 
-/// Reviewed class 2 of [`blocks`].
-fn program_rule_of(effect: &Effect, root: &HostLayout) -> bool {
+/// Reviewed class 2 of [`blocks`]. The planned name, and where the record
+/// was observed the observed key and the credential's actual program, must
+/// all name a program inside that root's own kernel store. Evidence that
+/// exists but cannot be read (another key form, another credential form,
+/// no program in it) blocks; only a record never observed rests on its
+/// name alone.
+fn program_rule_of(effect: &Effect, cores: &Path) -> bool {
+    let inside = |path: &Path| path_inside(path, cores);
+    if effect.kind != EffectKind::WinProgramFirewallRule || !our_program_rule(&effect.key, inside) {
+        return false;
+    }
+    let Some(observation) = &effect.observation else {
+        return true;
+    };
+    if let Some(key) = &observation.key
+        && !our_program_rule(key, inside)
+    {
+        return false;
+    }
+    match &observation.credential {
+        None => true,
+        Some(etd_sysfx::Credential::Opaque { value }) => {
+            serde_json::from_str::<serde_json::Value>(value).is_ok_and(|credential| {
+                credential["program"]
+                    .as_str()
+                    .is_some_and(|program| inside(Path::new(program)))
+            })
+        }
+        Some(_) => false,
+    }
+}
+
+/// A rule key in our firewall group named `EasyTier <program> (Inbound |
+/// Outbound)` (as the plan names them; read back lower-cased) whose
+/// program passes `inside`.
+fn our_program_rule(key: &ObjectKey, inside: impl Fn(&Path) -> bool) -> bool {
     use etd_core_easytier::plan::effects::FIREWALL_GROUP;
     let ObjectKey::Rule {
         name,
         group: Some(group),
-    } = &effect.key
+    } = key
     else {
         return false;
     };
-    if effect.kind != EffectKind::WinProgramFirewallRule || group != FIREWALL_GROUP {
+    if !group.eq_ignore_ascii_case(FIREWALL_GROUP) {
         return false;
     }
-    // `EasyTier <program> (Inbound|Outbound)`, as the plan names them.
-    let program = name
-        .strip_prefix("EasyTier ")
+    strip_ci(name, "EasyTier ")
         .and_then(|rest| {
-            rest.strip_suffix(" (Inbound)")
-                .or_else(|| rest.strip_suffix(" (Outbound)"))
+            unsuffix_ci(rest, " (Inbound)").or_else(|| unsuffix_ci(rest, " (Outbound)"))
         })
-        .map(Path::new);
-    let recorded = effect
-        .observation
-        .as_ref()
-        .and_then(|observation| match &observation.credential {
-            Some(etd_sysfx::Credential::Opaque { value }) => {
-                serde_json::from_str::<serde_json::Value>(value).ok()
-            }
-            _ => None,
-        })
-        .map(|credential| credential["program"].as_str().map(PathBuf::from));
-    let inside = |path: &Path| path_inside(path, &root.cores);
-    match (program, recorded) {
-        (Some(program), None) => inside(program),
-        (Some(program), Some(Some(recorded))) => inside(program) && inside(&recorded),
-        // A credential without a program, or a name of another form.
-        _ => false,
-    }
+        .is_some_and(|program| inside(Path::new(program)))
+}
+
+fn strip_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    text.get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .and_then(|_| text.get(prefix.len()..))
+}
+
+fn unsuffix_ci<'a>(text: &'a str, suffix: &str) -> Option<&'a str> {
+    let at = text.len().checked_sub(suffix.len())?;
+    text.get(at..)
+        .filter(|tail| tail.eq_ignore_ascii_case(suffix))
+        .and_then(|_| text.get(..at))
 }
 
 #[cfg(windows)]
@@ -262,8 +289,13 @@ async fn leftovers(root: &HostLayout, stores: &[PathBuf], boot: &BootId) -> bool
     open.map_or(true, |effects| {
         effects
             .iter()
-            .any(|effect| blocks(effect, boot, root, stores))
+            .any(|effect| blocks(effect, boot, &root.cores, stores))
     })
+}
+
+/// `<SID>`: the per-user session root a session layout lives in.
+fn user_root_of(layout: &HostLayout) -> &Path {
+    layout.state.parent().unwrap_or(&layout.state)
 }
 
 /// A root without a ledger whose state or run directory is not empty (or
@@ -391,6 +423,14 @@ pub(super) async fn reclaim_all_users(locks: &HostLayout, purge: bool) -> Result
 pub(super) async fn drain(purge: bool) -> Result<()> {
     for layout in NativeHostFilesystem.session_layouts().map_err(refusal)? {
         if !storage::ledger_exists(&layout.state)? {
+            // A fresh root holds nothing; one a host got further in, with
+            // no ledger, is of unknown ownership: kept, never purged.
+            ensure!(
+                !unknown_owner(&layout.state, &layout.run),
+                "the elevated session root of {} has files but no ledger, so what it owns is unknown; it was left untouched. An administrator who has confirmed it holds nothing needed may delete {}, then retry",
+                owner_sid(&layout),
+                user_root_of(&layout).display()
+            );
             continue;
         }
         let sid = owner_sid(&layout);
@@ -436,11 +476,36 @@ mod tests {
         }
     }
 
+    /// Two session roots' kernel stores, a prefix-spoofing sibling and a
+    /// kernel in the first, as real directories (containment is checked
+    /// on the filesystem).
     #[cfg(windows)]
-    fn root() -> HostLayout {
-        NativeHostFilesystem
-            .session_layout("S-1-5-21-1-2-3-1002")
-            .unwrap()
+    struct Stores {
+        _dir: tempfile::TempDir,
+        cores: PathBuf,
+        other: PathBuf,
+        spoof: PathBuf,
+        kernel: PathBuf,
+    }
+
+    #[cfg(windows)]
+    fn stores() -> Stores {
+        let dir = tempfile::tempdir().unwrap();
+        let cores = dir.path().join("S-1-5-21-1-2-3-1002").join("cores");
+        let other = dir.path().join("S-1-5-21-1-2-3-1003").join("cores");
+        let spoof = dir.path().join("S-1-5-21-1-2-3-1002").join("cores2");
+        for store in [&cores, &other, &spoof] {
+            std::fs::create_dir_all(store.join("0a")).unwrap();
+        }
+        let kernel = cores.join("0a").join("easytier-core.exe");
+        std::fs::write(&kernel, b"fixture").unwrap();
+        Stores {
+            _dir: dir,
+            cores,
+            other,
+            spoof,
+            kernel,
+        }
     }
 
     #[cfg(windows)]
@@ -461,8 +526,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn instance_records_block_unless_they_ended_with_a_reboot() {
-        let (now, root) = (BootId("now".into()), root());
-        let blocked = |persistence, boot| blocks(&effect(persistence, boot), &now, &root, &[]);
+        let (now, fixture) = (BootId("now".into()), stores());
+        let blocked =
+            |persistence, boot| blocks(&effect(persistence, boot), &now, &fixture.cores, &[]);
         assert!(!blocked(Persistence::UntilReboot, "before"));
         assert!(!blocked(Persistence::WithProcess, "before"));
         assert!(blocked(Persistence::UntilReboot, "now"));
@@ -474,8 +540,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn only_shared_drivers_loaded_from_the_system_or_a_session_store_are_ignored() {
-        let (now, root) = (BootId("now".into()), root());
-        let stores = [root.cores.clone()];
+        let (now, fixture) = (BootId("now".into()), stores());
+        let stores = [fixture.cores.clone(), fixture.other.clone()];
         let driver = |name: &str, state, image: Option<String>| Effect {
             scope: EffectScope::Product,
             kind: EffectKind::Driver,
@@ -485,13 +551,11 @@ mod tests {
                 .and_then(|image| observed(Some(serde_json::json!({ "image_path": image })), None)),
             ..effect(Persistence::Persistent, "now")
         };
-        let blocked = |effect: Effect| blocks(&effect, &now, &root, &stores);
-        let in_store = root
-            .cores
-            .join("0a")
-            .join("wintun.sys")
-            .display()
-            .to_string();
+        let blocked = |effect: Effect| blocks(&effect, &now, &fixture.cores, &stores);
+        let in_store = fixture.other.join("0a").join("wintun.sys");
+        let in_store = in_store.display().to_string();
+        let spoofed = fixture.spoof.join("0a").join("wintun.sys");
+        let escaping = format!(r"{}\..\cores2\0a\wintun.sys", fixture.cores.display());
         assert!(!blocked(driver(
             "wintun",
             EffectState::Applied,
@@ -508,10 +572,25 @@ mod tests {
             Some(r"C:\Temp\wintun.sys".into())
         )));
         assert!(blocked(driver(
+            "wintun",
+            EffectState::Applied,
+            Some(spoofed.display().to_string())
+        )));
+        assert!(blocked(driver(
+            "wintun",
+            EffectState::Applied,
+            Some(escaping)
+        )));
+        assert!(blocked(driver(
             "other",
             EffectState::Applied,
             Some(in_store)
         )));
+        let unreadable = Effect {
+            observation: observed(Some(serde_json::json!({ "path": "x" })), None),
+            ..driver("wintun", EffectState::Planned, None)
+        };
+        assert!(blocked(unreadable), "observed without an image path");
         // Never observed: ignored only if never loaded, or another program's.
         assert!(!blocked(driver("wintun", EffectState::Planned, None)));
         assert!(!blocked(driver("wintun", EffectState::Conflict, None)));
@@ -525,9 +604,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn only_our_program_rules_on_that_roots_own_kernels_are_ignored() {
-        let (now, root) = (BootId("now".into()), root());
-        let kernel = root.cores.join("0a").join("easytier-core.exe");
-        let rule = |program: &Path, group: Option<&str>, recorded: Option<&Path>| Effect {
+        let fixture = stores();
+        let kernel = fixture.kernel.as_path();
+        let rule = |program: &Path, group: Option<&str>| Effect {
             scope: EffectScope::CoreBinary {
                 sha256: "0a".into(),
             },
@@ -536,29 +615,101 @@ mod tests {
                 name: format!("EasyTier {} (Inbound)", program.display()),
                 group: group.map(Into::into),
             },
-            observation: recorded.and_then(|recorded| {
-                observed(
-                    None,
-                    Some(serde_json::json!({ "program": recorded.display().to_string() })),
-                )
-            }),
             ..effect(Persistence::Persistent, "now")
         };
-        let blocked = |effect: Effect| blocks(&effect, &now, &root, &[]);
-        assert!(!blocked(rule(&kernel, Some("EasyTier"), None)));
-        assert!(!blocked(rule(&kernel, Some("EasyTier"), Some(&kernel))));
-        assert!(blocked(rule(&kernel, None, None)));
-        assert!(blocked(rule(&kernel, Some("Other"), None)));
-        let elsewhere = Path::new(r"C:\Temp\easytier-core.exe");
-        assert!(blocked(rule(elsewhere, Some("EasyTier"), None)));
-        assert!(blocked(rule(&kernel, Some("EasyTier"), Some(elsewhere))));
-        let other_root = NativeHostFilesystem
-            .session_layout("S-1-5-21-1-2-3-1003")
-            .unwrap()
-            .cores
-            .join("0a")
-            .join("easytier-core.exe");
-        assert!(blocked(rule(&other_root, Some("EasyTier"), None)));
+        let ours = |effect: &Effect| program_rule_of(effect, &fixture.cores);
+        let read_back =
+            |effect: Effect, key: Option<ObjectKey>, credential: Option<etd_sysfx::Credential>| {
+                Effect {
+                    observation: Some(etd_sysfx::Observation {
+                        credential,
+                        key,
+                        observed_at: "1970-01-01T00:00:00Z".parse().unwrap(),
+                        detail: None,
+                    }),
+                    ..effect
+                }
+            };
+        let opaque = |value: serde_json::Value| {
+            Some(etd_sysfx::Credential::Opaque {
+                value: value.to_string(),
+            })
+        };
+        let program = |path: &Path| {
+            opaque(serde_json::json!({ "program": path.display().to_string().to_lowercase() }))
+        };
+
+        // Never observed: the planned name decides.
+        assert!(ours(&rule(kernel, Some("EasyTier"))));
+        assert!(!ours(&rule(kernel, None)));
+        assert!(!ours(&rule(kernel, Some("Other"))));
+        assert!(!ours(&rule(
+            &fixture.other.join("0a").join("easytier-core.exe"),
+            Some("EasyTier")
+        )));
+        assert!(!ours(&rule(
+            &fixture.spoof.join("0a").join("easytier-core.exe"),
+            Some("EasyTier")
+        )));
+        let escaping = PathBuf::from(format!(
+            r"{}\..\cores2\0a\easytier-core.exe",
+            fixture.cores.display()
+        ));
+        assert!(!ours(&rule(&escaping, Some("EasyTier"))));
+        assert!(!ours(&Effect {
+            kind: EffectKind::WinFirewallRule,
+            ..rule(kernel, Some("EasyTier"))
+        }));
+
+        // Observed: the read-back key (lower-cased) and the actual program
+        // must agree; unreadable evidence blocks.
+        let lower = ObjectKey::Rule {
+            name: format!("easytier {} (inbound)", kernel.display()).to_lowercase(),
+            group: Some("easytier".into()),
+        };
+        assert!(ours(&read_back(
+            rule(kernel, Some("EasyTier")),
+            Some(lower.clone()),
+            program(kernel)
+        )));
+        assert!(ours(&read_back(rule(kernel, Some("EasyTier")), None, None)));
+        assert!(!ours(&read_back(
+            rule(kernel, Some("EasyTier")),
+            Some(lower.clone()),
+            program(&fixture.spoof.join("x.exe"))
+        )));
+        assert!(!ours(&read_back(
+            rule(kernel, Some("EasyTier")),
+            None,
+            opaque(serde_json::json!({ "name": "x" }))
+        )));
+        assert!(!ours(&read_back(
+            rule(kernel, Some("EasyTier")),
+            None,
+            Some(etd_sysfx::Credential::Opaque {
+                value: "not json".into()
+            })
+        )));
+        assert!(!ours(&read_back(
+            rule(kernel, Some("EasyTier")),
+            Some(ObjectKey::Service { name: "x".into() }),
+            None
+        )));
+        let elsewhere = ObjectKey::Rule {
+            name: format!(
+                "EasyTier {} (Outbound)",
+                fixture.spoof.join("x.exe").display()
+            ),
+            group: Some("EasyTier".into()),
+        };
+        assert!(!ours(&read_back(
+            Effect {
+                state: EffectState::Conflict,
+                ..rule(kernel, Some("EasyTier"))
+            },
+            Some(elsewhere),
+            None
+        )));
     }
 
     #[test]

@@ -1,0 +1,47 @@
+name: Fluent gallery preview
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [wbs/FL3-gallery]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gallery-preview-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+
+jobs:
+  snapshots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install Linux and software renderer dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang cmake pkg-config libssl-dev libfontconfig1-dev libfreetype6-dev libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev libxcb-dri3-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev mesa-vulkan-drivers libdbus-1-dev fonts-liberation
+      - name: Install pinned protoc
+        shell: pwsh
+        run: ./.github/scripts/setup-protoc.ps1
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          save-if: 'false'
+      - name: Check the runnable example
+        run: cargo check --locked -p etd-ui --example gallery
+      - name: Offscreen gallery screenshots
+        env:
+          GALLERY_SCREENSHOT_DIR: ${{ runner.temp }}/fluent-gallery
+          WGPU_BACKEND: vulkan
+        run: cargo test --locked -p etd-ui --lib gallery::tests::capture_gallery_screenshots -- --ignored --nocapture
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fluent-gallery
+          path: ${{ runner.temp }}/fluent-gallery/*.png
+          if-no-files-found: error

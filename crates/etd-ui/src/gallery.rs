@@ -940,6 +940,27 @@ mod tests {
             window.press("space", cx);
             window.render_frame(cx);
             assert_eq!(window.find("tabs-1").selected(), Some(true));
+
+            window.click("gallery-nav-dialogs", cx);
+            window.render_frame(cx);
+            window.click("flyout-open", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        // A popup opened while an older one closes keeps the focus it took.
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.press("escape", cx);
+            window.render_frame(cx);
+            window.click("dialog-open", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("dialog").is_none());
         })
         .unwrap();
     }

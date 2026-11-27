@@ -701,6 +701,13 @@ struct PopupFocus {
     build: PopupBuilder,
 }
 
+/// Counts popups opened in this app, so a closing popup can tell whether
+/// a newer one now owns focus.
+#[derive(Default)]
+struct PopupEpoch(u64);
+
+impl gpui_kit::Global for PopupEpoch {}
+
 /// Lives exactly as long as the popup renders; its release is the popup
 /// closing.
 struct PopupFocusState {
@@ -720,6 +727,11 @@ impl RenderOnce for PopupFocus {
             let opener = window.focused(cx);
             let handle = window.window_handle();
             let open = cx.entity().downgrade();
+            let epoch = {
+                let latest = cx.default_global::<PopupEpoch>();
+                latest.0 += 1;
+                latest.0
+            };
             window.defer(cx, move |window, cx| {
                 // Skip if the popup closed again before this ran.
                 if open.upgrade().is_some() {
@@ -727,9 +739,13 @@ impl RenderOnce for PopupFocus {
                 }
             });
             cx.on_release(move |this: &mut PopupFocusState, app| {
-                // A press elsewhere that moved focus keeps it there.
+                // A press elsewhere that moved focus keeps it there, and a
+                // popup opened since then keeps the focus it took.
                 if let (true, Some(opener)) = (this.inside.get(), opener) {
                     app.defer(move |app| {
+                        if app.default_global::<PopupEpoch>().0 != epoch {
+                            return;
+                        }
                         handle
                             .update(app, |_, window, cx| window.focus(&opener, cx))
                             .ok();

@@ -2641,6 +2641,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "async-trait",
+ "directories",
  "etd-app",
  "etd-client",
  "etd-contract",

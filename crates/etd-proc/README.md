@@ -54,8 +54,12 @@ Not frozen:
   criteria are re-checked immediately before `SIGKILL`, leaving a narrow
   verify-to-signal window on that platform only. Other platforms answer `Uncertain`.
 - **Marker sweep.** `find_marked` matches processes of the host's user whose image is
-  under `exe_root` and whose arguments reference a path under `cmdline_root`. A live
-  candidate whose fields cannot be observed is an error, not a skip. It walks
+  under `exe_root` and whose arguments reference a path under `cmdline_root`. A
+  candidate whose fields cannot all be read (one caught starting or exiting) is looked
+  at again, up to 20 times 10 ms apart; it is excluded only on positive evidence (a
+  criterion read and not matching, or a confirmed exit). One still unreadable and alive
+  is an error, not a skip, naming the unreadable fields and, on Linux, the `/proc`
+  state, exiting flag and uid. It walks
   processes, not threads (on Linux a thread is never a candidate of its own); a
   zombie is skipped only once its thread list shows it alone or its exit is confirmed:
   a leader whose other threads still run stays a candidate, and an unreadable thread

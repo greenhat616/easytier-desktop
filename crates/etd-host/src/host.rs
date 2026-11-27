@@ -1067,11 +1067,20 @@ pub async fn reclaim(mode: HostMode, _all: bool, purge: bool, all_users: bool) -
         !all_users || mode == HostMode::ElevatedSession,
         "--all-users applies only to --mode elevated-session"
     );
+    if all_users {
+        // Every user's sessions, independent of the caller's token: the
+        // app uninstaller runs this as LocalSystem. Only the shared
+        // maintenance and host locks are taken from a layout, and the
+        // service's has the same ones.
+        ensure!(
+            NativeServiceManager.entry_is_elevated()?,
+            "administrator privileges required"
+        );
+        let locks = NativeHostFilesystem.service_layout()?;
+        return session::reclaim_all_users(&locks, purge).await;
+    }
     let layout = layout(mode)?;
     match mode {
-        HostMode::ElevatedSession if all_users => {
-            return session::reclaim_all_users(&layout, purge).await;
-        }
         HostMode::ElevatedSession => return session::reclaim_own(&layout, purge).await,
         HostMode::Service | HostMode::User | HostMode::Unspecified => (),
     }

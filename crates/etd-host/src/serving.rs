@@ -23,7 +23,7 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context as TaskContext, Poll},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -609,18 +609,28 @@ impl LeaseRule {
     }
 
     /// Whether the client `peer` holds the lease, and the process pin that
-    /// keeps that answer true while the connection lives.
-    fn holds(&self, peer: &PeerIdentity) -> (bool, Option<ClientPin>) {
+    /// keeps that answer true while the connection lives. `accepted`: when
+    /// the pipe connection was accepted, so after its client connected.
+    fn holds(&self, peer: &PeerIdentity, accepted: SystemTime) -> (bool, Option<ClientPin>) {
         match self {
             Self::None => (false, None),
             Self::Every => (true, None),
             #[cfg(windows)]
+            // The pin is taken right after accept and tied to the client
+            // pid by its creation time: a process created after the accept
+            // reused the pid and is not the client. Left open: the client
+            // exiting and its pid being reused, by a process at the UI path,
+            // between the IPC layer reading the pid and this open, before
+            // the accept returned. That miscounts a lease (not an
+            // authorization; issue #2).
             Self::UiImage(Some(ui)) => match etd_sysfx_os::service::ProcessPin::open(peer.pid) {
                 Ok(pin) => {
-                    let holds = pin
-                        .image()
-                        .and_then(std::fs::canonicalize)
-                        .is_ok_and(|image| same_path(&image, ui));
+                    let holds = pin.created() <= accepted
+                        && pin.alive().unwrap_or(false)
+                        && pin
+                            .image()
+                            .and_then(std::fs::canonicalize)
+                            .is_ok_and(|image| same_path(&image, ui));
                     (holds, Some(pin))
                 }
                 Err(error) => {
@@ -631,7 +641,7 @@ impl LeaseRule {
             // No elevated session host on Unix.
             #[cfg(unix)]
             Self::UiImage(_) => {
-                let _ = peer;
+                let _ = (peer, accepted);
                 (false, None)
             }
             #[cfg(windows)]
@@ -718,7 +728,7 @@ impl TrackedListener {
 impl Listener for TrackedListener {
     async fn accept(&mut self) -> io::Result<(BoxConn, PeerIdentity)> {
         let (conn, peer) = self.listener.accept().await?;
-        let (holder, pin) = self.lease.holds(&peer);
+        let (holder, pin) = self.lease.holds(&peer, SystemTime::now());
         self.presence.change(true, holder);
         Ok((
             Box::new(TrackedConnection {
@@ -771,6 +781,10 @@ impl AsyncWrite for TrackedConnection {
 mod lease_tests {
     use super::*;
 
+    fn now() -> SystemTime {
+        SystemTime::now()
+    }
+
     fn peer(pid: u32) -> PeerIdentity {
         PeerIdentity {
             user: OsUserId::UnixUid(1),
@@ -784,10 +798,16 @@ mod lease_tests {
     #[test]
     fn only_the_rule_of_the_form_decides_the_lease() {
         let me = peer(std::process::id());
-        assert!(!LeaseRule::None.holds(&me).0, "the service has no lease");
-        assert!(LeaseRule::Every.holds(&me).0, "every user host connection");
         assert!(
-            !LeaseRule::UiImage(None).holds(&me).0,
+            !LeaseRule::None.holds(&me, now()).0,
+            "the service has no lease"
+        );
+        assert!(
+            LeaseRule::Every.holds(&me, now()).0,
+            "every user host connection"
+        );
+        assert!(
+            !LeaseRule::UiImage(None).holds(&me, now()).0,
             "no UI beside the host: no holder"
         );
         assert!(matches!(
@@ -811,18 +831,23 @@ mod lease_tests {
     fn an_elevated_session_lease_needs_the_ui_image() {
         let me = peer(std::process::id());
         let image = std::env::current_exe().unwrap().canonicalize().unwrap();
-        let (holds, pin) = LeaseRule::UiImage(Some(image.clone())).holds(&me);
+        let (holds, pin) = LeaseRule::UiImage(Some(image.clone())).holds(&me, now());
         assert!(holds);
         assert!(pin.is_some(), "the client process stays pinned");
         let upper = std::path::PathBuf::from(image.to_string_lossy().to_uppercase());
         assert!(
-            LeaseRule::UiImage(Some(upper)).holds(&me).0,
+            LeaseRule::UiImage(Some(upper)).holds(&me, now()).0,
             "case-insensitive"
         );
         let other = image.with_file_name("etd-ui.exe");
-        assert!(!LeaseRule::UiImage(Some(other)).holds(&me).0);
+        assert!(!LeaseRule::UiImage(Some(other)).holds(&me, now()).0);
+        // A process created after the accept reused the client's pid.
+        let (holds, pin) =
+            LeaseRule::UiImage(Some(image.clone())).holds(&me, SystemTime::UNIX_EPOCH);
+        assert!(!holds, "created after the accept: not the client");
+        assert!(pin.is_some());
         // A pid that cannot be opened holds nothing.
-        assert!(!LeaseRule::UiImage(Some(image)).holds(&peer(0)).0);
+        assert!(!LeaseRule::UiImage(Some(image)).holds(&peer(0), now()).0);
     }
 }
 

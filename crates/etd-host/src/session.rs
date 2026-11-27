@@ -10,7 +10,10 @@ use etd_sysfx::{
     sqlite::{OpenOptions, SqliteLedger},
 };
 use etd_sysfx_os::service::NotConforming;
-use std::{fmt, path::Path};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+};
 
 /// Why an elevated session host refused to start or reclaim. Each has its
 /// own process exit code so the UI (ES4) can tell them apart.
@@ -115,24 +118,135 @@ fn enter(layout: &HostLayout) -> Result<MaintenanceLock> {
     Ok(command)
 }
 
-/// Of a ledger's open instance records, those that block another user's
-/// session: all but records that ended with a reboot since.
-fn blocking(effects: &[Effect], boot: &BootId) -> bool {
-    effects
-        .iter()
-        .any(|effect| !(effect.persistence == Persistence::UntilReboot && &effect.boot != boot))
+/// Whether an open record of another user's session root blocks this
+/// session (doc#13 #ownership). `root`: that root; `stores`: the kernel
+/// stores of every verified session root.
+///
+/// - Any scope: a record that ended with a reboot since never blocks
+///   (`UntilReboot` and `WithProcess` written in another boot).
+/// - Instance scope: blocks. A normal exit closes these; open ones are a
+///   crashed session's leftovers.
+/// - Outside instance scope only two reviewed classes are ignored
+///   (lead-approved, topic#51 msg#1824), because every host re-ensures
+///   them and none deletes them, so nothing another root's host does acts
+///   on them:
+///   1. Product `Driver` records of the shared `WinDivert` / `wintun`
+///      services whose observed image path is in the system driver
+///      directory or inside a verified `<SID>\cores` (the removal of a
+///      store is guarded by the driver-reference check). Without an
+///      observation only a `Planned` record (never loaded by that root's
+///      kernels) or a `Conflict` one (another program's, found before the
+///      spawn) is ignored.
+///   2. CoreBinary `WinProgramFirewallRule` records in our firewall group
+///      whose program path lies inside that root's own `<SID>\cores`.
+///
+///   Anything else blocks: other kinds or names, other paths, unknown or
+///   unreadable values.
+fn blocks(effect: &Effect, boot: &BootId, root: &HostLayout, stores: &[PathBuf]) -> bool {
+    let ended_with_reboot = matches!(
+        effect.persistence,
+        Persistence::UntilReboot | Persistence::WithProcess
+    ) && &effect.boot != boot;
+    if ended_with_reboot {
+        return false;
+    }
+    match &effect.scope {
+        EffectScope::Instance { .. } => true,
+        EffectScope::Product => !shared_driver_elsewhere(effect, stores),
+        EffectScope::CoreBinary { .. } => !program_rule_of(effect, root),
+        // A scope this build does not know: unknown ownership.
+        _ => true,
+    }
 }
 
-/// Read another user's session ledger without changing it. A ledger that
-/// cannot be read counts as blocking (fail closed).
-async fn leftovers(state: &Path, boot: &BootId) -> bool {
-    match storage::ledger_exists(state) {
-        Ok(false) => return false,
+/// Reviewed class 1 of [`blocks`].
+fn shared_driver_elsewhere(effect: &Effect, stores: &[PathBuf]) -> bool {
+    use etd_core_easytier::plan::effects::{WINDIVERT_DRIVER, WINTUN_DRIVER};
+    let named = matches!(&effect.key, ObjectKey::Service { name }
+        if name == WINDIVERT_DRIVER || name == WINTUN_DRIVER);
+    if !(shared_driver(effect.kind, Some(&effect.scope)) && named) {
+        return false;
+    }
+    match image_path(effect.observation.as_ref()) {
+        Some(image) => driver_image_allowed(&image, stores),
+        None => {
+            effect.observation.is_none()
+                && matches!(effect.state, EffectState::Planned | EffectState::Conflict)
+        }
+    }
+}
+
+/// Reviewed class 2 of [`blocks`].
+fn program_rule_of(effect: &Effect, root: &HostLayout) -> bool {
+    use etd_core_easytier::plan::effects::FIREWALL_GROUP;
+    let ObjectKey::Rule {
+        name,
+        group: Some(group),
+    } = &effect.key
+    else {
+        return false;
+    };
+    if effect.kind != EffectKind::WinProgramFirewallRule || group != FIREWALL_GROUP {
+        return false;
+    }
+    // `EasyTier <program> (Inbound|Outbound)`, as the plan names them.
+    let program = name
+        .strip_prefix("EasyTier ")
+        .and_then(|rest| {
+            rest.strip_suffix(" (Inbound)")
+                .or_else(|| rest.strip_suffix(" (Outbound)"))
+        })
+        .map(Path::new);
+    let recorded = effect
+        .observation
+        .as_ref()
+        .and_then(|observation| match &observation.credential {
+            Some(etd_sysfx::Credential::Opaque { value }) => {
+                serde_json::from_str::<serde_json::Value>(value).ok()
+            }
+            _ => None,
+        })
+        .map(|credential| credential["program"].as_str().map(PathBuf::from));
+    let inside = |path: &Path| path_inside(path, &root.cores);
+    match (program, recorded) {
+        (Some(program), None) => inside(program),
+        (Some(program), Some(Some(recorded))) => inside(program) && inside(&recorded),
+        // A credential without a program, or a name of another form.
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn driver_image_allowed(image: &str, stores: &[PathBuf]) -> bool {
+    etd_sysfx_os::service::driver_image_allowed(image, stores)
+}
+#[cfg(windows)]
+fn path_inside(path: &Path, dir: &Path) -> bool {
+    etd_sysfx_os::service::path_inside(path, dir)
+}
+// No session roots outside Windows: nothing is ever ignored there.
+#[cfg(unix)]
+fn driver_image_allowed(_: &str, _: &[PathBuf]) -> bool {
+    false
+}
+#[cfg(unix)]
+fn path_inside(_: &Path, _: &Path) -> bool {
+    false
+}
+
+/// Whether another user's session root holds anything that blocks this
+/// session, read without changing it. Fails closed: a ledger that cannot
+/// be read blocks, and so does a root with no ledger but with what a host
+/// leaves before it (a repair index, logs, runtime directories): its
+/// ownership is unknown.
+async fn leftovers(root: &HostLayout, stores: &[PathBuf], boot: &BootId) -> bool {
+    match storage::ledger_exists(&root.state) {
+        Ok(false) => return unknown_owner(&root.state, &root.run),
         Ok(true) => (),
         Err(_) => return true,
     }
     let Ok(ledger) = SqliteLedger::open_with_options(
-        state.join(LEDGER),
+        root.state.join(LEDGER),
         boot.clone(),
         OpenOptions {
             read_only: true,
@@ -143,25 +257,34 @@ async fn leftovers(state: &Path, boot: &BootId) -> bool {
     else {
         return true;
     };
-    // Instance records only: a normal exit closes them, so open ones are a
-    // crashed session's leftovers. Product records (shared drivers, the
-    // WFP provider and sublayer, which only the lock holder manages) and
-    // kernel-binary records (program rules on that root's own kernel
-    // paths) do not cross roots (doc#13 #ownership) and stay until purge.
-    // `reclaim --all-users` without --purge clears exactly these.
-    let open = ledger.open_effects(&ScopeFilter::default()).await;
+    let open = ledger.open_effects(&ScopeFilter::all()).await;
     let _ = ledger.close().await;
-    open.map_or(true, |effects| blocking(&effects, boot))
+    open.map_or(true, |effects| {
+        effects
+            .iter()
+            .any(|effect| blocks(effect, boot, root, stores))
+    })
+}
+
+/// A root without a ledger whose state or run directory is not empty (or
+/// cannot be read): a host got that far, so its ownership is unknown.
+fn unknown_owner(state: &Path, run: &Path) -> bool {
+    let empty =
+        |dir: &Path| std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_none());
+    !(empty(state) && empty(run))
 }
 
 /// Machine-wide reconciliation (doc#13 #ownership, under the maintenance
-/// lock): every other verified session root must hold no open record. The
-/// user's own ledger never blocks; the startup self-check reclaims it.
+/// and host locks): no other verified session root may hold anything that
+/// [`blocks`]. The user's own ledger never blocks; its startup self-check
+/// reclaims it.
 async fn reconcile(own: &HostLayout, boot: &BootId) -> Result<()> {
+    let roots = NativeHostFilesystem.session_layouts().map_err(refusal)?;
+    let stores: Vec<PathBuf> = roots.iter().map(|root| root.cores.clone()).collect();
     let mut blocked = Vec::new();
-    for other in NativeHostFilesystem.session_layouts().map_err(refusal)? {
-        if other.state != own.state && leftovers(&other.state, boot).await {
-            blocked.push(owner_sid(&other));
+    for other in &roots {
+        if other.state != own.state && leftovers(other, &stores, boot).await {
+            blocked.push(owner_sid(other));
         }
     }
     if !blocked.is_empty() {
@@ -253,9 +376,11 @@ pub(super) async fn reclaim_own(layout: &HostLayout, purge: bool) -> Result<()> 
 
 /// `reclaim --mode elevated-session --all-users`: every user's root, under
 /// the same locks.
-pub(super) async fn reclaim_all_users(own: &HostLayout, purge: bool) -> Result<()> {
-    let _command = enter(own)?;
-    let _guard = NativeHostFilesystem.lock(own)?;
+/// `locks`: any layout with the shared maintenance directory; only its
+/// locks are taken.
+pub(super) async fn reclaim_all_users(locks: &HostLayout, purge: bool) -> Result<()> {
+    let _command = enter(locks)?;
+    let _guard = NativeHostFilesystem.lock(locks)?;
     drain(purge).await
 }
 
@@ -309,27 +434,144 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    fn root() -> HostLayout {
+        NativeHostFilesystem
+            .session_layout("S-1-5-21-1-2-3-1002")
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    fn observed(
+        detail: Option<serde_json::Value>,
+        credential: Option<serde_json::Value>,
+    ) -> Option<etd_sysfx::Observation> {
+        Some(etd_sysfx::Observation {
+            credential: credential.map(|value| etd_sysfx::Credential::Opaque {
+                value: value.to_string(),
+            }),
+            key: None,
+            observed_at: "1970-01-01T00:00:00Z".parse().unwrap(),
+            detail: detail.map(|detail| detail.to_string()),
+        })
+    }
+
+    #[cfg(windows)]
     #[test]
-    fn only_records_from_an_earlier_boot_that_ended_with_it_do_not_block() {
-        let now = BootId("now".into());
-        assert!(!blocking(&[], &now));
-        assert!(!blocking(
-            &[effect(Persistence::UntilReboot, "before")],
-            &now
-        ));
-        assert!(blocking(&[effect(Persistence::UntilReboot, "now")], &now));
-        assert!(blocking(&[effect(Persistence::Persistent, "before")], &now));
-        assert!(blocking(
-            &[effect(Persistence::WithProcess, "before")],
-            &now
-        ));
-        assert!(blocking(
-            &[
-                effect(Persistence::UntilReboot, "before"),
-                effect(Persistence::Persistent, "now")
-            ],
-            &now
-        ));
+    fn instance_records_block_unless_they_ended_with_a_reboot() {
+        let (now, root) = (BootId("now".into()), root());
+        let blocked = |persistence, boot| blocks(&effect(persistence, boot), &now, &root, &[]);
+        assert!(!blocked(Persistence::UntilReboot, "before"));
+        assert!(!blocked(Persistence::WithProcess, "before"));
+        assert!(blocked(Persistence::UntilReboot, "now"));
+        assert!(blocked(Persistence::WithProcess, "now"));
+        assert!(blocked(Persistence::Persistent, "before"));
+        assert!(blocked(Persistence::Persistent, "now"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn only_shared_drivers_loaded_from_the_system_or_a_session_store_are_ignored() {
+        let (now, root) = (BootId("now".into()), root());
+        let stores = [root.cores.clone()];
+        let driver = |name: &str, state, image: Option<String>| Effect {
+            scope: EffectScope::Product,
+            kind: EffectKind::Driver,
+            key: ObjectKey::Service { name: name.into() },
+            state,
+            observation: image
+                .and_then(|image| observed(Some(serde_json::json!({ "image_path": image })), None)),
+            ..effect(Persistence::Persistent, "now")
+        };
+        let blocked = |effect: Effect| blocks(&effect, &now, &root, &stores);
+        let in_store = root
+            .cores
+            .join("0a")
+            .join("wintun.sys")
+            .display()
+            .to_string();
+        assert!(!blocked(driver(
+            "wintun",
+            EffectState::Applied,
+            Some(in_store.clone())
+        )));
+        assert!(!blocked(driver(
+            "WinDivert",
+            EffectState::Applied,
+            Some(r"\SystemRoot\System32\drivers\WinDivert64.sys".into())
+        )));
+        assert!(blocked(driver(
+            "wintun",
+            EffectState::Applied,
+            Some(r"C:\Temp\wintun.sys".into())
+        )));
+        assert!(blocked(driver(
+            "other",
+            EffectState::Applied,
+            Some(in_store)
+        )));
+        // Never observed: ignored only if never loaded, or another program's.
+        assert!(!blocked(driver("wintun", EffectState::Planned, None)));
+        assert!(!blocked(driver("wintun", EffectState::Conflict, None)));
+        assert!(blocked(driver("wintun", EffectState::Applied, None)));
+        assert!(blocked(Effect {
+            kind: EffectKind::ServiceRegistration,
+            ..driver("wintun", EffectState::Planned, None)
+        }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn only_our_program_rules_on_that_roots_own_kernels_are_ignored() {
+        let (now, root) = (BootId("now".into()), root());
+        let kernel = root.cores.join("0a").join("easytier-core.exe");
+        let rule = |program: &Path, group: Option<&str>, recorded: Option<&Path>| Effect {
+            scope: EffectScope::CoreBinary {
+                sha256: "0a".into(),
+            },
+            kind: EffectKind::WinProgramFirewallRule,
+            key: ObjectKey::Rule {
+                name: format!("EasyTier {} (Inbound)", program.display()),
+                group: group.map(Into::into),
+            },
+            observation: recorded.and_then(|recorded| {
+                observed(
+                    None,
+                    Some(serde_json::json!({ "program": recorded.display().to_string() })),
+                )
+            }),
+            ..effect(Persistence::Persistent, "now")
+        };
+        let blocked = |effect: Effect| blocks(&effect, &now, &root, &[]);
+        assert!(!blocked(rule(&kernel, Some("EasyTier"), None)));
+        assert!(!blocked(rule(&kernel, Some("EasyTier"), Some(&kernel))));
+        assert!(blocked(rule(&kernel, None, None)));
+        assert!(blocked(rule(&kernel, Some("Other"), None)));
+        let elsewhere = Path::new(r"C:\Temp\easytier-core.exe");
+        assert!(blocked(rule(elsewhere, Some("EasyTier"), None)));
+        assert!(blocked(rule(&kernel, Some("EasyTier"), Some(elsewhere))));
+        let other_root = NativeHostFilesystem
+            .session_layout("S-1-5-21-1-2-3-1003")
+            .unwrap()
+            .cores
+            .join("0a")
+            .join("easytier-core.exe");
+        assert!(blocked(rule(&other_root, Some("EasyTier"), None)));
+    }
+
+    #[test]
+    fn a_root_without_a_ledger_blocks_once_a_host_got_further() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, run) = (dir.path().join("state"), dir.path().join("run"));
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&run).unwrap();
+        assert!(!unknown_owner(&state, &run));
+        std::fs::write(state.join("repair-index.json"), b"{}").unwrap();
+        assert!(unknown_owner(&state, &run));
+        std::fs::remove_file(state.join("repair-index.json")).unwrap();
+        std::fs::create_dir(run.join("i")).unwrap();
+        assert!(unknown_owner(&state, &run));
+        assert!(unknown_owner(&dir.path().join("missing"), &run));
     }
 
     #[test]

@@ -85,16 +85,11 @@ with `/DEPENDENTLOADFLAG:0x800`.
 
 1. Take the maintenance lock. Inside it: refuse if the service is registered (in any
    state) or its state directory exists; create the missing protected session
-   directories and verify the per-user tree, which must include `profile\`; change
+   directories and verify the per-user tree, which must include `profile\` (an
+   existing tree is verified whole before anything is created in it); change
    the working directory to the `<SID>` root.
 2. Still inside it, take the singleton lock (a running privileged host makes this
-   fail as "host already running"), then reconcile machine-wide: open every other
-   verified `<SID>` ledger read-only and refuse if any holds an open instance record,
-   except records that ended with a reboot since (`UntilReboot` with another boot
-   id). Unreadable counts as open. The user's own ledger never blocks; its
-   self-check reclaims it. Only instance records count: a normal exit closes them,
-   while product records (shared drivers, the WFP provider and sublayer) and
-   kernel-binary records do not cross roots and stay until a purge. Then the kernel
+   fail as "host already running"), then reconcile machine-wide (below). Then the kernel
    store: on first start the bundled kernels beside the host image are copied into
    `<SID>\cores` and hashed there; when this build's table changed they are merged
    again (no SHA directory is deleted, so kernels open records name stay).
@@ -103,9 +98,33 @@ with `/DEPENDENTLOADFLAG:0x800`.
    (`USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `HOMEDRIVE`/`HOMEPATH`) set to
    `<SID>\profile`. Ctrl-C, `ReleaseLease` (stop), the lease grace (30 s with no
    lease holder) or the end of the Windows session stop it. A hidden top-level window
-   hears `WM_QUERYENDSESSION`, starts the normal shutdown and holds the session end
-   (`ShutdownBlockReasonCreate`) until the host has released its lock, within the
-   stop's worst case.
+   hears the session end. `WM_QUERYENDSESSION` only marks the end as held
+   (`ShutdownBlockReasonCreate`): another program may still veto the logoff, and a
+   vetoed one (`WM_ENDSESSION` with FALSE) leaves the host running. `WM_ENDSESSION`
+   with TRUE starts the normal shutdown and holds the end until the host has
+   released its lock, within the stop's worst case. The trade-off: the cleanup
+   starts later, when the end is certain, not when it is first asked.
+
+Machine-wide reconciliation opens every other verified `<SID>` ledger read-only and
+refuses (exit 5) if any open record there blocks. The user's own ledger never
+blocks; its self-check reclaims it.
+
+- A record that ended with a reboot since never blocks (`UntilReboot` or
+  `WithProcess`, written in another boot).
+- Instance records block: a normal exit closes them, so open ones are a crashed
+  session's leftovers.
+- Outside instance scope only two reviewed classes are ignored, because every host
+  re-ensures them and none deletes them:
+  1. product `Driver` records of the shared `WinDivert` / `wintun` services whose
+     observed image path is in the system driver directory or inside a verified
+     `<SID>\cores` (a store is removed only after the driver-reference check). Without
+     an observation only a `Planned` record (never loaded by that root's kernels) or
+     a `Conflict` one (another program's) is ignored;
+  2. kernel-binary `WinProgramFirewallRule` records in our firewall group whose
+     program path lies inside that root's own `<SID>\cores`.
+- Everything else blocks: other kinds, names, groups or paths, scopes this build does
+  not know, a ledger that cannot be read, and a root with no ledger whose `state\` or
+  `run\` is not empty (a host got that far; ownership unknown).
 
 Lease holders are only connections whose client process image, read from a handle
 opened on the client pid at accept and kept for the connection's life, is the
@@ -318,8 +337,12 @@ for `--purge` (`reclaim --all --purge`, as the uninstaller calls it); without
 service checks, then the singleton lock) and reclaims the current user's own root.
 With `--all-users` it reclaims every verified `<SID>` root; with `--all --purge` it
 purges them all and then removes `EasyTierDesk.session` (what an app uninstaller
-calls). `--all-users` is refused with any other mode. `remove-core` is not available
-for the session mode.
+calls). `--all-users` does not depend on the caller's token: it runs as LocalSystem
+(the MSI) or as an elevated administrator, and takes only the shared locks. Before
+anything is removed, every `<SID>\cores` passes the same driver-reference check as the
+service's uninstall; a reference, or a check that cannot decide, keeps every root
+and fails. `--all-users` is refused with any other mode. `remove-core` is not
+available for the session mode.
 
 `remove-core <version>` runs `ReclaimEngine::reclaim_core` for the kernel's SHA-256,
 requires no candidates, conflicts or open core-binary records, clears the selected

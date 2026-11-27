@@ -110,8 +110,10 @@ cargo nextest run -p etd-host
   non-conforming session root, a leftover service state directory, a registered
   service and a junction in the tree; a real run with handshake, `install` and
   `reclaim` failing on the shared lock, exit after the lease grace with a non-UI
-  client, `ReleaseLease`; another user's leftover blocking until
-  `reclaim --all-users`; the uninstaller purge; `install` draining a session root.
+  client, a real kernel (the bundled release) applied, ready and stopped, then
+  `ReleaseLease`; a file in place of `profile`; another user's leftover blocking until
+  `reclaim --all-users`; the uninstaller purge run as LocalSystem; `install` draining
+  a session root.
 - `core_lock.rs`: `cores.lock` parser (row forms, invalid names, duplicates, targets).
 - `singleton.rs`: a second process cannot take the host lock until it is released.
 - `user_mode_e2e.rs`: native IPC, the production composition and lease loop, real

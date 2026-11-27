@@ -59,7 +59,10 @@ Windows machine locations (`%ProgramData%`, `%ProgramFiles%`) are read from HKLM
 64-bit view (the profile list's `ProgramData`, `ProgramFilesDir`), with only
 `%SystemDrive%` expanded, to the drive of the Windows directory; no shell API and no
 environment is involved. The user host's `%LOCALAPPDATA%` is the Known Folder,
-through shell32 loaded from System32 for that call only. User form: state is
+through shell32 loaded from System32 for that call only, and only for an unelevated
+token: an elevated process (install, uninstall, reclaim, an elevated `doctor` or
+`--mode user` command, the service) is refused before the shell is asked, so no
+user-redirectable folder is ever resolved with administrator rights. User form: state is
 `%LOCALAPPDATA%\EasyTierDesk`, `~/Library/Application Support/easytier-desk` or
 `$XDG_STATE_HOME/easytier-desk` (default `~/.local/state/easytier-desk`), with `run/`
 and `cores/` inside; directories are created private to the user (mode 0700, or a

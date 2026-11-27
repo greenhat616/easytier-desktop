@@ -39,7 +39,9 @@ jobs:
         env:
           GALLERY_SCREENSHOT_DIR: ${{ runner.temp }}/fluent-gallery
           WGPU_BACKEND: vulkan
-        run: cargo test --locked -p etd-ui --lib gallery::tests::capture_gallery_screenshots -- --ignored --nocapture
+        run: |
+          cargo test --locked -p etd-ui --lib gallery::tests::capture_gallery_screenshots -- --ignored --nocapture
+          cargo test --locked -p etd-ui --test view_binding capture_product_layout_screenshots -- --ignored --nocapture
       - uses: actions/upload-artifact@v4
         with:
           name: fluent-gallery

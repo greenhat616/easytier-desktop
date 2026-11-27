@@ -64,7 +64,10 @@ search App Paths**, and the package does not change `PATH`: in a terminal, run
 ### Custom actions
 
 All four run the payload's `etd-host.exe` through `WixQuietExec` (no console window) as
-LocalSystem (`Impersonate="no"`). Each command's output goes to the MSI log
+LocalSystem (`Impersonate="no"`). That LocalSystem token lacks SeDebugPrivilege: the
+Windows Installer service's RequiredPrivileges omit it. `etd-host uninstall` therefore
+reads loaded-driver paths from the kernel module list there, and still fails closed when
+a path is incomplete (see the `etd-sysfx-os` README). Each command's output goes to the MSI log
 (`/l*v`, lines starting `WixQuietExec`).
 
 | Action | When | Runs | Scheduled |

@@ -14,8 +14,14 @@ The case walks one machine through:
    id, install key, ledger settings (allow list) and state;
 4. an upgrade (C) whose new host never serves: etd-host rolls the service
    back, Windows Installer rolls the payload back; B stays installed;
-5. a full uninstall: Service.installed compares the machine with before
-   step 2, and no payload, shortcut, App Paths entry or product remains.
+5. with a WinDivert driver loaded from a store-length path, a process
+   without SeDebugPrivilege reads complete loaded-driver paths from the
+   kernel module list (driver_probe.py), the fallback etd-host uses where
+   Windows Installer custom actions run (msg#1764);
+6. a full uninstall, whose driver reference check runs under the Windows
+   Installer service's token, without SeDebugPrivilege: Service.installed
+   compares the machine with before step 2, and no payload, shortcut, App
+   Paths entry or product remains.
 """
 
 import json
@@ -119,6 +125,49 @@ def no_backups(service):
         assert not leftover.exists(), f"upgrade left {leftover}"
 
 
+def module_path(raw):
+    path = raw.removeprefix("\\??\\")
+    if path.lower().startswith("\\systemroot\\"):
+        return Path(os.environ["SystemRoot"]) / path[len("\\systemroot\\"):]
+    return Path(path)
+
+
+def probe_loaded_driver_paths(service):
+    """A WinDivert driver loaded from a path as long as the protected store's
+    is reported completely to a process without SeDebugPrivilege."""
+    root = Path(os.environ["ProgramFiles"]) / "EasyTierDesk-driver-probe"
+    store = service.cores / os.environ["ETD_G2_SHA"]
+    directory = root / "cores" / os.environ["ETD_G2_SHA"]
+    directory.mkdir(parents=True)
+    driver = directory / "WinDivert64.sys"
+    shutil.copy2(store / "WinDivert64.sys", driver)
+    name = "etd-driver-probe"
+    command("sc.exe", "create", name, "type=", "kernel", "start=", "demand", "binPath=", driver)
+    try:
+        command("sc.exe", "start", name)
+        result = command(sys.executable, "-B", "-I", Path(__file__).with_name("driver_probe.py"))
+        report = json.loads(result.stdout)
+        found = [raw for raw in report["modules"]
+                 if raw.lower().endswith("\\windivert64.sys") and module_path(raw).exists()
+                 and module_path(raw).samefile(driver)]
+        print(f"driver probe on Windows {report['display_version']} build {report['build']}: "
+              f"SeDebugPrivilege removed={report['debug_privilege_removed']}, "
+              f"enable refused={report['debug_privilege_enable_refused']}; "
+              f"EnumDeviceDrivers {report['enum_count']} entries, {report['enum_null_bases']} with hidden bases; "
+              f"SystemModuleInformation {report['module_count']} entries, problems={report['problems']}; "
+              f"WinDivert: {found}", flush=True)
+        assert report["debug_privilege_removed"] and report["debug_privilege_enable_refused"], report
+        assert not report["problems"], report["problems"]
+        assert report["module_count"] == report["enum_count"] == len(report["modules"]), report
+        assert found, f"no complete path for {driver} in {report['modules']}"
+    finally:
+        command("sc.exe", "stop", name, check=False)
+        command("sc.exe", "delete", name, check=False)
+        eventually("probe driver service removed", lambda: command("sc.exe", "query", name, check=False).returncode,
+                   lambda code: code == 1060, timeout=30)
+        shutil.rmtree(root)
+
+
 def failed_first_install(service, msi):
     """A refused first install: etd-host install fails, Windows Installer
     rolls back, a foreign directory stays as it was."""
@@ -216,7 +265,10 @@ def msi_lifecycle():
         print("failed upgrade to 0.1.2: msiexec 1603; etd-host restored and restarted 0.1.1, "
               "Windows Installer restored its payload", flush=True)
 
-    # 5. Full uninstall (Service.installed compared the machine).
+        # 5. Loaded-driver paths without SeDebugPrivilege.
+        probe_loaded_driver_paths(service)
+
+    # 6. Full uninstall (Service.installed compared the machine).
     assert removed == ["0.1.1"], f"uninstalled {removed}"
     assert not PAYLOAD.exists(), f"uninstall left {PAYLOAD}"
     assert not MENU.exists(), f"uninstall left {MENU}"

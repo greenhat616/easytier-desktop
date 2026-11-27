@@ -90,8 +90,8 @@ no "Open log folder" entry in the UI yet.
 | `views/reclaim.rs` | Reclaim report with per-item candidate decisions (Delete / Keep), conflict release, quarantine retries. |
 | `views/ui.rs` | Small `#[inline(never)]` element builders and the appearance menu. |
 | `theme` / `preferences` | Fluent theme and the persisted theme choice (below). |
-| `assets` | `FluentAssets`: embedded Fluent icons composed with `gpui-kit`'s own assets. |
-| `tray` | `NativeTrayBackend`, generated indicator icons. |
+| `assets` | `FluentAssets` (embedded Fluent UI icons composed with `gpui-kit`) and `app_icons` (embedded Triad tray and X11 window PNGs). |
+| `tray` | `NativeTrayBackend`, rendering the Triad tray icon per state (`connected`, `connecting`, `disconnected`), taskbar theme (`light`/`dark`), and DPI (`16`/`24`). |
 
 The `#[inline(never)]` helpers returning `AnyElement` are deliberate: unoptimised debug
 builds otherwise overflow the 1 MiB main-thread stack on Windows.
@@ -108,11 +108,18 @@ host or network data; an unreadable file falls back to Follow system.
 
 ### Icons
 
-`assets/fluent/` holds a subset of Microsoft's Fluent System Icons (24 px regular SVGs,
-unmodified, MIT). [`assets/fluent/NOTICE.md`](assets/fluent/NOTICE.md) lists each file
-with its upstream path and commit; the license text is in
-[`assets/fluent/LICENSE.txt`](assets/fluent/LICENSE.txt). Keep both in sync when adding
-an icon, and add the file to the table in `src/assets.rs`.
+- **UI icons:** `assets/fluent/` holds a subset of Microsoft's Fluent System Icons (24 px
+  regular SVGs, unmodified, MIT). [`assets/fluent/NOTICE.md`](assets/fluent/NOTICE.md)
+  lists each file with its upstream path and commit; the license text is in
+  [`assets/fluent/LICENSE.txt`](assets/fluent/LICENSE.txt). Keep both in sync when adding
+  an icon, and add the file to the table in `src/assets.rs`.
+- **Application & tray icons:** the Triad icon set lives in
+  [`packaging/assets/icons/`](../../packaging/assets/README.md). On Windows, `build.rs`
+  and `app.rc` embed `packaging/assets/icons/app.ico` as icon resource `1` (used by
+  Explorer, shortcuts, GPUI, and `WM_SETICON`); on Linux, `WindowOptions` sets
+  `app_id = "easytier-desktop"` and embeds `app-64.png` for X11 `_NET_WM_ICON`; the system
+  tray loads the pre-rendered Triad tray PNGs and switches `light`/`dark` and `16`/`24`
+  live with taskbar theme and DPI.
 
 ## Platform notes
 

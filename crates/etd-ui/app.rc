@@ -1,0 +1,4 @@
+// Application icon resource (ordinal 1) for etd-ui.exe.
+// Used by Windows Explorer, Start Menu shortcuts, GPUI's WNDCLASSW loader,
+// and WM_SETICON (ICON_SMALL / ICON_BIG).
+1 ICON "../../packaging/assets/icons/app.ico"

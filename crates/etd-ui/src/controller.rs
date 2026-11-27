@@ -438,6 +438,9 @@ impl UiController {
             }),
             focus: true,
             show: true,
+            app_id: Some("easytier-desktop".into()),
+            #[cfg(target_os = "linux")]
+            icon: Some(crate::assets::app_icons::window_icon_rgba()),
             window_background: crate::theme::window_background(cx),
             ..Default::default()
         };

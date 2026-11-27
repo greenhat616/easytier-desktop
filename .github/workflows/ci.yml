@@ -155,12 +155,16 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          cargo nextest list --locked --profile privileged -p etd-ipc --run-ignored only --test unix_service --test stale_endpoint
+          # unix_service's macOS case binds below /private/var/run, which is
+          # group-writable there, so the listener refuses it: not run on macOS.
+          ipc_tests="--test unix_service --test stale_endpoint"
+          runtime=/run/etd-g1
+          if [ "$RUNNER_OS" = macOS ]; then ipc_tests="--test stale_endpoint"; runtime=/private/var/run/etd-g1; fi
+          cargo nextest list --locked --profile privileged -p etd-ipc --run-ignored only $ipc_tests
           cargo nextest list --locked --profile privileged -p etd-testkit --run-ignored only --test tier2
-          if [ "$RUNNER_OS" = macOS ]; then runtime=/private/var/run/etd-g1; else runtime=/run/etd-g1; fi
           sudo install -d -m 0700 -o root "$runtime"
           as_root() { sudo -E env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "CI=true" "ETD_G1_SERVICE_RUNTIME=$runtime" "$(command -v cargo)" "$@"; }
-          as_root nextest run --locked --profile privileged -p etd-ipc --run-ignored only --test unix_service --test stale_endpoint --success-output immediate
+          as_root nextest run --locked --profile privileged -p etd-ipc --run-ignored only $ipc_tests --success-output immediate
           as_root nextest run --locked --profile privileged -p etd-testkit --run-ignored only --test tier2 --success-output immediate
       # The cache is saved as the runner user, which cannot manage root's files.
       - name: Return build files to the runner user

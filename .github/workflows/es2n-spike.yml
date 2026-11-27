@@ -32,9 +32,12 @@ jobs:
           $count = @(Get-NetFirewallRule -PolicyStore PersistentStore).Count
           $env:ETD_SPIKE_A = $a
           $env:ETD_SPIKE_B = $b
+          $code = 0
           try {
-            & spike/es2n-wmi/target/debug/es2n-wmi-spike.exe $count
-            $code = $LASTEXITCODE
+            foreach ($mode in 'none', 'inproc', 'treatas', 'proxy', 'dgco', 'fw') {
+              & spike/es2n-wmi/target/debug/es2n-wmi-spike.exe $count $mode
+              if ($LASTEXITCODE -ne 0) { $code = 1 }
+            }
             Write-Host "PowerShell view afterwards:"
             foreach ($store in 'PersistentStore', 'ActiveStore') {
               foreach ($id in $a, $b) {

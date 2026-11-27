@@ -230,12 +230,15 @@ async fn user_inputs_do_not_reach_the_elevated_workers() {
         0,
         "a worker tried to load the HKCU profiler"
     );
+    // Script modules load from $PSHOME\Modules; a binary module such as
+    // CimCmdlets reports its assembly in the global assembly cache.
     let home = ps("$PSHOME").to_lowercase();
+    let gac = ps("$env:SystemRoot").to_lowercase() + r"\microsoft.net\assembly\";
     for module in report["modules"].as_array().unwrap() {
         let path = module["path"].as_str().unwrap().to_lowercase();
         assert!(
-            path.starts_with(&format!(r"{home}\modules\")),
-            "module from outside $PSHOME: {module}"
+            path.starts_with(&format!(r"{home}\modules\")) || path.starts_with(&gac),
+            "module from outside $PSHOME and the GAC: {module}"
         );
     }
     let environment: BTreeMap<String, String> = report["environment"]

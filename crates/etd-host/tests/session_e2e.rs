@@ -291,13 +291,26 @@ async fn elevated_session_host_end_to_end() {
         .spawn()
         .unwrap();
     let mut session = client(&endpoint).await;
-    let released = session
-        .release_lease(request(ReleaseLeaseRequest {
-            instances: LeaseRelease::StopInstances as i32,
-        }))
-        .await
-        .unwrap()
-        .into_inner();
+    // The pipe is up before the self-check ends; until then lease calls
+    // answer FailedPrecondition.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let released = loop {
+        match session
+            .release_lease(request(ReleaseLeaseRequest {
+                instances: LeaseRelease::StopInstances as i32,
+            }))
+            .await
+        {
+            Ok(response) => break response.into_inner(),
+            Err(status)
+                if status.code() == tonic::Code::FailedPrecondition
+                    && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(200)).await
+            }
+            Err(status) => panic!("release lease: {status:?}"),
+        }
+    };
     assert!(released.host_exiting);
     let status = tokio::task::block_in_place(|| wait_exit(&mut child, Duration::from_secs(60)));
     assert!(status.success(), "{status:?}");

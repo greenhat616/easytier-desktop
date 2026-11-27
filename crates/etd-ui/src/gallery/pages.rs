@@ -26,6 +26,7 @@ use crate::views::{
     },
     dialogs::{DialogButtons, DialogResult, content_dialog, flyout_panel, teaching_tip},
     menus::{BarCommand, MenuCheck, MenuEntry, MenuHandler, MenuItem, command_bar, menu_flyout},
+    navigation::{IndexHandler, Tab, breadcrumb_bar, nav_view_item, selector_bar, tab_view},
     ui::{BtnStyle, action_button, settings_switch},
 };
 
@@ -67,6 +68,13 @@ pub(super) struct DemoState {
     dialog_open: bool,
     dialog_result: SharedString,
     tip_open: bool,
+    nav_selected: usize,
+    nav_expanded: bool,
+    crumbs: usize,
+    selector: usize,
+    tabs: Vec<usize>,
+    tab_selected: usize,
+    next_tab: usize,
 }
 
 impl DemoState {
@@ -111,6 +119,13 @@ impl DemoState {
             dialog_open: false,
             dialog_result: "None".into(),
             tip_open: false,
+            nav_selected: 0,
+            nav_expanded: true,
+            crumbs: CRUMBS.len(),
+            selector: 0,
+            tabs: vec![0, 1, 2],
+            tab_selected: 0,
+            next_tab: 3,
         }
     }
 }
@@ -128,6 +143,14 @@ impl Gallery {
     }
     pub(super) fn demo_dialog_result(&self) -> SharedString {
         self.demo.dialog_result.clone()
+    }
+    pub(super) fn demo_nav(&self) -> (usize, usize, usize, usize) {
+        (
+            self.demo.nav_selected,
+            self.demo.crumbs,
+            self.demo.selector,
+            self.demo.tabs.len(),
+        )
     }
 }
 
@@ -1000,4 +1023,166 @@ pub(super) fn dialogs_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<Any
         section("Flyout", [flyout_button], cx),
         section("TeachingTip", [tip_target], cx),
     ]
+}
+
+const NAV_ITEMS: [(&str, &str, Option<&str>, usize); 6] = [
+    ("Home", "fluent/globe.svg", None, 0),
+    ("Collections", "fluent/grid.svg", Some("group"), 0),
+    ("Recent", "fluent/document.svg", Some("child"), 1),
+    ("Favorites", "fluent/folder.svg", Some("child"), 1),
+    ("People", "fluent/person.svg", None, 0),
+    ("Settings", "fluent/settings.svg", None, 0),
+];
+const CRUMBS: [&str; 4] = ["Home", "Documents", "Design", "Specs"];
+const SELECTOR: [&str; 3] = ["Recent", "Shared", "Favorites"];
+
+#[inline(never)]
+pub(super) fn navigation_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<AnyElement> {
+    let demo = &view.demo;
+
+    // NavigationView pane with an expandable group.
+    let mut pane = div()
+        .id("nav-pane")
+        .w(px(320.))
+        .py(px(4.))
+        .flex()
+        .flex_col();
+    for (ix, (label, icon, kind, depth)) in NAV_ITEMS.iter().enumerate() {
+        if kind == &Some("child") && !demo.nav_expanded {
+            continue;
+        }
+        let is_group = kind == &Some("group");
+        let on_click = {
+            let view = cx.entity().downgrade();
+            move |_: &mut Window, cx: &mut App| {
+                view.update(cx, |this, cx| {
+                    if is_group {
+                        this.demo.nav_expanded = !this.demo.nav_expanded;
+                    } else {
+                        this.demo.nav_selected = ix;
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+        };
+        pane = pane.child(nav_view_item(
+            SharedString::from(format!("nav-item-{ix}")),
+            Some(icon),
+            label,
+            *depth,
+            !is_group && demo.nav_selected == ix,
+            is_group.then_some(demo.nav_expanded),
+            on_click,
+            cx,
+        ));
+    }
+    let nav = div()
+        .flex()
+        .flex_row()
+        .gap(px(16.))
+        .child(pane)
+        .child(
+            div()
+                .text_size(px(14.))
+                .line_height(px(20.))
+                .child(SharedString::from(format!(
+                    "Selected: {}",
+                    NAV_ITEMS[demo.nav_selected].0
+                ))),
+        )
+        .into_any_element();
+
+    let crumbs = breadcrumb_bar(
+        "crumbs",
+        &CRUMBS[..demo.crumbs],
+        index_handler(cx, |this, ix| this.demo.crumbs = ix + 1),
+        cx,
+    );
+    let reset_crumbs = action_button(
+        "crumbs-reset",
+        "Reset path",
+        BtnStyle::new(ButtonVariant::Default, Size::Medium),
+        cx.listener(|this, _: &gpui_kit::ClickEvent, _, cx| {
+            this.demo.crumbs = CRUMBS.len();
+            cx.notify();
+        }),
+    );
+
+    let selector = selector_bar(
+        "selector",
+        &SELECTOR,
+        demo.selector,
+        index_handler(cx, |this, ix| this.demo.selector = ix),
+        cx,
+    );
+
+    let tabs: Vec<Tab> = demo
+        .tabs
+        .iter()
+        .map(|n| Tab {
+            label: TAB_NAMES[n % TAB_NAMES.len()],
+            icon: "fluent/document.svg",
+        })
+        .collect();
+    let content = SharedString::from(match demo.tabs.get(demo.tab_selected) {
+        Some(n) => format!("Contents of {}", TAB_NAMES[n % TAB_NAMES.len()]),
+        None => "No open documents".to_owned(),
+    });
+    let tab_view = tab_view(
+        "tabs",
+        &tabs,
+        demo.tab_selected,
+        index_handler(cx, |this, ix| this.demo.tab_selected = ix),
+        index_handler(cx, |this, ix| {
+            if ix < this.demo.tabs.len() {
+                this.demo.tabs.remove(ix);
+            }
+            let last = this.demo.tabs.len().saturating_sub(1);
+            this.demo.tab_selected = this.demo.tab_selected.min(last);
+        }),
+        {
+            let view = cx.entity().downgrade();
+            move |_, cx| {
+                view.update(cx, |this, cx| {
+                    let next = this.demo.next_tab;
+                    this.demo.next_tab += 1;
+                    this.demo.tabs.push(next);
+                    this.demo.tab_selected = this.demo.tabs.len() - 1;
+                    cx.notify();
+                })
+                .ok();
+            }
+        },
+        div().child(content).into_any_element(),
+        cx,
+    );
+
+    vec![
+        section("NavigationView", [nav], cx),
+        section(
+            "BreadcrumbBar",
+            [crumbs, div().flex().child(reset_crumbs).into_any_element()],
+            cx,
+        ),
+        section("SelectorBar", [selector], cx),
+        section("TabView", [tab_view], cx),
+    ]
+}
+
+const TAB_NAMES: [&str; 5] = ["Document 1", "Document 2", "Document 3", "Notes", "Draft"];
+
+/// An index callback that updates the gallery's demo state and redraws.
+fn index_handler(
+    cx: &mut Context<Gallery>,
+    update: impl Fn(&mut Gallery, usize) + 'static,
+) -> IndexHandler {
+    let view = cx.entity().downgrade();
+    Rc::new(move |ix, _, cx| {
+        view.update(cx, |this, cx| {
+            update(this, ix);
+            cx.notify();
+        })
+        .ok();
+    })
 }

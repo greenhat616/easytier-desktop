@@ -75,6 +75,7 @@ enum Page {
     BasicInput,
     Menus,
     Dialogs,
+    Navigation,
 }
 
 struct Gallery {
@@ -199,6 +200,14 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
         "fluent/chat.svg",
         cx,
     );
+    let navigation = nav(
+        Page::Navigation,
+        "gallery-nav-navigation",
+        "Navigation",
+        "fluent/navigation.svg",
+        "fluent/navigation.svg",
+        cx,
+    );
     let mut sidebar = Sidebar::new("gallery-sidebar")
         .w(px(220.))
         .h_full()
@@ -210,6 +219,7 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
         .child(basic)
         .child(menus)
         .child(dialogs)
+        .child(navigation)
         .child(settings);
     if !view.collapsed {
         sidebar = sidebar.footer(div().w_full().child(theme_menu(cx)));
@@ -558,6 +568,7 @@ impl Render for Gallery {
             Page::BasicInput => ("Basic input", pages::basic_input_page(self, window, cx)),
             Page::Menus => ("Menus & toolbars", pages::menus_page(self, cx)),
             Page::Dialogs => ("Dialogs & flyouts", pages::dialogs_page(self, cx)),
+            Page::Navigation => ("Navigation", pages::navigation_page(self, cx)),
         };
         div()
             .id("gallery-root")
@@ -886,6 +897,49 @@ mod tests {
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
             assert_eq!(window.find("dialog-open").focused(), Some(true));
+            // The TeachingTip's close button answers Enter.
+            window.click("tip-target", cx);
+            window.render_frame(cx);
+            tab_to(window, "tip-close", cx);
+            window.press("enter", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("tip").is_none());
+
+            // Navigation.
+            window.click("gallery-nav-navigation", cx);
+            window.render_frame(cx);
+            assert!(window.find("nav-item-2").visible());
+            assert_eq!(window.find("nav-item-0").bounds().size.height, px(36.));
+            // Children keep the pane's margins; their content indents 31 px.
+            assert_eq!(
+                window.find("nav-item-2").bounds().left()
+                    - window.find("nav-item-0").bounds().left(),
+                px(0.)
+            );
+            window.click("nav-item-3", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_nav().0, 3);
+            window.click("nav-item-1", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("nav-item-2").is_none());
+            window.click("crumbs-1", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_nav().1, 2);
+            assert!(window.try_find("crumbs-2").is_none());
+            window.click("selector-2", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_nav().2, 2);
+            assert_eq!(window.find("selector-2").selected(), Some(true));
+            window.click("tabs-add", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_nav().3, 4);
+            window.click("tabs-0-close", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_nav().3, 3);
+            tab_to(window, "tabs-1", cx);
+            window.press("space", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("tabs-1").selected(), Some(true));
         })
         .unwrap();
     }
@@ -1113,6 +1167,24 @@ mod tests {
             cx.capture_screenshot(handle)
                 .unwrap()
                 .save(output.join(format!("gallery-dialogs-{name}-dialog.png")))
+                .unwrap();
+            // Navigation page.
+            cx.update_window(handle, |_, window, cx| {
+                window.press("escape", cx);
+                window.render_frame(cx);
+                window.click("gallery-nav-navigation", cx);
+                window.render_frame(cx);
+                window.click("nav-item-3", cx);
+                window.render_frame(cx);
+                window.click("selector-1", cx);
+                window.render_frame(cx);
+                assert!(window.find("tabs").visible());
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(format!("gallery-navigation-{name}.png")))
                 .unwrap();
         }
     }

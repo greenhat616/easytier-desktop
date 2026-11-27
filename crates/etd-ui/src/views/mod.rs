@@ -5,6 +5,7 @@ pub mod controls;
 pub mod dialogs;
 pub mod instances;
 pub mod menus;
+pub mod navigation;
 pub mod reclaim;
 pub mod ui;
 

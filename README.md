@@ -144,12 +144,13 @@ text boxes, navigation items, InfoBars, selected cards, progress rings, and
 appearance choices. Its state is in-memory: it does not open a host connection,
 tray, profile library, or production UI preferences.
 
-The gallery's Basic input, Settings, Menus & toolbars and Dialogs & flyouts
-pages show controls that the product does not use yet (CheckBox,
+The gallery's Basic input, Settings, Menus & toolbars, Dialogs & flyouts and
+Navigation pages show controls that the product does not use yet (CheckBox,
 RadioButtons, ToggleButton, DropDownButton, SplitButton, ComboBox, Slider,
 NumberBox, SettingsCard, SettingsExpander, MenuFlyout, CommandBar,
-ContentDialog, Flyout and TeachingTip). They live in `etd-ui`'s
-`views::controls`, `views::menus` and `views::dialogs` and take their values
+ContentDialog, Flyout, TeachingTip, NavigationView items, BreadcrumbBar,
+SelectorBar and TabView). They live in `etd-ui`'s `views::controls`,
+`views::menus`, `views::dialogs` and `views::navigation` and take their values
 from the WinUI theme resources and the Windows Community Toolkit
 SettingsControls. Each is a Tab stop with the WinUI focus visual; open
 flyouts take Up, Down and Escape and give focus back when they close.

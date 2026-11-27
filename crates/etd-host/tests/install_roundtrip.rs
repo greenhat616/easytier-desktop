@@ -593,8 +593,7 @@ impl Installed {
         let connector = Arc::new(LocalConnector {
             expectation: ServerExpectation {
                 exe_dir: layout.executable.parent().unwrap().to_owned(),
-                user: None,
-                privileged: true,
+                requirement: ServerRequirement::Service,
             },
         });
         let image = layout.executable.canonicalize().unwrap();

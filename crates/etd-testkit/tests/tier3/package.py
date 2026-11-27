@@ -93,11 +93,13 @@ def journal():
 
 
 def settings(service):
+    """The ledger's settings row (allow list included), as stored."""
     db = sqlite3.connect((service.state / "ledger.sqlite3").as_uri() + "?mode=ro", uri=True)
     try:
-        return db.execute("SELECT payload FROM settings WHERE singleton = 1").fetchone()[0]
+        payload = db.execute("SELECT payload FROM settings WHERE singleton = 1").fetchone()[0]
     finally:
         db.close()
+    return payload.encode() if isinstance(payload, str) else bytes(payload)
 
 
 def serving(service, what):
@@ -153,9 +155,16 @@ def msi_lifecycle():
         assert result.returncode == 0, f"msiexec exited {result.returncode}"
 
     def uninstall():
-        [(code, version)] = products()
-        assert version == "0.1.1", version
-        return msiexec("/x", code, "uninstall")
+        # Whatever is installed, even after an earlier failure; the version
+        # is checked once the uninstall has run.
+        result = None
+        for code, version in products():
+            removed.append(version)
+            result = msiexec("/x", code, f"uninstall-{version}")
+        assert result is not None, "no EasyTier Desktop product to uninstall"
+        return result
+
+    removed = []
 
     with service.installed(install=install, uninstall=uninstall):
         # 2. First install.
@@ -166,7 +175,7 @@ def msi_lifecycle():
         assert (MENU / "EasyTier Desktop.lnk").is_file(), "no Start menu shortcut"
         assert app_path() == (str(PAYLOAD / "etd-ctl.exe"), str(PAYLOAD) + "\\"), app_path()
         assert digest(service.host) == images[a], "the service image is not the payload's"
-        assert ALLOWED in settings(service), "ETD_ALLOW_USER did not reach the allow list"
+        assert ALLOWED.encode() in settings(service), "ETD_ALLOW_USER did not reach the allow list"
         install_id = journal()["install_id"]
         key = digest(service.state / "repair-index.json")
         kept = settings(service)
@@ -208,6 +217,7 @@ def msi_lifecycle():
               "Windows Installer restored its payload", flush=True)
 
     # 5. Full uninstall (Service.installed compared the machine).
+    assert removed == ["0.1.1"], f"uninstalled {removed}"
     assert not PAYLOAD.exists(), f"uninstall left {PAYLOAD}"
     assert not MENU.exists(), f"uninstall left {MENU}"
     assert app_path() is None, "uninstall left the App Paths entry"

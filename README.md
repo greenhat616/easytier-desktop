@@ -162,6 +162,10 @@ cargo deny --locked check
 `#[ignore]` and run only in CI or disposable VMs; never run them on your own desktop.
 See [Development workflow](docs/development/workflow.md) for the details.
 
+Installer packages are built with `cargo xtask dist`; the Windows MSI needs WiX 7.0.1,
+whose binaries come under the Open Source Maintenance Fee EULA (this project accepts it
+as a non-commercial open source project). See [Packaging](docs/packaging/README.md).
+
 ## Project layout
 
 ```text
@@ -180,8 +184,9 @@ crates/
   etd-core-api       kernel adapter traits, independent of EasyTier
   etd-core-easytier  EasyTier adapter: launch plans, effect prediction, management RPC
   etd-testkit        fakes, conformance suites, fake-core, integration tiers (test-only)
-xtask/               cargo xtask: architecture boundary check and repository tests
-docs/                architecture, development standards, testing
+packaging/           pinned upstream kernels, installer templates (WiX)
+xtask/               cargo xtask: boundary check, kernel fetch, packaging, repository tests
+docs/                architecture, development standards, testing, packaging
 skills/etd-ctl/      agent skill for operating a host with etd-ctl
 ```
 

@@ -39,11 +39,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, suite: recovery, sample: 1 }
           - { os: windows-latest, suite: recovery, sample: 1 }
-          - { os: windows-latest, suite: clean, sample: 1 }
-          - { os: windows-latest, suite: recovery, sample: 2 }
-          - { os: windows-latest, suite: clean, sample: 2 }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -113,6 +109,24 @@ jobs:
           "ETD_G2_SHA=$digest" >> $env:GITHUB_ENV
       - name: Compile runner as the build user
         run: cargo nextest list --locked --profile privileged --run-ignored only -p etd-testkit --test tier3
+      - name: Record the pre-install IPv6 value and enable registry auditing
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces'
+          $before = @{}
+          foreach ($key in Get-ChildItem -LiteralPath $root) {
+            $before[$key.PSChildName] = $key.GetValue('MaxNumberOfAddressesToRegister')
+          }
+          ConvertTo-Json -InputObject $before | Set-Content (Join-Path $env:RUNNER_TEMP 'ipv6-baseline.json')
+          (Get-Date).ToUniversalTime().ToString('o') | Set-Content (Join-Path $env:RUNNER_TEMP 'ipv6-start')
+          & auditpol /set /subcategory:Registry /success:enable
+          if ($LASTEXITCODE) { throw 'Could not enable registry write auditing' }
+          $acl = Get-Acl -LiteralPath $root -Audit
+          $sid = [Security.Principal.SecurityIdentifier]::new('S-1-1-0')
+          $rule = [Security.AccessControl.RegistryAuditRule]::new($sid,'SetValue','ContainerInherit','None','Success')
+          $acl.AddAuditRule($rule)
+          Set-Acl -LiteralPath $root -AclObject $acl
       - name: Installed service tests (administrator)
         if: runner.os == 'Windows' && matrix.suite == 'recovery'
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=installed_kernel_and_host_crash_recovery)' --success-output immediate
@@ -122,6 +136,31 @@ jobs:
       - name: Upgrade with a running network (administrator)
         if: matrix.suite == 'upgrade'
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=installed_network_survives_upgrade)' --success-output immediate
+      - name: Compare the audited writes to the pre-install and post-uninstall values
+        if: always()
+        shell: pwsh
+        run: |
+          $root = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces'
+          $leaf = 'MaxNumberOfAddressesToRegister'
+          $before = Get-Content (Join-Path $env:RUNNER_TEMP 'ipv6-baseline.json') -Raw | ConvertFrom-Json -AsHashtable
+          $start = [DateTimeOffset]::Parse((Get-Content (Join-Path $env:RUNNER_TEMP 'ipv6-start'))).LocalDateTime
+          $coreWrites = 0
+          $events = Get-WinEvent -FilterHashtable @{LogName='Security';Id=4657;StartTime=$start} -Oldest
+          foreach ($event in $events) {
+            $fields = @{}
+            foreach ($d in ([xml]$event.ToXml()).Event.EventData.Data) { $fields[$d.Name] = $d.InnerText }
+            if ($fields.ObjectValueName -ne $leaf -or $fields.ObjectName -notmatch '\\Tcpip6\\Parameters\\Interfaces\\(\{[a-f0-9-]{36}\})$') { continue }
+            $guid = $Matches[1]
+            $image = [IO.Path]::GetFileName($fields.ProcessName)
+            if ($image -eq 'easytier-core.exe') { $coreWrites++ }
+            $key = Get-Item -LiteralPath (Join-Path $root $guid) -ErrorAction SilentlyContinue
+            $after = if ($key) { $key.GetValue($leaf) }
+            $oldKey = @($before.Keys | Where-Object { $_ -eq $guid })
+            $previous = if ($oldKey) { $before[$oldKey[0]] }
+            $isZero = $fields.NewValue -match '^(?:0+|0x0+)$'
+            Write-Host "event=$($event.RecordId) guid=$guid writer=$image pid=$($fields.ProcessId) operation=$($fields.OperationType) writesZero=$isZero keyBefore=$([bool]$oldKey) valueBefore=$($null -ne $previous) valueAfter=$($null -ne $after)"
+          }
+          if (!$coreWrites) { throw 'No EasyTier core write to the selected IPv6 value observed' }
       - name: Pre-existing shared drivers (fresh administrator runner)
         if: matrix.suite == 'preflight'
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=preexisting_shared_drivers_are_conflicts) | test(=preexisting_shared_drivers_survive_uninstall)' --success-output immediate

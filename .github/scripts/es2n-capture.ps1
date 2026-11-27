@@ -2,8 +2,8 @@
 # matching -Processes it fails on any COM class, interface, AppID or type
 # library lookup, on any image loaded from outside System32, WinSxS or the
 # -Allowed directories, and on any -Absent DLL a process loads; for the
-# -Product processes also on any access to a user hive (HKCU, HKU\<user
-# SID>, HKU\.DEFAULT) that is not an exact operation and path of
+# -Product processes also on any access to a user hive (HKCU or any hive
+# under HKU) that is not an exact operation and path of
 # es2n-hkcu-allowed.tsv. Writes
 # <Name>-events.csv, <Name>-loads.txt and <Name>-verdict.txt to -Out.
 # Exit 1: the capture fails the gate.
@@ -36,11 +36,23 @@ $ours | Group-Object 'Process Name' | ForEach-Object { $verdict.Add("  $($_.Name
 if ($ours.Count -eq 0) { $verdict.Add('FAIL: no events by the processes under test') }
 $reg = @($ours | Where-Object { $_.Operation -like 'Reg*' })
 $com = @($reg | Where-Object { $_.Path -match '(^HKCR|Classes)\\(CLSID|Interface|AppID|TypeLib)(\\|$)' })
-# Every user hive is judged alike: HKCU, HKU\<user SID> and HKU\.DEFAULT.
-# An access is matched as HKCU\<rest of the path> against the exact list.
-$userHive = '^(HKCU|HKU\\S-1-5-21-[^\\]+|HKU\\\.DEFAULT)(?=\\|$)'
+# Every user hive is judged alike: HKCU and every hive loaded under HKU
+# (account SIDs, the service accounts S-1-5-18/19/20, .DEFAULT, any other
+# SID), each matched as HKCU\<rest of the path>; a <SID>_Classes hive is
+# the user's Software\Classes. RegSetInfoKey is matched with its
+# information class, so only the class on the list passes.
+$userHive = '^(HKCU|HKU\\[^\\]+)(?=\\|$)'
+$classesHive = '^HKU\\[^\\]+_Classes(?=\\|$)'
 $hkcu = @($reg | Where-Object { $_.Path -match $userHive })
-function Get-Canonical($row) { "$($row.Operation)|$($row.Path -replace $userHive, 'HKCU')".ToLowerInvariant() }
+function Get-Canonical($row) {
+  $path = if ($row.Path -match $classesHive) { $row.Path -replace $classesHive, 'HKCU\Software\Classes' } else { $row.Path -replace $userHive, 'HKCU' }
+  $operation = $row.Operation
+  if ($operation -eq 'RegSetInfoKey') {
+    $class = if ($row.Detail -match 'KeySetInformationClass:\s*(\w+)') { $Matches[1] } else { 'unknown' }
+    $operation = "RegSetInfoKey:$class"
+  }
+  "$operation|$path".ToLowerInvariant()
+}
 $permitted = @{}
 foreach ($line in Get-Content $HkcuAllowed) {
   if ($line -match '^\s*(#|$)') { continue }

@@ -36,7 +36,28 @@ pub struct HostLayout {
     pub socket_dir: Option<PathBuf>,
     /// Stable protected directory never removed by install/uninstall.
     pub maintenance: PathBuf,
+    /// Elevated session only: the protected, empty directory the kernel's
+    /// and the system workers' profile variables point at
+    /// (`<state>\..\profile`).
+    pub profile: Option<PathBuf>,
     user_host: bool,
+}
+
+/// A protected host directory that exists but does not conform (owner,
+/// access control, reparse point, hard link). It is refused, never repaired
+/// or adopted. Carried inside the `io::Error` of the session operations.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("session directory not conforming: {} ({reason})", path.display())]
+pub struct NotConforming {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+impl NotConforming {
+    /// The refusal inside `error`, if that is what it is.
+    pub fn of(error: &io::Error) -> Option<&Self> {
+        error.get_ref().and_then(|inner| inner.downcast_ref())
+    }
 }
 
 /// A cross-process exclusive OS lock. Keep the lock file: deleting it while
@@ -123,6 +144,33 @@ pub trait HostFilesystem {
     fn is_installed_image(&self, layout: &HostLayout) -> io::Result<bool>;
     fn lock(&self, layout: &HostLayout) -> io::Result<HostLock>;
     fn lock_maintenance(&self, layout: &HostLayout) -> io::Result<MaintenanceLock>;
+    /// Elevated session host of user `sid` (Windows only): everything under
+    /// `%ProgramData%\EasyTierDesk.session\<SID>`, locks shared with the
+    /// service.
+    fn session_layout(&self, _sid: &str) -> io::Result<HostLayout> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// Create the missing protected session directories, then verify the
+    /// whole per-user tree. Fails with [`NotConforming`] inside the error
+    /// for anything that exists but does not conform.
+    fn prepare_session(&self, _layout: &HostLayout) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// Verify a session tree without creating anything.
+    fn validate_session(&self, _layout: &HostLayout) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// Every per-user session root, each verified; one that does not
+    /// conform fails the whole call. Ownership is never inferred from a
+    /// directory's name.
+    fn session_layouts(&self) -> io::Result<Vec<HostLayout>> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// Remove `EasyTierDesk.session` after verifying it (install drained
+    /// every ledger in it first).
+    fn remove_session_roots(&self) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 }
 
 /// Privileged changes are deliberately separated from composition. Only the
@@ -157,6 +205,11 @@ pub trait ServiceManager {
     ) -> io::Result<Option<u32>>;
     fn deferred_worker_alive(&self, pid: u32) -> io::Result<bool>;
     fn entry_is_elevated(&self) -> io::Result<bool>;
+    /// The service is registered with the service manager (whatever its
+    /// state).
+    fn is_registered(&self) -> io::Result<bool> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
     /// `etd-host upgrade`: copy the running image (bound to the running
     /// process, not to its path) beside the installed host image, verify
     /// it, then swap it in, keeping the previous image as a backup until
@@ -253,6 +306,10 @@ impl ServiceManager for NativeServiceManager {
     fn entry_is_elevated(&self) -> io::Result<bool> {
         native::elevated()
     }
+    #[cfg(windows)]
+    fn is_registered(&self) -> io::Result<bool> {
+        native::service_registered()
+    }
     fn replace_host_image(&self, layout: &HostLayout) -> io::Result<()> {
         native::replace_host_image(layout)
     }
@@ -303,6 +360,18 @@ pub(super) fn is_image(current: &Path, executable: &Path) -> io::Result<bool> {
     }
 }
 
+/// The service's state directory exists (installed, or an uninstall that
+/// has not removed it yet).
+pub fn service_state_exists() -> io::Result<bool> {
+    service_layout()?.state.try_exists()
+}
+
+/// `%ProgramData%\EasyTierDesk.session` (Windows only).
+#[cfg(windows)]
+pub fn session_root() -> io::Result<PathBuf> {
+    native::session_root()
+}
+
 pub fn current_exe() -> io::Result<PathBuf> {
     std::env::current_exe()?.canonicalize()
 }
@@ -318,7 +387,10 @@ pub fn installed_host_dir() -> io::Result<PathBuf> {
 #[cfg(unix)]
 pub use unix::group_id as service_group_id;
 #[cfg(windows)]
-pub use windows::{dispatch_service, wait_uninstall_parent};
+pub use windows::{
+    ProcessPin, SessionEnd, SessionToken, dispatch_service, elevated_session_token,
+    harden_dll_search, wait_uninstall_parent,
+};
 
 #[derive(Default)]
 pub struct NativeHostFilesystem;
@@ -389,6 +461,7 @@ impl HostFilesystem for NativeHostFilesystem {
             maintenance: state.clone(),
             state,
             socket_dir,
+            profile: None,
             user_host: true,
         })
     }
@@ -435,6 +508,35 @@ impl HostFilesystem for NativeHostFilesystem {
         native::prepare_maintenance(layout)?;
         MaintenanceLock::acquire(&layout.maintenance)
     }
+    #[cfg(windows)]
+    fn session_layout(&self, sid: &str) -> io::Result<HostLayout> {
+        native::session_layout(sid)
+    }
+    #[cfg(windows)]
+    fn prepare_session(&self, layout: &HostLayout) -> io::Result<()> {
+        native::prepare_session(layout)
+    }
+    #[cfg(windows)]
+    fn validate_session(&self, layout: &HostLayout) -> io::Result<()> {
+        native::validate_session(layout)
+    }
+    #[cfg(windows)]
+    fn session_layouts(&self) -> io::Result<Vec<HostLayout>> {
+        native::session_layouts()
+    }
+    /// Unix has no elevated session host, so no session roots.
+    #[cfg(unix)]
+    fn session_layouts(&self) -> io::Result<Vec<HostLayout>> {
+        Ok(vec![])
+    }
+    #[cfg(windows)]
+    fn remove_session_roots(&self) -> io::Result<()> {
+        native::remove_session_roots()
+    }
+    #[cfg(unix)]
+    fn remove_session_roots(&self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
@@ -469,6 +571,7 @@ fn service_layout() -> io::Result<HostLayout> {
         state,
         socket_dir: None,
         maintenance: native::program_data()?.join("EasyTierDesk.maintenance"),
+        profile: None,
         user_host: false,
     })
 }
@@ -483,6 +586,7 @@ fn service_layout() -> io::Result<HostLayout> {
         state,
         socket_dir: Some(PathBuf::from("/run/easytier-desk")),
         maintenance: PathBuf::from("/var/lib/easytier-desk-maintenance"),
+        profile: None,
         user_host: false,
     })
 }
@@ -497,6 +601,7 @@ fn service_layout() -> io::Result<HostLayout> {
         state,
         socket_dir: Some(install.join("run")),
         maintenance: PathBuf::from("/Library/Application Support/easytier-desk-maintenance"),
+        profile: None,
         user_host: false,
     })
 }

@@ -40,6 +40,15 @@ use windows_service::{
     service_manager::{ServiceManager, ServiceManagerAccess},
 };
 
+mod session;
+pub use session::{
+    ProcessPin, SessionEnd, SessionToken, elevated_session_token, harden_dll_search,
+};
+pub(super) use session::{
+    prepare_session, remove_session_roots, service_registered, session_layout, session_layouts,
+    session_root, validate_session,
+};
+
 fn other(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }

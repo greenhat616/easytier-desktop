@@ -98,17 +98,62 @@ pub(crate) fn query_access_denied(pid: u32) -> bool {
     }
 }
 
-/// Linux: a zombie thread-group leader whose other threads still run (it
-/// left with `pthread_exit`). The process is not gone, and the snapshot lists
-/// no threads, so it must stay a candidate.
-#[cfg(target_os = "linux")]
-pub(crate) fn leader_outlived(pid: u32) -> bool {
-    std::fs::read_dir(format!("/proc/{pid}/task")).is_ok_and(|tasks| tasks.count() > 1)
+/// What runs beside a zombie or dead process entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(
+        dead_code,
+        reason = "only Linux snapshots can show a zombie leader with live threads"
+    )
+)]
+pub(crate) enum LeaderThreads {
+    /// Only the leader's own entry, or the process is confirmed exited.
+    Alone,
+    /// The leader left with `pthread_exit` while other threads still run:
+    /// the process is not gone.
+    Siblings,
+    /// The thread list could not be read and no exit was confirmed.
+    Unknown,
 }
 
+/// Linux: the threads of a zombie thread-group leader. The snapshot lists no
+/// threads, so a leader whose siblings still run must stay a candidate, and
+/// an unreadable thread list is unknown, never "alone".
+#[cfg(target_os = "linux")]
+pub(crate) fn leader_threads(pid: u32) -> LeaderThreads {
+    let listing = std::fs::read_dir(format!("/proc/{pid}/task"))
+        .map(|tasks| tasks.map(|entry| entry.map(drop)));
+    classify_threads(listing, || pid_absent(pid).unwrap_or(false))
+}
+
+/// Elsewhere a zombie has no running threads.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn leader_outlived(_pid: u32) -> bool {
-    false
+pub(crate) fn leader_threads(_pid: u32) -> LeaderThreads {
+    LeaderThreads::Alone
+}
+
+/// `listing`: the entries of `/proc/<pid>/task`. `exited`: an independent
+/// observation that the process is gone, consulted only when the listing
+/// does not settle it. Any error while listing makes the entries seen
+/// prove nothing.
+#[cfg(target_os = "linux")]
+fn classify_threads(
+    listing: io::Result<impl Iterator<Item = io::Result<()>>>,
+    exited: impl FnOnce() -> bool,
+) -> LeaderThreads {
+    let mut count = 0usize;
+    let complete = listing.is_ok_and(|entries| {
+        entries
+            .inspect(|entry| count += usize::from(entry.is_ok()))
+            .all(|entry| entry.is_ok())
+    });
+    match (complete, count) {
+        (true, 1) => LeaderThreads::Alone,
+        (true, n) if n > 1 => LeaderThreads::Siblings,
+        _ if exited() => LeaderThreads::Alone,
+        _ => LeaderThreads::Unknown,
+    }
 }
 
 pub(crate) fn minimal_process(process: &sysinfo::Process) -> bool {
@@ -619,6 +664,39 @@ mod minimal_snapshot_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn an_unreadable_thread_list_is_unknown_unless_the_exit_is_confirmed() {
+        fn entries(n: usize) -> io::Result<impl Iterator<Item = io::Result<()>>> {
+            Ok(std::iter::repeat_with(|| Ok(())).take(n))
+        }
+        fn denied() -> io::Result<std::iter::Empty<io::Result<()>>> {
+            Err(io::ErrorKind::PermissionDenied.into())
+        }
+        fn broken() -> io::Result<impl Iterator<Item = io::Result<()>>> {
+            Ok([Ok(()), Err(io::ErrorKind::NotFound.into()), Ok(())].into_iter())
+        }
+        assert_eq!(classify_threads(entries(1), || false), LeaderThreads::Alone);
+        assert_eq!(
+            classify_threads(entries(2), || false),
+            LeaderThreads::Siblings
+        );
+        assert_eq!(
+            classify_threads(entries(0), || false),
+            LeaderThreads::Unknown
+        );
+        assert_eq!(classify_threads(denied(), || false), LeaderThreads::Unknown);
+        assert_eq!(classify_threads(denied(), || true), LeaderThreads::Alone);
+        // An error while iterating: the entries seen prove nothing.
+        assert_eq!(classify_threads(broken(), || false), LeaderThreads::Unknown);
+        assert_eq!(classify_threads(broken(), || true), LeaderThreads::Alone);
+        // A live sibling is never overridden by the exit observation.
+        assert_eq!(
+            classify_threads(entries(3), || true),
+            LeaderThreads::Siblings
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn snapshots_list_processes_not_threads() {
         let (tid_tx, tid_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
@@ -631,7 +709,7 @@ mod minimal_snapshot_tests {
         let tid = tid_rx.recv().unwrap();
         let system = snapshot(ProcessesToUpdate::All).unwrap();
         // The worker runs beside the main thread: more than one task.
-        assert!(leader_outlived(std::process::id()));
+        assert_eq!(leader_threads(std::process::id()), LeaderThreads::Siblings);
         done_tx.send(()).unwrap();
         worker.join().unwrap();
         assert_ne!(tid, std::process::id());

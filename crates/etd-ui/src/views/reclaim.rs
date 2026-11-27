@@ -158,8 +158,8 @@ fn render_reclaim_instances(
 
 #[inline(never)]
 fn render_reclaim_instance_card(item: &InstanceReclaim, cx: &mut Context<MainView>) -> AnyElement {
-    let border = cx.theme().border;
-    let sec = cx.theme().secondary;
+    let border = crate::theme::card_stroke(cx);
+    let card = crate::theme::card_fill(cx);
     let muted = cx.theme().muted_foreground;
     let fg = cx.theme().foreground;
 
@@ -198,7 +198,7 @@ fn render_reclaim_instance_card(item: &InstanceReclaim, cx: &mut Context<MainVie
         .rounded_md()
         .border_1()
         .border_color(border)
-        .bg(sec.opacity(0.2))
+        .bg(card)
         .child(
             div()
                 .flex()
@@ -285,8 +285,8 @@ fn render_candidate_row(
     can_resolve: bool,
     cx: &mut Context<MainView>,
 ) -> AnyElement {
-    let border = cx.theme().border;
-    let sec = cx.theme().secondary;
+    let border = crate::theme::card_stroke(cx);
+    let card = crate::theme::card_fill(cx);
     let muted = cx.theme().muted_foreground;
 
     let cid = candidate.candidate_id.clone();
@@ -356,7 +356,7 @@ fn render_candidate_row(
         .rounded_md()
         .border_1()
         .border_color(border)
-        .bg(sec.opacity(0.25))
+        .bg(card)
         .child(
             div()
                 .flex_1()

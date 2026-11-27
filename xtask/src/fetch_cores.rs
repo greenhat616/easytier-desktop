@@ -8,10 +8,7 @@
 //! `crates/etd-host/cores.lock` (the default) or written into it
 //! (`--update-lock`, every target at once).
 
-#[path = "../../crates/etd-host/core_lock.rs"]
-#[allow(dead_code)]
-mod core_lock;
-
+use crate::core_lock;
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -22,8 +19,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const PIN: &str = "packaging/cores.toml";
-const LOCK: &str = "crates/etd-host/cores.lock";
+pub(crate) const PIN: &str = "packaging/cores.toml";
+pub(crate) const LOCK: &str = "crates/etd-host/cores.lock";
 const SUMS: &str = "SHA256SUMS";
 const MAX_ARCHIVE: u64 = 256 << 20;
 const MAX_MEMBER: u64 = 128 << 20;
@@ -75,14 +72,14 @@ pub struct Args {
 
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
-struct Pin {
+pub(crate) struct Pin {
     pub release: Release,
     pub target: Vec<Target>,
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
-struct Release {
+pub(crate) struct Release {
     pub repository: String,
     pub tag: String,
     pub commit: String,
@@ -91,7 +88,7 @@ struct Release {
 
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
-struct Target {
+pub(crate) struct Target {
     pub triple: String,
     pub archive: String,
     pub sha256: String,
@@ -100,7 +97,7 @@ struct Target {
 }
 
 impl Target {
-    fn executable(&self) -> &'static str {
+    pub(crate) fn executable(&self) -> &'static str {
         if self.triple.contains("-windows-") {
             "easytier-core.exe"
         } else {
@@ -132,7 +129,7 @@ fn is_hex(value: &str, len: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-fn parse_pin(text: &str) -> Result<Pin> {
+pub(crate) fn parse_pin(text: &str) -> Result<Pin> {
     let pin: Pin = toml::from_str(text).with_context(|| format!("invalid {PIN}"))?;
     let release = &pin.release;
     let mut owner_repo = release.repository.split('/');
@@ -192,7 +189,7 @@ fn parse_pin(text: &str) -> Result<Pin> {
 }
 
 /// The triple of the machine this xtask runs on.
-fn host_triple() -> Result<&'static str> {
+pub(crate) fn host_triple() -> Result<&'static str> {
     Ok(match (std::env::consts::ARCH, std::env::consts::OS) {
         ("x86_64", "windows") => "x86_64-pc-windows-msvc",
         ("aarch64", "windows") => "aarch64-pc-windows-msvc",
@@ -245,7 +242,7 @@ fn parse_sums(text: &str) -> Result<BTreeMap<&str, &str>> {
     Ok(sums)
 }
 
-fn sha256(bytes: &[u8]) -> String {
+pub(crate) fn sha256(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
         .fold(String::with_capacity(64), |mut text, byte| {

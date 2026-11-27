@@ -3,6 +3,10 @@
 mod boundaries;
 #[cfg(test)]
 mod ci_config;
+#[path = "../../crates/etd-host/core_lock.rs"]
+#[allow(dead_code)]
+mod core_lock;
+mod dist;
 mod fetch_cores;
 #[cfg(test)]
 mod spawn_flags;
@@ -19,6 +23,8 @@ enum Task {
     CheckBoundaries,
     /// Download, verify and extract the pinned upstream release kernels.
     FetchCores(fetch_cores::Args),
+    /// Stage a release payload and build its installer package.
+    Dist(dist::Args),
 }
 
 fn root() -> PathBuf {
@@ -44,5 +50,6 @@ fn main() -> Result<()> {
             Ok(())
         }
         Task::FetchCores(args) => fetch_cores::run(&root(), args),
+        Task::Dist(args) => dist::run(&root(), args),
     }
 }

@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        case: [session_host_crash_recovery_and_purge, session_and_service_exclude_each_other, session_kernel_port_refuses_other_identities]
+        case: [session_host_crash_recovery_and_purge, session_and_service_exclude_each_other, session_kernel_port_refuses_other_identities, session_ignores_planted_modules]
     runs-on: windows-latest
     timeout-minutes: 90
     env:

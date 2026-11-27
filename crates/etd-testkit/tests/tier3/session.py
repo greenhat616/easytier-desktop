@@ -479,24 +479,31 @@ def second_account_connects(port):
     return lines
 
 
+def running_network(session):
+    status = session.start()
+    instance, request = str(uuid.uuid4()), str(uuid.uuid4())
+    session.apply(spec(), instance, request, str(status["revision"]))
+    session.ready(instance)
+    return instance
+
+
+def wind_down(session, instance):
+    session.ctl("stop", instance)
+    eventually("stopped instance", lambda: session.view(instance),
+               lambda body: body.get("state") == "stopped", timeout=240)
+    session.release()
+    session.purge()
+
+
 def identities():
     """The real kernel's management port under the session fence refuses a
     non-elevated copy of the user's own token and a second standard account
-    at Medium and at Low integrity, while the elevated user connects; DLLs
-    planted beside the portable host are not loaded, and the kernel loads
-    only from its store and Windows
+    at Medium and at Low integrity, while the elevated user connects
     (doc#13#wbs ES5)."""
-    import psutil
     import socket
     with ExitStack() as stack:
         session = Session(stack)
-        system32 = Path(os.environ["SystemRoot"]) / "System32"
-        for name in PLANTED:
-            shutil.copy2(system32 / name, session.dir / name)
-        status = session.start()
-        instance, request = str(uuid.uuid4()), str(uuid.uuid4())
-        session.apply(spec(), instance, request, str(status["revision"]))
-        session.ready(instance)
+        instance = running_network(session)
         port = kernel_port(session)
         with socket.create_connection(("127.0.0.1", port), timeout=5):
             print(f"elevated user: connected to the kernel port {port}", flush=True)
@@ -512,32 +519,65 @@ def identities():
         # Administrators enabled, and the fence admits elevated
         # administrators by group (only an elevated parent can make one).
         print(f"elevated token lowered to Low (report only): {own_low_connect(port, session.dir)}", flush=True)
+        wind_down(session, instance)
 
-        portable = session.dir.resolve()
-        planted = {name.lower() for name in PLANTED}
-        host_modules = [m.path for m in psutil.Process(session.process.pid).memory_maps(grouped=True)
-                        if m.path and Path(m.path).resolve().parent == portable
-                        and Path(m.path).name.lower() in planted]
-        assert not host_modules, f"etd-host loaded planted modules: {host_modules}"
+
+# A same-name module where Windows PowerShell's NetSecurity module would be
+# found for this user: the elevated hosts start no PowerShell at all (ES2N),
+# so it must never be loaded.
+PLANTED_PS_MODULE = Path(os.environ.get("USERPROFILE", "C:/")) / "Documents" / "WindowsPowerShell" / "Modules" / "NetSecurity"
+
+
+def planted_modules():
+    """Defensive acceptance on a disposable runner (doc#13#wbs ES5, ruling
+    msg#2205): DLLs planted beside the portable host and a same-name
+    NetSecurity module in the user's own module path are never loaded; the
+    host and the kernel start no PowerShell; and a read-only list of every
+    module loaded shows nothing from the program directory but etd-host.exe,
+    and the kernel only its own store and Windows. (The PowerShell analysis
+    cache and HKCU .NET settings no longer apply: no host runs PowerShell or
+    .NET since ES2N.)"""
+    import psutil
+    with ExitStack() as stack:
+        session = Session(stack)
+        system32 = Path(os.environ["SystemRoot"]) / "System32"
+        for name in PLANTED:
+            shutil.copy2(system32 / name, session.dir / name)
+        assert not PLANTED_PS_MODULE.exists(), "the runner already has a user NetSecurity module"
+        PLANTED_PS_MODULE.mkdir(parents=True)
+        stack.callback(shutil.rmtree, PLANTED_PS_MODULE, ignore_errors=True)
+        (PLANTED_PS_MODULE / "NetSecurity.psm1").write_text(
+            "Set-Content -LiteralPath $env:TEMP\\es5-netsecurity-loaded.txt -Value $PID\n", encoding="utf-8")
+        marker = Path(os.environ["TEMP"]) / "es5-netsecurity-loaded.txt"
+        marker.unlink(missing_ok=True)
+
+        instance = running_network(session)
+        host = psutil.Process(session.process.pid)
         [kernel] = session.kernels()
-        store = Path(kernel.info["exe"]).resolve().parent
         windows = Path(os.environ["SystemRoot"]).resolve()
+        portable = session.dir.resolve()
+        host_dir = [m.path for m in host.memory_maps(grouped=True)
+                    if m.path and Path(m.path).resolve().parent == portable
+                    and Path(m.path).resolve() != session.host.resolve()]
+        assert not host_dir, f"etd-host loaded modules from its program directory: {host_dir}"
+        store = Path(kernel.info["exe"]).resolve().parent
         foreign = [m.path for m in kernel.memory_maps(grouped=True)
                    if m.path and m.path.lower().endswith(".dll")
                    and Path(m.path).resolve().parent != store
                    and not Path(m.path).resolve().is_relative_to(windows)]
         assert not foreign, f"the kernel loaded modules from outside its store and Windows: {foreign}"
-        print(f"etd-host loaded none of the {len(PLANTED)} planted modules; "
-              f"the kernel loads only from its store and Windows", flush=True)
+        shells = [p.name() for p in host.children(recursive=True)
+                  if p.name().lower() in ("powershell.exe", "pwsh.exe")]
+        assert not shells, f"the session host started PowerShell: {shells}"
+        assert not marker.exists(), "the planted NetSecurity module was loaded"
+        print(f"etd-host loaded none of the {len(PLANTED)} planted DLLs and nothing else from its directory; "
+              f"no PowerShell, the planted NetSecurity module unused; the kernel loads only from its store "
+              f"and Windows", flush=True)
+        wind_down(session, instance)
 
-        session.ctl("stop", instance)
-        eventually("stopped instance", lambda: session.view(instance),
-                   lambda body: body.get("state") == "stopped", timeout=240)
-        session.release()
-        session.purge()
 
-
-CASES = {"session_recovery": recovery, "session_exclusion": exclusion, "session_identities": identities}
+CASES = {"session_recovery": recovery, "session_exclusion": exclusion, "session_identities": identities,
+         "session_planted_modules": planted_modules}
 
 if __name__ == "__main__":
     CASES[sys.argv[1]]()

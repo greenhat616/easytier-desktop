@@ -113,6 +113,13 @@ fn session_kernel_port_refuses_other_identities() {
     run_script("session.py", "session_identities");
 }
 
+#[cfg(windows)]
+#[test]
+#[ignore = "plants DLLs and a PowerShell module for the elevated session host on a disposable hosted runner"]
+fn session_ignores_planted_modules() {
+    run_script("session.py", "session_planted_modules");
+}
+
 #[test]
 #[ignore = "installs and upgrades the privileged service on a disposable hosted runner"]
 fn installed_network_survives_upgrade() {

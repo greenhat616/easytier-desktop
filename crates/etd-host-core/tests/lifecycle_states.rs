@@ -74,6 +74,38 @@ async fn fifth_abnormal_exit_gives_up_with_desired_running() {
 }
 
 #[tokio::test]
+async fn an_exit_exactly_one_window_old_no_longer_counts() {
+    let world = World::new();
+    let mut h = world.start();
+    h.wait_serving().await;
+    h.apply("a", spec("net"), Desired::Running).await;
+    h.wait_state("a", S::ReadyFull).await;
+    let first = world.clock.now();
+    world.engine.exit(&world.last_kernel(), crash());
+    h.until_still("backoff", |h| h.state("a") == S::Backoff)
+        .await;
+    assert_eq!(h.status("a").unwrap().restart_attempt, 1);
+    h.until("epoch 2 ready", |h| {
+        h.status("a")
+            .is_some_and(|s| s.epoch == 2 && s.state() == S::ReadyFull)
+    })
+    .await;
+
+    // The restart policy forgets an exit once it is a full window old; the
+    // published counter must agree with it.
+    world
+        .clock
+        .advance(first + etd_proc::GIVE_UP_WINDOW - world.clock.now());
+    h.settle().await;
+    world.engine.exit(&world.last_kernel(), crash());
+    h.until_still("backoff", |h| h.state("a") == S::Backoff)
+        .await;
+    let status = h.status("a").unwrap();
+    assert_eq!(status.epoch, 2);
+    assert_eq!(status.restart_attempt, 1);
+}
+
+#[tokio::test]
 async fn basic_readiness_does_not_need_the_rpc() {
     let world = World::new();
     world

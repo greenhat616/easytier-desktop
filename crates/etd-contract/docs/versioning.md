@@ -289,18 +289,24 @@ configures:
 - `lint`: the `STANDARD` rules, except `RPC_REQUEST_STANDARD_NAME` and
   `RPC_RESPONSE_STANDARD_NAME`, because `Hello` / `Welcome` are intentional handshake
   names;
-- `breaking`: the `FILE` rule category.
+- `breaking`: the `FILE` rule category, with `FIELD_SAME_CARDINALITY` ignored in
+  `host.proto`: `3dcf200` gave `NetworkFlags.multi_thread` and `bind_device` explicit
+  presence, which is wire compatible and approved. `buf` ignores per file, not per
+  field.
 
 Run both from the repository root:
 
 ```sh
 buf lint
 buf breaking --against '.git#tag=freeze-v1'
+buf breaking --against ".git#ref=$(git merge-base origin/main HEAD)"
 ```
 
-`buf` is an extra tool that the repository does not install, and the CI workflows in
-this tree do not run it. The descriptor baseline test is the check that runs in CI
-(through `cargo nextest run --workspace`).
+The `contract` job of `ci.yml` runs the same checks on every push, with `buf`
+1.75.0; on `main` the second comparison is against its previous commit. The second
+comparison passes `buf.yaml`'s module and rules inline without `ignore_only`, so a new
+cardinality change in `host.proto` still fails it. The
+descriptor baseline test runs in CI too (through `cargo nextest run --workspace`).
 
 ## Changing the contract
 
@@ -315,4 +321,4 @@ an incidental edit. A compatible change:
    `every_contract_message_is_covered` test enforces this) and updates
    `tests/roles.rs` for new methods;
 4. regenerates the baseline with `ETD_UPDATE_BASELINE=1`, and passes `buf lint` and
-   `buf breaking --against '.git#tag=freeze-v1'`.
+   `buf breaking` (above).

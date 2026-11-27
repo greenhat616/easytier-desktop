@@ -7,12 +7,17 @@ use std::{
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 /// Fresh snapshot; do not reuse cached path, owner, or argv data after PID reuse.
+///
+/// Processes only: on Linux sysinfo would also list every thread as a process
+/// of its own, and a thread exiting mid-scan (its `/proc/<tid>` gone while
+/// its process lives) cannot be verified like a process.
 pub(crate) fn snapshot(pids: ProcessesToUpdate<'_>) -> Result<System, ProcessError> {
     let mut system = System::new().map_err(|e| ProcessError::Enumeration(e.to_string()))?;
     system.refresh_processes_specifics(
         pids,
         true,
         ProcessRefreshKind::nothing()
+            .without_tasks()
             .with_exe(UpdateKind::Always)
             .with_cmd(UpdateKind::Always)
             .with_user(UpdateKind::Always),
@@ -90,6 +95,64 @@ pub(crate) fn query_access_denied(pid: u32) -> bool {
             false
         }
         Err(error) => error.code() == ERROR_ACCESS_DENIED.to_hresult(),
+    }
+}
+
+/// What runs beside a zombie or dead process entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(
+        dead_code,
+        reason = "only Linux snapshots can show a zombie leader with live threads"
+    )
+)]
+pub(crate) enum LeaderThreads {
+    /// Only the leader's own entry, or the process is confirmed exited.
+    Alone,
+    /// The leader left with `pthread_exit` while other threads still run:
+    /// the process is not gone.
+    Siblings,
+    /// The thread list could not be read and no exit was confirmed.
+    Unknown,
+}
+
+/// Linux: the threads of a zombie thread-group leader. The snapshot lists no
+/// threads, so a leader whose siblings still run must stay a candidate, and
+/// an unreadable thread list is unknown, never "alone".
+#[cfg(target_os = "linux")]
+pub(crate) fn leader_threads(pid: u32) -> LeaderThreads {
+    let listing = std::fs::read_dir(format!("/proc/{pid}/task"))
+        .map(|tasks| tasks.map(|entry| entry.map(drop)));
+    classify_threads(listing, || pid_absent(pid).unwrap_or(false))
+}
+
+/// Elsewhere a zombie has no running threads.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn leader_threads(_pid: u32) -> LeaderThreads {
+    LeaderThreads::Alone
+}
+
+/// `listing`: the entries of `/proc/<pid>/task`. `exited`: an independent
+/// observation that the process is gone, consulted only when the listing
+/// does not settle it. Any error while listing makes the entries seen
+/// prove nothing.
+#[cfg(target_os = "linux")]
+fn classify_threads(
+    listing: io::Result<impl Iterator<Item = io::Result<()>>>,
+    exited: impl FnOnce() -> bool,
+) -> LeaderThreads {
+    let mut count = 0usize;
+    let complete = listing.is_ok_and(|entries| {
+        entries
+            .inspect(|entry| count += usize::from(entry.is_ok()))
+            .all(|entry| entry.is_ok())
+    });
+    match (complete, count) {
+        (true, 1) => LeaderThreads::Alone,
+        (true, n) if n > 1 => LeaderThreads::Siblings,
+        _ if exited() => LeaderThreads::Alone,
+        _ => LeaderThreads::Unknown,
     }
 }
 
@@ -597,5 +660,63 @@ mod minimal_snapshot_tests {
             Path::new("/user.slice/processkit-12-abcd-1")
         );
         assert!(processkit_cgroup(Path::new("/user.slice/app.scope")).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unreadable_thread_list_is_unknown_unless_the_exit_is_confirmed() {
+        fn entries(n: usize) -> io::Result<impl Iterator<Item = io::Result<()>>> {
+            Ok(std::iter::repeat_with(|| Ok(())).take(n))
+        }
+        fn denied() -> io::Result<std::iter::Empty<io::Result<()>>> {
+            Err(io::ErrorKind::PermissionDenied.into())
+        }
+        fn broken() -> io::Result<impl Iterator<Item = io::Result<()>>> {
+            Ok([Ok(()), Err(io::ErrorKind::NotFound.into()), Ok(())].into_iter())
+        }
+        assert_eq!(classify_threads(entries(1), || false), LeaderThreads::Alone);
+        assert_eq!(
+            classify_threads(entries(2), || false),
+            LeaderThreads::Siblings
+        );
+        assert_eq!(
+            classify_threads(entries(0), || false),
+            LeaderThreads::Unknown
+        );
+        assert_eq!(classify_threads(denied(), || false), LeaderThreads::Unknown);
+        assert_eq!(classify_threads(denied(), || true), LeaderThreads::Alone);
+        // An error while iterating: the entries seen prove nothing.
+        assert_eq!(classify_threads(broken(), || false), LeaderThreads::Unknown);
+        assert_eq!(classify_threads(broken(), || true), LeaderThreads::Alone);
+        // A live sibling is never overridden by the exit observation.
+        assert_eq!(
+            classify_threads(entries(3), || true),
+            LeaderThreads::Siblings
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn snapshots_list_processes_not_threads() {
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            // SAFETY: gettid has no preconditions and only reads the caller's id.
+            let tid = unsafe { libc::gettid() };
+            tid_tx.send(u32::try_from(tid).unwrap()).unwrap();
+            let _ = done_rx.recv();
+        });
+        let tid = tid_rx.recv().unwrap();
+        let system = snapshot(ProcessesToUpdate::All).unwrap();
+        // The worker runs beside the main thread: more than one task.
+        assert_eq!(leader_threads(std::process::id()), LeaderThreads::Siblings);
+        done_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert_ne!(tid, std::process::id());
+        assert!(system.process(pid(std::process::id())).is_some());
+        assert!(
+            system.process(pid(tid)).is_none(),
+            "thread {tid} listed as a process"
+        );
     }
 }

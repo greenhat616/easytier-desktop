@@ -68,10 +68,10 @@ checks every workflow for this.
 | `etd-sysfx-os --test windows_reclaim`, `windows_fence` | Real wintun, firewall and registry objects, same-name conflicts; WFP fence against a second account | `o1-windows.yml` |
 | `etd-sysfx-os --test linux_reclaim`, `linux_fence` | netlink adapters, systemd-resolved, nftables fence by uid, distribution parsers | `o2-linux.yml` |
 | `etd-sysfx-os --test macos_reclaim`, `macos_fence`, `macos_resolver` | utun ownership, PF anchor fence against a second account, foreign resolver files untouched | `o3-macos.yml` |
-| `etd-ipc --test unix_service`, `stale_endpoint` | Root-owned service sockets, second-account rejection, stale endpoint recovery | Root runner; not yet wired into a workflow |
+| `etd-ipc --test unix_service`, `stale_endpoint` | Root-owned service sockets, second-account rejection, stale endpoint recovery | `ci.yml` job `privileged-install` as root: both on Linux, `stale_endpoint` on macOS (the macOS case of `unix_service` binds below the group-writable `/private/var/run`, which the listener refuses) |
 | `etd-ipc --test pipe_acl` | Windows pipe ACL with a temporary second account. Not `#[ignore]`: the account case runs only with `ETD_IPC_CI_ACCOUNTS=1` and an elevated token. Never set that variable on a desktop | `ci.yml` `check` job on Windows |
 | `etd-ipc --test session_pipe_acl`, `session_clients`, `session_server_verify` | Elevated session pipe: DACL and Medium no-write-up/no-read-up label, client admission (restricted Medium, Low, AppContainer and second-account tokens), server elevation check against a non-elevated squatter | `ci.yml` `privileged-install` on Windows |
-| `etd-testkit --test tier2` (ignored case) | UI crash against a service-form test host | Root / LocalSystem with `ETD_G1_SERVICE_RUNTIME`; not yet wired into a workflow |
+| `etd-testkit --test tier2` (ignored case) | UI crash against a service-form test host | `ci.yml` job `privileged-install` on Linux and macOS, as root with `ETD_G1_SERVICE_RUNTIME`. Not on Windows: it needs LocalSystem, which the runner's administrator is not |
 | `etd-core-easytier --test session_real` | Identify, start, readiness and queries against the bundled v2.7.1 release kernel | Unprivileged; `ci.yml` `check` job on all three OSes (`--profile ci --run-ignored only`, kernel from `cargo xtask fetch-cores`) |
 | `etd-testkit --test tier3` | Installed service with the release kernel: crash recovery, native inventory, Magic DNS refusal (macOS), shared drivers, program rule conflict, bounded stop and clean uninstall (Windows), `etd-host upgrade` with a running network, management port and utun takeover by a test-owned impostor | `privileged.yml`, one job per suite on fresh hosted runners |
 
@@ -89,7 +89,7 @@ uninstall. They refuse to run outside a GitHub-hosted runner. See the
 
 | Workflow | Trigger | Jobs |
 | --- | --- | --- |
-| `ci.yml` | Every push and pull request | `boundaries` (rustfmt, `check-boundaries`); `check` on Windows, macOS and Linux (Clippy `-D warnings`, `nextest --profile ci`, `session_real` against the release kernel, doc tests); `privileged-install` on all three; `dependencies` (`cargo deny`) |
+| `ci.yml` | Every push and pull request | `boundaries` (rustfmt, `check-boundaries`); `contract` (`buf lint`, `buf breaking` against `freeze-v1` and against the start of the change); `check` on Windows, macOS and Linux (Clippy `-D warnings`, `nextest --profile ci`, `session_real` against the release kernel, doc tests); `privileged-install` on all three (on Linux and macOS also the root-only `etd-ipc` socket tests and tier 2's service-form case); `dependencies` (`cargo deny`) |
 | `o1-windows.yml` | Windows adapter branch, manual | Windows privileged adapters with the bundled release kernel and its Wintun |
 | `o2-linux.yml` | Linux adapter branch, manual | Linux privileged adapters, distribution parser matrix (Debian 12, Fedora), kernel capability check |
 | `o3-macos.yml` | macOS adapter branch, manual | macOS PF, utun, resolver and service reinstall |

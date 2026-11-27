@@ -191,7 +191,9 @@ only in the observation detail, so nothing it saw can later authorise a delete.
 ### Sweep and repair index
 
 The platform `Sweeper` finds product-marked objects outside the ledger. Objects an
-open record already locates are skipped. Objects in an exclusive container (WFP
+open record already locates are skipped; interface names and GUIDs match without
+regard to ASCII case, and so do service names on Windows (the service control manager
+may report another case than the planned key). Other keys match exactly. Objects in an exclusive container (WFP
 sublayer, nftables table, PF anchor, host-owned runtime root) are removed, but only
 once no kernel process record is open. Everything else is a candidate: names
 re-derived from the repair index (`FoundBy::DerivedName`) or a bare `etd-` prefix

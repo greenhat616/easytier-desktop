@@ -82,4 +82,5 @@ cargo nextest run -p etd-testkit
 The tier 2 privileged case (`killed_ui_does_not_stop_service_host_after_lease_grace`)
 is `#[ignore]` and needs root / LocalSystem plus `ETD_G1_SERVICE_RUNTIME`; it runs only
 with `--profile privileged --run-ignored only` in CI or a disposable VM, never on a
-developer desktop. See [`../../docs/testing/README.md`](../../docs/testing/README.md).
+developer desktop. CI's `privileged-install` job runs it as root on Linux and macOS;
+no Windows job runs it, because the runner's administrator is not LocalSystem. See [`../../docs/testing/README.md`](../../docs/testing/README.md).

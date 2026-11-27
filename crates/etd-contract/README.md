@@ -99,6 +99,6 @@ ETD_UPDATE_BASELINE=1 cargo nextest run -p etd-contract
 ```
 
 A removed or changed line is reported as `BREAKING` and needs a new major version.
-`buf lint` and `buf breaking --against '.git#tag=freeze-v1'` (configured in the root
-`buf.yaml`) are run by hand; see [docs/versioning.md](docs/versioning.md). Nothing in
+`buf lint` and `buf breaking` (configured in the root `buf.yaml`) run in CI's
+`contract` job; see [docs/versioning.md](docs/versioning.md). Nothing in
 this crate is privileged.

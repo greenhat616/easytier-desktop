@@ -275,7 +275,16 @@ fn candidate_matches(
         process.status(),
         ProcessStatus::Zombie | ProcessStatus::Dead
     ) {
-        return Ok(false);
+        match identity::leader_threads(process.pid().as_u32()) {
+            identity::LeaderThreads::Alone => return Ok(false),
+            // Verified like any live candidate (its image is unreadable now).
+            identity::LeaderThreads::Siblings => {}
+            identity::LeaderThreads::Unknown => {
+                return Err(ProcessError::Enumeration(
+                    "zombie process: live threads cannot be ruled out".into(),
+                ));
+            }
+        }
     }
     let owner = process.user_id().map(|user| user == own);
     #[cfg(windows)]
@@ -1435,6 +1444,64 @@ mod audit_tests {
         assert!(match_criteria(Some(true), Some(true), None).is_err());
         assert!(!match_criteria(None, Some(false), None).unwrap());
         assert!(match_criteria(Some(true), Some(true), Some(true)).unwrap());
+    }
+
+    /// A leader that left with a raw `exit` while another thread runs is the
+    /// zombie entry of a live process: the sweep must not exclude it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_zombie_leader_with_a_live_thread_stays_a_candidate() {
+        const HELPER: &str = "import ctypes, os, threading, time\n\
+threading.Thread(target=time.sleep, args=(60,)).start()\n\
+nr = {'x86_64': 60, 'aarch64': 93}[os.uname().machine]\n\
+ctypes.CDLL(None).syscall(nr, 0)\n";
+        // no-window: Linux only
+        let mut child = std::process::Command::new("python3")
+            .args(["-c", HELPER])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let is_zombie = || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    let (_, rest) = stat.rsplit_once(')')?;
+                    Some(rest.trim_start().starts_with('Z'))
+                })
+                == Some(true)
+        };
+        // Bounded wait for the helper's leader to exit (an observation loop).
+        let zombie = (0..500).any(|_| {
+            is_zombie() || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            }
+        });
+        let outcome = std::panic::catch_unwind(|| {
+            assert!(zombie, "the helper's leader never became a zombie");
+            assert_eq!(
+                identity::leader_threads(pid),
+                identity::LeaderThreads::Siblings
+            );
+            let pids = [identity::pid(pid)];
+            let snapshot = identity::snapshot(ProcessesToUpdate::Some(&pids)).unwrap();
+            let process = snapshot.process(pids[0]).unwrap();
+            assert_eq!(process.status(), ProcessStatus::Zombie);
+            let own = process.user_id().unwrap().clone();
+            let dir = tempfile::tempdir().unwrap();
+            let marker = ProcessMarker {
+                exe_root: "/usr".into(),
+                cmdline_root: dir.path().into(),
+            };
+            assert!(candidate_matches(process, &own, &marker).is_err());
+            assert!(marked_candidate(process, &own, &marker).is_err());
+        });
+        // SAFETY: signals our own child; SIGKILL ends every thread of it.
+        unsafe { libc::kill(i32::try_from(pid).unwrap(), libc::SIGKILL) };
+        child.wait().unwrap();
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     /// sysinfo drops an unreaped zombie from its macOS snapshot (no image or

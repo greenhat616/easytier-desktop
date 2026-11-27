@@ -1,7 +1,8 @@
 //! The compiled descriptor matches the frozen baseline in
 //! `tests/baseline/etd.v1.txt`: one line per message field, enum value and
 //! method, so any renumbering, retyping, rename or removal shows up as a
-//! diff. `buf breaking` enforces the same in CI against the `freeze-v1` tag.
+//! diff. CI's `contract` job runs `buf breaking` against the `freeze-v1` tag
+//! and against the start of each change.
 //!
 //! Additive changes (new fields, values, methods) are allowed by the
 //! contract's minor-version rules; accept them by regenerating the baseline

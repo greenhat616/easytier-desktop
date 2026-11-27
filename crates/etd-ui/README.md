@@ -60,7 +60,7 @@ protected install directory. Logging uses `tracing-subscriber` with `RUST_LOG`
 | --- | --- |
 | `main.rs` | Binary entry point, wiring described above. |
 | `composition` | Production services; elevation-aware launcher (an elevated UI refuses to start a user host and offers the service instead); platform service installer. |
-| `controller` | `UiController`: applies `WindowAction`s, pumps tray events, runs the exit gate. |
+| `controller` | `UiController`: applies `WindowAction`s, pumps tray events, runs the exit gate. When GPUI quits without our exit command (logoff or shutdown; on macOS also Quit from the Dock), its quit hook runs the gate with `ExitReason::SessionEnd`, blocking under the gate's deadlines because the process ends right after. |
 | `model` | `UiModel`; detail tabs Nodes / Routes / Traffic are gated on host capabilities. |
 | `editor` | Network editor. Suggested listeners come from `etd_app::SUGGESTED_LISTENERS` (port 11010 set, no `faketcp`). |
 | `views/mod.rs` | `MainView`, sidebar, section switch. |
@@ -118,7 +118,8 @@ and `UiController` in GPUI's headless `TestAppContext`, with a fake tray, fake i
 and fakes from `etd-testkit`, and covers: live theme switching, instance conditions
 (waiting, gave up, cut unconfirmed), capability-gated pages, that the editor never stores
 a secret, reclaim per-item confirmation, the reconnecting banner, the not-installed and
-elevated-refusal flows, trayless fallback and exit gate order, hide to tray and restore,
+elevated-refusal flows, trayless fallback and exit gate order, the session-end exit,
+hide to tray and restore,
 the icon asset source, and rendering every view on a 768 KiB stack (the Windows
 stack-overflow guard). Unit tests in `src/theme.rs`, `src/preferences.rs`,
 `src/assets.rs` and `src/tray.rs` cover accent contrast, Mica fallback, font choice,

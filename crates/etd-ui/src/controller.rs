@@ -1,7 +1,7 @@
 //! Main-thread UI controller coordinating `AppBridge`, `WindowTray`, `TrayDriver`,
 //! `ExitGate`, window generation tracking, and service installation.
 
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use etd_app::{
@@ -22,6 +22,11 @@ use crate::{
     model::{DetailTab, InstallStatus, Section, UiModel},
     views::MainView,
 };
+
+/// Upper bound for the exit gate when the operating system ends the session.
+/// The gate's own step deadlines keep it under five seconds; this only stops a
+/// wedged step from holding the main thread for longer.
+const SESSION_END_LIMIT: Duration = Duration::from_secs(5);
 
 /// Optional test/runtime hook invoked when the UI finishes the exit sequence
 /// (defaults to `cx.quit()`).
@@ -163,6 +168,15 @@ impl UiController {
             })
             .detach();
         }
+
+        // Logoff, shutdown or a platform quit end the GPUI event loop without
+        // our exit command: run the gate from GPUI's quit hook then.
+        let session_ctrl = controller.clone();
+        cx.on_app_quit(move |cx| {
+            session_ctrl.end_session(cx);
+            async {}
+        })
+        .detach();
 
         // Kick off auto-connect probe against installed service or running user host.
         controller.send_command(UserCommand::AutoConnect);
@@ -487,6 +501,39 @@ impl UiController {
             window.activate_window();
         });
         Ok(())
+    }
+
+    /// Runs [`ExitGate`] for [`ExitReason::SessionEnd`]: GPUI is already quitting
+    /// because the operating system ended the session (logoff or shutdown) or quit
+    /// the app (macOS Dock). GPUI waits only briefly for asynchronous quit hooks and
+    /// the process ends right after, so the gate runs here, blocking the main thread
+    /// under its own step deadlines, and does not ask GPUI to quit again. Does
+    /// nothing once an exit has begun (the ordinary exit path ends in this hook too).
+    pub fn end_session(&self, cx: &mut App) {
+        if self.exit_gate.is_triggered() {
+            return;
+        }
+        // Only marks the state table as exiting: the gate cannot wait for a task.
+        let _ = self
+            .window_tray
+            .borrow_mut()
+            .handle(WindowInput::ExitRequested(ExitReason::SessionEnd));
+        let mut steps = OptionalRuntime(self.runtime.borrow_mut().take());
+        let tray_driver = self.tray_driver.clone();
+        let gate = self.exit_gate.clone();
+        let exit = async move {
+            gate.run(&mut steps, LeaseRelease::StopInstances, || {
+                tray_driver.borrow_mut().remove();
+            })
+            .await
+        };
+        if cx
+            .foreground_executor()
+            .block_with_timeout(SESSION_END_LIMIT, exit)
+            .is_err()
+        {
+            tracing::warn!("exit gate did not finish before the session ended");
+        }
     }
 
     /// Runs [`ExitGate`] before quitting GPUI (`settle_instances` -> `stop_subscriptions`

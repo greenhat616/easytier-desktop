@@ -3,7 +3,7 @@ name: Fluent gallery preview
 on:
   workflow_dispatch:
   push:
-    branches: [wbs/FL3-gallery]
+    branches: ['wbs/FL*']
 
 permissions:
   contents: read
@@ -27,9 +27,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential clang cmake pkg-config libssl-dev libfontconfig1-dev libfreetype6-dev libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev libxcb-dri3-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev mesa-vulkan-drivers libdbus-1-dev fonts-liberation
-      - name: Install pinned protoc
-        shell: pwsh
-        run: ./.github/scripts/setup-protoc.ps1
+      - uses: ./.github/actions/setup-tools
+        with:
+          tools: protoc
       - uses: Swatinem/rust-cache@v2.9.3
         with:
           save-if: 'false'

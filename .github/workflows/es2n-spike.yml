@@ -179,3 +179,27 @@ jobs:
           path: |
             C:\pm\*-classes.csv
             C:\pm\*-loads.txt
+  fwapi-2022:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: FirewallAPI flat API on Server 2022
+        shell: pwsh
+        run: |
+          cargo build --manifest-path spike/es2n-native/Cargo.toml
+          [Environment]::OSVersion.Version.ToString() | Write-Host
+          $a = 'etd-es2n-a''q\b"c'
+          $b = 'etd-es2n-b'
+          foreach ($id in $a, $b) {
+            New-NetFirewallRule -Name $id -DisplayName 'etd-es2n-dup' -Group 'etd-es2n' -Direction Inbound -Program 'C:\etd-es2n\core.exe' -Action Allow | Out-Null
+          }
+          $count = @(Get-NetFirewallRule -PolicyStore PersistentStore).Count
+          $env:ETD_SPIKE_A = $a
+          $env:ETD_SPIKE_B = $b
+          $env:ETD_SPIKE_FREE = 'byhandle'
+          & spike/es2n-native/target/debug/es2n-native-spike.exe $count fwapi
+          $code = $LASTEXITCODE
+          Write-Host "exit: $code"
+          Remove-NetFirewallRule -Name $a, $b -ErrorAction SilentlyContinue
+          exit $code

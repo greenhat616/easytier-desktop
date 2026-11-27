@@ -1,4 +1,4 @@
-//! A small always-on-top pop-out window with its own Fluent title bar, for
+//! An always-on-top pop-out window with its own Fluent title bar, for
 //! keeping one room's status in view while the main window is hidden.
 //! Values come from the WinUI TitleBar control (TitleBar_themeresources.xaml)
 //! where it has them; the caption button follows Windows 11's own.
@@ -20,16 +20,21 @@ pub const TITLE_BAR_HEIGHT: Pixels = px(32.);
 /// Windows 11 caption buttons are 46 × 32.
 const CAPTION_BUTTON_WIDTH: Pixels = px(46.);
 
-/// Window options for a pop-out of `width` × `height`, placed near the top
-/// right of the primary display.
+/// Window options for a resizable pop-out of `width` × `height`, no
+/// smaller than `min`, placed near the top right of the primary display.
 ///
-/// On Windows it is a `WindowKind::PopUp`: WS_EX_TOPMOST keeps it above
-/// other windows and WS_EX_TOOLWINDOW keeps it out of the taskbar and
-/// Alt+Tab, so it lives apart from the main window and stays when that
-/// hides. It has no system frame, so it draws [`title_bar`] and is a fixed
-/// size. Elsewhere it is a `Floating` window, since X11 pop-ups are
-/// override-redirect and could not be moved.
-pub fn window_options(title: &str, width: Pixels, height: Pixels, cx: &App) -> WindowOptions {
+/// It is a `WindowKind::Floating` window with the system title bar hidden,
+/// so it keeps the native frame, shadow and edge resizing and draws
+/// [`title_bar`] itself. It is a separate top-level window, so it stays when
+/// the main window hides. On Windows, call [`pin`] once it is open to keep
+/// it above other windows and out of the taskbar and Alt+Tab.
+pub fn window_options(
+    title: &str,
+    width: Pixels,
+    height: Pixels,
+    min: gpui_kit::Size<Pixels>,
+    cx: &App,
+) -> WindowOptions {
     let display = cx.primary_display();
     let area = display
         .as_ref()
@@ -49,18 +54,32 @@ pub fn window_options(title: &str, width: Pixels, height: Pixels, cx: &App) -> W
             appears_transparent: true,
             ..Default::default()
         }),
-        kind: if cfg!(target_os = "windows") {
-            WindowKind::PopUp
-        } else {
-            WindowKind::Floating
-        },
-        is_resizable: false,
+        kind: WindowKind::Floating,
+        is_resizable: true,
         is_minimizable: false,
+        window_min_size: Some(min),
         focus: true,
         show: true,
         window_background: WindowBackgroundAppearance::Opaque,
         ..Default::default()
     }
+}
+
+/// Keeps a pop-out above other windows and out of the taskbar and Alt+Tab
+/// (WS_EX_TOPMOST and WS_EX_TOOLWINDOW, set by the OS adapter). Elsewhere
+/// it does nothing; the window stays a `Floating` window.
+pub fn pin(window: &Window) {
+    #[cfg(target_os = "windows")]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        if let Ok(handle) = HasWindowHandle::window_handle(window)
+            && let RawWindowHandle::Win32(handle) = handle.as_raw()
+        {
+            let _ = etd_sysfx_os::appearance::pin_window_on_top(handle.hwnd);
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = window;
 }
 
 /// A compact WinUI TitleBar: 32 px (TitleBarCompactHeight), a 16 px icon
@@ -73,8 +92,9 @@ pub fn window_options(title: &str, width: Pixels, height: Pixels, cx: &App) -> W
 /// window.
 ///
 /// The close button is a Windows 11 caption button, 46 × 32 with a 10 px
-/// glyph; it turns `#C42B1C` with a white glyph on hover and 90 % of that
-/// when pressed. Those are the system's own values, not WinUI resources.
+/// glyph, dimmed to 50 % with the title while the window is inactive; it
+/// turns `#C42B1C` with a full white glyph on hover and 90 % of that when
+/// pressed. Those are the system's own values, not WinUI resources.
 pub fn title_bar(
     id: &'static str,
     icon: &'static str,
@@ -100,7 +120,7 @@ pub fn title_bar(
         .flex()
         .items_center()
         .justify_center()
-        .text_color(fg)
+        .text_color(fg.opacity(opacity))
         .hover(move |s| s.bg(close_red).text_color(gpui_kit::white()))
         .active(move |s| s.bg(close_pressed).text_color(gpui_kit::white()))
         .on_click(move |event, window, cx| on_close(event, window, cx))
@@ -156,4 +176,37 @@ pub fn title_bar(
 /// for a window without Mica.
 pub fn surface(cx: &App) -> gpui_kit::Hsla {
     crate::views::dialogs::solid_base(cx)
+}
+
+/// One ListView row (ListViewItem_themeresources.xaml): at least 40 px tall
+/// (ListViewItemMinHeight) with 16,0,12,0 padding, and a 4 px-cornered
+/// backplate inset 4,2 (ListViewBaseItemChrome s_backplateMargin) that shows
+/// `SubtleFillColorSecondary` on hover and `Tertiary` when pressed
+/// (ListViewItemBackgroundPointerOver / Pressed). `content` fills the row.
+pub fn list_view_item(
+    id: impl Into<gpui_kit::ElementId>,
+    label: impl Into<SharedString>,
+    content: AnyElement,
+    cx: &App,
+) -> AnyElement {
+    let hover = crate::theme::subtle_fill_secondary(cx);
+    let pressed = crate::theme::subtle_fill_tertiary(cx);
+    div()
+        .id(id)
+        .test_support()
+        .role(Role::ListItem)
+        .aria_label(label.into())
+        .mx(px(4.))
+        .my(px(2.))
+        .min_h(px(40.))
+        .rounded(px(4.))
+        .pl(px(12.))
+        .pr(px(8.))
+        .py(px(6.))
+        .flex()
+        .items_center()
+        .hover(move |s| s.bg(hover))
+        .active(move |s| s.bg(pressed))
+        .child(content)
+        .into_any_element()
 }

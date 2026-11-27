@@ -1705,13 +1705,161 @@ pub(super) fn feedback_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<An
     ]
 }
 
-/// The room status pop-out: an always-on-top window with its own title bar.
+/// The room status pop-out (doc#23 S3): an always-on-top, resizable window
+/// with its own title bar, the room's address, and a scrolling peer list.
 pub(super) struct RoomPopOut;
+
+/// Demo peers: name, virtual address, status, latency text.
+const PEERS: [(&str, &str, Status, &str); 9] = [
+    (
+        "alice-desktop",
+        "10.144.144.4",
+        Status::Success,
+        "12 ms · Direct",
+    ),
+    (
+        "bob-laptop",
+        "10.144.144.5",
+        Status::Success,
+        "18 ms · Direct",
+    ),
+    (
+        "carol-nas",
+        "10.144.144.6",
+        Status::Caution,
+        "64 ms · Relayed",
+    ),
+    (
+        "dave-steamdeck",
+        "10.144.144.7",
+        Status::Success,
+        "23 ms · Direct",
+    ),
+    (
+        "erin-phone",
+        "10.144.144.8",
+        Status::Caution,
+        "97 ms · Relayed",
+    ),
+    (
+        "frank-server-in-the-basement",
+        "10.144.144.9",
+        Status::Success,
+        "5 ms · Direct",
+    ),
+    (
+        "grace-tablet",
+        "10.144.144.10",
+        Status::Informational,
+        "Connecting",
+    ),
+    ("heidi-pc", "10.144.144.11", Status::Critical, "Offline"),
+    (
+        "ivan-mini",
+        "10.144.144.12",
+        Status::Success,
+        "31 ms · Direct",
+    ),
+];
 
 impl gpui_kit::Render for RoomPopOut {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::views::popout;
         let fg = cx.theme().foreground;
+        let secondary = crate::theme::text_secondary(cx);
+        let header = div()
+            .flex_shrink_0()
+            .px(px(16.))
+            .pb(px(12.))
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(20.))
+                            .line_height(px(28.))
+                            .font_semibold()
+                            .child(crate::views::pseudo::t("Weekend LAN")),
+                    )
+                    .child(status_badge(
+                        "popout-badge",
+                        Status::Success,
+                        "Connected",
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .line_height(px(20.))
+                            .text_color(secondary)
+                            .child("10.144.144.3"),
+                    )
+                    .child(copy_button(
+                        "popout-copy",
+                        "Copy IP address",
+                        "Copied",
+                        "10.144.144.3",
+                    )),
+            );
+        let mut rows = div().flex().flex_col().pb(px(4.));
+        for (ix, (name, ip, status, latency)) in PEERS.into_iter().enumerate() {
+            let row = div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(12.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(14.))
+                                .line_height(px(20.))
+                                .child(crate::views::pseudo::t(name)),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(12.))
+                                .line_height(px(16.))
+                                .text_color(secondary)
+                                .child(ip),
+                        ),
+                )
+                .child(div().flex_shrink_0().max_w(px(160.)).child(status_badge(
+                    SharedString::from(format!("popout-peer-{ix}-badge")),
+                    status,
+                    latency,
+                    cx,
+                )))
+                .into_any_element();
+            rows = rows.child(popout::list_view_item(
+                SharedString::from(format!("popout-peer-{ix}")),
+                format!("{name}, {ip}, {latency}"),
+                row,
+                cx,
+            ));
+        }
         div()
             .id("popout-root")
             .test_support()
@@ -1719,8 +1867,6 @@ impl gpui_kit::Render for RoomPopOut {
             .flex()
             .flex_col()
             .bg(popout::surface(cx))
-            .border_1()
-            .border_color(crate::theme::flyout_stroke(cx))
             .text_color(fg)
             .child(popout::title_bar(
                 "popout-title",
@@ -1731,49 +1877,23 @@ impl gpui_kit::Render for RoomPopOut {
                 window,
                 cx,
             ))
+            .child(header)
             .child(
                 div()
-                    .flex_1()
-                    .min_h_0()
+                    .flex_shrink_0()
                     .px(px(16.))
-                    .pb(px(16.))
-                    .flex()
-                    .flex_col()
-                    .items_start()
-                    .gap(px(8.))
-                    .child(status_badge(
-                        "popout-badge",
-                        Status::Success,
-                        "18 ms · Direct",
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(4.))
-                            .child(
-                                div()
-                                    .text_size(px(14.))
-                                    .line_height(px(20.))
-                                    .child("10.144.144.3"),
-                            )
-                            .child(copy_button(
-                                "popout-copy",
-                                "Copy IP address",
-                                "Copied",
-                                "10.144.144.3",
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .line_height(px(16.))
-                            .text_color(crate::theme::text_secondary(cx))
-                            .child(crate::views::pseudo::t("3 of 4 peers online")),
-                    ),
+                    .pb(px(4.))
+                    .text_size(px(14.))
+                    .line_height(px(20.))
+                    .font_semibold()
+                    .child(crate::views::pseudo::t("Peers")),
             )
+            .child(crate::views::layout::scroll_viewer_fill(
+                "popout-peers",
+                rows.into_any_element(),
+                window,
+                cx,
+            ))
     }
 }
 
@@ -1787,9 +1907,18 @@ impl Gallery {
         {
             return;
         }
-        let options = crate::views::popout::window_options("Weekend LAN", px(320.), px(136.), cx);
-        self.demo.popout = gpui_kit::open_window(options, cx, |_, cx| cx.new(|_| RoomPopOut))
-            .ok()
-            .map(|(handle, _)| handle);
+        let options = crate::views::popout::window_options(
+            "Weekend LAN",
+            px(420.),
+            px(520.),
+            gpui_kit::size(px(320.), px(240.)),
+            cx,
+        );
+        self.demo.popout = gpui_kit::open_window(options, cx, |window, cx| {
+            crate::views::popout::pin(window);
+            cx.new(|_| RoomPopOut)
+        })
+        .ok()
+        .map(|(handle, _)| handle);
     }
 }

@@ -687,8 +687,8 @@ mod tests {
     use super::*;
     use gpui_kit::{TestAppContext, test::TestWindowExt as _};
 
-    /// "Pop out" opens one always-on-top room window with its own title
-    /// bar; a second press brings the same one forward, and its close
+    /// "Pop out" opens one always-on-top, resizable room window with its
+    /// own title bar and a scrolling peer list; a second press brings the same one forward, and its close
     /// button closes it.
     #[gpui_kit::test]
     fn gallery_pops_out_one_room_window(cx: &mut TestAppContext) {
@@ -730,6 +730,20 @@ mod tests {
             );
             assert_eq!(window.find("popout-title-close").label(), Some("Close"));
             assert!(window.find("popout-badge").visible());
+            // S3's peer list: 40 px rows inset 4,2 that scroll in the space
+            // left under the header.
+            let row = window.find("popout-peer-0").bounds();
+            assert!(row.size.height >= px(40.));
+            let list = window.find("popout-peers").bounds();
+            let last = window.find("popout-peer-8").bounds();
+            assert!(last.bottom() > list.bottom(), "nine peers overflow 520 px");
+            window.scroll(
+                "popout-peers-area",
+                gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-400.))),
+                cx,
+            );
+            window.render_frame(cx);
+            assert!(window.find("popout-peer-8").bounds().bottom() <= list.bottom() + px(1.));
         })
         .unwrap();
         // A second press brings the same window forward.

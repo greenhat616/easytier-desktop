@@ -879,7 +879,7 @@ mod tests {
     use super::*;
     use gpui_kit::{
         AppContext as _, Context, Render, TestAppContext, WindowOptions, size,
-        test::{TestAppContextExt as _, TestEventExt as _, TestWindowExt as _},
+        test::{TestEventExt as _, TestWindowExt as _},
     };
 
     struct ControlDemo {

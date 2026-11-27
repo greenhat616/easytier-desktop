@@ -1076,10 +1076,7 @@ mod tests {
                 window.render_frame(cx);
                 window.click("tip-target", cx);
                 window.render_frame(cx);
-                window.click("flyout-open", cx);
-                window.render_frame(cx);
                 assert!(window.find("tip").visible());
-                assert!(window.find("flyout").visible());
             })
             .unwrap();
             cx.run_until_parked();
@@ -1088,9 +1085,20 @@ mod tests {
                 .save(output.join(format!("gallery-dialogs-{name}.png")))
                 .unwrap();
             cx.update_window(handle, |_, window, cx| {
-                window.press("escape", cx);
-                window.render_frame(cx);
                 window.click("tip-close", cx);
+                window.render_frame(cx);
+                window.click("flyout-open", cx);
+                window.render_frame(cx);
+                assert!(window.find("flyout").visible());
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(format!("gallery-dialogs-{name}-flyout.png")))
+                .unwrap();
+            cx.update_window(handle, |_, window, cx| {
+                window.press("escape", cx);
                 window.render_frame(cx);
                 window.click("dialog-open", cx);
                 window.render_frame(cx);

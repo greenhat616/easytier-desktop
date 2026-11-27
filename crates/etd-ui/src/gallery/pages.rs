@@ -920,6 +920,7 @@ pub(super) fn dialogs_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<Any
                 .flex()
                 .flex_col()
                 .gap(px(12.))
+                .items_start()
                 .child("Recent samples will be removed. Continue?")
                 .child(action_button(
                     "flyout-confirm",
@@ -991,7 +992,7 @@ pub(super) fn dialogs_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<Any
     vec![
         section(
             "ContentDialog",
-            std::iter::once(open_dialog)
+            std::iter::once(div().flex().child(open_dialog).into_any_element())
                 .chain(std::iter::once(dialog_note))
                 .chain(dialog),
             cx,

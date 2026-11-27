@@ -458,6 +458,14 @@ pub(super) async fn drain(purge: bool) -> Result<()> {
         NativeHostFilesystem
             .remove_session_roots()
             .map_err(refusal)?;
+        // The privileged hosts' volatile boot marker (Windows HKLM; gone at
+        // the next boot anyway): no record is left that it dates. A
+        // service installed next writes it again when it starts.
+        etd_sysfx_os::remove_service_boot_marker()
+            .map_err(anyhow::Error::from)
+            .context(
+                r"cannot remove the boot marker HKLM\SOFTWARE\EasyTierDesk\Volatile; retry the purge",
+            )?;
     }
     Ok(())
 }

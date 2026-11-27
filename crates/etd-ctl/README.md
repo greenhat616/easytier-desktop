@@ -18,7 +18,7 @@ Global options, accepted before or after the subcommand:
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--json` | off | Machine-readable JSON on stdout; errors as JSON on stderr |
-| `--host <service\|user>` | `service` | Which host form to talk to |
+| `--host <service\|user\|elevated-session>` | `service` | Which host form to talk to |
 | `--endpoint <ENDPOINT>` | per host form | Pipe name (Windows) or socket path (Unix) to use instead |
 | `--host-dir <DIR>` | see below | Directory the host executable must run from |
 | `--timeout <SECONDS>` | `10` | 1 to 3600: wait for the connection, and for each reply |
@@ -59,17 +59,20 @@ name, on Unix as a socket path. Otherwise:
 | `--host` | Windows | Linux | macOS |
 | --- | --- | --- | --- |
 | `service` | `\\.\pipe\easytier-desk-host` | `/run/easytier-desk/host.sock` | `/Library/Application Support/easytier-desk/run/host.sock` |
+| `elevated-session` | `\\.\pipe\easytier-desk-session-<current user SID>` | refused | refused |
 | `user` | `\\.\pipe\easytier-desk-user-<current user SID>` | `$XDG_RUNTIME_DIR/host.sock`, else `/tmp/easytier-desk-<uid>/host.sock` | `<per-user temp dir>/easytier-desk/host.sock` |
 
 Verification: before sending anything, the connection must prove that the server is
 `<DIR>/etd-host` (`etd-host.exe` on Windows). `--host service` also requires a
 SYSTEM / root server on a protected endpoint. `--host user` requires a server running
-as the current user. `DIR` is `--host-dir`, or by default:
+as the current user. `--host elevated-session` requires a server running as the
+current user with an elevated token. `DIR` is `--host-dir`, or by default:
 
 - `--host service`: the installed service directory, from
   `etd_sysfx_os::service::installed_host_dir()`: `%ProgramFiles%\EasyTierDesk`,
   `/usr/local/lib/easytier-desk` or `/Library/Application Support/easytier-desk`;
-- `--host user`: the directory containing the `etd-ctl` executable.
+- `--host user` and `--host elevated-session`: the directory containing the
+  `etd-ctl` executable.
 
 The per-platform checks are described in the [etd-ipc README](../etd-ipc/README.md).
 

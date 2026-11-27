@@ -1,0 +1,699 @@
+"""Elevated session host acceptance (ES5, doc#13#wbs, topic#51 msg#2183) on the
+disposable Windows privileged runner: the portable layout (etd-host.exe with
+its bundled kernels in a user-writable directory), driven only through its
+public commands. This test image, copied beside the host as etd-ui.exe,
+holds the lease the way the UI does."""
+
+from contextlib import ExitStack, contextmanager
+import json
+import os
+from pathlib import Path
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+from service import command, eventually, require_runner
+from consistency import (
+    adapter_defaults, check_closed, managed_service_changes, record_windows_adapter, runner_noise, scope,
+    system_policy_changes, tun_created,
+)
+from inventory import assert_exited, capture
+
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+EXIT_SERVICE_INSTALLED = 3
+EXIT_NOT_CONFORMING = 4
+SHARED_DRIVERS = ("wintun", "windivert")
+
+
+def spec():
+    return {"display_name": "ES5 session", "network_name": "es5-ci",
+            "ipv4_cidr": "192.0.2.57/28", "no_listener": True,
+            "flags": {"disable_ipv6": True, "disable_udp_hole_punching": True}}
+
+
+def current_sid():
+    line = command("whoami", "/user", "/fo", "csv", "/nh").stdout.strip()
+    return line.rsplit(",", 1)[-1].strip('"')
+
+
+class Session:
+    def __init__(self, stack):
+        require_runner()
+        binaries = Path(os.environ["ETD_G2_BIN"])
+        self.dir = Path(stack.enter_context(
+            tempfile.TemporaryDirectory(prefix="etd-es5-", dir=os.environ["RUNNER_TEMP"],
+                                        ignore_cleanup_errors=True)))
+        for name in ("etd-host.exe", "etd-ctl.exe"):
+            shutil.copy2(binaries / name, self.dir / name)
+        shutil.copytree(binaries / "cores", self.dir / "cores")
+        shutil.copy2(os.environ["ETD_G2_TEST_IMAGE"], self.dir / "etd-ui.exe")
+        self.host = self.dir / "etd-host.exe"
+        self.client = self.dir / "etd-ctl.exe"
+        self.ui = self.dir / "etd-ui.exe"
+        self.root = Path(os.environ["ProgramData"]) / "EasyTierDesk.session" / current_sid()
+        self.state = self.root / "state"
+        self.runtime = self.root / "run"
+        self.cores = self.root / "cores"
+        self.core = self.cores / os.environ["ETD_G2_SHA"] / "easytier-core.exe"
+        self.process = None
+        self.lease = None
+        self.log = self.dir / "host-stderr.log"
+        self.adapter_indices = {}
+        stack.callback(self.teardown)
+
+    # -- the host and the UI's lease ------------------------------------
+    def run(self, *args):
+        return command(self.host, *args, check=False, timeout=180)
+
+    def start(self):
+        with self.log.open("ab") as log:
+            self.process = subprocess.Popen([self.host, "run", "--mode", "elevated-session"],
+                                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                            stderr=log, creationflags=NO_WINDOW)
+        reply = self.dir / "lease-reply"
+        reply.unlink(missing_ok=True)
+        env = dict(os.environ, ETD_G2_DESKTOP="hold", ETD_G2_SESSION_DIR=str(self.dir),
+                   ETD_G2_INSTANCE="lease", ETD_G2_REQUEST="lease", ETD_G2_REVISION="0",
+                   ETD_G2_REPLY=str(reply))
+        self.lease = subprocess.Popen([self.ui, "--exact", "desktop::peer", "--nocapture"],
+                                      env=env, stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+        try:
+            eventually("UI lease connection", lambda: reply.exists() or self.process.poll() is not None,
+                       bool, timeout=120)
+        except AssertionError:
+            self.report_log()
+            raise
+        if self.process.poll() is not None:
+            self.report_log()
+            raise AssertionError(f"session host exited {self.process.returncode} at start")
+        status = eventually("session host serving", lambda: self.ctl("status"),
+                            lambda body: body["host"]["phase"] == "serving")
+        assert status["host"]["mode"] == "elevated_session", status["host"]
+        assert status["host"]["role"] == "admin", status["host"]
+        return status
+
+    def drop_lease(self):
+        if self.lease is not None:
+            self.lease.kill()
+            self.lease.wait(timeout=10)
+            self.lease = None
+
+    def release(self):
+        """The UI goes away: the host stops its kernels and exits after the
+        30 s lease grace."""
+        self.drop_lease()
+        code = self.process.wait(timeout=180)
+        assert code == 0, f"session host exited {code} after the lease grace"
+        self.process = None
+
+    def teardown(self):
+        self.drop_lease()
+        if self.process is not None and self.process.poll() is None:
+            self.process.kill()
+            self.process.wait(timeout=30)
+        self.report_log()
+
+    def report_log(self):
+        if self.log.exists():
+            text = self.log.read_text(encoding="utf-8", errors="replace").strip()
+            if text:
+                print(f"session host stderr (last 2000 chars):\n{text[-2000:]}", flush=True)
+
+    # -- public commands -----------------------------------------------
+    def ctl_raw(self, *args, timeout_arg=None):
+        extra = ["--timeout", str(timeout_arg)] if timeout_arg else []
+        return command(self.client, "--host", "elevated-session", "--host-dir", self.dir, "--json",
+                       *extra, *args, check=False)
+
+    def ctl(self, *args):
+        result = self.ctl_raw(*args)
+        if result.returncode:
+            raise RuntimeError(f"etd-ctl {args[0]} exited {result.returncode}: {result.stderr.strip()}")
+        return json.loads(result.stdout)
+
+    def apply(self, body, instance, request, revision):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps(body), encoding="utf-8")
+            return self.ctl("apply", "--start", "-f", path, "--instance", instance,
+                            "--request-id", request, "--expected-revision", revision)
+
+    def view(self, instance):
+        result = self.ctl_raw("status", timeout_arg=2)
+        if result.returncode == 3:
+            return {}
+        if result.returncode:
+            raise RuntimeError(result.stderr)
+        body = json.loads(result.stdout)
+        return next((row["status"] or {} for row in body["instances"]
+                     if row["instance_id"] == instance), {})
+
+    def ready(self, instance, after=0):
+        def ready_or_failed(status):
+            if status.get("state") in ("quarantined", "gave_up", "cut_unconfirmed"):
+                raise AssertionError(f"recovery stopped: {status}")
+            return status.get("state") in ("ready_basic", "ready_full") and status["epoch"] > after
+        try:
+            return eventually("new ready generation", lambda: self.view(instance), ready_or_failed,
+                              timeout=240)
+        except AssertionError:
+            for row in self.effects():
+                print(f"{row['kind']} {row['state']}: {row.get('last_error') or ''}", flush=True)
+            raise
+
+    def track_adapter(self, baseline, instance, view):
+        """Record the running generation's adapter, whose default values
+        Windows keeps after it goes away (consistency.adapter_defaults)."""
+        live = self.inventory()
+        tuns = [r for r in self.effects() if r["kind"] == "win.tun"
+                and r["scope"] == scope(instance, view["epoch"]) and r["state"] != "reclaimed"]
+        assert len(tuns) == 1, "expected a single adapter record for the running generation"
+        record_windows_adapter(baseline, live, tuns[0]["key"], view["interface_name"], self.adapter_indices)
+
+    def purge(self):
+        """Purge the session root. A root a shared driver's registration
+        still references is retained, and the command says so."""
+        # Only --all-users removes the roots (cli-and-install.md, reclaim);
+        # an elevated administrator may run it.
+        result = self.run("reclaim", "--mode", "elevated-session", "--all-users", "--all", "--purge")
+        print(f"purge: exit {result.returncode}: {result.stdout.strip()} {result.stderr.strip()}", flush=True)
+        assert result.returncode == 0, f"purge exited {result.returncode}: {result.stderr}"
+        if self.root.exists():
+            remaining = sorted(str(p.relative_to(self.root)) for p in self.root.rglob("*"))
+            print(f"purge output: {result.stdout.strip()} {result.stderr.strip()}", flush=True)
+            print(f"retained session root entries: {remaining}", flush=True)
+            assert "retained" in (result.stdout + result.stderr).lower(),                 "the purge left the session root without saying why"
+        return result
+
+    def effects(self):
+        ledger = self.state / "ledger.sqlite3"
+        if not ledger.exists():
+            return []
+        db = sqlite3.connect(ledger.as_uri() + "?mode=ro", uri=True)
+        try:
+            return [json.loads(row[0]) for row in db.execute("SELECT payload FROM effects")]
+        finally:
+            db.close()
+
+    def inventory(self):
+        return capture(self.runtime, [self.dir, self.cores])
+
+    def crash(self, image):
+        import psutil
+        matches = [p for p in psutil.process_iter(["pid", "exe"], ad_value=None)
+                   if p.info["exe"] and Path(p.info["exe"]) == image]
+        assert len(matches) == 1, f"expected one process running {image}, found {len(matches)}"
+        matches[0].kill()
+        matches[0].wait(15)
+        return matches[0].pid
+
+    def kernels(self):
+        import psutil
+        psutil.process_iter.cache_clear()
+        return [p for p in psutil.process_iter(["pid", "exe"], ad_value=None)
+                if p.info["exe"] and Path(p.info["exe"]).name.lower() == "easytier-core.exe"]
+
+
+def machine_delta(before, after, adapter_indices):
+    delta = before.delta(after) - managed_service_changes(before, after)
+    delta -= runner_noise(before, after) | tun_created(before, after)
+    delta -= adapter_defaults(before, after, adapter_indices)
+    delta -= system_policy_changes(before, after, "uninstalled")
+    # The shared drivers are re-ensured by every host and never deleted.
+    for name in SHARED_DRIVERS:
+        key = ("service", name)
+        if key not in before.rows and key in after.rows:
+            delta.discard(key)
+    return delta
+
+
+def recovery():
+    """Start, kill the kernel, kill the host, then the next start's
+    self-check reclaims; the lease grace ends the host; the purge leaves the
+    machine as before (doc#13#wbs ES5, first item)."""
+    with ExitStack() as stack:
+        session = Session(stack)
+        before = session.inventory()
+        status = session.start()
+        instance, request = str(uuid.uuid4()), str(uuid.uuid4())
+        session.apply(spec(), instance, request, str(status["revision"]))
+        first = session.ready(instance)
+        session.track_adapter(before, instance, first)
+        print(f"session kernel ready: {first['state']} epoch={first['epoch']}", flush=True)
+        assert session.core.is_file(), "the kernel runs from the protected session store"
+
+        old = first["epoch"]
+        session.crash(session.core)
+        first = session.ready(instance, after=old)
+        session.track_adapter(before, instance, first)
+        check_closed(session, instance, old)
+        print(f"after the kernel crash: epoch {first['epoch']}", flush=True)
+
+        old = first["epoch"]
+        kernels = {(p.pid, p.create_time()) for p in session.kernels()}
+        host_pid = session.crash(session.host)
+        session.process = None
+        session.drop_lease()
+        open_records = [r for r in session.effects() if r["state"] != "reclaimed"]
+        assert open_records, "a crashed host leaves open records for the next start"
+        session.start()
+        first = session.ready(instance, after=old)
+        session.track_adapter(before, instance, first)
+        check_closed(session, instance, old)
+        assert_exited(kernels, timeout=30)
+        print(f"after the host crash ({host_pid}): the self-check reclaimed epoch {old}, "
+              f"now epoch {first['epoch']}", flush=True)
+
+        session.ctl("stop", instance)
+        eventually("stopped instance", lambda: session.view(instance),
+                   lambda body: body.get("state") == "stopped", timeout=240)
+        check_closed(session, instance, first["epoch"])
+        session.release()
+        assert not session.kernels(), "no kernel outlives the session host"
+
+        session.purge()
+        after = session.inventory()
+        delta = machine_delta(before, after, session.adapter_indices)
+        assert not delta, f"session start to purge differences: {sorted(delta)}"
+
+
+def exclusion():
+    """A squatted session directory is refused; the service and the session
+    exclude each other, and install drains a crashed session's ledger before
+    it registers the service."""
+    with ExitStack() as stack:
+        session = Session(stack)
+        before = session.inventory()
+        # Squatting: EasyTierDesk.session made by someone else (inherited
+        # ProgramData access, so users may write) is refused, untouched.
+        squatted = session.root.parent
+        squatted.mkdir()
+        refused = session.run("run", "--mode", "elevated-session")
+        assert refused.returncode == EXIT_NOT_CONFORMING, f"squatted root: exit {refused.returncode}"
+        assert squatted.is_dir() and not any(squatted.iterdir()), "a refused start changes nothing"
+        squatted.rmdir()
+        status = session.start()
+        instance, request = str(uuid.uuid4()), str(uuid.uuid4())
+        session.apply(spec(), instance, request, str(status["revision"]))
+        session.track_adapter(before, instance, session.ready(instance))
+        refused = session.run("install")
+        assert refused.returncode != 0, "install while the session host runs"
+        assert command("sc.exe", "query", "easytier-desk-host", check=False).returncode != 0, \
+            "a refused install registers nothing"
+        session.crash(session.host)
+        session.process = None
+        session.drop_lease()
+        assert any(r["state"] != "reclaimed" for r in session.effects())
+
+        installed = session.run("install")
+        assert installed.returncode == 0, f"install exited {installed.returncode}: {installed.stderr}"
+        try:
+            pending = [(r["kind"], r["state"]) for r in session.effects() if r["state"] != "reclaimed"]
+            assert not pending, f"install left the session ledger open: {pending}"
+            started = session.run("run", "--mode", "elevated-session")
+            assert started.returncode == EXIT_SERVICE_INSTALLED, \
+                f"session start with the service registered exited {started.returncode}"
+        finally:
+            removed = session.run("uninstall")
+            assert removed.returncode == 0, f"uninstall exited {removed.returncode}: {removed.stderr}"
+        session.purge()
+        after = session.inventory()
+        delta = machine_delta(before, after, session.adapter_indices)
+        assert not delta, f"session start to uninstall differences: {sorted(delta)}"
+
+
+def pe_imports(path):
+    """The DLL names in a PE32+ image's import table: what the loader
+    resolves at start. Delay-loaded and LoadLibrary DLLs are not in it."""
+    import struct
+    data = Path(path).read_bytes()
+    pe = struct.unpack_from("<I", data, 0x3C)[0]
+    assert data[pe:pe + 4] == b"PE\0\0", path
+    count, = struct.unpack_from("<H", data, pe + 6)
+    optional_size, = struct.unpack_from("<H", data, pe + 20)
+    optional = pe + 24
+    assert struct.unpack_from("<H", data, optional)[0] == 0x20B, f"{path} is not PE32+"
+    import_rva, _ = struct.unpack_from("<II", data, optional + 112 + 8)
+    sections = [struct.unpack_from("<IIII", data, optional + optional_size + 40 * i + 8) for i in range(count)]
+
+    def offset(rva):
+        for size, address, raw_size, raw in sections:
+            if address <= rva < address + max(size, raw_size):
+                return rva - address + raw
+        raise AssertionError(f"{path}: RVA {rva:#x} outside every section")
+
+    names, at = [], offset(import_rva)
+    while any(descriptor := struct.unpack_from("<IIIII", data, at)):
+        start = offset(descriptor[3])
+        names.append(data[start:data.index(b"\0", start)].decode("ascii").lower())
+        at += 20
+    return names
+
+
+def known_dlls():
+    import winreg
+    names = set()
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                        r"SYSTEM\CurrentControlSet\Control\Session Manager\KnownDLLs") as key:
+        for index in range(winreg.QueryInfoKey(key)[1]):
+            _, value, kind = winreg.EnumValue(key, index)
+            if kind == winreg.REG_SZ:
+                names.add(value.lower())
+    return names
+
+
+def plantable(image, known):
+    """`image`'s imported DLLs a search could take from its own folder: not
+    KnownDLLs, not API sets, and present in System32 to copy."""
+    system32 = Path(os.environ["SystemRoot"]) / "System32"
+    return sorted(name for name in pe_imports(image)
+                  if name not in known and not name.startswith(("api-ms-", "ext-ms-"))
+                  and (system32 / name).is_file())
+
+CONNECT = r"""
+$ErrorActionPreference = 'Continue'
+$label = ((whoami /groups) -match 'Mandatory Label') -replace '\s+', ' '
+$s = [Net.Sockets.Socket]::new([Net.Sockets.AddressFamily]::InterNetwork, [Net.Sockets.SocketType]::Stream, [Net.Sockets.ProtocolType]::Tcp)
+try { $s.Connect('127.0.0.1', __PORT__); $verdict = 'connected' }
+catch { $e = $_.Exception; while ($e.InnerException) { $e = $e.InnerException }; $verdict = "error $($e.NativeErrorCode) $($e.SocketErrorCode)" }
+finally { $s.Dispose() }
+"$(whoami) | $label | $verdict"
+"""
+
+
+def encoded(script):
+    import base64
+    return base64.b64encode(script.encode("utf-16-le")).decode()
+
+
+def kernel_port(session):
+    [kernel] = session.kernels()
+    argv = kernel.cmdline()
+    address = argv[argv.index("--rpc-portal") + 1]
+    host, port = address.rsplit(":", 1)
+    assert host == "127.0.0.1", address
+    return int(port)
+
+
+def low_copy(directory):
+    """A copy of Windows PowerShell labelled Low: a process started from it
+    runs at Low integrity (the file's label caps the new token)."""
+    powershell = Path(os.environ["SystemRoot"]) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    copy = directory / "low-powershell.exe"
+    shutil.copy2(powershell, copy)
+    command("icacls", copy, "/setintegritylevel", "low")
+    return copy
+
+
+def own_low_connect(port, directory):
+    result = command(low_copy(directory), "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                     encoded(CONNECT.replace("__PORT__", str(port))), check=False)
+    return result.stdout.strip() or result.stderr.strip()
+
+
+SECOND_ACCOUNT = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @'
+using System;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+using Microsoft.Win32.SafeHandles;
+public static class Es5Probe {
+  [DllImport("advapi32", SetLastError = true, CharSet = CharSet.Unicode)]
+  static extern bool LogonUserW(string user, string domain, string password, int type, int provider, out IntPtr token);
+  [DllImport("advapi32", SetLastError = true)]
+  static extern bool DuplicateTokenEx(IntPtr token, uint access, IntPtr attributes, int level, int type, out IntPtr copy);
+  [DllImport("advapi32", SetLastError = true, CharSet = CharSet.Unicode)]
+  static extern bool ConvertStringSidToSidW(string text, out IntPtr sid);
+  [DllImport("advapi32")]
+  static extern int GetLengthSid(IntPtr sid);
+  [DllImport("advapi32", SetLastError = true)]
+  static extern bool SetTokenInformation(IntPtr token, int kind, ref Label label, int length);
+  [DllImport("kernel32")]
+  static extern bool CloseHandle(IntPtr handle);
+  [DllImport("kernel32")]
+  static extern IntPtr GetCurrentProcess();
+  [DllImport("advapi32", SetLastError = true)]
+  static extern bool GetTokenInformation(IntPtr token, int kind, IntPtr buffer, int length, out int needed);
+  [DllImport("advapi32")]
+  static extern IntPtr GetSidSubAuthorityCount(IntPtr sid);
+  [DllImport("advapi32")]
+  static extern IntPtr GetSidSubAuthority(IntPtr sid, uint index);
+  [DllImport("advapi32", SetLastError = true)]
+  static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+  [DllImport("advapi32", SetLastError = true)]
+  static extern bool CreateRestrictedToken(IntPtr token, uint flags, uint disableCount, Label[] disable,
+    uint deleteCount, IntPtr delete, uint restrictCount, IntPtr restrict, out IntPtr restricted);
+  [StructLayout(LayoutKind.Sequential)]
+  public struct Label { public IntPtr Sid; public uint Attributes; }
+  // The user's own token with Administrators deny-only and the fewest
+  // privileges, at Medium: what a non-elevated process of the user has.
+  static string Try(int port) {
+    using (var s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)) {
+      try { s.Connect("127.0.0.1", port); return "connected"; }
+      catch (SocketException e) { return "error " + e.NativeErrorCode + " " + e.SocketErrorCode; }
+    }
+  }
+  // The integrity RID of the token the calling thread impersonates.
+  static string ThreadIntegrity() {
+    using (var identity = WindowsIdentity.GetCurrent(true)) {
+      if (identity == null) return "not impersonating";
+      int needed;
+      GetTokenInformation(identity.Token, 25, IntPtr.Zero, 0, out needed);
+      IntPtr buffer = Marshal.AllocHGlobal(needed);
+      try {
+        if (!GetTokenInformation(identity.Token, 25, buffer, needed, out needed))
+          return "integrity failed " + Marshal.GetLastWin32Error();
+        IntPtr sid = Marshal.ReadIntPtr(buffer);
+        uint last = (uint)Marshal.ReadByte(GetSidSubAuthorityCount(sid)) - 1;
+        return "0x" + ((uint)Marshal.ReadInt32(GetSidSubAuthority(sid, last))).ToString("X");
+      } finally { Marshal.FreeHGlobal(buffer); }
+    }
+  }
+  // Same process, no impersonation: the elevated token connects.
+  public static string Plain(int port) { return "plain | kernel=" + Try(port); }
+  public static string Own(int port, int control) {
+    IntPtr own;
+    if (!OpenProcessToken(GetCurrentProcess(), 0xF01FF, out own)) return "open failed " + Marshal.GetLastWin32Error();
+    IntPtr admins;
+    ConvertStringSidToSidW("S-1-5-32-544", out admins);
+    IntPtr restricted;
+    bool made = CreateRestrictedToken(own, 0x1, 1, new[] { new Label { Sid = admins } }, 0, IntPtr.Zero, 0, IntPtr.Zero,
+      out restricted);
+    CloseHandle(own);
+    if (!made) return "restrict failed " + Marshal.GetLastWin32Error();
+    return Probe(restricted, "S-1-16-8192", port, control);
+  }
+  public static string Connect(string user, string password, int port, int control, bool low) {
+    IntPtr logon;
+    // Interactive, else network logon: either gives the account's own token.
+    if (!LogonUserW(user, ".", password, 2, 0, out logon) && !LogonUserW(user, ".", password, 3, 0, out logon))
+      return "logon failed " + Marshal.GetLastWin32Error();
+    return Probe(logon, low ? "S-1-16-4096" : null, port, control);
+  }
+  // Impersonate a copy of `token` (closed here), lowered to `labelSid` if
+  // given; from that one thread read the token's integrity back, connect to
+  // the control listener (expected to connect: loopback itself is allowed)
+  // and then to the kernel port.
+  static string Probe(IntPtr token, string labelSid, int port, int control) {
+    IntPtr copy;
+    bool duplicated = DuplicateTokenEx(token, 0x02000000, IntPtr.Zero, 2, 2, out copy);
+    CloseHandle(token);
+    if (!duplicated) return "duplicate failed " + Marshal.GetLastWin32Error();
+    if (labelSid != null) {
+      IntPtr sid;
+      ConvertStringSidToSidW(labelSid, out sid);
+      var label = new Label { Sid = sid, Attributes = 0x20 };
+      if (!SetTokenInformation(copy, 25, ref label, Marshal.SizeOf(label) + GetLengthSid(sid)))
+        return "label failed " + Marshal.GetLastWin32Error();
+    }
+    using (var handle = new SafeAccessTokenHandle(copy)) {
+      return WindowsIdentity.RunImpersonated(handle, () => {
+        string name = WindowsIdentity.GetCurrent(true).Name;
+        return name + " | rid=" + ThreadIntegrity() + " | control=" + Try(control) + " | kernel=" + Try(port);
+      });
+    }
+  }
+}
+'@
+[Es5Probe]::Plain(__PORT__)
+[Es5Probe]::Own(__PORT__, __CONTROL__)
+foreach ($low in $false, $true) { [Es5Probe]::Connect('__NAME__', $env:ES5_PROBE_SECRET, __PORT__, __CONTROL__, $low) }
+"""
+
+
+def second_account_connects(port, control):
+    """A temporary standard account (random password, never printed)
+    connects from a thread impersonating its own logon token, at Medium and
+    lowered to Low integrity; the account is removed afterwards. (A child
+    process of another account cannot initialise on the runner's window
+    station, and the host's own fence probe impersonates the same way.)"""
+    name = "es5probe"
+    # At most 14 characters: net user asks for confirmation beyond that.
+    password = uuid.uuid4().hex[:10] + "Aa1!"
+    command("net", "user", name, password, "/add")
+    try:
+        script = (SECOND_ACCOUNT.replace("__NAME__", name).replace("__PORT__", str(port))
+                  .replace("__CONTROL__", str(control)))
+        # Windows PowerShell with its own module path, not pwsh 7's
+        # (inherited from the runner), so its cmdlets load.
+        env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
+        result = command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                         encoded(script), check=False, env=dict(env, ES5_PROBE_SECRET=password))
+    finally:
+        command("net", "user", name, "/delete", check=False)
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) != 4:
+        raise AssertionError(f"identity probes: {result.stdout} {result.stderr}")
+    return lines
+
+
+def running_network(session):
+    status = session.start()
+    instance, request = str(uuid.uuid4()), str(uuid.uuid4())
+    session.apply(spec(), instance, request, str(status["revision"]))
+    session.ready(instance)
+    return instance
+
+
+def wind_down(session, instance):
+    session.ctl("stop", instance)
+    eventually("stopped instance", lambda: session.view(instance),
+               lambda body: body.get("state") == "stopped", timeout=240)
+    session.release()
+    session.purge()
+
+
+def identities():
+    """The real kernel's management port under the session fence refuses a
+    non-elevated copy of the user's own token and a second standard account
+    at Medium and at Low integrity, while the elevated user connects
+    (doc#13#wbs ES5). Attribution (audit msg#2224): the probing process
+    connects to the kernel port without impersonation; each impersonated
+    thread reads its token's integrity back and connects to a second
+    loopback listener, so a refusal is the kernel port's own."""
+    import socket
+    with ExitStack() as stack:
+        session = Session(stack)
+        instance = running_network(session)
+        port = kernel_port(session)
+        with socket.create_connection(("127.0.0.1", port), timeout=5):
+            print(f"elevated user: connected to the kernel port {port}", flush=True)
+        listener = stack.enter_context(socket.create_server(("127.0.0.1", 0), backlog=16))
+        control = listener.getsockname()[1]
+        plain, own, medium, low = second_account_connects(port, control)
+        print(f"same probe process, not impersonating: {plain}", flush=True)
+        print(f"own token, not elevated: {own}", flush=True)
+        print(f"second account at Medium: {medium}", flush=True)
+        print(f"second account at Low: {low}", flush=True)
+        assert plain == "plain | kernel=connected", plain
+        for verdict, who, rid in ((own, os.environ["USERNAME"], "0x2000"),
+                                  (medium, "es5probe", "0x2000"), (low, "es5probe", "0x1000")):
+            expected = f"\\{who} | rid={rid} | control=connected | kernel=error 10013 AccessDenied"
+            assert verdict.lower().endswith(expected.lower()), verdict
+        # Reported, not judged: a Low copy of the elevated token keeps
+        # Administrators enabled, and the fence admits elevated
+        # administrators by group (only an elevated parent can make one).
+        print(f"elevated token lowered to Low (report only): {own_low_connect(port, session.dir)}", flush=True)
+        wind_down(session, instance)
+
+
+# A same-name module where Windows PowerShell's NetSecurity module would be
+# found for this user: the elevated hosts start no PowerShell at all (ES2N),
+# so it must never be loaded.
+PLANTED_PS_MODULE = Path(os.environ.get("USERPROFILE", "C:/")) / "Documents" / "WindowsPowerShell" / "Modules" / "NetSecurity"
+
+
+def planted_modules():
+    """Defensive acceptance on a disposable runner (doc#13#wbs ES5, ruling
+    msg#2205, audit msg#2224). Beside the portable host go System32 copies
+    of every DLL in etd-host.exe's import table that is not a KnownDLL or
+    an API set (read from the image, printed), plus those of the test
+    image running beside it as etd-ui.exe, and a same-name NetSecurity
+    module goes in the user's own PowerShell module path. Then:
+    - etd-host has each of its own imports loaded from System32, so an
+      import never loaded fails rather than passing;
+    - etd-host maps nothing from its folder (or below) but etd-host.exe;
+    - positive control: the unhardened test image in the same folder loads
+      plants from that folder, so the plants work and the check sees them;
+    - neither host nor kernel starts PowerShell, the planted module never
+      runs, and the kernel maps DLLs only from its store, System32 and
+      WinSxS.
+    Out of scope: DLLs loaded at run time (LoadLibrary, delay load), which
+    SetDefaultDllDirectories(SYSTEM32) covers, and the PowerShell analysis
+    cache and HKCU .NET settings, which no host has used since ES2N."""
+    import psutil
+    with ExitStack() as stack:
+        session = Session(stack)
+        known = known_dlls()
+        own = plantable(session.host, known)
+        peer = plantable(session.ui, known)
+        assert own, "etd-host.exe imports nothing outside KnownDLLs: nothing to plant"
+        print(f"planted for etd-host.exe ({len(own)}): {', '.join(own)}", flush=True)
+        print(f"planted for the test image ({len(peer)}): {', '.join(peer)}", flush=True)
+        system32 = Path(os.environ["SystemRoot"]) / "System32"
+        for name in sorted(set(own) | set(peer)):
+            shutil.copy2(system32 / name, session.dir / name)
+        assert not PLANTED_PS_MODULE.exists(), "the runner already has a user NetSecurity module"
+        PLANTED_PS_MODULE.mkdir(parents=True)
+        stack.callback(shutil.rmtree, PLANTED_PS_MODULE, ignore_errors=True)
+        (PLANTED_PS_MODULE / "NetSecurity.psm1").write_text(
+            "Set-Content -LiteralPath $env:TEMP\\es5-netsecurity-loaded.txt -Value $PID\n", encoding="utf-8")
+        marker = Path(os.environ["TEMP"]) / "es5-netsecurity-loaded.txt"
+        marker.unlink(missing_ok=True)
+
+        instance = running_network(session)
+        portable = session.dir.resolve()
+
+        def mapped(process):
+            return {Path(m.path).resolve() for m in process.memory_maps(grouped=True) if m.path}
+
+        host = psutil.Process(session.process.pid)
+        host_maps = mapped(host)
+        by_name = {}
+        for path in host_maps:
+            by_name.setdefault(path.name.lower(), []).append(path)
+        windows32 = system32.resolve()
+        # System32, or WinSxS for side-by-side DLLs such as comctl32.
+        allowed = (windows32, (Path(os.environ["SystemRoot"]) / "WinSxS").resolve())
+        wrong = {name: [str(path) for path in by_name.get(name, [])] for name in own
+                 if not by_name.get(name)
+                 or not all(any(path.is_relative_to(root) for root in allowed) for path in by_name[name])}
+        assert not wrong, f"etd-host imports not loaded, or not from System32/WinSxS: {wrong}"
+        own_folder = sorted(str(path) for path in host_maps
+                            if path.is_relative_to(portable) and path != session.host.resolve())
+        assert not own_folder, f"etd-host loaded modules from its program folder: {own_folder}"
+        print(f"etd-host loaded all {len(own)} imports from System32/WinSxS and nothing from its folder but itself",
+              flush=True)
+
+        control = sorted(path.name for path in mapped(psutil.Process(session.lease.pid))
+                         if path.parent == portable and path.name.lower() in set(own) | set(peer))
+        print(f"positive control: the test image beside it loaded from the folder: {', '.join(control)}",
+              flush=True)
+        assert control, "the unhardened test image loaded no plant: the check cannot see a planted load"
+
+        [kernel] = session.kernels()
+        store = Path(kernel.info["exe"]).resolve().parent
+        foreign = sorted(str(path) for path in mapped(kernel)
+                         if path.suffix.lower() == ".dll" and path.parent != store
+                         and not any(path.is_relative_to(root) for root in allowed))
+        assert not foreign, f"the kernel loaded modules from outside its store, System32 and WinSxS: {foreign}"
+        shells = [p.name() for p in host.children(recursive=True)
+                  if p.name().lower() in ("powershell.exe", "pwsh.exe")]
+        assert not shells, f"the session host started PowerShell: {shells}"
+        assert not marker.exists(), "the planted NetSecurity module was loaded"
+        print("no PowerShell, the planted NetSecurity module unused; the kernel loads only from its store, "
+              "System32 and WinSxS", flush=True)
+        wind_down(session, instance)
+
+
+CASES = {"session_recovery": recovery, "session_exclusion": exclusion, "session_identities": identities,
+         "session_planted_modules": planted_modules}
+
+if __name__ == "__main__":
+    CASES[sys.argv[1]]()

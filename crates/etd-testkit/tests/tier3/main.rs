@@ -92,6 +92,34 @@ fn service_stop_with_a_running_network_is_bounded() {
     run_case("stop_running");
 }
 
+#[cfg(windows)]
+#[test]
+#[ignore = "runs the elevated session host with a real kernel on a disposable hosted runner"]
+fn session_host_crash_recovery_and_purge() {
+    run_script("session.py", "session_recovery");
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "runs the elevated session host, then installs the service, on a disposable hosted runner"]
+fn session_and_service_exclude_each_other() {
+    run_script("session.py", "session_exclusion");
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "runs the elevated session host and a temporary second account on a disposable hosted runner"]
+fn session_kernel_port_refuses_other_identities() {
+    run_script("session.py", "session_identities");
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "plants DLLs and a PowerShell module for the elevated session host on a disposable hosted runner"]
+fn session_ignores_planted_modules() {
+    run_script("session.py", "session_planted_modules");
+}
+
 #[test]
 #[ignore = "installs and upgrades the privileged service on a disposable hosted runner"]
 fn installed_network_survives_upgrade() {

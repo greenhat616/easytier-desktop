@@ -10,6 +10,7 @@ pub fn endpoint(host: HostKind, custom: Option<String>) -> Result<Endpoint, CtlE
     match host {
         HostKind::Service => Ok(local_endpoint(service_endpoint().to_owned())),
         HostKind::User => user_endpoint(),
+        HostKind::ElevatedSession => session_endpoint(),
     }
 }
 
@@ -47,14 +48,34 @@ fn user_endpoint() -> Result<Endpoint, CtlError> {
 
 #[cfg(windows)]
 fn user_endpoint() -> Result<Endpoint, CtlError> {
+    let sid = current_sid()?;
+    Ok(Endpoint::NamedPipe(format!(
+        r"\\.\pipe\easytier-desk-user-{sid}"
+    )))
+}
+
+#[cfg(windows)]
+fn session_endpoint() -> Result<Endpoint, CtlError> {
+    let sid = current_sid()?;
+    Ok(Endpoint::NamedPipe(format!(
+        r"\\.\pipe\easytier-desk-session-{sid}"
+    )))
+}
+#[cfg(unix)]
+fn session_endpoint() -> Result<Endpoint, CtlError> {
+    Err(CtlError::internal(
+        "the elevated session host is Windows-only".to_owned(),
+    ))
+}
+
+#[cfg(windows)]
+fn current_sid() -> Result<String, CtlError> {
     use etd_ipc::OsUserId;
     let user = etd_ipc::platform::current_user().map_err(|error| {
         CtlError::internal(format!("cannot identify the current user: {error}"))
     })?;
     match user {
-        OsUserId::WindowsSid(sid) => Ok(Endpoint::NamedPipe(format!(
-            r"\\.\pipe\easytier-desk-user-{sid}"
-        ))),
+        OsUserId::WindowsSid(sid) => Ok(sid),
         _ => Err(CtlError::internal("unexpected kind of user id".to_owned())),
     }
 }
@@ -63,13 +84,14 @@ pub fn expectation(host: HostKind, dir: Option<PathBuf>) -> Result<ServerExpecta
     let exe_dir = match (dir, host) {
         (Some(dir), _) => dir,
         (None, HostKind::Service) => service_install_dir()?,
-        (None, HostKind::User) => own_dir()?,
+        (None, HostKind::User | HostKind::ElevatedSession) => own_dir()?,
     };
     Ok(ServerExpectation {
         exe_dir,
         requirement: match host {
             HostKind::Service => ServerRequirement::Service,
             HostKind::User => ServerRequirement::CurrentUser,
+            HostKind::ElevatedSession => ServerRequirement::CurrentUserElevated,
         },
     })
 }

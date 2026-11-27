@@ -46,6 +46,21 @@ jobs:
           - os: windows-latest
             suite: recovery
           - os: windows-latest
+            suite: session-identities
+            session_test: session_kernel_port_refuses_other_identities
+          - os: windows-latest
+            suite: session-recovery
+            session_test: session_host_crash_recovery_and_purge
+          - os: windows-latest
+            suite: session-exclusion
+            session_test: session_and_service_exclude_each_other
+          # Defensive acceptance on a disposable runner (doc#13#wbs ES5,
+          # topic#51 msg#2205): planted DLLs and a same-name PowerShell
+          # module are never loaded by the elevated session host.
+          - os: windows-latest
+            suite: session-planted
+            session_test: session_ignores_planted_modules
+          - os: windows-latest
             suite: preflight
           - os: windows-latest
             suite: program
@@ -101,7 +116,7 @@ jobs:
           @'
 
           [[profile.privileged.overrides]]
-          filter = 'test(=installed_kernel_and_host_crash_recovery) | test(=installed_network_uninstall_restores_machine) | test(=service_stop_with_a_running_network_is_bounded) | test(=msi_installs_upgrades_rolls_back_and_uninstalls)'
+          filter = 'test(=installed_kernel_and_host_crash_recovery) | test(=installed_network_uninstall_restores_machine) | test(=service_stop_with_a_running_network_is_bounded) | test(=msi_installs_upgrades_rolls_back_and_uninstalls) | test(/^session_/)'
           slow-timeout = { period = "120s", terminate-after = 15 }
           '@ | Add-Content -LiteralPath .config/nextest.toml
       - name: Allow for the Debian package lifecycle
@@ -252,6 +267,11 @@ jobs:
       - name: Installed service tests (administrator)
         if: runner.os == 'Windows' && matrix.suite == 'recovery'
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=installed_kernel_and_host_crash_recovery)' --success-output immediate
+      - name: Elevated session host acceptance (administrator)
+        if: matrix.session_test != ''
+        env:
+          SESSION_TEST: ${{ matrix.session_test }}
+        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E "test(=$env:SESSION_TEST)" --success-output immediate
       - name: Service STOP with a running network (administrator)
         if: matrix.suite == 'stop'
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=service_stop_with_a_running_network_is_bounded)' --success-output immediate

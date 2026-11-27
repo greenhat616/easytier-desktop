@@ -46,6 +46,8 @@ pub enum HostKind {
     Service,
     /// The current user's own host.
     User,
+    /// The current user's elevated session host (Windows only).
+    ElevatedSession,
 }
 
 #[derive(Debug, Subcommand)]

@@ -402,9 +402,11 @@ for `--purge` (`reclaim --all --purge`, as the uninstaller calls it); without
 `reclaim --mode elevated-session` takes the session entry's locks (maintenance, the
 service checks, then the singleton lock) and reclaims the current user's own root.
 With `--all-users` it reclaims every verified `<SID>` root; with `--all --purge` it
-purges them all and then removes `EasyTierDesk.session` (what an app uninstaller
-calls). `--all-users` does not depend on the caller's token: it runs as LocalSystem
-(the MSI) or as an elevated administrator, and takes only the shared locks. Before
+purges them all, then removes `EasyTierDesk.session` and the privileged hosts' volatile
+boot marker `HKLM\SOFTWARE\EasyTierDesk\Volatile` (what an app uninstaller calls).
+The user's own `reclaim --all --purge` closes every record but keeps the root.
+`--all-users` does not depend on the caller's token: it runs as LocalSystem (the MSI)
+or as an elevated administrator, and takes only the shared locks. Before
 anything is removed, every `<SID>\cores` passes the same driver-reference check as the
 service's uninstall; a reference, or a check that cannot decide, keeps every root
 and fails. `--all-users` is refused with any other mode. `remove-core` is not

@@ -36,6 +36,25 @@ class TOKEN_PRIVILEGES(ctypes.Structure):
     _fields_ = [("PrivilegeCount", wintypes.DWORD), ("Luid", LUID), ("Attributes", wintypes.DWORD)]
 
 
+# Full signatures: ctypes' default int would truncate 64-bit handles such as
+# GetCurrentProcess()'s pseudo-handle.
+kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+kernel32.GetCurrentProcess.argtypes = []
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+advapi32.OpenProcessToken.restype = wintypes.BOOL
+advapi32.LookupPrivilegeValueW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(LUID)]
+advapi32.LookupPrivilegeValueW.restype = wintypes.BOOL
+advapi32.AdjustTokenPrivileges.argtypes = [wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(TOKEN_PRIVILEGES),
+                                           wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p]
+advapi32.AdjustTokenPrivileges.restype = wintypes.BOOL
+psapi.EnumDeviceDrivers.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+psapi.EnumDeviceDrivers.restype = wintypes.BOOL
+ntdll.NtQuerySystemInformation.argtypes = [ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong,
+                                           ctypes.POINTER(ctypes.c_ulong)]
+ntdll.NtQuerySystemInformation.restype = ctypes.c_long
+
+
 def set_debug(attributes):
     """Apply `attributes` to SeDebugPrivilege on this process token; the
     Win32 error AdjustTokenPrivileges leaves (0 or ERROR_NOT_ALL_ASSIGNED)."""

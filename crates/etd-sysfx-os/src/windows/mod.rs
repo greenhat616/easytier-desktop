@@ -16,6 +16,7 @@ pub fn remove_service_boot_marker() -> Result<(), crate::OsError> {
 /// session input tests. Uses the worker profile `adapters()` set.
 #[cfg(feature = "ci-test-fixtures")]
 pub fn worker_diagnostics() -> Result<Value, crate::OsError> {
+    crate::ci_test_fixtures_build();
     let mut rows =
         execution::run(json!({"op": "diagnostics"})).map_err(|e| crate::OsError::Os {
             code: e.code,

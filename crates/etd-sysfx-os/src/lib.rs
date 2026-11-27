@@ -115,3 +115,45 @@ pub fn shutdown_helpers() -> Result<(), OsError> {
         Ok(())
     }
 }
+
+/// Kept in every binary built with the `ci-test-fixtures` feature and in no
+/// other: `cargo xtask dist` refuses to package an etd-host image holding it.
+#[cfg(feature = "ci-test-fixtures")]
+#[used]
+static CI_TEST_FIXTURES_MARKER: [u8; 26] = *b"ETD-CI-TEST-FIXTURES-BUILD";
+
+/// Whether this build carries the CI test fixtures. Every fixture entry
+/// point calls this, which keeps the marker in any binary that links one.
+pub fn ci_test_fixtures_build() -> bool {
+    #[cfg(feature = "ci-test-fixtures")]
+    {
+        std::hint::black_box(&CI_TEST_FIXTURES_MARKER);
+        true
+    }
+    #[cfg(not(feature = "ci-test-fixtures"))]
+    false
+}
+
+#[cfg(test)]
+mod fixture_marker_tests {
+    #[test]
+    fn this_binary_holds_the_fixture_marker_exactly_when_built_with_fixtures() {
+        // Spelled backwards, so the needle itself never appears in the image.
+        let needle: Vec<u8> = std::hint::black_box("DLIUB-SERUTXIF-TSET-IC-DTE")
+            .bytes()
+            .rev()
+            .collect();
+        assert!(needle.starts_with(b"ETD-CI-") && needle.len() == 26);
+        let image = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let found = image
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte == needle[0])
+            .any(|(at, _)| image[at..].starts_with(&needle));
+        assert_eq!(
+            super::ci_test_fixtures_build(),
+            cfg!(feature = "ci-test-fixtures")
+        );
+        assert_eq!(found, super::ci_test_fixtures_build());
+    }
+}

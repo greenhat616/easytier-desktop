@@ -282,10 +282,9 @@ impl ServiceManager for NativeServiceManager {
 /// the `ci-test-fixtures` feature (never in a product build): true when
 /// the protected maintenance directory holds `ci-upgrade-fault` with a
 /// line naming `point`. Only an administrator can create that file.
-/// `cargo xtask dist` recognises a test build by this file name in the
-/// etd-host image and refuses to package it.
 #[cfg(feature = "ci-test-fixtures")]
 pub fn ci_upgrade_fault(layout: &HostLayout, point: &str) -> bool {
+    crate::ci_test_fixtures_build();
     fs::read_to_string(layout.maintenance.join("ci-upgrade-fault"))
         .is_ok_and(|faults| faults.lines().any(|fault| fault.trim() == point))
 }

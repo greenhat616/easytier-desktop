@@ -44,8 +44,8 @@ stateDiagram-v2
     Applied --> Reclaimed
     Reclaiming --> Reclaimed: verified gone / restored
     Reclaiming --> Quarantined: 5 failures, or process liveness unknown
-    Reclaiming --> Candidate: present, no credential on record
-    Reclaiming --> Conflict: present, different credential
+    Reclaiming --> Candidate: present, no credential on record, or NotDeletable
+    Reclaiming --> Conflict: present, different credential, or HeldBy
     Quarantined --> Reclaiming: retry (failures reset)
     Quarantined --> Reclaimed
     Candidate --> Reclaiming: administrator DELETE
@@ -165,7 +165,12 @@ Per record: move to `Reclaiming`, probe, decide, act, verify.
 | present, record never got a credential | `Candidate` (never deleted automatically) |
 
 After a delete the object must probe absent, otherwise it is a failure. A reclaimer's
-`CredentialMismatch` becomes a conflict. At `QUARANTINE_AFTER` (5) consecutive failures
+`CredentialMismatch` becomes a conflict, and so does `HeldBy(holder)`: a positive proof
+that another owner holds the object now, named in a report note. `NotDeletable(reason)`
+(ours, but that reclaimer never deletes it, such as a live wintun adapter) makes the record
+a candidate; an administrator's DELETE meets the same answer and leaves it a candidate
+with a note. Neither counts as a failure; both are re-probed on every run and close once
+the object is gone. An unprovable holder is `Busy`, a failure. At `QUARANTINE_AFTER` (5) consecutive failures
 the record is quarantined; `retry` moves quarantined records back to `Reclaiming` and
 runs the instance's open generations again. A held record stores the credential it saw
 only in the observation detail, so nothing it saw can later authorise a delete.

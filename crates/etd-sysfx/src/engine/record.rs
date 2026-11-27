@@ -236,25 +236,51 @@ impl Ctx<'_> {
                 )
                 .await
             }
-            Authority::Candidate => {
-                self.ledger
-                    .transition(
-                        &e.id,
-                        EffectState::Candidate,
-                        Some(report::held_observation(&found, None)),
-                    )
-                    .await?;
-                Ok(RecordOutcome::Held)
-            }
+            Authority::Candidate => self.candidate(e, &found).await,
             Authority::Conflict => self.conflict(e, &found).await,
             Authority::Delete | Authority::Restore | Authority::ByReclaimer => {
                 match r.reclaim(e).await {
                     Err(ReclaimError::CredentialMismatch) => self.conflict(e, &found).await,
+                    // Left in place without a failure: re-probed by
+                    // `recheck_held` on every run, closed once gone.
+                    Err(ReclaimError::HeldBy(holder)) => {
+                        self.notes.push(format!(
+                            "{} {:?}: held by {holder}; left in place",
+                            e.kind,
+                            report::lookup_key(e)
+                        ));
+                        self.conflict(e, &found).await
+                    }
+                    Err(ReclaimError::NotDeletable(why)) => {
+                        self.notes.push(format!(
+                            "{} {:?}: not deleted ({why}); listed as a candidate",
+                            e.kind,
+                            report::lookup_key(e)
+                        ));
+                        self.candidate(e, &found).await
+                    }
                     Err(err) => self.fail(e, &err.to_string()).await,
                     Ok(done) => self.verify(e, r.as_ref(), done).await,
                 }
             }
         }
+    }
+
+    /// Present but not ours to delete automatically. The found credential
+    /// goes only into the detail, for an administrator's decision.
+    async fn candidate(
+        &mut self,
+        e: &Effect,
+        found: &Observation,
+    ) -> Result<RecordOutcome, LedgerError> {
+        self.ledger
+            .transition(
+                &e.id,
+                EffectState::Candidate,
+                Some(report::held_observation(found, None)),
+            )
+            .await?;
+        Ok(RecordOutcome::Held)
     }
 
     async fn conflict(
@@ -363,6 +389,16 @@ impl Ctx<'_> {
                 };
                 let outcome = match r.reclaim(&approved).await {
                     Ok(done) => self.verify(&approved, r.as_ref(), done).await?,
+                    // The reclaimer never deletes it: the record stays a
+                    // candidate as reported, without a failure.
+                    Err(ReclaimError::NotDeletable(why)) => {
+                        self.ledger
+                            .transition(&e.id, EffectState::Candidate, e.observation.clone())
+                            .await?;
+                        self.notes
+                            .push(format!("{id}: delete refused, not deletable: {why}"));
+                        return Ok(());
+                    }
                     Err(err) => self.fail(e, &err.to_string()).await?,
                 };
                 if outcome != RecordOutcome::Closed {

@@ -83,6 +83,7 @@ ledger.
 | `reclaim_order.rs`, `reclaim_uncertain_hold.rs` | Process first, then rank order; a failing rank holds back higher ranks |
 | `reclaim_credential.rs`, `reclaim_third_party.rs` | Foreign objects with our names are never deleted (conflict or candidate) |
 | `reclaim_quarantine.rs`, `reclaim_idempotent.rs` | Quarantine after five failures, retry; second run writes nothing; reboot closes volatile records |
+| `reclaim_left_in_place.rs` | `HeldBy` is a conflict and `NotDeletable` a candidate: no failure, self-closing once gone; other errors still quarantine |
 | `reclaim_replay.rs` | Crash at every system or ledger step, then replay converges (proptest) |
 | `reclaim_core.rs`, `reclaim_rulings.rs` | Core-binary and product scope, leases, decision gates, offline reports |
 

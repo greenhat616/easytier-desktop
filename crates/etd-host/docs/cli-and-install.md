@@ -12,7 +12,7 @@ deleted (deleting a lock file while someone waits on it would allow a second loc
 | Lock | File | Kind | Held by |
 | --- | --- | --- | --- |
 | Singleton (host lifetime) | `host.lock` | non-blocking; a second holder gets "host already running; stop it before maintenance" | a running host, and every maintenance command that opens the ledger |
-| Maintenance command | `maintenance-command.lock` | blocking | `install`, `upgrade`, `uninstall`, `resume-service`, and `reclaim` / `remove-core` in service mode |
+| Maintenance command | `maintenance-command.lock` | blocking | `install`, `upgrade`, `uninstall`, `resume-service`, `reclaim` / `remove-core` in service mode, and every elevated session entry (`run` until it holds the singleton lock, both `reclaim` forms) |
 
 For the service both live in a separate maintenance directory (table below) that
 install and uninstall never remove. A user host locks its state directory, and also
@@ -22,6 +22,13 @@ serve the same user endpoint.
 Because the running service holds the singleton lock, `reclaim` and `remove-core` in
 service mode refuse until the service is stopped. That makes them the only ledger
 writer while they run.
+
+The elevated session host uses the service's maintenance directory and so the same
+two locks: at most one privileged host (service or one user's session) runs at a
+time. Every privileged entry takes the maintenance lock first, checks inside it, then
+takes the singleton lock. A session host releases the maintenance lock once it holds
+the singleton lock, so `install` then fails at once on the singleton lock ("host
+already running") instead of waiting.
 
 ## Directories
 
@@ -35,6 +42,18 @@ Service form (paths come from the OS, never from clients):
 | Endpoint | `\\.\pipe\easytier-desk-host` | `/run/easytier-desk/host.sock` | `<install>/run/host.sock` |
 | Maintenance dir | `%ProgramData%\EasyTierDesk.maintenance` | `/var/lib/easytier-desk-maintenance` | `/Library/Application Support/easytier-desk-maintenance` |
 | Registration | SCM service `easytier-desk-host` | `/etc/systemd/system/easytier-desk-host.service` | `/Library/LaunchDaemons/easytier-desk-host.plist` |
+
+Elevated session form (Windows only): everything under
+`%ProgramData%\EasyTierDesk.session\<SID>` (`<SID>` from the host's own token):
+`state\` (ledger, logs, repair index), `run\`, `cores\` and an empty `profile\`, which
+the kernel's and the system workers' profile variables point at. Endpoint
+`\\.\pipe\easytier-desk-session-<SID>`; maintenance directory and locks as the
+service's. `EasyTierDesk.session` and each `<SID>` root are created with the same
+protected descriptor as the service directories (owner SYSTEM or Administrators,
+only SYSTEM and Administrators granted). Every start verifies the whole per-user tree:
+access control, no reparse point, no file with a second hard link. A directory that
+exists but does not conform is refused, never repaired or adopted; the same check
+runs before another user's root is read, reclaimed or removed.
 
 Windows locations come from Known Folders. User form: state is
 `%LOCALAPPDATA%\EasyTierDesk`, `~/Library/Application Support/easytier-desk` or
@@ -56,6 +75,55 @@ user-only DACL on Windows).
 
 On Windows, `run --mode service` enters the SCM dispatcher, which runs the same host.
 
+## `run --mode elevated-session`
+
+Windows only (refused elsewhere); the command takes no directory or path option.
+Before any directory or lock, the token must be elevated (`TokenElevation`), at
+integrity High or above, and not SYSTEM. On Windows every command first restricts the
+DLL search path to System32 (`SetDefaultDllDirectories`), and `etd-host.exe` links
+with `/DEPENDENTLOADFLAG:0x800`.
+
+1. Take the maintenance lock. Inside it: refuse if the service is registered (in any
+   state) or its state directory exists; create the missing protected session
+   directories and verify the per-user tree, which must include `profile\`; change
+   the working directory to the `<SID>` root.
+2. Still inside it, take the singleton lock (a running privileged host makes this
+   fail as "host already running"), then reconcile machine-wide: open every other
+   verified `<SID>` ledger read-only and refuse if any holds an open instance record,
+   except records that ended with a reboot since (`UntilReboot` with another boot
+   id). Unreadable counts as open. The user's own ledger never blocks; its
+   self-check reclaims it. Only instance records count: a normal exit closes them,
+   while product records (shared drivers, the WFP provider and sublayer) and
+   kernel-binary records do not cross roots and stay until a purge. Then the kernel
+   store: on first start the bundled kernels beside the host image are copied into
+   `<SID>\cores` and hashed there; when this build's table changed they are merged
+   again (no SHA directory is deleted, so kernels open records name stay).
+3. Release the maintenance lock and serve as the service does, with the fence, the
+   owner-only session pipe, mode `ELEVATED_SESSION` and the kernel's profile variables
+   (`USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `HOMEDRIVE`/`HOMEPATH`) set to
+   `<SID>\profile`. Ctrl-C, `ReleaseLease` (stop), the lease grace (30 s with no
+   lease holder) or the end of the Windows session stop it. A hidden top-level window
+   hears `WM_QUERYENDSESSION`, starts the normal shutdown and holds the session end
+   (`ShutdownBlockReasonCreate`) until the host has released its lock, within the
+   stop's worst case.
+
+Lease holders are only connections whose client process image, read from a handle
+opened on the client pid at accept and kept for the connection's life, is the
+`etd-ui.exe` beside the host image. That does not authenticate the UI: any program of
+the same user at that path counts; protecting the path is the installer's job
+(accepted risk, issue #2). The CLI and other clients can operate the host but do not
+keep it alive.
+
+Refusals exit with their own codes so the UI can tell them apart:
+
+| Exit code | Meaning |
+| --- | --- |
+| 3 | The service is registered, or its uninstall is unfinished (state directory left) |
+| 4 | A session directory exists but does not conform; left untouched |
+| 5 | Other users' sessions left open records; run `reclaim --mode elevated-session --all-users` |
+| 6 | The session pipe name is taken by another process |
+| 1 | Any other failure, including a token that is not an elevated administrator |
+
 Dependency wiring (`host::dependencies`): ProcessKit engine with the installed image
 as the console-ctrl helper; repair index file and install key; OS adapters from
 `etd_sysfx_os::adapters` (on a platform without them, fail-closed stand-ins that
@@ -71,9 +139,12 @@ becomes an admin allow-list entry.
 
 1. Take the maintenance lock. An existing journal must be in phase `Installing` (an
    interrupted install, which is rolled back first); anything else refuses.
-2. Take the singleton lock. **Preflight:** refuse if any product directory, the
-   group, the unit file or the service registration already exists. Install never
-   adopts objects it did not create.
+2. Take the singleton lock (so no elevated session host runs). Drain the elevated
+   sessions: reclaim and purge every verified `%ProgramData%\EasyTierDesk.session\<SID>`
+   root, then remove `EasyTierDesk.session`; a candidate, conflict or non-conforming
+   directory refuses the install with the report. **Preflight:** refuse if any
+   product directory, the group, the unit file or the service registration already
+   exists. Install never adopts objects it did not create.
 3. Begin the journal. Every resource is recorded as planned before it is created, so
    a rollback removes only what this installation created.
 4. Create the directories and copy the running executable into the install
@@ -242,6 +313,13 @@ service mode) and runs `reclaim_all`: scope `Instances`, or `Everything` with
 "reclaim incomplete" if anything remains. `--all` is the required explicit switch
 for `--purge` (`reclaim --all --purge`, as the uninstaller calls it); without
 `--purge` it changes nothing, and every instance is reclaimed either way.
+
+`reclaim --mode elevated-session` takes the session entry's locks (maintenance, the
+service checks, then the singleton lock) and reclaims the current user's own root.
+With `--all-users` it reclaims every verified `<SID>` root; with `--all --purge` it
+purges them all and then removes `EasyTierDesk.session` (what an app uninstaller
+calls). `--all-users` is refused with any other mode. `remove-core` is not available
+for the session mode.
 
 `remove-core <version>` runs `ReclaimEngine::reclaim_core` for the kernel's SHA-256,
 requires no candidates, conflicts or open core-binary records, clears the selected

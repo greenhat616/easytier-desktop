@@ -55,7 +55,11 @@ access control, no reparse point, no file with a second hard link. A directory t
 exists but does not conform is refused, never repaired or adopted; the same check
 runs before another user's root is read, reclaimed or removed.
 
-Windows locations come from Known Folders. User form: state is
+Windows machine locations (`%ProgramData%`, `%ProgramFiles%`) are read from HKLM's
+64-bit view (the profile list's `ProgramData`, `ProgramFilesDir`), with only
+`%SystemDrive%` expanded, to the drive of the Windows directory; no shell API and no
+environment is involved. The user host's `%LOCALAPPDATA%` is the Known Folder,
+through shell32 loaded from System32 for that call only. User form: state is
 `%LOCALAPPDATA%\EasyTierDesk`, `~/Library/Application Support/easytier-desk` or
 `$XDG_STATE_HOME/easytier-desk` (default `~/.local/state/easytier-desk`), with `run/`
 and `cores/` inside; directories are created private to the user (mode 0700, or a

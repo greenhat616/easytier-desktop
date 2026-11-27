@@ -267,8 +267,12 @@ Used only by privileged hosts with a kernel adapter profile and a platform fence
    refusal on an empty port proves nothing and stays `Pending`.
 4. Any mismatch is `Failed`: the supervisor kills the kernel and reclaims, and the
    next generation is planned with `ManagementGuard::DenyAll`. The kernel driver
-   accepts deny-all only when the adapter profile marks it verified; otherwise no
-   privileged instance starts.
+   accepts deny-all only when the adapter profile marks it verified
+   (`AdapterProfile::deny_all_verified`); otherwise the plan is refused, the instance
+   goes `GAVE_UP` with notice `start.refused`, and no privileged kernel runs
+   unguarded (fail closed). No current profile sets the flag, so today every fence
+   failure on a privileged host ends in `GAVE_UP`; the deny-all fallback switches on
+   only once a kernel's profile proves it.
 5. The rule ranks after the process record, so the reclaim engine removes it only
    once the kernel is verified dead. The orchestrator never removes it itself.
 

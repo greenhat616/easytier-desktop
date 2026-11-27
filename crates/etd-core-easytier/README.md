@@ -46,7 +46,9 @@ revision of at least seven hex digits that prefixes the profile's full hash; a d
 profile (`NoProfile`); a user host may run it lifecycle-only. A profile grants no
 trust: only binaries whose SHA-256 is in `etd-host`'s `cores.lock` can be installed or
 launched. Both profiles have `deny_all_verified = false`, so a `DenyAll` guard cannot be
-planned yet.
+planned yet: on a privileged host a fence failure ends with the instance gave up (fail
+closed) instead of a deny-all generation. Set the flag only for a kernel build whose
+deny-all allow list has been verified to reject every source.
 
 ### `plan_launch`
 

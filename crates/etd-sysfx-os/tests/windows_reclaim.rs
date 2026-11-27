@@ -10,6 +10,63 @@ use etd_testkit::{
 };
 use std::{process::Command, sync::Arc};
 
+/// The runner is an elevated administrator, not SYSTEM: like the elevated
+/// session host, its management workers get the protected profile directory
+/// next to the state directory, which the composition root creates.
+/// The session tree's protected profile directory, as the composition root
+/// makes it: SYSTEM and Administrators only, the whole DACL replaced (an
+/// elevated creator's default DACL can add an explicit entry for the user).
+fn protected_profile(path: &std::path::Path) {
+    use ::windows::{
+        Win32::{
+            Foundation::{HLOCAL, LocalFree},
+            Security::{
+                Authorization::{
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+                    SE_FILE_OBJECT, SetNamedSecurityInfoW,
+                },
+                DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
+                PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+            },
+        },
+        core::HSTRING,
+    };
+    std::fs::create_dir(path).unwrap();
+    unsafe {
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            &HSTRING::from("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"),
+            SDDL_REVISION_1,
+            &mut sd,
+            None,
+        )
+        .unwrap();
+        let mut present = false.into();
+        let mut defaulted = false.into();
+        let mut dacl = std::ptr::null_mut();
+        GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted).unwrap();
+        SetNamedSecurityInfoW(
+            &HSTRING::from(path.as_os_str()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl),
+            None,
+        )
+        .ok()
+        .unwrap();
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+    }
+}
+
+fn session_state(dir: &std::path::Path) -> std::path::PathBuf {
+    protected_profile(&dir.join("profile"));
+    let state = dir.join("state");
+    std::fs::create_dir(&state).unwrap();
+    state
+}
+
 fn ps(script: &str) -> String {
     let output = Command::new("powershell.exe")
         .no_window()
@@ -59,7 +116,7 @@ fn boot_marker_stable_and_volatile() {
     assert_eq!(std::env::var("CI").as_deref(), Ok("true"));
     let dir = tempfile::tempdir().unwrap();
     let config = OsConfig {
-        state_dir: dir.path().into(),
+        state_dir: session_state(dir.path()),
         run_dir: dir.path().join("run"),
         core_store_dir: dir.path().join("core"),
     };
@@ -111,7 +168,7 @@ async fn profile_signature_cleanup() {
     assert_eq!(std::env::var("CI").as_deref(), Ok("true"));
     let dir = tempfile::tempdir().unwrap();
     let os = adapters(&OsConfig {
-        state_dir: dir.path().into(),
+        state_dir: session_state(dir.path()),
         run_dir: dir.path().join("run"),
         core_store_dir: dir.path().join("core"),
     })
@@ -190,7 +247,7 @@ async fn registry_and_magic_dns() {
     let core_store = dir.path().join("core");
     std::fs::create_dir(&core_store).unwrap();
     let os = adapters(&OsConfig {
-        state_dir: dir.path().into(),
+        state_dir: session_state(dir.path()),
         run_dir: dir.path().join("run"),
         core_store_dir: core_store.clone(),
     })
@@ -352,10 +409,12 @@ async fn registry_and_magic_dns() {
         child
     };
     let foreign = fixture(dir.path());
-    assert!(matches!(
-        reclaimer(effect.kind).reclaim(&effect).await,
-        Err(ReclaimError::Busy(_))
-    ));
+    // Proven external and nothing replayed yet: held by it, left in place.
+    let held = reclaimer(effect.kind).reclaim(&effect).await;
+    assert!(
+        matches!(&held, Err(ReclaimError::HeldBy(h)) if h.contains("easytier-gate-fixture")),
+        "{held:?}"
+    );
     assert!(
         os.observer
             .observe(effect.kind, &magic_key)
@@ -370,6 +429,18 @@ async fn registry_and_magic_dns() {
             .unwrap()
             .is_some()
     );
+    // As left by an earlier replay interrupted after restoring the
+    // SearchList: it must finish, so the same holder is only Busy.
+    ps(&format!(
+        "Set-ItemProperty -LiteralPath '{tcpip}' -Name SearchList -Value 'original.invalid'"
+    ));
+    assert!(matches!(
+        reclaimer(effect.kind).reclaim(&effect).await,
+        Err(ReclaimError::Busy(_))
+    ));
+    ps(&format!(
+        "Set-ItemProperty -LiteralPath '{tcpip}' -Name SearchList -Value 'current.invalid'"
+    ));
     drop(foreign);
     let own = fixture(&core_store);
     assert_eq!(
@@ -416,7 +487,7 @@ async fn reclaim_and_conflict() {
     assert_eq!(std::env::var("CI").as_deref(), Ok("true"));
     let dir = tempfile::tempdir().unwrap();
     let os = adapters(&OsConfig {
-        state_dir: dir.path().into(),
+        state_dir: session_state(dir.path()),
         run_dir: dir.path().join("run"),
         core_store_dir: dir.path().join("core"),
     })
@@ -571,7 +642,7 @@ async fn real_wintun_after_kill() {
     let exe = std::path::PathBuf::from(std::env::var_os("ETD_O1_CORE").expect("S2-pinned CI core"));
     let dir = tempfile::tempdir().unwrap();
     let os = adapters(&OsConfig {
-        state_dir: dir.path().into(),
+        state_dir: session_state(dir.path()),
         run_dir: dir.path().join("run"),
         core_store_dir: exe.parent().unwrap().into(),
     })
@@ -681,9 +752,10 @@ async fn real_wintun_after_kill() {
         scope.clone(),
     );
     let reclaimer = |kind| os.reclaimers.iter().find(|r| r.kind() == kind).unwrap();
+    // Live and ours: never uninstalled, listed as a candidate instead.
     assert!(matches!(
         reclaimer(adapter.kind).reclaim(&adapter).await,
-        Err(ReclaimError::Busy(_))
+        Err(ReclaimError::NotDeletable(_))
     ));
     let mut effects = Vec::new();
     for protocol in ["TCP", "UDP", "ICMP", "ALL"] {
@@ -869,7 +941,7 @@ async fn a_disabled_driver_service_without_a_file_is_observed() {
     assert_eq!(std::env::var("CI").as_deref(), Ok("true"));
     let dir = tempfile::tempdir().unwrap();
     let os = adapters(&OsConfig {
-        state_dir: dir.path().into(),
+        state_dir: session_state(dir.path()),
         run_dir: dir.path().join("run"),
         core_store_dir: dir.path().join("core"),
     })
@@ -969,7 +1041,7 @@ async fn a_foreign_program_rule_is_observed_not_an_error() {
     assert_eq!(std::env::var("CI").as_deref(), Ok("true"));
     let dir = tempfile::tempdir().unwrap();
     let os = adapters(&OsConfig {
-        state_dir: dir.path().into(),
+        state_dir: session_state(dir.path()),
         run_dir: dir.path().join("run"),
         core_store_dir: dir.path().join("core"),
     })
@@ -1034,7 +1106,7 @@ fn uninstall_removes_only_the_service_boot_marker() {
     assert_eq!(std::env::var("CI").as_deref(), Ok("true"));
     let dir = tempfile::tempdir().unwrap();
     let config = OsConfig {
-        state_dir: dir.path().into(),
+        state_dir: session_state(dir.path()),
         run_dir: dir.path().join("run"),
         core_store_dir: dir.path().join("core"),
     };

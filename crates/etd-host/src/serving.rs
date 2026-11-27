@@ -8,6 +8,7 @@ use etd_host_core::{
     api::{Command, HostDeps, HostView, orchestrator_channel},
     auth::allow_list::AllowListAuthorizer,
     lifecycle::Orchestrator,
+    negotiate::VersionInterceptor,
     service::{AllowListSink, ContractService},
     stub::host_service_server::HostServiceServer,
 };
@@ -456,7 +457,9 @@ pub(crate) async fn serve_with_deps_and(
     let (stop_server, stop_rx) = oneshot::channel::<()>();
     let mut server = tokio::spawn(
         tonic::transport::Server::builder()
-            .add_service(HostServiceServer::new(svc))
+            // Incompatible version metadata is refused before the body is
+            // decoded; the handlers check it again.
+            .add_service(HostServiceServer::with_interceptor(svc, VersionInterceptor))
             .serve_with_incoming_shutdown(incoming, async {
                 let _ = stop_rx.await;
             }),

@@ -189,8 +189,10 @@ kernel. For each instance a privileged host therefore:
 4. **Falls back** to the kernel's own allow list rejecting every source only if the
    adapter profile states that this configuration was verified for that kernel
    version; the instance then has lifecycle, logs and reclaim only. Otherwise the
-   privileged instance does not start. No current profile marks deny-all as verified,
-   so today an unverifiable fence means no privileged instance. Automatic restarts keep
+   privileged instance does not start: the instance goes "gave up" (fail closed). No
+   current profile marks deny-all as verified, so today every fence failure on a
+   privileged host ends there; the fallback switches on only once a kernel's adapter
+   profile proves the deny-all configuration. Automatic restarts keep
    this verdict; an explicit stop, then start, or `etd-ctl start --retry`, tries a fresh
    fence.
 5. **Removes the fence** only after the kernel is confirmed dead.

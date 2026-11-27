@@ -43,6 +43,19 @@ pub enum ReclaimError {
     Timeout,
     #[error("indeterminate: {0}")]
     Indeterminate(String),
+    /// Proven held by another owner (named here), so not ours to undo now:
+    /// the record becomes a conflict, left in place and reported, and
+    /// closes once the object is gone. Only for a positive proof; an
+    /// unprovable holder is [`ReclaimError::Busy`]. The engine honours it
+    /// only on a record's first reclaim attempt; after an earlier one it is
+    /// a failure like `Busy`.
+    #[error("held by {0}")]
+    HeldBy(String),
+    /// Ours, but this reclaimer never deletes it (the reason is given): the
+    /// record becomes a candidate, listed and never retried towards
+    /// quarantine, and closes once the object is gone.
+    #[error("not deletable: {0}")]
+    NotDeletable(String),
 }
 
 /// Probe, delete, verify for one [`EffectKind`]. Every method is idempotent:

@@ -17,7 +17,7 @@ with default bodies.
 | `CoreDriver` | `identify(binary)`, `profile(core)`, `plan_launch(ctx)`, `attach(endpoint, core)` |
 | `CoreSession` | `wait_ready(deadline)` (full readiness), `query(QueryKind)`, `poll_events(since)` |
 | `CoreDescriptor` | What a binary reports: kernel `version` and upstream `proto_revision` |
-| `AdapterProfile` | One kernel build paired with the adapter's knowledge of it (`id`, `deny_all_verified`) |
+| `AdapterProfile` | One kernel build paired with the adapter's knowledge of it (`id`, `deny_all_verified`: only then may a privileged host fall back to deny-all after a fence failure; otherwise the instance gives up) |
 | `LaunchContext` | Instance, reserved epoch and the persisted `LaunchInputs` (re-exported from `etd-sysfx`) |
 | `LaunchPlan` | `Command`, files to write, `Readiness`, predicted `EffectIntent`s, guard, endpoint, single-writer claims, feature verdicts |
 | `PlannedFile` | A file for the epoch directory; `Debug` prints only its size (it may hold the network secret) |

@@ -22,8 +22,8 @@ ever executed as code.
 | Reclaimers | WFP fence, wintun adapter, interface and program firewall rules, registry values, NRPT rule, Magic DNS recovery, network profile, routes, drivers | TUN, systemd-resolved link, routes, nftables fence | utun, routes, PF fence |
 | Interface credential | adapter LUID + device instance id | interface index + boot id | interface index + boot id |
 | Fence container | WFP provider + sublayer `51e7d002-7bc3-43b9-a795-7b80c196382f` | one nftables table `inet etd_f_<id>_<port>` per fence | PF anchor `com.apple/easytier-desk` |
-| Fence identity rule | permit SYSTEM, block everyone else | reject unless socket uid is 0 | block unless user is 0 |
-| Dropped-privilege probe | process as `NT AUTHORITY\LocalService` | socket created with fsuid 65534 | `sudo -n -u nobody nc -z` |
+| Fence identity rule | service: permit SYSTEM; elevated session: permit SYSTEM and enabled Administrators; block everyone else | reject unless socket uid is 0 | block unless user is 0 |
+| Dropped-privilege probe | service: process as `NT AUTHORITY\LocalService`; elevated session: restricted Medium copy of the host token | socket created with fsuid 65534 | `sudo -n -u nobody nc -z` |
 | Boot id | UUID in a volatile registry key | `/proc/sys/kernel/random/boot_id` | `sysctl kern.bootsessionuuid` |
 | Magic DNS | one upstream recovery record, replayed while no other EasyTier runs | per-link resolve1 settings reverted on the verified link | feature disabled by the planner; `/etc/resolver` untouched |
 | Fence available | always offered (installation needs SYSTEM) | always offered (installation needs root) | only when the host runs as root |
@@ -32,12 +32,37 @@ ever executed as code.
 
 System queries and changes use native APIs (IP Helper, CfgMgr, WFP, registry, SCM) and
 one constant PowerShell script (`system.ps1`) run by `execution.rs` from the system
-directory with a fixed environment; the request is JSON passed in an environment
-variable, never interpolated into script source.
+directory with a fixed environment; requests are JSON lines on its standard input,
+never interpolated into script source.
+
+**Host form.** Derived from the host's own token, never configured: a SYSTEM token is
+the system service; any other elevated token is the elevated session (doc#13), whose
+fence differs (below) and whose user profile, HKCU and environment are untrusted,
+because the same user's non-elevated processes can write them. The script therefore
+turns module autoloading off (`$PSModuleAutoLoadingPreference = 'None'`) and imports
+every module it uses by absolute path under `$PSHOME\Modules` (in every form); the
+worker keeps `-NoProfile` and an explicit environment, and under an elevated host that
+is not SYSTEM `USERPROFILE`, `APPDATA`, `LOCALAPPDATA` and `HOMEDRIVE`/`HOMEPATH` point
+at `<state_dir>\..\profile`, the protected empty directory of the session tree, with
+`PSModuleAnalysisCachePath=NUL`. It is never created here: when it is absent (an
+administrator's command over the service layout) the worker gets no profile variables
+at all, as before; when it is present it must be a plain directory owned by SYSTEM or
+Administrators, with no allow entry that gives anyone else a write right, whose final
+path (links and junctions resolved) is the path itself, or the worker fails closed.
+There is never a fallback to the user's profile.
+
+The .NET Framework runtime also reads its settings from the user's
+`HKCU\Software\Microsoft\.NETFramework`. On the CI runner, profiler settings there
+(`COR_ENABLE_PROFILING`, `COR_PROFILER`, `COR_PROFILER_PATH`) make an elevated
+PowerShell try to load the named DLL. The environment takes precedence, so workers of
+an elevated host that is not SYSTEM run with `COR_ENABLE_PROFILING=0`. This is defence
+in depth, not a fix: other runtime settings in HKCU are not neutralised and the list is
+not closed; replacing PowerShell with native APIs for the session form is the open
+alternative (topic#51).
 
 | Kind | Observed as | Reclaim |
 | --- | --- | --- |
-| `win.tun` | Adapter by name or derived GUID; present only with an IP interface or a live PnP devnode (phantom table rows ignored). Credential `WinAdapter { luid, device_instance_id }` | Never uninstalled: returns `Busy` until the adapter is gone |
+| `win.tun` | Adapter by name or derived GUID; present only with an IP interface or a live PnP devnode (phantom table rows ignored). Credential `WinAdapter { luid, device_instance_id }` | Never uninstalled: a live adapter with our credential answers `NotDeletable`, so the record is a candidate that closes once the adapter is gone (whether it can outlive its creator is spike S2) |
 | `route` | Routes whose interface is the adapter | Verify only: `Busy` while any remain |
 | `win.firewall_rule` | Rule by exact display name and group; credential = rule id. A same-name rule in another group is reported as foreign | Delete by rule id, re-checked in the same script step |
 | `win.program_firewall_rule` | Credential = rule id, name, program path, direction, group (core-binary scope) | Delete only if program, direction and group still match |
@@ -52,18 +77,46 @@ variable, never interpolated into script source.
 EasyTier installation. Before each mutating stage the reclaimer re-reads the record and
 checks that no other EasyTier process runs; the kernel processes of this product are
 recognised by the identity of their opened image file inside the protected kernel
-store, not by a path prefix. Otherwise it returns `Busy` and the engine retries.
+store, not by a path prefix. If every running candidate was read and placed, and one is
+outside the store, the first gate (before any change) answers `HeldBy` with that
+process's name and image, but only while the system still holds every entry the record
+lists (each NRPT rule present, each saved `SearchList` different from its original): an
+earlier replay interrupted part-way leaves the system short of that, so it must finish.
+The engine adds the durable half: it honours `HeldBy` only on the record's first attempt
+(an observation alone cannot tell a value changed and then restored by someone else).
+The record then becomes a conflict, left in place, and closes once the key is gone (the
+other EasyTier's own clean-up removes it). A candidate that cannot be read or placed, a
+failed enumeration, a changed record, a record whose entries are not all in place or
+cannot be read, or a holder that appears once this replay has changed something is
+`Busy`, and the engine retries towards quarantine. A
+conflict is never replayed: if the other EasyTier never used Magic DNS and exits, our
+state stays in the key until the next EasyTier that enables Magic DNS cleans it (our next
+start included) or an administrator keeps the record.
 
 **Fence.** Key = UUIDv5(sublayer, `instance:epoch:port`). `install` adds, in one WFP
-transaction, four persistent filters at `ALE_AUTH_CONNECT` (IPv4 and IPv6 × permit and
-block) for TCP to `127.0.0.1` / `::1` on the port: permit when the connecting user
-matches SYSTEM, block otherwise. Filters and containers carry a SYSTEM/Administrators
-security descriptor, and a container whose ACL admits an ordinary user is never treated
-as exclusive. A port that is already fenced is refused. `verify` requires all four
-filters before and after, exactly one listener on the exact address owned by the
-expected pid (a wildcard listener is rejected), a successful host connection, and a
-refusal (`WSAEACCES`) from a PowerShell probe started with `LogonUserW` as LocalService
-(no stored password).
+transaction, four filters at `ALE_AUTH_CONNECT` (IPv4 and IPv6 × permit and block) for
+TCP to `127.0.0.1` / `::1` on the port: permit when the connecting token matches the
+form's `ALE_USER_ID` descriptor, block otherwise. Filters and containers carry a
+SYSTEM/Administrators security descriptor, and a container whose ACL admits an
+ordinary user is never treated as exclusive. A port that is already fenced is refused.
+`verify` requires all four filters, of the verifying host's own form, before and after
+(absent either time is `Missing`), exactly one listener on the exact address owned by
+the expected pid (a wildcard listener is rejected), a successful host connection, and a
+refusal (`WSAEACCES`) seen by a probe of the form's unprivileged identity.
+
+| | System service (SYSTEM token) | Elevated session (other elevated token) |
+| --- | --- | --- |
+| Permit descriptor | `D:P(A;;0x1;;;SY)` | `D:P(A;;0x1;;;SY)(A;;0x1;;;BA)`: Administrators matches only where the group is enabled, so SYSTEM and elevated administrators; never the user SID or a group a non-elevated token has enabled |
+| Filters, provider, sublayer | persistent; owner SYSTEM | non-persistent, in a non-dynamic engine session: they outlive the host until BFE stops; owner Administrators |
+| Ledger persistence | `Persistent` | `UntilReboot`: the next start closes the record by boot id; a BFE restart while running is caught by the runtime fence re-verification (all filters missing) |
+| Negative probe | PowerShell started with `LogonUserW` as LocalService (no stored password); the script exits unless it runs as `S-1-5-19` | No child process: a dedicated host thread impersonates (`SetThreadToken`, `SecurityImpersonation`) a restricted copy of the host token (Administrators deny-only, minimal privileges, Medium integrity), checks that its effective token is that user with Administrators deny-only at Medium, then creates, binds and connects a socket in separate steps (only the connect's `WSAEACCES` is a refusal; any earlier failure is an error), and reverts. The probe's application id is `etd-host.exe`: a third-party filter keyed on another executable is outside what it represents. A child of the same user could be ended by any of the user's processes with the "refused" exit code; a thread of the elevated host cannot be reached that way |
+
+An existing fence is read back as exactly one of the two shapes (persistence flag and
+permit descriptor must agree, and all four filters must have the same form), whichever
+form installed it, so either host can reclaim the other's records, but only a fence of
+the verifying host's form verifies. Installing requires the container to have the
+installing form's persistence; an empty container of the other form (no filter at all
+in the sublayer) is deleted and recreated.
 
 **Boot id.** A random UUID stored as `BootId` in the volatile key
 `HKLM\SOFTWARE\EasyTierDesk\Volatile` (proven volatile, ACL SYSTEM + Administrators)
@@ -76,8 +129,8 @@ record and the wintun / WinDivert drivers (candidates only).
 
 **Not reclaimed.** The wintun adapter and routes are verified, never deleted. Drivers
 are product scope; the reclaimer probes them but has no removal path. The UPnP mapping
-is record-only. A registry value someone else changed is left as is. Magic DNS waits
-while another EasyTier process runs.
+is record-only. A registry value someone else changed is left as is. Magic DNS is left
+in place, as a conflict, while another EasyTier process runs.
 
 ## Linux
 
@@ -177,7 +230,7 @@ a developer machine.
 
 | Platform | Test files | Workflow |
 | --- | --- | --- |
-| Windows | `windows_reclaim.rs`: volatile boot marker, network profile and signature cleanup, registry + NRPT + Magic DNS recovery, firewall reclaim and same-name conflict, real wintun after a kill (`ETD_O1_CORE`, the bundled v2.7.1 release kernel from `cargo xtask fetch-cores`). `windows_fence.rs`: WFP fence as LocalSystem (scheduled task) with a second local account as the denied client | `.github/workflows/o1-windows.yml` (also clippy and unprivileged lib tests) |
+| Windows | `windows_reclaim.rs`: volatile boot marker, network profile and signature cleanup, registry + NRPT + Magic DNS recovery, firewall reclaim and same-name conflict, real wintun after a kill (`ETD_O1_CORE`, the bundled v2.7.1 release kernel from `cargo xtask fetch-cores`). `windows_fence.rs`: WFP fence as LocalSystem (scheduled task) with a second local account as the denied client, and the elevated session fence as the runner's administrator (non-persistent filters, restricted Medium copy refused while the listener is up). `windows_session_inputs.rs` (feature `ci-test-fixtures`): a planted personal module, a poisoned module analysis cache and HKCU .NET profiler settings (event 1022 for a worker-like control, none for the workers) do not reach the workers of an elevated host that is not SYSTEM, whose environment holds only the explicit variables | `.github/workflows/o1-windows.yml` (also clippy and unprivileged lib tests) |
 | Linux | `linux_reclaim.rs`: real link, route and resolve1, plus runs without resolved and without a system bus. `linux_fence.rs`: fence survives host death, second account, kernel-store image check | `.github/workflows/o2-linux.yml`; it also parses Debian 12 and Fedora 44 `nft` output with the lib's ignored fixture tests and checks the pinned kernel's TUN capability as root, with `CAP_NET_ADMIN`, and without |
 | macOS | `macos_reclaim.rs` (utun ownership, verify-only reclaim, unnamed utun records), `macos_fence.rs` (PF fence, host death, second account), `macos_resolver.rs` (rejected Magic DNS keeps foreign resolvers), lib test `missing_image_preserves_foreign_identity` | `.github/workflows/o3-macos.yml` (also the `etd-host` install roundtrip) |
 | all | `service/**` through `etd-host`'s `install_roundtrip` | `.github/workflows/ci.yml` job `privileged-install`; job `check` runs the unprivileged tests on all three systems |

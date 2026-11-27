@@ -249,8 +249,9 @@ an installation it did not make.
 `reclaim` opens the ledger under the singleton lock (plus the maintenance lock in
 service mode) and runs `reclaim_all`: scope `Instances`, or `Everything` with
 `--purge` (which first commits a `PurgeAll`). It prints the report and fails with
-"reclaim incomplete" if anything remains. `--purge` requires `--all`; the scope
-otherwise does not depend on `--all`.
+"reclaim incomplete" if anything remains. `--all` is the required explicit switch
+for `--purge` (`reclaim --all --purge`, as the uninstaller calls it); without
+`--purge` it changes nothing, and every instance is reclaimed either way.
 
 `remove-core <version>` runs `ReclaimEngine::reclaim_core` for the kernel's SHA-256,
 requires no candidates, conflicts or open core-binary records, clears the selected

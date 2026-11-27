@@ -1,6 +1,24 @@
 //! One protected PowerShell execution environment. The management script is
 //! constant; only JSON requests reach it, one per line on its standard input.
-use super::{WinError, encoded_command};
+//!
+//! The environment is explicit, never inherited. Under an elevated host that
+//! is not SYSTEM (the elevated session) every user profile, HKCU and
+//! environment input is untrusted (doc#13#untrusted): the profile variables
+//! point at the protected, empty profile directory of the session tree,
+//! the script imports its modules by absolute path with autoloading off,
+//! and the CLR profiler is switched off in the environment.
+//!
+//! The last is defence in depth, not a fix: the .NET Framework runtime also
+//! reads its settings from the user's HKCU\Software\Microsoft\.NETFramework,
+//! which the user's non-elevated processes can write. The environment takes
+//! precedence, which neutralises the profiler (shown on the CI runner: with
+//! the HKCU profiler settings an elevated PowerShell tries to load the
+//! profiler DLL, with COR_ENABLE_PROFILING=0 it does not). Other runtime
+//! settings in HKCU are not neutralised; that list is not closed.
+use super::{
+    WinError, encoded_command,
+    token::{self, HostToken},
+};
 use serde_json::Value;
 use std::os::windows::io::AsRawHandle;
 use std::{
@@ -10,10 +28,246 @@ use std::{
         ffi::{OsStrExt, OsStringExt},
         process::CommandExt,
     },
-    path::PathBuf,
+    path::{Component, Path, PathBuf, Prefix},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
+
+/// The protected directory the children of an elevated non-SYSTEM host get
+/// as their profile; set by `adapters()`.
+static WORKER_PROFILE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+pub(super) fn set_worker_profile(profile: Option<PathBuf>) {
+    *WORKER_PROFILE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = profile;
+}
+
+/// FILE_ATTRIBUTE_REPARSE_POINT.
+const REPARSE_POINT: u32 = 0x400;
+
+/// Access rights that let a principal change a directory, its security or
+/// its entries: FILE_WRITE_DATA (add file), FILE_APPEND_DATA (add
+/// subdirectory), FILE_WRITE_EA, FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES,
+/// DELETE, WRITE_DAC, WRITE_OWNER, GENERIC_ALL, GENERIC_WRITE.
+const WRITE_RIGHTS: u32 = 0x0002
+    | 0x0004
+    | 0x0010
+    | 0x0040
+    | 0x0100
+    | 0x0001_0000
+    | 0x0004_0000
+    | 0x0008_0000
+    | 0x1000_0000
+    | 0x4000_0000;
+
+/// The protection of `path`: whether its owner is SYSTEM or Administrators
+/// (a non-elevated process cannot arrange that), and whether its DACL lets
+/// only SYSTEM and Administrators write (else the entry that does not).
+/// Any allow entry with a write right
+/// for another principal, a null DACL or an entry of another type refuses.
+fn protection(path: &Path) -> Result<(bool, Option<String>), WinError> {
+    use ::windows::{
+        Win32::{
+            Foundation::{HLOCAL, LocalFree},
+            Security::{
+                ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
+                Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
+                DACL_SECURITY_INFORMATION, GetAce, IsValidSid, IsWellKnownSid,
+                OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+                WinBuiltinAdministratorsSid, WinLocalSystemSid,
+            },
+        },
+        core::HSTRING,
+    };
+    let mut owner = PSID::default();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: the out pointers are valid; the owner SID and the DACL point
+    // into the descriptor the call allocates, freed after their last use.
+    unsafe {
+        GetNamedSecurityInfoW(
+            &HSTRING::from(path.as_os_str()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            Some(&mut dacl),
+            None,
+            &mut descriptor,
+        )
+        .ok()
+        .map_err(WinError::windows)?;
+        let privileged = |sid: PSID| {
+            IsWellKnownSid(sid, WinLocalSystemSid).as_bool()
+                || IsWellKnownSid(sid, WinBuiltinAdministratorsSid).as_bool()
+        };
+        let owner_privileged = !owner.0.is_null() && privileged(owner);
+        let mut violation = dacl.is_null().then(|| "no DACL".to_owned());
+        if violation.is_none() {
+            for index in 0..(*dacl).AceCount as u32 {
+                let mut ace = std::ptr::null_mut();
+                if GetAce(dacl, index, &mut ace).is_err() {
+                    violation = Some(format!("entry {index} unreadable"));
+                    break;
+                }
+                let header = ace.cast::<ACE_HEADER>().read_unaligned();
+                match header.AceType {
+                    // ACCESS_DENIED: never grants anything.
+                    1 => {}
+                    // ACCESS_ALLOWED: write rights only for SYSTEM and
+                    // Administrators.
+                    0 if usize::from(header.AceSize) >= size_of::<ACCESS_ALLOWED_ACE>() => {
+                        let allowed = ace.cast::<ACCESS_ALLOWED_ACE>().read_unaligned();
+                        let sid = PSID(
+                            ace.cast::<u8>()
+                                .add(std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart))
+                                .cast(),
+                        );
+                        if !IsValidSid(sid).as_bool() {
+                            violation = Some(format!("entry {index} has an invalid SID"));
+                            break;
+                        }
+                        if allowed.Mask & WRITE_RIGHTS != 0 && !privileged(sid) {
+                            violation = Some(format!(
+                                "entry {index} allows {:#x} to {}",
+                                allowed.Mask,
+                                super::token::sid_string(sid)
+                                    .unwrap_or_else(|_| "an unreadable SID".into())
+                            ));
+                            break;
+                        }
+                    }
+                    other => {
+                        violation = Some(format!("entry {index} has type {other}"));
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+        Ok((owner_privileged, violation))
+    }
+}
+
+/// Whether `path` is owned by SYSTEM or Administrators.
+#[cfg(test)]
+fn privileged_owner(path: &Path) -> Result<bool, WinError> {
+    Ok(protection(path)?.0)
+}
+
+/// `path` without a `\\?\` prefix, for comparing paths.
+fn plain(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned()
+}
+
+/// `path` with every short (8.3) component expanded. Links and junctions
+/// are not followed.
+fn long_path(path: &Path) -> Result<PathBuf, WinError> {
+    use ::windows::{Win32::Storage::FileSystem::GetLongPathNameW, core::HSTRING};
+    use std::os::windows::ffi::OsStringExt;
+    let wide = HSTRING::from(path.as_os_str());
+    let mut buffer = vec![0u16; 512];
+    loop {
+        // SAFETY: `wide` is NUL-terminated; the buffer is writable for its
+        // length.
+        let n = unsafe { GetLongPathNameW(&wide, Some(&mut buffer)) } as usize;
+        if n == 0 {
+            return Err(WinError::windows(::windows::core::Error::from_thread()));
+        }
+        if n < buffer.len() {
+            return Ok(PathBuf::from(OsString::from_wide(&buffer[..n])));
+        }
+        buffer.resize(n, 0);
+    }
+}
+
+/// The protected profile directory, or why it is refused: a plain
+/// directory owned by SYSTEM or Administrators whose DACL lets no one else
+/// write, and whose final path (all links and junctions resolved) is the
+/// path itself, so no ancestor redirects it.
+fn protected_profile_vars(profile: &Path) -> Result<Vec<(OsString, OsString)>, WinError> {
+    let vars = profile_vars(profile)?;
+    let refused = |why: &str| {
+        WinError::invalid(format!(
+            "worker profile directory {}: {why}",
+            profile.display()
+        ))
+    };
+    let (owner, violation) = protection(profile)?;
+    if !owner {
+        return Err(refused("not owned by SYSTEM or Administrators"));
+    }
+    if let Some(violation) = violation {
+        return Err(refused(&format!(
+            "writable by others than SYSTEM and Administrators ({violation})"
+        )));
+    }
+    let resolved = std::fs::canonicalize(profile).map_err(|e| refused(&e.to_string()))?;
+    // Short (8.3) names are aliases, not links: compare long forms.
+    let long = long_path(profile).map_err(|e| refused(&e.message))?;
+    if !plain(&resolved).eq_ignore_ascii_case(&plain(&long)) {
+        return Err(refused(&format!(
+            "resolves to {} (a link or junction on the path)",
+            resolved.display()
+        )));
+    }
+    Ok(vars)
+}
+
+/// The profile variables pointing at `profile`, which must be an existing
+/// plain directory (not a reparse point) on an absolute drive path. It is
+/// neither created nor repaired here; the composition root made and
+/// verified it. The module analysis cache is turned off (an invalid path,
+/// as documented in about_Environment_Variables) rather than redirected.
+fn profile_vars(profile: &Path) -> Result<Vec<(OsString, OsString)>, WinError> {
+    use std::os::windows::fs::MetadataExt;
+    let refused = |why: &str| {
+        WinError::invalid(format!(
+            "worker profile directory {}: {why}",
+            profile.display()
+        ))
+    };
+    let mut components = profile.components();
+    let drive = match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+                format!("{}:", char::from(letter))
+            }
+            _ => return Err(refused("not on a drive path")),
+        },
+        _ => return Err(refused("not absolute")),
+    };
+    if components.next() != Some(Component::RootDir) {
+        return Err(refused("not absolute"));
+    }
+    let mut rest = PathBuf::new();
+    for component in components {
+        match component {
+            Component::Normal(name) => rest.push(name),
+            _ => return Err(refused("not a normalised path")),
+        }
+    }
+    if rest.as_os_str().is_empty() {
+        return Err(refused("a drive root"));
+    }
+    let metadata = std::fs::symlink_metadata(profile).map_err(|e| refused(&e.to_string()))?;
+    if !metadata.is_dir() || metadata.file_attributes() & REPARSE_POINT != 0 {
+        return Err(refused("not a plain directory"));
+    }
+    let full = PathBuf::from(format!("{drive}\\")).join(&rest);
+    let mut home = OsString::from("\\");
+    home.push(rest.as_os_str());
+    Ok(vec![
+        ("APPDATA".into(), full.clone().into_os_string()),
+        ("HOMEDRIVE".into(), drive.into()),
+        ("HOMEPATH".into(), home),
+        ("LOCALAPPDATA".into(), full.clone().into_os_string()),
+        ("PSModuleAnalysisCachePath".into(), "NUL".into()),
+        ("USERPROFILE".into(), full.into_os_string()),
+    ])
+}
 
 pub(super) struct Environment {
     pub exe: PathBuf,
@@ -22,6 +276,9 @@ pub(super) struct Environment {
 }
 impl Environment {
     pub fn new() -> Result<Self, WinError> {
+        Self::for_host(token::host_token()?)
+    }
+    fn for_host(host: HostToken) -> Result<Self, WinError> {
         let mut buf = [0u16; 32768];
         let n = unsafe {
             ::windows::Win32::System::SystemInformation::GetSystemDirectoryW(Some(&mut buf))
@@ -36,7 +293,7 @@ impl Environment {
         let ps = cwd.join("WindowsPowerShell/v1.0");
         let path =
             std::env::join_paths([&cwd, &ps]).map_err(|e| WinError::invalid(e.to_string()))?;
-        let vars = vec![
+        let mut vars: Vec<(OsString, OsString)> = vec![
             ("ComSpec".into(), cwd.join("cmd.exe").into_os_string()),
             ("Path".into(), path),
             ("PSModulePath".into(), ps.join("Modules").into_os_string()),
@@ -45,6 +302,33 @@ impl Environment {
             ("TMP".into(), root.join("Temp").into_os_string()),
             ("windir".into(), root.as_os_str().to_owned()),
         ];
+        if host == HostToken::Elevated {
+            vars.push(("COR_ENABLE_PROFILING".into(), "0".into()));
+            let profile = WORKER_PROFILE
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(profile) = profile {
+                match std::fs::symlink_metadata(&profile) {
+                    // No session tree. Meant only for an elevated
+                    // administrator's command over the service layout (for
+                    // example `etd-host uninstall`): no profile variables
+                    // at all, as before; never the user's own profile. The
+                    // elevated session host never gets here: it refuses to
+                    // start, before adapters(), unless <SID>\profile exists
+                    // and passes verify_tree (ES3, topic#51 msg#1722).
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    // Present: it must be the protected directory, or fail
+                    // closed. A non-elevated process cannot make a
+                    // directory owned by SYSTEM or Administrators.
+                    _ => {
+                        vars.extend(protected_profile_vars(&profile)?);
+                    }
+                }
+            }
+        }
+        // The block for CreateProcessAsUserW must be sorted.
+        vars.sort_by_key(|(name, _)| name.to_ascii_uppercase());
         Ok(Self {
             exe: ps.join("powershell.exe"),
             cwd,
@@ -72,6 +356,19 @@ impl Environment {
             .creation_flags(0x08000000);
         cmd
     }
+}
+
+/// The management script as it is sent: without whole-line comments,
+/// indentation and blank lines, none of which PowerShell needs (the script
+/// has no here-strings or line continuations). The encoded command line is
+/// limited to 32767 characters.
+fn script() -> String {
+    include_str!("system.ps1")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn io_error(e: std::io::Error) -> WinError {
@@ -288,7 +585,7 @@ impl Worker {
             "-NoProfile",
             "-NonInteractive",
             "-EncodedCommand",
-            &encoded_command(include_str!("system.ps1")),
+            &encoded_command(&script()),
         ])
         .env("ETD_OS_SERVE", "1")
         .stdin(Stdio::piped())
@@ -575,6 +872,12 @@ fn checkin(worker: Option<Worker>) {
 }
 
 pub fn run(request: Value) -> Result<Vec<Value>, WinError> {
+    // The script's diagnostics report exists for the CI fixtures only.
+    if !cfg!(feature = "ci-test-fixtures") && request["op"] == "diagnostics" {
+        return Err(WinError::invalid(
+            "the diagnostics request is only for CI fixtures",
+        ));
+    }
     // One retry, only for a request that never reached a reused worker
     // (it died while idle): delivering it to a fresh one is safe.
     let mut retried = false;
@@ -688,7 +991,98 @@ fn settle(deadline: Instant) -> Result<(), WinError> {
 mod tests {
     use super::*;
 
+    /// Workers of an elevated test process (the CI runner) need a profile
+    /// directory, as under the elevated session host.
+    fn test_profile() {
+        static PROFILE: std::sync::OnceLock<(tempfile::TempDir, PathBuf)> =
+            std::sync::OnceLock::new();
+        let (_, path) = PROFILE.get_or_init(protected_dir);
+        set_worker_profile(Some(path.clone()));
+    }
+
+    /// Replace the DACL of `path` with the one in `sddl`, not inherited.
+    fn set_dacl(path: &Path, sddl: &str) {
+        use ::windows::{
+            Win32::{
+                Foundation::{HLOCAL, LocalFree},
+                Security::{
+                    Authorization::{
+                        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+                        SE_FILE_OBJECT, SetNamedSecurityInfoW,
+                    },
+                    DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
+                    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+                },
+            },
+            core::HSTRING,
+        };
+        unsafe {
+            let mut sd = PSECURITY_DESCRIPTOR::default();
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                &HSTRING::from(sddl),
+                SDDL_REVISION_1,
+                &mut sd,
+                None,
+            )
+            .unwrap();
+            let mut present = false.into();
+            let mut defaulted = false.into();
+            let mut dacl = std::ptr::null_mut();
+            GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted).unwrap();
+            SetNamedSecurityInfoW(
+                &HSTRING::from(path.as_os_str()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(dacl),
+                None,
+            )
+            .ok()
+            .unwrap();
+            let _ = LocalFree(Some(HLOCAL(sd.0)));
+        }
+    }
+
+    /// A temporary directory under its final path, with the session tree's
+    /// DACL (SYSTEM and Administrators only) when this process is elevated:
+    /// only then is it owned by Administrators and can keep access.
+    fn protected_dir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = PathBuf::from(plain(&std::fs::canonicalize(dir.path()).unwrap()));
+        if privileged_owner(&path).unwrap() {
+            set_dacl(&path, "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
+        }
+        (dir, path)
+    }
+
+    #[test]
+    fn only_system_and_administrators_may_write_a_protected_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        // The owner keeps READ_CONTROL and WRITE_DAC whatever the DACL.
+        for (sddl, writes) in [
+            ("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", true),
+            (
+                "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)",
+                true,
+            ),
+            ("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(D;OICI;FA;;;WD)", true),
+            ("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)", false),
+            ("D:P(A;OICI;FA;;;SY)(A;OICI;0x2;;;BU)", false),
+            ("D:P(A;OICI;FA;;;SY)(A;OICI;GW;;;AU)", false),
+        ] {
+            set_dacl(dir.path(), sddl);
+            assert_eq!(
+                protection(dir.path()).unwrap().1.is_none(),
+                writes,
+                "{sddl}"
+            );
+        }
+        set_dacl(dir.path(), "D:P(A;OICI;FA;;;OW)");
+    }
+
     fn fresh() -> Worker {
+        test_profile();
         let job = Job::new().unwrap();
         let worker = Worker::spawn(&job, u64::MAX).unwrap();
         // The test keeps the job alive by leaking it with the worker.
@@ -765,6 +1159,7 @@ mod tests {
     // closes it for good.
     #[test]
     fn shutdown_ends_every_worker_and_admits_no_more() {
+        test_profile();
         assert_eq!(run(serde_json::json!({"op":"magic"})).unwrap().len(), 1);
         let job = pool().job.clone().expect("a job for the first worker");
         assert!(job.active().unwrap() > 0, "the idle worker runs in the job");
@@ -837,6 +1232,122 @@ mod tests {
         ));
         assert!(started.elapsed() < DEADLINE);
         worker.end();
+    }
+
+    fn value<'a>(vars: &'a [(OsString, OsString)], name: &str) -> Option<&'a OsString> {
+        vars.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+    }
+
+    #[test]
+    fn profile_variables_point_at_the_profile_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let vars = profile_vars(dir.path()).unwrap();
+        for name in ["USERPROFILE", "APPDATA", "LOCALAPPDATA"] {
+            assert_eq!(Path::new(value(&vars, name).unwrap()), dir.path(), "{name}");
+        }
+        let mut home = value(&vars, "HOMEDRIVE").unwrap().clone();
+        home.push(value(&vars, "HOMEPATH").unwrap());
+        assert_eq!(Path::new(&home), dir.path());
+        assert_eq!(value(&vars, "PSModuleAnalysisCachePath").unwrap(), "NUL");
+        assert_eq!(vars.len(), 6);
+    }
+
+    #[test]
+    fn a_profile_that_is_not_a_plain_absolute_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        for refused in [
+            dir.path().join("missing"),
+            file,
+            dir.path().join("..").join(dir.path().file_name().unwrap()),
+            PathBuf::from(r"relative\profile"),
+            PathBuf::from(r"\profile"),
+            PathBuf::from(r"C:\"),
+            PathBuf::from(r"\\server\share\profile"),
+        ] {
+            assert!(profile_vars(&refused).is_err(), "{}", refused.display());
+        }
+    }
+
+    #[test]
+    fn only_an_elevated_host_that_is_not_system_redirects() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        // No session tree: no profile variables, the profiler still off.
+        for profile in [None, Some(dir.path().join("missing"))] {
+            set_worker_profile(profile);
+            let environment = Environment::for_host(HostToken::Elevated).unwrap();
+            assert!(value(&environment.vars, "USERPROFILE").is_none());
+            assert_eq!(
+                value(&environment.vars, "COR_ENABLE_PROFILING").unwrap(),
+                "0"
+            );
+        }
+        // Present but not a plain directory: fail closed.
+        set_worker_profile(Some(file));
+        assert!(Environment::for_host(HostToken::Elevated).is_err());
+        // Neither SYSTEM nor a standard host changes its environment.
+        set_worker_profile(Some(dir.path().to_owned()));
+        for host in [HostToken::System, HostToken::Standard] {
+            let environment = Environment::for_host(host).unwrap();
+            assert!(
+                value(&environment.vars, "USERPROFILE").is_none(),
+                "{host:?}"
+            );
+            assert!(
+                value(&environment.vars, "COR_ENABLE_PROFILING").is_none(),
+                "{host:?}"
+            );
+        }
+        // A directory an elevated process created is owned by
+        // Administrators; a standard user's is not, and is refused.
+        let result = Environment::for_host(HostToken::Elevated);
+        if privileged_owner(dir.path()).unwrap() {
+            // Owned by Administrators but writable by the user (the
+            // inherited temp DACL): refused.
+            let refused = result.err().unwrap();
+            assert!(refused.message.contains("writable"), "{}", refused.message);
+            let (_protected, path) = protected_dir();
+            set_worker_profile(Some(path.clone()));
+            let environment = Environment::for_host(HostToken::Elevated).unwrap();
+            assert_eq!(
+                Path::new(value(&environment.vars, "USERPROFILE").unwrap()),
+                path
+            );
+            let names: Vec<_> = environment
+                .vars
+                .iter()
+                .map(|(name, _)| name.to_ascii_uppercase())
+                .collect();
+            assert!(names.is_sorted(), "{names:?}");
+        } else {
+            assert!(result.err().unwrap().message.contains("not owned"));
+        }
+    }
+
+    #[test]
+    fn the_encoded_script_fits_a_command_line() {
+        let raw = include_str!("system.ps1");
+        // Trimming lines is only safe without here-strings and continuations.
+        assert!(!raw.contains("@\"") && !raw.contains("@'"));
+        assert!(raw.lines().all(|line| !line.trim_end().ends_with('`')));
+        // 32767 characters, less the executable path and the other arguments.
+        let encoded = encoded_command(&script()).len();
+        assert!(encoded < 30_000, "{encoded}");
+        assert!(script().starts_with("$PSModuleAutoLoadingPreference = 'None'"));
+    }
+
+    #[cfg(not(feature = "ci-test-fixtures"))]
+    #[test]
+    fn the_diagnostics_request_is_refused_without_the_ci_fixtures() {
+        let refused = run(serde_json::json!({"op": "diagnostics"})).unwrap_err();
+        assert!(
+            refused.message.contains("CI fixtures"),
+            "{}",
+            refused.message
+        );
     }
 
     #[test]

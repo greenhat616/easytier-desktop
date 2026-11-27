@@ -290,7 +290,7 @@ fn machine_descriptor(sd: PSECURITY_DESCRIPTOR, label: &str) -> Result<(), WinEr
             .map_err(WinError::windows)?;
         GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted).map_err(WinError::windows)?;
         if !present.as_bool()
-            || !trusted_acl(dacl, false)?
+            || !trusted_acl(dacl)?
             || owner.0.is_null()
             || !(IsWellKnownSid(owner, WinLocalSystemSid).as_bool()
                 || IsWellKnownSid(owner, WinBuiltinAdministratorsSid).as_bool())

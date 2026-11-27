@@ -31,7 +31,7 @@ use ::windows::{
     },
     core::{HSTRING, PWSTR},
 };
-use etd_sysfx::Reclaimed;
+use etd_sysfx::{ReclaimError, Reclaimed};
 use std::{
     os::windows::ffi::OsStringExt,
     path::{Path, PathBuf},
@@ -42,6 +42,34 @@ const MAGIC: &str = r"SOFTWARE\EasyTier\MagicDNS";
 const NRPT: &str = r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig";
 fn busy(message: impl std::fmt::Display) -> WinError {
     WinError::invalid(format!("BUSY: {message}"))
+}
+/// Why a replay did not finish.
+pub(super) enum ReplayError {
+    /// Proven held by another EasyTier (named), with nothing replayed yet.
+    HeldBy(String),
+    Win(WinError),
+}
+impl From<WinError> for ReplayError {
+    fn from(e: WinError) -> Self {
+        Self::Win(e)
+    }
+}
+impl ReplayError {
+    pub(super) fn reclaim(self) -> ReclaimError {
+        match self {
+            Self::HeldBy(holder) => ReclaimError::HeldBy(holder),
+            Self::Win(e) => e.reclaim(),
+        }
+    }
+}
+
+/// What the process gate found.
+#[derive(Debug, PartialEq, Eq)]
+enum Gate {
+    /// No EasyTier process outside the kernel store runs.
+    Clear,
+    /// Every candidate was proven, and this one runs outside the store.
+    External(String),
 }
 
 #[derive(PartialEq, Eq)]
@@ -187,12 +215,16 @@ fn candidates() -> Result<Vec<CandidateImage>, WinError> {
     Ok(out)
 }
 
-fn gate_candidates(root: &Path, items: Vec<CandidateImage>) -> Result<(), WinError> {
+fn gate_candidates(root: &Path, items: Vec<CandidateImage>) -> Result<Gate, WinError> {
     let (_root_handle, root_id, _, is_dir) =
         open_identity(root).map_err(|e| busy(format!("core store identity unavailable: {e}")))?;
     if !is_dir {
         return Err(busy("core store is not a directory"));
     }
+    // An external process is a proven holder only once every candidate is
+    // proven: any candidate that cannot be read or placed stays Busy, even
+    // beside a proven external one.
+    let mut external = None;
     for (name, path) in items {
         let path = path.map_err(|e| busy(format!("cannot read candidate {name}: {e}")))?;
         if !inside_store(&root_id, &path).map_err(|e| {
@@ -200,12 +232,15 @@ fn gate_candidates(root: &Path, items: Vec<CandidateImage>) -> Result<(), WinErr
                 "cannot prove candidate {name} is in core store: {e}"
             ))
         })? {
-            return Err(busy(format!("external EasyTier process {name}")));
+            external.get_or_insert_with(|| format!("{name} image {}", path.display()));
         }
     }
-    Ok(())
+    Ok(match external {
+        Some(holder) => Gate::External(format!("external EasyTier process {holder}")),
+        None => Gate::Clear,
+    })
 }
-fn gate(root: &Path) -> Result<(), WinError> {
+fn gate(root: &Path) -> Result<Gate, WinError> {
     gate_candidates(
         root,
         candidates().map_err(|e| busy(format!("cannot enumerate processes: {e}")))?,
@@ -294,25 +329,88 @@ fn load() -> Result<Option<Recovery>, WinError> {
     saved.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Some(Recovery { ids, saved }))
 }
-fn confirm(root: &Path, expected: &Recovery) -> Result<(), WinError> {
-    gate(root)?;
+fn confirm(root: &Path, expected: &Recovery) -> Result<Gate, WinError> {
+    let gate = gate(root)?;
     if load()?.as_ref() != Some(expected) {
         return Err(busy("Magic DNS recovery record changed during replay"));
     }
-    Ok(())
+    Ok(gate)
 }
-pub(super) fn replay(root: &Path) -> Result<Reclaimed, WinError> {
+/// A gate after this replay changed something: an external holder does not
+/// make the rest someone else's, so retry (Busy) to finish it.
+fn confirm_clear(root: &Path, expected: &Recovery) -> Result<(), WinError> {
+    match confirm(root, expected)? {
+        Gate::Clear => Ok(()),
+        Gate::External(holder) => Err(busy(format!("{holder} started during the replay"))),
+    }
+}
+/// The verdict of the first gate. An external holder is `HeldBy` only with
+/// durable proof that no replay, in this call or an earlier one, changed
+/// anything yet: the system still holds every entry the record says was
+/// applied. Anything else, or anything uncertain, is Busy.
+fn first_gate(
+    gate: Gate,
+    untouched: impl FnOnce() -> Result<bool, WinError>,
+) -> Result<(), ReplayError> {
+    match gate {
+        Gate::Clear => Ok(()),
+        Gate::External(holder) => match untouched() {
+            Ok(true) => Err(ReplayError::HeldBy(holder)),
+            Ok(false) => Err(busy(format!(
+                "{holder}; an earlier replay may have changed this record's state"
+            ))
+            .into()),
+            Err(e) => Err(busy(format!("{holder}; cannot read this record's state: {e}")).into()),
+        },
+    }
+}
+/// Whether the system still holds every entry the record says was applied:
+/// each listed NRPT rule present, and each saved `SearchList` different from
+/// its original (the replay writes exactly the original). `nrpt_rule`:
+/// whether the rule's key exists. `search_list`: `None` if the interface
+/// key is gone, else its `SearchList` value.
+fn untouched_by(
+    recovery: &Recovery,
+    nrpt_rule: impl Fn(&str) -> Result<bool, WinError>,
+    search_list: impl Fn(&str) -> Result<Option<Option<RawValue>>, WinError>,
+) -> Result<bool, WinError> {
+    for id in &recovery.ids {
+        if !nrpt_rule(id)? {
+            return Ok(false);
+        }
+    }
+    for saved in &recovery.saved {
+        match search_list(&saved.path)? {
+            Some(now) if now != saved.original => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+fn untouched(recovery: &Recovery) -> Result<bool, WinError> {
+    untouched_by(
+        recovery,
+        |id| Ok(Key::open(HKEY_LOCAL_MACHINE, &format!(r"{NRPT}\{id}"), KEY_READ)?.is_some()),
+        |path| {
+            Key::open(HKEY_LOCAL_MACHINE, path, KEY_READ)?
+                .map(|key| key.read("SearchList"))
+                .transpose()
+        },
+    )
+}
+pub(super) fn replay(root: &Path) -> Result<Reclaimed, ReplayError> {
     let Some(recovery) = load()? else {
         return Ok(Reclaimed::AlreadyAbsent);
     };
-    // Gate and re-read the record directly before EACH mutating stage.
-    confirm(root, &recovery)?;
+    // Gate and re-read the record directly before EACH mutating stage. Only
+    // the first gate, before any change, may answer HeldBy.
+    first_gate(confirm(root, &recovery)?, || untouched(&recovery))?;
     if let Some(nrpt) = Key::open(HKEY_LOCAL_MACHINE, NRPT, KEY_READ | KEY_WRITE)? {
         for id in &recovery.ids {
             nrpt.delete_child(id)?;
         }
     }
-    confirm(root, &recovery)?;
+    confirm_clear(root, &recovery)?;
     for saved in &recovery.saved {
         if let Some(target) = Key::open(HKEY_LOCAL_MACHINE, &saved.path, KEY_READ | KEY_SET_VALUE)?
         {
@@ -322,7 +420,7 @@ pub(super) fn replay(root: &Path) -> Result<Reclaimed, WinError> {
             }
         }
     }
-    confirm(root, &recovery)?;
+    confirm_clear(root, &recovery)?;
     delete_key(HKEY_LOCAL_MACHINE, MAGIC, true)?;
     Ok(Reclaimed::Removed)
 }
@@ -338,17 +436,30 @@ mod tests {
         let own = root.join("easytier-core.exe");
         std::fs::write(&own, b"fixture").unwrap();
         let alias = root.join("..").join("core").join("easytier-core.exe");
-        assert!(gate_candidates(&root, vec![("own".into(), Ok(alias))]).is_ok());
+        assert_eq!(
+            gate_candidates(&root, vec![("own".into(), Ok(alias))]).unwrap(),
+            Gate::Clear
+        );
         let external = dir.path().join("core-other");
         std::fs::create_dir(&external).unwrap();
         let image = external.join("easytier-core.exe");
         std::fs::write(&image, b"fixture").unwrap();
+        let held = gate_candidates(&root, vec![("external".into(), Ok(image.clone()))]).unwrap();
         assert!(
-            gate_candidates(&root, vec![("external".into(), Ok(image))])
-                .unwrap_err()
-                .message
-                .contains("BUSY:")
+            matches!(&held, Gate::External(h) if h.contains("external") && h.contains("core-other")),
+            "{held:?}"
         );
+        // Beside an unprovable candidate, in either order, it stays Busy.
+        let unreadable = || ("unreadable".into(), Err(WinError::invalid("missing path")));
+        for items in [
+            vec![("external".into(), Ok(image.clone())), unreadable()],
+            vec![unreadable(), ("external".into(), Ok(image.clone()))],
+        ] {
+            assert!(matches!(
+                gate_candidates(&root, items).unwrap_err().reclaim(),
+                ReclaimError::Busy(_)
+            ));
+        }
         assert!(
             gate_candidates(
                 &root,
@@ -365,6 +476,96 @@ mod tests {
                 .contains("BUSY:")
         );
     }
+    fn raw(text: &str) -> RawValue {
+        RawValue {
+            ty: ::windows::Win32::System::Registry::REG_SZ,
+            bytes: text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+        }
+    }
+
+    /// A replay interrupted in an earlier call leaves the system short of
+    /// what the record lists; a later call that finds an external holder
+    /// must then retry (Busy), never answer HeldBy.
+    #[test]
+    fn held_by_needs_every_applied_entry_still_in_place() {
+        let recovery = Recovery {
+            ids: vec!["{a}".into(), "{b}".into()],
+            saved: vec![
+                Saved {
+                    path: "if-1".into(),
+                    original: Some(raw("corp.example")),
+                },
+                Saved {
+                    path: "if-2".into(),
+                    original: None,
+                },
+            ],
+        };
+        let applied = Some(raw("corp.example,et.net"));
+        // Rules present, then the SearchList of if-1 and of if-2.
+        let state =
+            |rules: &[&str], one: Option<Option<RawValue>>, two: Option<Option<RawValue>>| {
+                untouched_by(
+                    &recovery,
+                    |id| Ok(rules.contains(&id)),
+                    |path| {
+                        Ok(if path == "if-1" {
+                            one.clone()
+                        } else {
+                            two.clone()
+                        })
+                    },
+                )
+            };
+        let all: &[&str] = &["{a}", "{b}"];
+        let verdict = |untouched: Result<bool, WinError>| match first_gate(
+            Gate::External("external EasyTier process x".into()),
+            || untouched,
+        ) {
+            Err(ReplayError::HeldBy(h)) => Ok(h),
+            Err(ReplayError::Win(e)) => Err(e.reclaim()),
+            Ok(()) => panic!("an external holder never clears the gate"),
+        };
+        // Nothing replayed yet: HeldBy.
+        let fresh = state(all, Some(applied.clone()), Some(applied.clone()));
+        assert_eq!(verdict(fresh).unwrap(), "external EasyTier process x");
+        for (what, partial) in [
+            // Stage 1 interrupted: one rule already deleted.
+            (
+                "one rule gone",
+                state(&["{b}"], Some(applied.clone()), Some(applied.clone())),
+            ),
+            // Stage 1 done, stage 2 not started.
+            (
+                "rules gone",
+                state(&[], Some(applied.clone()), Some(applied.clone())),
+            ),
+            // Stage 2 interrupted: one SearchList restored or deleted.
+            (
+                "list restored",
+                state(all, Some(Some(raw("corp.example"))), Some(applied.clone())),
+            ),
+            (
+                "list deleted",
+                state(all, Some(applied.clone()), Some(None)),
+            ),
+            // An interface key gone: cannot tell.
+            ("interface gone", state(all, None, Some(applied.clone()))),
+        ] {
+            assert!(
+                matches!(verdict(partial), Err(ReclaimError::Busy(_))),
+                "{what}"
+            );
+        }
+        // The state cannot be read: Busy.
+        assert!(matches!(
+            verdict(Err(WinError::invalid("access denied"))),
+            Err(ReclaimError::Busy(m)) if m.contains("cannot read")
+        ));
+        // No external holder: the replay goes on, whatever the state.
+        assert!(first_gate(Gate::Clear, || Ok(false)).is_ok());
+    }
+
     #[test]
     fn candidate_names() {
         assert!(candidate("EasyTier-core.exe"));

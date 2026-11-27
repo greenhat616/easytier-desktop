@@ -1,5 +1,5 @@
-//! Windows system effects, using a persistent native WFP fence and independent
-//! Windows management provider queries. No request data is executed as code.
+//! Windows system effects, using a native WFP fence and independent Windows
+//! management provider queries. No request data is executed as code.
 pub mod appearance;
 pub mod driver_refs;
 
@@ -11,11 +11,30 @@ pub fn remove_service_boot_marker() -> Result<(), crate::OsError> {
         message: e.message,
     })
 }
+/// Disposable CI runners only: the management worker's own report of its
+/// environment, loaded modules and runtime settings, for the elevated
+/// session input tests. Uses the worker profile `adapters()` set.
+#[cfg(feature = "ci-test-fixtures")]
+pub fn worker_diagnostics() -> Result<Value, crate::OsError> {
+    let mut rows =
+        execution::run(json!({"op": "diagnostics"})).map_err(|e| crate::OsError::Os {
+            code: e.code,
+            message: e.message,
+        })?;
+    if rows.len() != 1 {
+        return Err(crate::OsError::Os {
+            code: -1,
+            message: "expected exactly one diagnostics row".into(),
+        });
+    }
+    Ok(rows.remove(0))
+}
 mod execution;
 mod interfaces;
 mod magic;
 mod probe;
 mod registry;
+mod token;
 mod wfp;
 
 use crate::{OsAdapters, OsConfig, OsError};
@@ -271,7 +290,7 @@ fn fence_presence(complete: bool) -> Result<(), FenceError> {
         Ok(())
     } else {
         Err(FenceError::Missing(
-            "persistent fence is incomplete: our WFP filters are not all present".into(),
+            "fence is incomplete: our WFP filters are not all present".into(),
         ))
     }
 }
@@ -445,7 +464,9 @@ impl Reclaimer for WindowsReclaimer {
         };
         let response = match self.0 {
             EffectKind::WinFenceFilter => {let key=e.key.clone();return blocking(move||wfp::remove(&key)).await.map_err(WinError::reclaim);},
-            EffectKind::WinTunAdapter => return Err(ReclaimError::Busy("live adapter; never uninstall live wintun".into())),
+            // Ours (same credential) but never uninstalled live: listed as a
+            // candidate, closed once gone (topic#59 msg#1766).
+            EffectKind::WinTunAdapter => return Err(ReclaimError::NotDeletable("live adapter; never uninstall live wintun".into())),
             EffectKind::Route => return Err(ReclaimError::Busy("routes still present; never delete routes blindly".into())),
             EffectKind::WinRegistryValue => {
                 let (path,value) = registry_value_key(&e.key).map_err(WinError::reclaim)?;
@@ -454,7 +475,7 @@ impl Reclaimer for WindowsReclaimer {
             }
             EffectKind::WinMagicDnsRecovery => {
                 if e.undo != Undo::ReplayUpstreamRecovery { return Err(ReclaimError::CredentialMismatch); }
-                let root=self.1.clone();return blocking(move||magic::replay(&root)).await.map_err(WinError::reclaim);
+                let root=self.1.clone();return blocking(move||Ok(magic::replay(&root))).await.map_err(WinError::reclaim)?.map_err(magic::ReplayError::reclaim);
             }
             EffectKind::WinFirewallRule | EffectKind::WinProgramFirewallRule | EffectKind::WinNrptRule | EffectKind::WinNetworkProfile => {
                 if e.undo != Undo::EnsureAbsent { return Err(ReclaimError::CredentialMismatch); }
@@ -1036,7 +1057,37 @@ impl<S: SweepSource> Sweeper for WindowsSweeper<S> {
         })
     }
 }
-struct WindowsFence;
+/// Which fence the host installs, derived from its own token (doc#13#trust),
+/// never configured: a SYSTEM host is the system service, any other host the
+/// elevated session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FenceForm {
+    /// Persistent filters permitting SYSTEM; LocalService negative probe.
+    Service,
+    /// Non-persistent filters permitting SYSTEM and enabled Administrators;
+    /// negative probe with a restricted Medium copy of the host's token.
+    Session,
+}
+impl FenceForm {
+    fn of(host: token::HostToken) -> Self {
+        if host == token::HostToken::System {
+            Self::Service
+        } else {
+            Self::Session
+        }
+    }
+    /// The ledger persistence of a fence record. Session filters vanish at
+    /// the next BFE start, so the next start closes their record by boot id.
+    fn persistence(self) -> Persistence {
+        match self {
+            Self::Service => Persistence::Persistent,
+            Self::Session => Persistence::UntilReboot,
+        }
+    }
+}
+struct WindowsFence {
+    form: FenceForm,
+}
 #[async_trait]
 impl PortFence for WindowsFence {
     fn plan(&self, spec: &FenceSpec) -> EffectIntent {
@@ -1048,7 +1099,7 @@ impl PortFence for WindowsFence {
             kind: EffectKind::WinFenceFilter,
             key: wfp::key(spec),
             undo: Undo::EnsureAbsent,
-            persistence: Persistence::Persistent,
+            persistence: self.form.persistence(),
         }
     }
     async fn install(&self, spec: &FenceSpec) -> Result<Observation, FenceError> {
@@ -1060,7 +1111,8 @@ impl PortFence for WindowsFence {
             ));
         }
         let key = wfp::key(spec);
-        blocking(move || wfp::install(&key))
+        let form = self.form;
+        blocking(move || wfp::install(&key, form))
             .await
             .map_err(WinError::fence)
     }
@@ -1070,8 +1122,9 @@ impl PortFence for WindowsFence {
         listener_pid: u32,
     ) -> Result<FenceVerification, FenceError> {
         let key = wfp::key(spec);
+        let form = self.form;
         fence_presence(
-            blocking(move || wfp::complete(&key))
+            blocking(move || wfp::complete(&key, form))
                 .await
                 .map_err(WinError::fence)?,
         )?;
@@ -1086,19 +1139,17 @@ impl PortFence for WindowsFence {
         let mut host = host_connect(spec.address).await;
         let address = spec.address;
         let unprivileged =
-            tokio::task::spawn_blocking(move || probe::unprivileged_connect(address))
+            tokio::task::spawn_blocking(move || probe::unprivileged_connect(address, form))
                 .await
                 .map_err(|e| FenceError::Probe(e.to_string()))??;
         let check = listener_check(spec.address, listener_pid).await;
         let key = wfp::key(spec);
-        if !blocking(move || wfp::complete(&key))
-            .await
-            .map_err(WinError::fence)?
-        {
-            return Err(FenceError::Probe(
-                "persistent fence changed during verification".into(),
-            ));
-        }
+        // Positively absent after the probe is as missing as before it.
+        fence_presence(
+            blocking(move || wfp::complete(&key, form))
+                .await
+                .map_err(WinError::fence)?,
+        )?;
         if host == DirectionResult::Connected && check == ListenerCheck::Expected {
             host = host_connect(spec.address).await;
         }
@@ -1116,6 +1167,24 @@ impl PortFence for WindowsFence {
     }
 }
 pub(crate) fn adapters(config: &OsConfig) -> Result<OsAdapters, OsError> {
+    let os_error = |e: WinError| OsError::Os {
+        code: e.code,
+        message: e.message,
+    };
+    let host = token::host_token().map_err(os_error)?;
+    // An elevated host that is not SYSTEM runs its PowerShell workers with
+    // profile variables in the protected session tree (doc#13#untrusted):
+    // <state_dir>\..\profile, created and verified by the composition root.
+    execution::set_worker_profile(match host {
+        token::HostToken::Elevated => Some(
+            config
+                .state_dir
+                .parent()
+                .ok_or_else(|| os_error(WinError::invalid("state directory has no parent")))?
+                .join("profile"),
+        ),
+        token::HostToken::System | token::HostToken::Standard => None,
+    });
     let reclaimers: Vec<Arc<dyn Reclaimer>> = [
         EffectKind::WinFenceFilter,
         EffectKind::WinTunAdapter,
@@ -1151,7 +1220,9 @@ pub(crate) fn adapters(config: &OsConfig) -> Result<OsAdapters, OsError> {
         observer: Arc::new(WindowsObserver {
             run_dir: config.run_dir.clone(),
         }),
-        fence: Some(Arc::new(WindowsFence)),
+        fence: Some(Arc::new(WindowsFence {
+            form: FenceForm::of(host),
+        })),
     })
 }
 #[cfg(test)]
@@ -1296,6 +1367,31 @@ mod tests {
         );
         assert!(!program_credential_matches(&key, &other));
         assert_ne!(obs.credential, other.credential);
+    }
+    #[test]
+    fn the_fence_form_follows_the_host_token() {
+        assert_eq!(FenceForm::of(token::HostToken::System), FenceForm::Service);
+        assert_eq!(
+            FenceForm::of(token::HostToken::Elevated),
+            FenceForm::Session
+        );
+        assert_eq!(
+            FenceForm::of(token::HostToken::Standard),
+            FenceForm::Session
+        );
+        let spec = FenceSpec {
+            instance: InstanceId::from("fence-form"),
+            epoch: Epoch(1),
+            address: "127.0.0.1:1234".parse().unwrap(),
+        };
+        // Session filters vanish with BFE: the next start closes the record
+        // by boot id instead of probing it.
+        for (form, persistence) in [
+            (FenceForm::Service, Persistence::Persistent),
+            (FenceForm::Session, Persistence::UntilReboot),
+        ] {
+            assert_eq!(WindowsFence { form }.plan(&spec).persistence, persistence);
+        }
     }
     #[test]
     fn incomplete_filters_in_a_successful_enumeration_are_missing() {

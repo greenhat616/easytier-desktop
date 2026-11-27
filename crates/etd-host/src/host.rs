@@ -1850,9 +1850,25 @@ mod purge_flow_tests {
                 .unwrap();
         }
 
+        /// Recorded before the spawn and never read back (the kernel died
+        /// first or never loaded it), like the planned WinDivert record in
+        /// the takeover ledger dumps. `registered`: the service exists.
+        async fn planned(&self, name: &str, registered: bool) {
+            if registered {
+                self.sys.create_ours(EffectKind::Driver, driver(name));
+            }
+            self.ledger.record(Self::intent(name)).await.unwrap();
+        }
+
         async fn purge(&self) -> Result<()> {
             let observer = self.sys.observer();
             reclaim_with(self.ledger.as_ref(), &self.engine, observer.as_ref(), true).await
+        }
+
+        /// The reclaim a host start runs (instances only).
+        async fn startup(&self) -> Result<()> {
+            let observer = self.sys.observer();
+            reclaim_with(self.ledger.as_ref(), &self.engine, observer.as_ref(), false).await
         }
 
         async fn open(&self) -> Vec<Effect> {
@@ -1897,6 +1913,38 @@ mod purge_flow_tests {
         assert!(m.open().await.is_empty());
         m.purge().await.unwrap();
         m.untouched(&["wintun", "windivert"]);
+    }
+
+    #[tokio::test]
+    async fn planned_shared_driver_records_are_kept_or_closed_by_a_purge() {
+        let m = Machine::new();
+        m.planned("WinDivert", true).await;
+        m.planned("wintun", false).await;
+        m.purge().await.unwrap();
+        assert!(m.open().await.is_empty());
+        m.purge().await.unwrap();
+        m.untouched(&["WinDivert"]);
+    }
+
+    #[tokio::test]
+    async fn startup_reclaims_never_quarantine_shared_driver_records() {
+        let m = Machine::new();
+        m.created("wintun").await;
+        m.planned("WinDivert", true).await;
+        for _ in 0..=etd_sysfx::QUARANTINE_AFTER {
+            m.startup().await.unwrap();
+        }
+        let open = m.open().await;
+        assert_eq!(open.len(), 2, "{open:?}");
+        assert!(
+            open.iter()
+                .all(|e| e.state != EffectState::Quarantined && e.failures == 0),
+            "{open:?}"
+        );
+        // The uninstall's purge still completes and leaves both in place.
+        m.purge().await.unwrap();
+        assert!(m.open().await.is_empty());
+        m.untouched(&["wintun", "WinDivert"]);
     }
 
     #[tokio::test]

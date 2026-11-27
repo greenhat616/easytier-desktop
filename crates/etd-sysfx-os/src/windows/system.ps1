@@ -1,6 +1,19 @@
 # Invoked only via the fixed system PowerShell path; request data is JSON,
 # never interpolated into executable script source. All output is UTF-8 JSON.
+# No module is autoloaded: autoloading searches the user's Documents module
+# directory (a known folder HKCU can redirect) and reads the module analysis
+# cache, both writable by the user's non-elevated processes when the host
+# runs with the user's elevated token. Every module the script uses is
+# imported from $PSHOME by absolute path.
+$PSModuleAutoLoadingPreference = 'None'
 $ErrorActionPreference = 'Stop'
+# Microsoft.PowerShell.Utility: ConvertFrom-Json, ConvertTo-Json, Select-Object, Sort-Object
+# CimCmdlets: Get-CimInstance
+# NetSecurity: Get-NetFirewallRule, Get-NetFirewallApplicationFilter, Remove-NetFirewallRule
+# NetTCPIP: Get-NetIPAddress, Get-NetRoute, Get-NetTCPConnection
+foreach ($module in 'Microsoft.PowerShell.Utility','CimCmdlets','NetSecurity','NetTCPIP') {
+    Import-Module -Name ([IO.Path]::Combine($PSHOME,'Modules',$module,"$module.psd1"))
+}
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $q = if ($env:ETD_OS_SERVE -eq '1') { $null } else { ConvertFrom-Json $env:ETD_OS_REQUEST }
@@ -138,6 +151,16 @@ function Execute-Request {
         'services' { return @(Get-CimInstance Win32_Service | ForEach-Object { @{name=$_.Name;description="$($_.PathName)|$($_.StartMode)|$($_.State)"} }) }
         'drivers' { return @(Get-CimInstance Win32_SystemDriver | ForEach-Object { @{name=$_.Name;description="$($_.PathName)|$($_.StartMode)|$($_.State)"} }) }
         'processes' { return @(Get-CimInstance Win32_Process | ForEach-Object { @{pid=$_.ProcessId;name=$_.Name;path=$_.ExecutablePath;start=$_.CreationDate.ToUniversalTime().Ticks.ToString()} }) }
+        'diagnostics' {
+            # What the worker runs with, for the session input tests.
+            $vars = [Environment]::GetEnvironmentVariables()
+            return @{
+                environment=@($vars.Keys | Sort-Object | ForEach-Object { @{name=[string]$_;value=[string]$vars[$_]} })
+                modules=@(Get-Module | ForEach-Object { @{name=$_.Name;path=$_.Path} })
+                autoload=[string]$PSModuleAutoLoadingPreference
+                native_images=@([Diagnostics.Process]::GetCurrentProcess().Modules | Where-Object { $_.ModuleName -like '*.ni.dll' }).Count
+            }
+        }
         'registry_rows' {
             foreach ($prefix in @($tcpip,$tcpip6,$netbt)) {
                 foreach ($name in @(RegNames $prefix)) {

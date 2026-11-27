@@ -123,8 +123,9 @@ the major equals `VERSION_MAJOR`:
 `ContractService` runs this check first in the guard of every handler, unary and
 streaming, so a bare generated server or a direct call cannot skip it.
 `negotiate::VersionInterceptor` runs the same check at the tonic transport boundary,
-before Protobuf decoding. The production `etd-host` relies on the handler check only;
-the interceptor is used in the `etd-host-core` tests.
+before Protobuf decoding. The production `etd-host` installs it on its server, so a
+request with incompatible metadata is refused before its body is decoded (tier 2
+`incompatible_version_metadata_is_refused_before_decoding`); the handlers check again.
 
 ## Roles
 

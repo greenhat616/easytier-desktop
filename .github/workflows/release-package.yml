@@ -245,6 +245,7 @@ jobs:
           path: |
             ${{ runner.temp }}/next/x86_64-unknown-linux-gnu/*.deb
             ${{ runner.temp }}/next/x86_64-unknown-linux-gnu/*.rpm
+            ${{ runner.temp }}/next/x86_64-unknown-linux-gnu/*.pkg.tar.zst
           if-no-files-found: error
 
   smoke-windows:
@@ -371,10 +372,38 @@ jobs:
             bash /scripts/rpm-smoke.sh \
             "/pkg/release/easytier-desktop-${VERSION}-1.x86_64.rpm" "/pkg/next/easytier-desktop-${NEXT}-1.x86_64.rpm"
 
+  # The same for the Arch package (no systemd in the container either).
+  smoke-arch:
+    needs: [version, package-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      NEXT: ${{ needs.version.outputs.next }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-linux
+          path: ${{ runner.temp }}/pkg/release
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: smoke-linux
+          path: ${{ runner.temp }}/pkg/next
+      # archlinux:base-20261122.0.629543, pinned by the image index digest.
+      - name: Install, upgrade and remove the release Arch package
+        run: |
+          docker run --rm -v "$RUNNER_TEMP/pkg:/pkg:ro" -v "$GITHUB_WORKSPACE/.github/scripts:/scripts:ro" \
+            docker.io/library/archlinux@sha256:375a401bb3c6376b37f40b6dfa25067db37ec78d0b7af67ae6315f43a0184a9d \
+            bash /scripts/arch-smoke.sh \
+            "/pkg/release/easytier-desktop-${VERSION}-1-x86_64.pkg.tar.zst" "/pkg/next/easytier-desktop-${NEXT}-1-x86_64.pkg.tar.zst"
+
   # Read-only: gather the four release packages and their checksums. A
   # dispatch stops here with an artifact; nothing gets write permission.
   checksums:
-    needs: [version, package-windows, package-linux, smoke-windows, smoke-linux, smoke-rpm]
+    needs: [version, package-windows, package-linux, smoke-windows, smoke-linux, smoke-rpm, smoke-arch]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:

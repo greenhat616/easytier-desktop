@@ -49,6 +49,8 @@ jobs:
             suite: stop
           - os: windows-latest
             suite: upgrade
+          - os: windows-latest
+            suite: msi
           - os: ubuntu-latest
             suite: takeover
           - os: macos-latest
@@ -93,7 +95,7 @@ jobs:
           @'
 
           [[profile.privileged.overrides]]
-          filter = 'test(=installed_kernel_and_host_crash_recovery) | test(=installed_network_uninstall_restores_machine) | test(=service_stop_with_a_running_network_is_bounded)'
+          filter = 'test(=installed_kernel_and_host_crash_recovery) | test(=installed_network_uninstall_restores_machine) | test(=service_stop_with_a_running_network_is_bounded) | test(=msi_installs_upgrades_rolls_back_and_uninstalls)'
           slow-timeout = { period = "120s", terminate-after = 15 }
           '@ | Add-Content -LiteralPath .config/nextest.toml
       - name: Allow for the takeover generations and native cleanup
@@ -124,6 +126,34 @@ jobs:
           "ETD_G2_BIN=$env:GITHUB_WORKSPACE/target/debug" >> $env:GITHUB_ENV
           "ETD_G2_SHA=$digest" >> $env:GITHUB_ENV
           "ETD_G2_PYTHON=$((Get-Command python -CommandType Application | Select-Object -First 1).Source)" >> $env:GITHUB_ENV
+      # Test packages only: their etd-host carries the CI upgrade fault, which
+      # release packages never do (PK5 checks release artifacts).
+      - name: Build the test MSIs (WiX 7.0.1, OSMF EULA accepted)
+        if: matrix.suite == 'msi'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo build --locked -p etd-host --features etd-sysfx-os/ci-test-fixtures
+          cargo build --locked -p etd-ui
+          dotnet tool install --global wix --version 7.0.1
+          $tools = Join-Path $env:USERPROFILE '.dotnet/tools'
+          $env:PATH = "$tools;$env:PATH"
+          $tools >> $env:GITHUB_PATH
+          # Non-commercial open source use of the WiX 7 binaries (msg#1468).
+          wix eula accept wix7
+          wix extension add -g WixToolset.Util.wixext/7.0.1
+          foreach ($package in @(@('A', '0.1.0'), @('B', '0.1.1'), @('C', '0.1.2'))) {
+            $name, $version = $package
+            $bin = Join-Path $env:RUNNER_TEMP "msi-bin-$name"
+            New-Item -ItemType Directory -Force $bin | Out-Null
+            foreach ($exe in 'etd-ui.exe', 'etd-host.exe', 'etd-ctl.exe') { Copy-Item "target/debug/$exe" $bin }
+            # A distinct host image per package: bytes appended to the PE.
+            [IO.File]::AppendAllText((Join-Path $bin 'etd-host.exe'), "`0etd-msi-$name")
+            $out = Join-Path $env:RUNNER_TEMP "msi-$name"
+            cargo xtask dist --bin-dir $bin --cores target/debug/cores/2.7.1 --out $out --package-version $version
+            "ETD_MSI_$name=$out/x86_64-pc-windows-msvc/easytier-desktop-$version-x86_64.msi" >> $env:GITHUB_ENV
+          }
       - name: Compile runner as the build user
         run: cargo nextest list --locked --profile privileged --run-ignored only -p etd-testkit --test tier3
       - name: Installed service tests (administrator)
@@ -144,6 +174,16 @@ jobs:
       - name: Pre-existing inactive program rule (fresh administrator runner)
         if: matrix.suite == 'program'
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=preexisting_program_rule_blocks_start)' --success-output immediate
+      - name: Windows MSI install, upgrade, rollback and uninstall (administrator)
+        if: matrix.suite == 'msi'
+        run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(=msi_installs_upgrades_rolls_back_and_uninstalls)' --success-output immediate
+      - name: Keep the MSI logs
+        if: failure() && matrix.suite == 'msi'
+        uses: actions/upload-artifact@v4
+        with:
+          name: msi-logs
+          path: ${{ runner.temp }}/msi-logs
+          if-no-files-found: ignore
       - name: Management port takeover (administrator)
         if: runner.os == 'Windows' && matrix.suite == 'takeover'
         run: cargo nextest run --locked --profile privileged --run-ignored only -p etd-testkit --test tier3 -E 'test(/^takeover_/)' --success-output immediate

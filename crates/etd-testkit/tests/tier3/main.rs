@@ -97,3 +97,9 @@ fn service_stop_with_a_running_network_is_bounded() {
 fn installed_network_survives_upgrade() {
     run_case("upgrade_running");
 }
+
+#[test]
+#[ignore = "installs, upgrades and removes the Windows MSI on a disposable hosted runner"]
+fn msi_installs_upgrades_rolls_back_and_uninstalls() {
+    run_script("package.py", "msi_lifecycle");
+}

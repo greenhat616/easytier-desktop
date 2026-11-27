@@ -291,21 +291,27 @@ const SETTLE_PAUSE: Duration = Duration::from_millis(10);
 /// Re-observe a candidate until its criteria settle. Excluded (`Ok(false)`)
 /// only on positive evidence: a mismatch in a criterion that was read, or a
 /// confirmed exit. Still unobservable after `attempts` is the last error;
-/// nothing is excluded for being unreadable.
+/// nothing is excluded for being unreadable. An error comes with the number
+/// of observations made.
 fn settle(
     attempts: usize,
     mut observe: impl FnMut() -> Result<Observed, ProcessError>,
     mut exited: impl FnMut() -> Result<bool, ProcessError>,
     mut pause: impl FnMut(),
-) -> Result<bool, ProcessError> {
+) -> Result<bool, (usize, ProcessError)> {
     let mut last = ProcessError::Enumeration("candidate not observed".into());
     for attempt in 0..attempts {
         if attempt > 0 {
             pause();
         }
-        match observe()? {
+        let seen = attempt + 1;
+        match observe().map_err(|error| (seen, error))? {
             Observed::Matches(matches) => return Ok(matches),
-            Observed::Missing | Observed::Unobservable(_) if exited()? => return Ok(false),
+            Observed::Missing | Observed::Unobservable(_)
+                if exited().map_err(|error| (seen, error))? =>
+            {
+                return Ok(false);
+            }
             Observed::Missing => {
                 last = ProcessError::Enumeration(
                     "candidate disappeared from snapshot but is not confirmed exited".into(),
@@ -314,23 +320,23 @@ fn settle(
             Observed::Unobservable(error) => last = error,
         }
     }
-    Err(last)
+    Err((attempts, last))
 }
 
 /// An enumeration error with what the system says about the process now
 /// (Linux: `/proc` state, exiting flag, uid, existence).
-fn diagnosed(pid: u32, error: ProcessError) -> ProcessError {
+fn diagnosed(pid: u32, observations: usize, error: ProcessError) -> ProcessError {
     #[cfg(target_os = "linux")]
     return match error {
         ProcessError::Enumeration(message) => ProcessError::Enumeration(format!(
-            "{message} after {SETTLE_ATTEMPTS} observations; now {}",
+            "{message} after {observations} observation(s); now {}",
             identity::proc_summary(pid)
         )),
         other => other,
     };
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = pid;
+        let _ = (pid, observations);
         error
     }
 }
@@ -456,7 +462,7 @@ fn marked_candidate(
         || Ok(read_token(pid)?.is_none()),
         || std::thread::sleep(SETTLE_PAUSE),
     )
-    .map_err(|error| candidate_error(diagnosed(pid, error)))?;
+    .map_err(|(observations, error)| candidate_error(diagnosed(pid, observations, error)))?;
     if !matches {
         return Ok(None);
     }
@@ -1562,9 +1568,27 @@ mod audit_tests {
         assert!(verdict.unwrap());
         // Stays unreadable and alive: an error after every attempt.
         let (verdict, seen, pauses) = run(vec![], usize::MAX);
-        let error = verdict.unwrap_err().to_string();
+        let (observations, error) = verdict.unwrap_err();
+        assert_eq!(observations, 5);
+        let error = error.to_string();
         assert!(error.contains("unobservable: image, argv"), "{error}");
         assert_eq!((seen, pauses), (5, 4));
+        // An observation that fails outright ends early, with its count.
+        let mut n = 0;
+        let failed = settle(
+            5,
+            || {
+                n += 1;
+                if n == 2 {
+                    Err(ProcessError::Enumeration("snapshot failed".into()))
+                } else {
+                    Ok(unreadable())
+                }
+            },
+            || Ok(false),
+            || {},
+        );
+        assert_eq!(failed.unwrap_err().0, 2);
     }
 
     /// The diagnostic names the `/proc` state of a half-observable process.
@@ -1591,7 +1615,15 @@ mod audit_tests {
         let uid = unsafe { libc::getuid() };
         assert!(summary.contains(&format!("uid {uid}")), "{summary}");
         assert!(identity::proc_summary(pid).contains("exited"));
-        let error = diagnosed(pid, ProcessError::Enumeration("unobservable: image".into()));
+        let error = diagnosed(
+            pid,
+            3,
+            ProcessError::Enumeration("unobservable: image".into()),
+        );
+        assert!(
+            error.to_string().contains("after 3 observation(s)"),
+            "{error}"
+        );
         assert!(
             error.to_string().contains("now no /proc entry (exited)"),
             "{error}"

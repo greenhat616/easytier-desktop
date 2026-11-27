@@ -587,6 +587,7 @@ pub async fn install(users: &[String], owner: Option<String>) -> Result<()> {
     }
     NativeServiceManager.preflight_install(&layout)?;
     let mut journal = LifecycleJournal::begin_owned(&layout, owner)?;
+    let mut enrolled = Vec::new();
     let result: Result<()> = async {
         NativeServiceManager.prepare_install(&layout, &mut journal)?;
         journal.plan(Resource::Data)?;
@@ -601,6 +602,7 @@ pub async fn install(users: &[String], owner: Option<String>) -> Result<()> {
         let seed: Result<()> = async {
             let entries = seed_entries(users)?;
             policy(mode, &entries)?;
+            enrolled = entries.iter().map(describe_entry).collect();
             maintenance_change(deps.host.ledger.as_ref(), Change::SetAllowList(entries)).await?;
             Ok(())
         }
@@ -629,7 +631,26 @@ pub async fn install(users: &[String], owner: Option<String>) -> Result<()> {
     finish_install_handoff(command, start_and_verify(&layout, &install_id), || {
         uninstall_locked(&layout, Some(&install_id))
     })
-    .await
+    .await?;
+    println!("installed; allow list: {}", enrolled.join(", "));
+    Ok(())
+}
+
+/// One allow-list entry for the installer's report, e.g. `admin user S-1-5-18`.
+fn describe_entry(entry: &AllowEntry) -> String {
+    let role = match Role::try_from(entry.role) {
+        Ok(Role::Admin) => "admin",
+        Ok(Role::Control) => "control",
+        _ => "other",
+    };
+    let who = match entry.principal.as_ref().and_then(|p| p.id.as_ref()) {
+        Some(Id::WindowsUserSid(sid)) => format!("user {sid}"),
+        Some(Id::WindowsGroupSid(sid)) => format!("group {sid}"),
+        Some(Id::UnixUid(uid)) => format!("uid {uid}"),
+        Some(Id::UnixGid(gid)) => format!("gid {gid}"),
+        None => "nobody".to_owned(),
+    };
+    format!("{role} {who}")
 }
 
 async fn finish_install_handoff<F, Fut>(

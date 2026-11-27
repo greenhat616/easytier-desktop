@@ -288,7 +288,7 @@ pub fn tab_view(
     let fg = cx.theme().foreground;
     let hover = theme::winui_brush(cx, 0x0000000A, 0xFFFFFF0F);
     let pressed = theme::winui_brush(cx, 0xFFFFFFB3, 0x3A3A3A73);
-    let tertiary = theme::winui_brush(cx, 0xF9F9F9FF, 0x282828FF);
+    let tertiary = crate::views::dialogs::solid_tertiary(cx);
     let stroke = theme::card_stroke(cx);
     let subtle = theme::subtle_fill_secondary(cx);
     let subtle_pressed = theme::subtle_fill_tertiary(cx);
@@ -433,4 +433,81 @@ pub fn tab_view(
                 .child(content),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::{Hsla, TestAppContext, component::ActiveTheme as _};
+
+    use crate::theme::{self, ControlState, contrast};
+    use crate::views::dialogs;
+
+    /// `top` composited over the opaque `bottom`, as 0xRRGGBB.
+    fn over(top: Hsla, bottom: Hsla) -> u32 {
+        let (t, b) = (top.to_rgb(), bottom.to_rgb());
+        let mix = |a: f32, z: f32| ((a * t.a + z * (1. - t.a)).clamp(0., 1.) * 255.).round() as u32;
+        mix(t.r, b.r) << 16 | mix(t.g, b.g) << 8 | mix(t.b, b.b)
+    }
+
+    /// Text in the FL5 gallery controls meets WCAG AA (4.5:1) on the fills
+    /// it sits on, and the accent selection pills reach 3:1 against theirs.
+    /// Pressed text (TextFillColorTertiary) is a momentary WinUI state and
+    /// disabled text is exempt, so neither is checked.
+    #[gpui_kit::test]
+    fn fl5_text_and_fills_are_readable_in_both_themes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            theme::install_palette(cx);
+            for mode in [
+                gpui_kit::component::ThemeMode::Light,
+                gpui_kit::component::ThemeMode::Dark,
+            ] {
+                gpui_kit::component::Theme::change(mode, None, cx);
+                let fg = cx.theme().foreground;
+                let page = cx.theme().background;
+                let card = cx.theme().popover;
+                let base = dialogs::solid_base(cx);
+                let tertiary = dialogs::solid_tertiary(cx);
+                let layer = over(dialogs::layer_alt(cx), base);
+                let accent = theme::accent_fill(ControlState::Rest, cx);
+                for surface in [page, card] {
+                    let selected = over(theme::subtle_fill_secondary(cx), surface);
+                    let pairs = [
+                        ("text on surface", over(fg, surface), over(surface, surface)),
+                        (
+                            "secondary text",
+                            over(theme::text_secondary(cx), surface),
+                            over(surface, surface),
+                        ),
+                        ("selected nav item", over(fg, surface), selected),
+                    ];
+                    for (what, text, fill) in pairs {
+                        assert!(contrast(text, fill) >= 4.5, "{what} {mode:?}");
+                    }
+                    assert!(
+                        contrast(over(accent, surface), selected) >= 3.,
+                        "nav pill {mode:?}"
+                    );
+                    assert!(
+                        contrast(over(accent, surface), over(surface, surface)) >= 3.,
+                        "SelectorBar pill {mode:?}"
+                    );
+                }
+                for (what, fill) in [
+                    ("dialog body", layer),
+                    ("dialog buttons", over(base, base)),
+                    ("TabView / TeachingTip", over(tertiary, tertiary)),
+                ] {
+                    assert!(
+                        contrast(over(fg, fill_hsla(fill)), fill) >= 4.5,
+                        "{what} {mode:?}"
+                    );
+                }
+            }
+        });
+    }
+
+    fn fill_hsla(rgb: u32) -> Hsla {
+        gpui_kit::rgb(rgb).into()
+    }
 }

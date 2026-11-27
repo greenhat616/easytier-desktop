@@ -34,17 +34,17 @@ pub enum DialogResult {
 pub type DialogHandler = Rc<dyn Fn(DialogResult, &mut Window, &mut App)>;
 
 /// `SolidBackgroundFillColorBase` (#F3F3F3 / #202020): ContentDialogBackground.
-fn solid_base(cx: &App) -> Hsla {
+pub(crate) fn solid_base(cx: &App) -> Hsla {
     theme::winui_brush(cx, 0xF3F3F3FF, 0x202020FF)
 }
 
 /// `SolidBackgroundFillColorTertiary` (#F9F9F9 / #282828): TeachingTipBackgroundBrush.
-fn solid_tertiary(cx: &App) -> Hsla {
+pub(crate) fn solid_tertiary(cx: &App) -> Hsla {
     theme::winui_brush(cx, 0xF9F9F9FF, 0x282828FF)
 }
 
 /// `LayerFillColorAlt` (#FFFFFF / #0DFFFFFF): ContentDialogTopOverlay.
-fn layer_alt(cx: &App) -> Hsla {
+pub(crate) fn layer_alt(cx: &App) -> Hsla {
     theme::winui_brush(cx, 0xFFFFFFFF, 0xFFFFFF0D)
 }
 

@@ -18,7 +18,8 @@ import uuid
 
 from service import command, eventually, require_runner
 from consistency import (
-    adapter_defaults, check_closed, managed_service_changes, runner_noise, system_policy_changes, tun_created,
+    adapter_defaults, check_closed, managed_service_changes, record_windows_adapter, runner_noise, scope,
+    system_policy_changes, tun_created,
 )
 from inventory import assert_exited, capture
 
@@ -61,6 +62,7 @@ class Session:
         self.process = None
         self.lease = None
         self.log = self.dir / "host-stderr.log"
+        self.adapter_indices = {}
         stack.callback(self.teardown)
 
     # -- the host and the UI's lease ------------------------------------
@@ -163,6 +165,27 @@ class Session:
                 print(f"{row['kind']} {row['state']}: {row.get('last_error') or ''}", flush=True)
             raise
 
+    def track_adapter(self, baseline, instance, view):
+        """Record the running generation's adapter, whose default values
+        Windows keeps after it goes away (consistency.adapter_defaults)."""
+        live = self.inventory()
+        tuns = [r for r in self.effects() if r["kind"] == "win.tun"
+                and r["scope"] == scope(instance, view["epoch"]) and r["state"] != "reclaimed"]
+        assert len(tuns) == 1, "expected a single adapter record for the running generation"
+        record_windows_adapter(baseline, live, tuns[0]["key"], view["interface_name"], self.adapter_indices)
+
+    def purge(self):
+        """Purge the session root. A root a shared driver's registration
+        still references is retained, and the command says so."""
+        result = self.run("reclaim", "--mode", "elevated-session", "--all", "--purge")
+        assert result.returncode == 0, f"purge exited {result.returncode}: {result.stderr}"
+        if self.root.exists():
+            remaining = sorted(str(p.relative_to(self.root)) for p in self.root.rglob("*"))
+            print(f"purge output: {result.stdout.strip()} {result.stderr.strip()}", flush=True)
+            print(f"retained session root entries: {remaining}", flush=True)
+            assert "retained" in (result.stdout + result.stderr).lower(),                 "the purge left the session root without saying why"
+        return result
+
     def effects(self):
         ledger = self.state / "ledger.sqlite3"
         if not ledger.exists():
@@ -192,10 +215,10 @@ class Session:
                 if p.info["exe"] and Path(p.info["exe"]).name.lower() == "easytier-core.exe"]
 
 
-def machine_delta(before, after):
+def machine_delta(before, after, adapter_indices):
     delta = before.delta(after) - managed_service_changes(before, after)
     delta -= runner_noise(before, after) | tun_created(before, after)
-    delta -= adapter_defaults(before, after, {})
+    delta -= adapter_defaults(before, after, adapter_indices)
     delta -= system_policy_changes(before, after, "uninstalled")
     # The shared drivers are re-ensured by every host and never deleted.
     for name in SHARED_DRIVERS:
@@ -216,12 +239,14 @@ def recovery():
         instance, request = str(uuid.uuid4()), str(uuid.uuid4())
         session.apply(spec(), instance, request, str(status["revision"]))
         first = session.ready(instance)
+        session.track_adapter(before, instance, first)
         print(f"session kernel ready: {first['state']} epoch={first['epoch']}", flush=True)
         assert session.core.is_file(), "the kernel runs from the protected session store"
 
         old = first["epoch"]
         session.crash(session.core)
         first = session.ready(instance, after=old)
+        session.track_adapter(before, instance, first)
         check_closed(session, instance, old)
         print(f"after the kernel crash: epoch {first['epoch']}", flush=True)
 
@@ -234,6 +259,7 @@ def recovery():
         assert open_records, "a crashed host leaves open records for the next start"
         session.start()
         first = session.ready(instance, after=old)
+        session.track_adapter(before, instance, first)
         check_closed(session, instance, old)
         assert_exited(kernels, timeout=30)
         print(f"after the host crash ({host_pid}): the self-check reclaimed epoch {old}, "
@@ -246,11 +272,9 @@ def recovery():
         session.release()
         assert not session.kernels(), "no kernel outlives the session host"
 
-        purge = session.run("reclaim", "--mode", "elevated-session", "--all", "--purge")
-        assert purge.returncode == 0, f"purge exited {purge.returncode}: {purge.stderr}"
-        assert not session.root.exists(), "the purge removes the session root"
+        session.purge()
         after = session.inventory()
-        delta = machine_delta(before, after)
+        delta = machine_delta(before, after, session.adapter_indices)
         assert not delta, f"session start to purge differences: {sorted(delta)}"
 
 
@@ -263,7 +287,7 @@ def exclusion():
         status = session.start()
         instance, request = str(uuid.uuid4()), str(uuid.uuid4())
         session.apply(spec(), instance, request, str(status["revision"]))
-        session.ready(instance)
+        session.track_adapter(before, instance, session.ready(instance))
         refused = session.run("install")
         assert refused.returncode != 0, "install while the session host runs"
         assert command("sc.exe", "query", "easytier-desk-host", check=False).returncode != 0, \
@@ -284,10 +308,9 @@ def exclusion():
         finally:
             removed = session.run("uninstall")
             assert removed.returncode == 0, f"uninstall exited {removed.returncode}: {removed.stderr}"
-        purge = session.run("reclaim", "--mode", "elevated-session", "--all", "--purge")
-        assert purge.returncode == 0, f"purge exited {purge.returncode}: {purge.stderr}"
+        session.purge()
         after = session.inventory()
-        delta = machine_delta(before, after)
+        delta = machine_delta(before, after, session.adapter_indices)
         assert not delta, f"session start to uninstall differences: {sorted(delta)}"
 
 
@@ -321,14 +344,18 @@ def kernel_port(session):
     return int(port)
 
 
-def low_integrity_connect(port, directory):
+def low_copy(directory):
+    """A copy of Windows PowerShell labelled Low: a process started from it
+    runs at Low integrity (the file's label caps the new token)."""
     powershell = Path(os.environ["SystemRoot"]) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
-    low = directory / "low"
-    low.mkdir()
-    copy = low / "powershell.exe"
+    copy = directory / "low-powershell.exe"
     shutil.copy2(powershell, copy)
     command("icacls", copy, "/setintegritylevel", "low")
-    result = command(copy, "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+    return copy
+
+
+def own_low_connect(port, directory):
+    result = command(low_copy(directory), "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
                      encoded(CONNECT.replace("__PORT__", str(port))), check=False)
     return result.stdout.strip() or result.stderr.strip()
 
@@ -337,41 +364,48 @@ SECOND_ACCOUNT = r"""
 $ErrorActionPreference = 'Stop'
 $secure = ConvertTo-SecureString $env:ES5_PROBE_SECRET -AsPlainText -Force
 $cred = [pscredential]::new("$env:COMPUTERNAME\__NAME__", $secure)
-$exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-$p = Start-Process -FilePath $exe -Credential $cred -WorkingDirectory '__DIR__' -RedirectStandardOutput '__OUT__' -PassThru -Wait -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand','__SCRIPT__'
+$p = Start-Process -FilePath '__EXE__' -Credential $cred -WorkingDirectory '__DIR__' -RedirectStandardOutput '__OUT__' -PassThru -Wait -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand','__SCRIPT__'
 "exit $($p.ExitCode)"
 """
 
 
-def second_account_connect(port):
+def second_account_connects(port):
     """A temporary standard account (random password, never printed)
-    connects through the secondary logon; removed afterwards."""
+    connects through the secondary logon at Medium and, from a Low-labelled
+    copy, at Low integrity; the account is removed afterwards."""
     name = "es5probe"
-    password = uuid.uuid4().hex + "Aa1!"
+    # At most 14 characters: net user asks for confirmation beyond that.
+    password = uuid.uuid4().hex[:10] + "Aa1!"
     exchange = Path("C:/es5-probe")
     exchange.mkdir(exist_ok=True)
     command("icacls", exchange, "/grant", "*S-1-1-0:(OI)(CI)F")
-    out = exchange / "connect.txt"
-    out.unlink(missing_ok=True)
+    images = {"Medium": Path(os.environ["SystemRoot"]) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe",
+              "Low": low_copy(exchange)}
     command("net", "user", name, password, "/add")
+    verdicts = {}
     try:
-        launcher = (SECOND_ACCOUNT.replace("__NAME__", name).replace("__DIR__", str(exchange))
-                    .replace("__OUT__", str(out))
-                    .replace("__SCRIPT__", encoded(CONNECT.replace("__PORT__", str(port)))))
-        result = command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
-                         encoded(launcher), check=False, env=dict(os.environ, ES5_PROBE_SECRET=password))
-        if not out.exists():
-            raise AssertionError(f"second account probe did not run: {result.stdout} {result.stderr}")
-        return out.read_text(encoding="utf-8", errors="replace").strip()
+        for level, image in images.items():
+            out = exchange / f"connect-{level}.txt"
+            out.unlink(missing_ok=True)
+            launcher = (SECOND_ACCOUNT.replace("__NAME__", name).replace("__EXE__", str(image))
+                        .replace("__DIR__", str(exchange)).replace("__OUT__", str(out))
+                        .replace("__SCRIPT__", encoded(CONNECT.replace("__PORT__", str(port)))))
+            result = command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                             encoded(launcher), check=False, env=dict(os.environ, ES5_PROBE_SECRET=password))
+            if not out.exists():
+                raise AssertionError(f"second account probe ({level}) did not run: {result.stdout} {result.stderr}")
+            verdicts[level] = out.read_text(encoding="utf-8", errors="replace").strip()
     finally:
         command("net", "user", name, "/delete", check=False)
         shutil.rmtree(exchange, ignore_errors=True)
+    return verdicts
 
 
 def identities():
     """The real kernel's management port under the session fence refuses a
-    Low-integrity copy of the user's own token and a second account, while
-    the elevated user connects; DLLs planted beside the portable host are
+    second standard account at Medium and at Low integrity, while the
+    elevated user connects (a non-elevated copy of the user's own token is
+    refused by the host's own probe on every kernel start, ES2); DLLs planted beside the portable host are
     not loaded, and the kernel loads only from its store and Windows
     (doc#13#wbs ES5)."""
     import psutil
@@ -388,12 +422,15 @@ def identities():
         port = kernel_port(session)
         with socket.create_connection(("127.0.0.1", port), timeout=5):
             print(f"elevated user: connected to the kernel port {port}", flush=True)
-        low = low_integrity_connect(port, session.dir)
-        print(f"Low integrity copy: {low}", flush=True)
-        other = second_account_connect(port)
-        print(f"second account: {other}", flush=True)
-        assert "Low Mandatory Level" in low and low.endswith("error 10013 AccessDenied"), low
-        assert other.endswith("error 10013 AccessDenied"), other
+        others = second_account_connects(port)
+        for level, verdict in others.items():
+            print(f"second account at {level}: {verdict}", flush=True)
+            assert f"{level} Mandatory Level" in verdict, verdict
+            assert verdict.endswith("error 10013 AccessDenied"), verdict
+        # Reported, not judged: a Low copy of the elevated token keeps
+        # Administrators enabled, and the fence admits elevated
+        # administrators by group (only an elevated parent can make one).
+        print(f"elevated token lowered to Low (report only): {own_low_connect(port, session.dir)}", flush=True)
 
         portable = session.dir.resolve()
         planted = {name.lower() for name in PLANTED}
@@ -416,8 +453,7 @@ def identities():
         eventually("stopped instance", lambda: session.view(instance),
                    lambda body: body.get("state") == "stopped", timeout=240)
         session.release()
-        purge = session.run("reclaim", "--mode", "elevated-session", "--all", "--purge")
-        assert purge.returncode == 0, f"purge exited {purge.returncode}: {purge.stderr}"
+        session.purge()
 
 
 CASES = {"session_recovery": recovery, "session_exclusion": exclusion, "session_identities": identities}

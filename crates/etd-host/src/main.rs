@@ -57,6 +57,9 @@ enum Action {
         #[arg(long, value_name = "SID_OR_UID")]
         allow_user: Vec<String>,
     },
+    /// Replace the installed service with this build, keeping its state
+    /// (requires administrator privileges; run from the new payload).
+    Upgrade,
     /// Stop, reclaim and remove the installed service.
     Uninstall {
         /// Report the durable uninstall phase and deferred worker outcome.
@@ -140,6 +143,7 @@ fn execute(cli: Cli) -> Result<()> {
             run_bounded(runtime, host::remove_core(mode.into(), &version)).0
         }
         Action::Install { allow_user } => run_bounded(runtime, host::install(&allow_user)).0,
+        Action::Upgrade => run_bounded(runtime, host::upgrade::upgrade()).0,
         Action::Uninstall {
             status,
             wait_parent,

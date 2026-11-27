@@ -64,7 +64,7 @@ checks every workflow for this.
 
 | Test | Covers | Runner |
 | --- | --- | --- |
-| `etd-host --test install_roundtrip` | Install (including the bundled release kernel staged beside the test image), service start, peer identity and roles, uninstall leaves no service, directory or group | `ci.yml` job `privileged-install`, all three OSes |
+| `etd-host --test install_roundtrip` | Install (including the bundled release kernel staged beside the test image), service start, peer identity and roles, uninstall leaves no service, directory or group; `upgrade` from a changed payload replaces the image, keeps install id, install key and allow list, is idempotent and refuses the installed image; a new host that never serves is rolled back and the previous service runs; an upgrade interrupted at `Replacing` is refused by `resume-service` and restored by the next upgrade and by uninstall | `ci.yml` job `privileged-install`, all three OSes |
 | `etd-sysfx-os --test windows_reclaim`, `windows_fence` | Real wintun, firewall and registry objects, same-name conflicts; WFP fence against a second account | `o1-windows.yml` |
 | `etd-sysfx-os --test linux_reclaim`, `linux_fence` | netlink adapters, systemd-resolved, nftables fence by uid, distribution parsers | `o2-linux.yml` |
 | `etd-sysfx-os --test macos_reclaim`, `macos_fence`, `macos_resolver` | utun ownership, PF anchor fence against a second account, foreign resolver files untouched | `o3-macos.yml` |
@@ -73,7 +73,7 @@ checks every workflow for this.
 | `etd-ipc --test session_pipe_acl`, `session_clients`, `session_server_verify` | Elevated session pipe: DACL and Medium no-write-up/no-read-up label, client admission (restricted Medium, Low, AppContainer and second-account tokens), server elevation check against a non-elevated squatter | `ci.yml` `privileged-install` on Windows |
 | `etd-testkit --test tier2` (ignored case) | UI crash against a service-form test host | `ci.yml` job `privileged-install` on Linux and macOS, as root with `ETD_G1_SERVICE_RUNTIME`. Not on Windows: it needs LocalSystem, which the runner's administrator is not |
 | `etd-core-easytier --test session_real` | Identify, start, readiness and queries against the bundled v2.7.1 release kernel | Unprivileged; `ci.yml` `check` job on all three OSes (`--profile ci --run-ignored only`, kernel from `cargo xtask fetch-cores`) |
-| `etd-testkit --test tier3` | Installed service with the release kernel: crash recovery, native inventory, Magic DNS refusal (macOS), shared drivers, program rule conflict, bounded stop and clean uninstall (Windows), management port and utun takeover by a test-owned impostor | `privileged.yml`, one job per suite on fresh hosted runners |
+| `etd-testkit --test tier3` | Installed service with the release kernel: crash recovery, native inventory, Magic DNS refusal (macOS), shared drivers, program rule conflict, bounded stop and clean uninstall (Windows), `etd-host upgrade` with a running network, management port and utun takeover by a test-owned impostor | `privileged.yml`, one job per suite on fresh hosted runners |
 
 `o1-windows.yml`, `o2-linux.yml` and `o3-macos.yml` run on pushes to their adapter
 branches and on manual dispatch (`workflow_dispatch`); run them by hand after changing

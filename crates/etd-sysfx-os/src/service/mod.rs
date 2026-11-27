@@ -10,10 +10,13 @@ use std::{
 
 #[cfg(all(windows, feature = "ci-test-fixtures"))]
 pub mod ci_fixture;
+mod image;
+mod running;
+pub use running::running_image_matches;
 mod journal;
 #[cfg(unix)]
 mod unix;
-pub use journal::{DeferredOutcome, LifecycleJournal, Phase, Resource};
+pub use journal::{DeferredOutcome, LifecycleJournal, Phase, Resource, UpgradeStage};
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
@@ -154,6 +157,45 @@ pub trait ServiceManager {
     ) -> io::Result<Option<u32>>;
     fn deferred_worker_alive(&self, pid: u32) -> io::Result<bool>;
     fn entry_is_elevated(&self) -> io::Result<bool>;
+    /// `etd-host upgrade`: copy the running image (bound to the running
+    /// process, not to its path) beside the installed host image, verify
+    /// it, then swap it in, keeping the previous image as a backup until
+    /// [`Self::discard_host_backup`]. The service must be stopped.
+    fn replace_host_image(&self, _layout: &HostLayout) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// Put the backed-up host image back; `Ok(false)` if there is none.
+    fn restore_host_image(&self, _layout: &HostLayout) -> io::Result<bool> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// Remove the image and registration backups and leftovers of a
+    /// committed upgrade.
+    fn discard_host_backup(&self, _layout: &HostLayout) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// Rewrite the service registration if this build's differs, saving
+    /// the previous one in the maintenance directory first. On Windows the
+    /// SCM configuration this build writes ([`Self::start`]) is the same
+    /// for every build, so there is nothing to save.
+    /// The backup is written atomically and bound to the active upgrade by
+    /// its digest in `journal`.
+    fn refresh_registration(
+        &self,
+        _layout: &HostLayout,
+        _journal: &mut LifecycleJournal,
+    ) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// Put a registration saved by [`Self::refresh_registration`] back;
+    /// `Ok(false)` if none was saved. A backup `journal` does not bind is
+    /// never restored.
+    fn restore_registration(
+        &self,
+        _layout: &HostLayout,
+        _journal: &LifecycleJournal,
+    ) -> io::Result<bool> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 }
 
 pub struct NativeServiceManager;
@@ -210,6 +252,54 @@ impl ServiceManager for NativeServiceManager {
     }
     fn entry_is_elevated(&self) -> io::Result<bool> {
         native::elevated()
+    }
+    fn replace_host_image(&self, layout: &HostLayout) -> io::Result<()> {
+        native::replace_host_image(layout)
+    }
+    fn restore_host_image(&self, layout: &HostLayout) -> io::Result<bool> {
+        native::restore_host_image(layout)
+    }
+    fn discard_host_backup(&self, layout: &HostLayout) -> io::Result<()> {
+        native::discard_host_backup(layout)
+    }
+    fn refresh_registration(
+        &self,
+        layout: &HostLayout,
+        journal: &mut LifecycleJournal,
+    ) -> io::Result<()> {
+        native::refresh_registration(layout, journal)
+    }
+    fn restore_registration(
+        &self,
+        layout: &HostLayout,
+        journal: &LifecycleJournal,
+    ) -> io::Result<bool> {
+        native::restore_registration(layout, journal)
+    }
+}
+
+/// CI fault injection for the privileged upgrade tests. Compiled only with
+/// the `ci-test-fixtures` feature (never in a product build): true when
+/// the protected maintenance directory holds `ci-upgrade-fault` with a
+/// line naming `point`. Only an administrator can create that file.
+#[cfg(feature = "ci-test-fixtures")]
+pub fn ci_upgrade_fault(layout: &HostLayout, point: &str) -> bool {
+    fs::read_to_string(layout.maintenance.join("ci-upgrade-fault"))
+        .is_ok_and(|faults| faults.lines().any(|fault| fault.trim() == point))
+}
+#[cfg(not(feature = "ci-test-fixtures"))]
+pub fn ci_upgrade_fault(_: &HostLayout, _: &str) -> bool {
+    false
+}
+
+/// Whether `current` (canonical) is `executable`. A missing executable is
+/// not the running image: between an upgrade's two renames there is none,
+/// and the next upgrade must still be able to restore it.
+pub(super) fn is_image(current: &Path, executable: &Path) -> io::Result<bool> {
+    match executable.canonicalize() {
+        Ok(installed) => Ok(current == installed),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -324,7 +414,7 @@ impl HostFilesystem for NativeHostFilesystem {
         native::prepare_maintenance(layout)
     }
     fn is_installed_image(&self, layout: &HostLayout) -> io::Result<bool> {
-        Ok(current_exe()? == layout.executable.canonicalize()?)
+        is_image(&current_exe()?, &layout.executable)
     }
     fn lock(&self, layout: &HostLayout) -> io::Result<HostLock> {
         if !layout.user_host {

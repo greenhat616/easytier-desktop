@@ -370,12 +370,26 @@ fn capabilities(mode: HostMode) -> Vec<String> {
 
 /// The listener, lease tracking and service lifecycle are shared by the
 /// production binary and native-transport composition tests.
+#[allow(dead_code)] // the tier-2 composition tests include this file
 pub(crate) async fn serve_with_deps(
+    mode: HostMode,
+    guard: LayoutLock,
+    deps: Arc<HostDeps>,
+    managed_stop: Option<watch::Receiver<bool>>,
+    start_blocker: Option<String>,
+) -> Result<Stopped> {
+    serve_with_deps_and(mode, guard, deps, managed_stop, start_blocker, None).await
+}
+
+/// [`serve_with_deps`], running `on_serving` once the startup self-check
+/// reaches Serving (not when it ends in diagnostics-only or shutdown).
+pub(crate) async fn serve_with_deps_and(
     mode: HostMode,
     guard: LayoutLock,
     deps: Arc<HostDeps>,
     mut managed_stop: Option<watch::Receiver<bool>>,
     start_blocker: Option<String>,
+    on_serving: Option<Box<dyn FnOnce() + Send>>,
 ) -> Result<Stopped> {
     // Load the exact durable settings before publishing the endpoint; no
     // mutation task exists until the new listener is bound with that policy.
@@ -403,6 +417,25 @@ pub(crate) async fn serve_with_deps(
             },
         },
     );
+    if let Some(on_serving) = on_serving {
+        let mut view = handle.watch_view();
+        tokio::spawn(async move {
+            loop {
+                let phase = view.borrow_and_update().snapshot.phase;
+                match v1::HostPhase::try_from(phase) {
+                    Ok(v1::HostPhase::Serving) => {
+                        let _ = tokio::task::spawn_blocking(on_serving).await;
+                        return;
+                    }
+                    Ok(v1::HostPhase::DiagnosticOnly | v1::HostPhase::ShuttingDown) => return,
+                    _ => {}
+                }
+                if view.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
     let svc = ContractService::with_allow_list_sink(
         mode,
         deps.ledger.clone(),

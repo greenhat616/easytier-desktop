@@ -16,6 +16,7 @@ that embeds the trusted kernel table. Binary only.
 | --- | --- |
 | `run [--mode user\|service]` | Run a host (default `user`). `service` is what the service manager starts. |
 | `install [--allow-user <SID\|UID>]...` | Install the system service (administrator). |
+| `upgrade` | Replace the installed service with this build and merge its kernels, keeping all state (administrator; run from the new payload). |
 | `uninstall` / `uninstall --status` | Stop, reclaim everything, remove the service; or report an unfinished uninstall. |
 | `resume-service` | Re-enable a service disabled by an uninstall that stopped before reclaim finished. |
 | `reclaim [--mode ...] [--all [--purge]]` | Reclaim ownership records while the host is stopped. |
@@ -72,6 +73,7 @@ accepted targets and validation rules are in the header of `cores.lock` and in
 | --- | --- |
 | `src/main.rs` | clap CLI; dispatches subcommands; Windows service dispatcher for `run --mode service`. |
 | `src/host.rs` | Layout per form, dependency wiring, `run`, install / uninstall / resume, reclaim, remove-core, doctor. |
+| `src/upgrade.rs` | `upgrade`: durable stages, image swap with `.prev` backup, kernel merge, registration backup, commit by the new host, rollback and crash recovery. |
 | `src/serving.rs` | Listener with allow-list ACL, capabilities, connection/lease presence, shutdown on signal or service stop. |
 | `src/storage.rs` | Repair index file, kernel manifest, verified install of bundled kernels, native-adapter history. |
 | `src/unavailable.rs` | Fail-closed adapters for a platform without native adapters: no new effects, no kernel launch. |
@@ -98,7 +100,11 @@ cargo nextest run -p etd-host
 - `singleton.rs`: a second process cannot take the host lock until it is released.
 - `user_mode_e2e.rs`: native IPC, the production composition and lease loop, real
   child containment, scripted kernel and OS observations; unprivileged.
-- `install_roundtrip.rs`: real install, connect, uninstall. `#[ignore]`, and it also
+- `install_roundtrip.rs`: real install, connect, uninstall; upgrade from a changed
+  payload (twice), state kept; rollback when the new host never serves; an upgrade
+  interrupted at `Replacing`, refused by `resume-service`, restored by the next
+  upgrade and by uninstall. The faults come from a CI-only fixture compiled only with
+  `etd-sysfx-os/ci-test-fixtures`. `#[ignore]`, and it also
   requires `CI=true` and `ETD_HOST_CI_INSTALL=1`. It runs only in the dedicated
   elevated CI jobs on disposable runners
   (`--profile privileged --run-ignored only --test install_roundtrip`). Never run it

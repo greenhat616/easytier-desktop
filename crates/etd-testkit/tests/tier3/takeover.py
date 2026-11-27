@@ -36,10 +36,18 @@ class Impostor:
         self.proc, self.status, self.stop = proc, status, stop
 
     def read(self):
-        try:
-            return json.loads(self.status.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return {}
+        # The impostor replaces the file atomically; on Windows an open can
+        # still fail while that replace is in progress, so retry briefly.
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                return json.loads(self.status.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                return {}
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.005)
 
     def wait(self, description, accept, timeout=60):
         def read():
@@ -231,10 +239,14 @@ def management_port():
 
         # B. Fence evidence: the next generation's planned port is taken
         # between plan commit and kernel bind, so the impostor is the listener
-        # the host finds on the fenced port.
+        # the host finds on the fenced port. An attempt is valid only when the
+        # host's refusal names the impostor; an epoch whose kernel failed by
+        # another path first (no such notice, next epoch ready) is void and
+        # retried. In every attempt the host must never reach the impostor.
         current = second
         ledger = service.state / "ledger.sqlite3"
-        for attempt in range(1, 5):
+        attempts = 8
+        for attempt in range(1, attempts + 1):
             stop_instance(service, instance, current["epoch"])
             with impostor("race", "--ledger", ledger, "--instance", instance, "--after", current["epoch"]) as racer:
                 racer.wait("ledger watch", lambda s: s.get("state") == "watching")
@@ -265,6 +277,15 @@ def management_port():
                 listener = f"management port 127.0.0.1:{port} is held by pid {outcome['pid']}, not the kernel"
                 fence = [text for text in host_notices(service, instance, "fence.failed") if listener in text]
                 print(f"fence.failed notices naming the impostor: {fence}", flush=True)
+                if not fence and result["state"] in READY and result["epoch"] > epoch:
+                    # Void: epoch {epoch} ended before the fence's listener
+                    # check (its kernel failed on the taken port first).
+                    final = racer.release()
+                    assert final.get("connections") == 0 and final.get("bytes") == 0, final
+                    print(f"race {attempt}: void, epoch {epoch} ended by another path; "
+                          f"impostor received nothing; epoch {result['epoch']} {result['state']}", flush=True)
+                    current = result
+                    continue
                 assert fence, f"no fence.failed notice names the impostor on {port}: "                               f"{host_notices(service, instance, 'fence.failed')}"
                 if result["state"] == "gave_up":
                     assert "DenyAll" in result.get("message", ""), result
@@ -284,7 +305,8 @@ def management_port():
                       f"{final['bytes']} bytes", flush=True)
             break
         else:
-            raise AssertionError("the impostor never took a planned port before the kernel in 4 attempts")
+            raise AssertionError(f"no valid attempt: the impostor never took a planned port before the kernel "
+                                 f"with the refusal naming it in {attempts} attempts")
 
         # Recovery once the impostor has gone.
         if result["state"] == "gave_up":

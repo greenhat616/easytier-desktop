@@ -1292,7 +1292,13 @@ fn main_thread_constrained_stack_renders_all_views_banners_and_editor_without_ov
                 window.input("中文测试net", cx);
                 window.click("editor-network-secret", cx);
                 window.input("secret-123", cx);
-                if !window.find("btn-suggested-listeners").visible() {
+                // The WinUI-style multiline InfoBars can consume different
+                // vertical space depending on text metrics. Scroll like a
+                // user until the later form control is in the viewport.
+                for _ in 0..6 {
+                    if window.find("btn-suggested-listeners").visible() {
+                        break;
+                    }
                     window.scroll(
                         "network-editor-scroll",
                         gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-140.))),

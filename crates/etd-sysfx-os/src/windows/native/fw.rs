@@ -35,6 +35,7 @@ const SUPPORTED_BUILDS: &[u32] = &[20348, 26100, 26200];
 /// FW_VERSION(2, 27).
 const BINARY_VERSION: u16 = 0x021B;
 const FW_STORE_TYPE_LOCAL: i32 = 2;
+const FW_POLICY_ACCESS_RIGHT_READ: i32 = 1;
 const FW_POLICY_ACCESS_RIGHT_READ_WRITE: i32 = 2;
 const FW_RULE_STATUS_CLASS_ALL: u32 = 0xFFFF_0000;
 const FW_RULE_STATUS_OK: u32 = 0x0001_0000;
@@ -271,7 +272,7 @@ fn check_build((major, minor, build): (u32, u32, u32)) -> Result<bool, WinError>
 /// enumerate every rule, each status OK and the list matching its count
 /// (the layout asserts hold at compile time). Nothing is changed.
 fn self_check(api: Api) -> Result<usize, WinError> {
-    let store = Store::open(api)?;
+    let store = Store::open(api, false)?;
     Ok(checked_rules(&store)?.len())
 }
 
@@ -333,8 +334,8 @@ fn load() -> Result<(Api, Acceptance), WinError> {
     } else {
         let rules = self_check(api).map_err(|e| {
             unsupported(format_args!(
-                "{major}.{minor}.{build} is not listed and its self-check failed: {}",
-                e.message
+                "{major}.{minor}.{build} is not listed and its self-check failed: {} (status {})",
+                e.message, e.code
             ))
         })?;
         tracing::info!(
@@ -368,7 +369,8 @@ struct Store {
     handle: *mut c_void,
 }
 impl Store {
-    fn open(api: Api) -> Result<Self, WinError> {
+    /// `write`: READ_WRITE (deletion); otherwise READ (listing, self-check).
+    fn open(api: Api, write: bool) -> Result<Self, WinError> {
         let mut handle = std::ptr::null_mut();
         // SAFETY: local store (no machine name), out pointer valid.
         status(
@@ -377,7 +379,11 @@ impl Store {
                     BINARY_VERSION,
                     std::ptr::null(),
                     FW_STORE_TYPE_LOCAL,
-                    FW_POLICY_ACCESS_RIGHT_READ_WRITE,
+                    if write {
+                        FW_POLICY_ACCESS_RIGHT_READ_WRITE
+                    } else {
+                        FW_POLICY_ACCESS_RIGHT_READ
+                    },
                     0,
                     &mut handle,
                 )
@@ -702,7 +708,7 @@ fn same(a: &str, b: &str) -> bool {
 /// being the rule's raw registry string.
 pub(super) fn rows(name: Option<String>, sweep: Sweep) -> Result<Vec<Value>, WinError> {
     call(move |api| {
-        let store = Store::open(api)?;
+        let store = Store::open(api, false)?;
         let rules = checked_rules(&store)?;
         drop(store);
         let key = Key::open(HKEY_LOCAL_MACHINE, RULES_KEY, KEY_READ)?;
@@ -769,7 +775,7 @@ fn delete_with(
     c: &Credential,
     registry: impl Fn(&str) -> Result<bool, WinError>,
 ) -> Result<&'static str, WinError> {
-    let store = Store::open(api)?;
+    let store = Store::open(api, true)?;
     let before = checked_rules(&store)?;
     let matching: Vec<&RuleRow> = before
         .iter()
@@ -839,6 +845,7 @@ mod tests {
         /// list it builds.
         static SKEW: Cell<i64> = const { Cell::new(0) };
         static HEADS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+        static ACCESS: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
     }
 
     fn wide(s: &str) -> *const u16 {
@@ -864,7 +871,8 @@ mod tests {
     ) -> u32 {
         assert_eq!(version, BINARY_VERSION);
         assert!(machine.is_null());
-        assert_eq!((store, access), (2, 2));
+        assert_eq!(store, 2);
+        ACCESS.with_borrow_mut(|a| a.push(access));
         // SAFETY: the caller's out pointer.
         unsafe { *out = std::ptr::dangling_mut::<c_void>() };
         0
@@ -920,6 +928,7 @@ mod tests {
         SKEW.set(skew);
         DELETED.with_borrow_mut(Vec::clear);
         HEADS.with_borrow_mut(Vec::clear);
+        ACCESS.with_borrow_mut(Vec::clear);
         RULES.set(
             rules
                 .iter()
@@ -957,6 +966,8 @@ mod tests {
             "removed"
         );
         assert_eq!(DELETED.with_borrow(Clone::clone), ["a'q\\b\"c"]);
+        // Deletion opens the store for writing.
+        assert_eq!(ACCESS.with_borrow(Clone::clone), [2]);
         // Two enumerations, each freed once; the store closed once.
         assert_eq!((FREED.get(), CLOSED.get()), (2, 1));
     }
@@ -982,7 +993,8 @@ mod tests {
     fn a_rule_left_in_the_registry_is_not_removed() {
         let api = fake(&[("a", "EasyTier rule", FW_RULE_STATUS_OK)], 0);
         assert!(delete_with(api, &credential("a"), |_| Ok(true)).is_err());
-        assert_eq!((FREED.get(), CLOSED.get()), (2, 1));
+        // The second enumeration is empty: a null list, nothing to free.
+        assert_eq!((FREED.get(), CLOSED.get()), (1, 1));
     }
 
     #[test]
@@ -1012,6 +1024,8 @@ mod tests {
             0,
         );
         assert_eq!(self_check(api).unwrap(), 2);
+        // Read-only: an unelevated doctor can run it.
+        assert_eq!(ACCESS.with_borrow(Clone::clone), [1]);
         assert!(DELETED.with_borrow(Vec::is_empty));
         assert_eq!((FREED.get(), CLOSED.get()), (1, 1));
         let api = fake(&[("a", "x", 0x0002_0000)], 0);

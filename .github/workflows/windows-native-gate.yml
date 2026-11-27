@@ -55,6 +55,7 @@ jobs:
           cargo nextest list --locked --profile privileged -p etd-sysfx-os --features ci-test-fixtures --run-ignored only --test windows_native_parity --test windows_fence
           cargo nextest list --locked --profile privileged -p etd-host --run-ignored only --test install_roundtrip
       - name: Fetch Process Monitor
+        id: procmon
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -80,7 +81,8 @@ jobs:
           }
           if ($code -ne 0 -or $captured -ne 0) { exit 1 }
       - name: Both host forms and the native operations under COM plants, captured
-        if: always()
+        # Also after a parity failure, but only once the tests and Procmon exist.
+        if: ${{ !cancelled() && steps.procmon.outcome == 'success' }}
         shell: pwsh
         env:
           CI: 'true'

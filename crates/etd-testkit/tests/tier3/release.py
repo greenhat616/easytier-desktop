@@ -9,8 +9,9 @@ binary) on the packages it is about to publish:
   bytes appended to etd-host, so the upgrade replaces the service image. It
   is a test artifact and never published.
 
-ETD_G2_BIN names the installed payload folder (whose etd-ctl talks to the
-service) and ETD_G2_SHA the digest of its kernel. Each case installs the
+ETD_G2_BIN names the release package's payload extracted to a folder that
+outlives the uninstall (its etd-ctl talks to the service, its etd-host reads
+the uninstall status) and ETD_G2_SHA the digest of its kernel. Each case installs the
 release package, checks the service serves from the payload image as owned
 by the package, upgrades to the next version keeping the install id, install
 key and ledger settings, and removes the package; Service.installed compares
@@ -66,7 +67,9 @@ def msi_release():
         assert digest(service.host) == digest(msi.PAYLOAD / "etd-host.exe")
         record = msi.journal()
         assert record["install_id"] == install_id and "upgrade" not in record, record
-        assert record.get("owner") == code_next, record
+        # The owner is the product that installed the service; an upgrade
+        # keeps it (the next uninstall removes the service whatever it is).
+        assert record.get("owner") == code, record
         assert digest(service.state / "repair-index.json") == key, "the install key changed"
         assert msi.settings(service) == kept, "the ledger settings changed"
         msi.no_backups(service)

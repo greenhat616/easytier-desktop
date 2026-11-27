@@ -186,7 +186,8 @@ jobs:
           arch="$out/easytier-desktop-${VERSION}-1-x86_64.pkg.tar.zst"
           ls -l "$out"
           dpkg-deb --info "$deb"
-          floor=$(dpkg-deb -f "$deb" Depends | grep -oE 'libc6 \(>= [0-9.]+\)' | grep -oE '[0-9][0-9.]*')
+          floor=$(dpkg-deb -f "$deb" Depends | sed -nE 's/.*libc6 \(>= ([0-9.]+)\).*/\1/p')
+          [[ -n "$floor" ]] || { echo "the deb has no libc6 lower bound"; exit 1; }
           echo "the packages need glibc $floor or newer"
           dpkg --compare-versions "$floor" le 2.35 || { echo "glibc $floor is newer than Ubuntu 22.04's 2.35"; exit 1; }
           x="$RUNNER_TEMP/extract"
@@ -245,7 +246,13 @@ jobs:
           & $python -m pip install psutil==7.0.0
           $env:ETD_RELEASE = Join-Path $env:RUNNER_TEMP "release/easytier-desktop-$env:VERSION-x86_64.msi"
           $env:ETD_RELEASE_NEXT = Join-Path $env:RUNNER_TEMP "next/easytier-desktop-$env:NEXT-x86_64.msi"
-          $env:ETD_G2_BIN = Join-Path $env:ProgramFiles 'EasyTier Desktop'
+          # The release payload, extracted (an administrative image, nothing
+          # installed) to a folder the uninstall leaves alone.
+          $extract = Join-Path $env:RUNNER_TEMP 'payload'
+          $process = Start-Process msiexec.exe -ArgumentList '/a', "`"$env:ETD_RELEASE`"", '/qn', "TARGETDIR=`"$extract`"" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "msiexec /a exited $($process.ExitCode)" }
+          $env:ETD_G2_BIN = (Get-ChildItem -LiteralPath $extract -Recurse -Filter etd-host.exe | Select-Object -First 1).DirectoryName
+          Write-Output "release payload: $env:ETD_G2_BIN"
           & $python -B -u crates/etd-testkit/tests/tier3/release.py msi_release
       - name: Keep the MSI logs
         if: failure()
@@ -291,9 +298,11 @@ jobs:
           set -euo pipefail
           python=$(mise which python)
           "$python" -m pip install psutil==7.0.0
+          # The release payload, extracted to a folder the purge leaves alone.
+          dpkg-deb -x "$RUNNER_TEMP/release/easytier-desktop_${VERSION}-1_amd64.deb" "$RUNNER_TEMP/payload"
           sudo env "PATH=$PATH" "RUNNER_TEMP=$RUNNER_TEMP" "GITHUB_WORKSPACE=$GITHUB_WORKSPACE" \
             "GITHUB_ACTIONS=$GITHUB_ACTIONS" "RUNNER_ENVIRONMENT=$RUNNER_ENVIRONMENT" "ETD_G2_CI=$ETD_G2_CI" \
-            "ETD_G2_SHA=$ETD_G2_SHA" "ETD_G2_BIN=/usr/lib/easytier-desktop" \
+            "ETD_G2_SHA=$ETD_G2_SHA" "ETD_G2_BIN=$RUNNER_TEMP/payload/usr/lib/easytier-desktop" \
             "ETD_RELEASE=$RUNNER_TEMP/release/easytier-desktop_${VERSION}-1_amd64.deb" \
             "ETD_RELEASE_NEXT=$RUNNER_TEMP/next/easytier-desktop_${NEXT}-1_amd64.deb" \
             "$python" -B -u crates/etd-testkit/tests/tier3/release.py deb_release

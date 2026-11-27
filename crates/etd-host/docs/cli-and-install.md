@@ -172,6 +172,15 @@ files (copied into the protected `<SID>\cores` and verified); networks without T
 manual regression record: it reports whether the kernel still loads the plant and
 passes either way.
 
+Under the same acceptance, rated low: CreateProcess reads the user's
+`HKCU\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers` value for the
+kernel's image path, so the user can attach a compatibility layer to the elevated kernel.
+Only Windows' built-in shims apply (custom shim databases need administrator rights) and
+the image itself stays in the protected store. An empty `__COMPAT_LAYER` in the kernel's
+environment does not override it (probe run 46069613257 on Server 2022 and 2025: the
+layer's AcLayers.dll still loads with it unset, empty, blank or `RunAsInvoker`), so the
+host sets nothing.
+
 Refusals exit with their own codes so the UI can tell them apart:
 
 | Exit code | Meaning |

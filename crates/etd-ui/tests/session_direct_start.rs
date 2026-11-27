@@ -17,17 +17,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// `target\<profile>\etd-host.exe`, built before this test.
+/// `target\<profile>\etd-host.exe`, built before this test. Test binaries
+/// sit somewhere below the profile directory (`deps\`, or `build\<crate>\…`
+/// with the newer build-dir layout), so look in each ancestor.
 fn host_program() -> PathBuf {
     let exe = std::env::current_exe().unwrap();
-    let profile_dir = exe.parent().and_then(|deps| deps.parent()).unwrap();
-    let program = profile_dir.join("etd-host.exe");
-    assert!(
-        program.is_file(),
-        "build etd-host first: {}",
-        program.display()
-    );
-    program
+    exe.ancestors()
+        .skip(1)
+        .map(|dir| dir.join("etd-host.exe"))
+        .find(|program| program.is_file())
+        .unwrap_or_else(|| panic!("build etd-host first (looked above {})", exe.display()))
 }
 
 #[test]

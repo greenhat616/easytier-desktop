@@ -1787,7 +1787,7 @@ impl Gallery {
         {
             return;
         }
-        let options = crate::views::popout::window_options("Weekend LAN", px(320.), px(168.), cx);
+        let options = crate::views::popout::window_options("Weekend LAN", px(320.), px(136.), cx);
         self.demo.popout = gpui_kit::open_window(options, cx, |_, cx| cx.new(|_| RoomPopOut))
             .ok()
             .map(|(handle, _)| handle);

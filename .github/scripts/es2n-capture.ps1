@@ -83,3 +83,5 @@ foreach ($dll in 'combase','oleaut32','ole32','shell32','windows.storage','Firew
 $verdict | Out-File "$Out\$Name-verdict.txt"
 $verdict | Write-Host
 if ($verdict | Where-Object { $_ -like 'FAIL:*' }) { exit 1 }
+# Explicitly: a passing verdict must not inherit the caller's last exit code.
+exit 0

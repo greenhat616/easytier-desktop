@@ -508,10 +508,7 @@ impl Render for Gallery {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui_kit::{
-        TestAppContext,
-        test::{TestAppContextExt as _, TestWindowExt as _},
-    };
+    use gpui_kit::{TestAppContext, test::TestWindowExt as _};
 
     #[gpui_kit::test]
     fn gallery_exercises_controls_without_host(cx: &mut TestAppContext) {
@@ -566,7 +563,7 @@ mod tests {
         use gpui_kit::{
             HeadlessAppContext,
             platform::{current_headless_renderer, current_platform},
-            test::TestEventExt as _,
+            test::{TestAppContextExt as _, TestEventExt as _},
         };
         use std::{path::PathBuf, sync::Arc, time::Duration};
         let output = PathBuf::from(

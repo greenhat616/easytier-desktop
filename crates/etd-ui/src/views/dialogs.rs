@@ -350,10 +350,14 @@ pub fn teaching_tip(
         |_, _, _| {},
         move |bounds, _, window, _| {
             let o = bounds.origin;
+            // The fill reaches 1 px further down to cover the card's top
+            // border under the tail; the stroked edges stop at the border.
             let mut fill_path = PathBuilder::fill();
-            fill_path.move_to(point(o.x, o.y + px(9.)));
+            fill_path.move_to(point(o.x, o.y + px(10.)));
+            fill_path.line_to(point(o.x, o.y + px(9.)));
             fill_path.line_to(point(o.x + px(8.), o.y + px(1.)));
             fill_path.line_to(point(o.x + px(16.), o.y + px(9.)));
+            fill_path.line_to(point(o.x + px(16.), o.y + px(10.)));
             fill_path.close();
             if let Ok(path) = fill_path.build() {
                 window.paint_path(path, fill);
@@ -371,7 +375,7 @@ pub fn teaching_tip(
     .top(px(-9.))
     .left(px(20.))
     .w(px(16.))
-    .h(px(9.));
+    .h(px(10.));
     let keys = on_close.clone();
     let tip = div()
         .id(id)

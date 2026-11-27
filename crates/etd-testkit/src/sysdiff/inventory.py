@@ -104,9 +104,11 @@ def processes(inv, paths):
         powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
         script = Path(os.environ["GITHUB_WORKSPACE"]) / "crates/etd-sysfx-os/src/windows/system.ps1"
         if script.is_file():
-            # Match the checkout bytes compiled into the installed host, including
-            # its line endings. Retain only verified process identities.
-            encoded = base64.b64encode(script.read_bytes().decode().encode("utf-16-le")).decode()
+            # Worker::spawn encodes execution.rs::script(), which trims each
+            # line and drops empty lines and whole-line comments before joining.
+            lines = (line.strip() for line in script.read_text(encoding="utf-8").splitlines())
+            body = "\n".join(line for line in lines if line and not line.startswith("#"))
+            encoded = base64.b64encode(body.encode("utf-16-le")).decode()
             args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded]
             for pid, row in table.items():
                 parent = table.get(row["ppid"])

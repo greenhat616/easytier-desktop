@@ -98,8 +98,9 @@ fn stamp(file: &File) -> io::Result<(u64, u64, u64, i64, i64)> {
 }
 #[cfg(windows)]
 fn stamp(file: &File) -> io::Result<u64> {
-    // The handle denies write and delete sharing; the size is a cheap
-    // consistency check only.
+    // Only a consistency check: what protects the bytes on Windows is the
+    // handle's share mode, which denies writing, renaming and deleting the
+    // file while it is open.
     Ok(file.metadata()?.len())
 }
 

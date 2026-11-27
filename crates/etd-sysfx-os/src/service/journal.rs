@@ -49,6 +49,11 @@ struct Record {
     /// none, so a host build without upgrade still reads the journal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     upgrade: Option<UpgradeStage>,
+    /// SHA-256 (hex) of the service registration this upgrade saved before
+    /// replacing it. Only a backup with this digest is ever restored; it is
+    /// cleared together with the stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    registration_backup: Option<String>,
 }
 
 /// Durable stages of `etd-host upgrade`, written before the step they name.
@@ -62,6 +67,9 @@ pub enum UpgradeStage {
     /// The payload is verified and in place; the new host is starting. It
     /// clears the stage itself once it serves, which commits the upgrade.
     Starting,
+    /// Restoring the previous image, kernels and registration; no host
+    /// starts until the restore has finished and cleared the stage.
+    RollingBack,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +118,7 @@ impl LifecycleJournal {
                 group_gid: None,
                 deferred: None,
                 upgrade: None,
+                registration_backup: None,
             },
         };
         journal.save()?;
@@ -208,19 +217,45 @@ impl LifecycleJournal {
         self.record.upgrade
     }
     /// Record an upgrade stage (only on an installed service), or `None`
-    /// once the upgrade is committed or rolled back.
+    /// once the upgrade is committed or rolled back, which also forgets the
+    /// registration backup.
     pub fn set_upgrade_stage(&mut self, stage: Option<UpgradeStage>) -> io::Result<()> {
         if stage.is_some() && self.record.phase != Phase::Installed {
             return Err(io::Error::other(
                 "only an installed service can be upgraded",
             ));
         }
-        if self.record.upgrade != stage {
-            let previous = std::mem::replace(&mut self.record.upgrade, stage);
+        let backup = if stage.is_some() {
+            self.record.registration_backup.clone()
+        } else {
+            None
+        };
+        if self.record.upgrade != stage || self.record.registration_backup != backup {
+            let previous = (
+                std::mem::replace(&mut self.record.upgrade, stage),
+                std::mem::replace(&mut self.record.registration_backup, backup),
+            );
             if let Err(error) = self.save() {
-                self.record.upgrade = previous;
+                (self.record.upgrade, self.record.registration_backup) = previous;
                 return Err(error);
             }
+        }
+        Ok(())
+    }
+    pub fn registration_backup(&self) -> Option<&str> {
+        self.record.registration_backup.as_deref()
+    }
+    /// Bind a saved registration (its SHA-256, hex) to the active upgrade.
+    pub fn set_registration_backup(&mut self, digest: String) -> io::Result<()> {
+        if self.record.upgrade.is_none() {
+            return Err(io::Error::other(
+                "a registration backup belongs to an active upgrade",
+            ));
+        }
+        let previous = self.record.registration_backup.replace(digest);
+        if let Err(error) = self.save() {
+            self.record.registration_backup = previous;
+            return Err(error);
         }
         Ok(())
     }
@@ -404,6 +439,7 @@ mod tests {
             UpgradeStage::Disabling,
             UpgradeStage::Replacing,
             UpgradeStage::Starting,
+            UpgradeStage::RollingBack,
         ] {
             journal.set_upgrade_stage(Some(stage)).unwrap();
             journal = LifecycleJournal::read(path.clone()).unwrap().unwrap();
@@ -412,9 +448,21 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"upgrade\":\"starting\"")
+                .contains("\"upgrade\":\"rolling_back\"")
+        );
+        // A registration backup is bound to the active upgrade only.
+        journal.set_registration_backup("ab".repeat(32)).unwrap();
+        journal
+            .set_upgrade_stage(Some(UpgradeStage::Starting))
+            .unwrap();
+        journal = LifecycleJournal::read(path.clone()).unwrap().unwrap();
+        assert_eq!(
+            journal.registration_backup(),
+            Some("ab".repeat(32).as_str())
         );
         journal.set_upgrade_stage(None).unwrap();
+        assert_eq!(journal.registration_backup(), None);
+        assert!(journal.set_registration_backup("cd".repeat(32)).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), clear);
         // A journal written before upgrade existed still reads.
         let old = clear.replace(",\"deferred\":null", "");

@@ -17,6 +17,32 @@ const UNIT: &str = "/Library/LaunchDaemons/easytier-desk-host.plist";
 #[cfg(target_os = "macos")]
 const UNIT_CONTENT: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>easytier-desk-host</string><key>ProgramArguments</key><array><string>/Library/Application Support/easytier-desk/etd-host</string><string>run</string><string>--mode</string><string>service</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>\n";
 
+/// Registrations earlier builds installed. A build that changes
+/// `UNIT_CONTENT` moves the previous content here, so its upgrade can stop
+/// the old service and a rollback can start it again with its own unit.
+const PREVIOUS_UNIT_CONTENTS: &[&str] = &[];
+
+/// Whether `content` is a registration this build recognises as its own.
+fn accepted_unit(content: &str) -> bool {
+    content == UNIT_CONTENT
+        || PREVIOUS_UNIT_CONTENTS.contains(&content)
+        || ci_previous_unit().is_some_and(|previous| content == previous)
+}
+
+/// The CI upgrade tests stand in a "previous build's" registration: this
+/// build's with a marker. Compiled only with `ci-test-fixtures`.
+#[cfg(feature = "ci-test-fixtures")]
+fn ci_previous_unit() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    return Some(format!("{UNIT_CONTENT}# etd-upgrade-ci\n"));
+    #[cfg(target_os = "macos")]
+    return Some(UNIT_CONTENT.replacen("<plist", "<!-- etd-upgrade-ci -->\n<plist", 1));
+}
+#[cfg(not(feature = "ci-test-fixtures"))]
+fn ci_previous_unit() -> Option<String> {
+    None
+}
+
 fn denied() -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
@@ -378,7 +404,7 @@ fn verify_unit(partial_install: bool) -> io::Result<()> {
     let path = Path::new(UNIT);
     check(path, false)?;
     let content = fs::read_to_string(path)?;
-    if content != UNIT_CONTENT && !(partial_install && UNIT_CONTENT.starts_with(&content)) {
+    if !accepted_unit(&content) && !(partial_install && UNIT_CONTENT.starts_with(&content)) {
         return Err(denied());
     }
     Ok(())
@@ -505,7 +531,7 @@ pub(super) fn unregister(layout: &HostLayout, partial_install: bool) -> io::Resu
     }
     if Path::new(UNIT).try_exists()? {
         verify_unit(partial_install)?;
-        if fs::read_to_string(UNIT)? == UNIT_CONTENT {
+        if accepted_unit(&fs::read_to_string(UNIT)?) {
             stop_and_disable(layout)?;
         }
         #[cfg(target_os = "macos")]
@@ -601,9 +627,11 @@ pub(super) fn restore_host_image(layout: &HostLayout) -> io::Result<bool> {
 pub(super) fn discard_host_backup(layout: &HostLayout) -> io::Result<()> {
     super::image::discard(&image_paths(layout)?, image_check)?;
     let saved = registration_backup(layout)?;
-    if fs::symlink_metadata(&saved).is_ok() {
-        check(&saved, false)?;
-        fs::remove_file(&saved)?;
+    for leftover in [saved.with_extension("tmp"), saved] {
+        if fs::symlink_metadata(&leftover).is_ok() {
+            check(&leftover, false)?;
+            fs::remove_file(&leftover)?;
+        }
     }
     Ok(())
 }
@@ -637,37 +665,76 @@ fn write_unit(content: &[u8]) -> io::Result<()> {
     invoke("/usr/bin/systemctl", &["daemon-reload"])?;
     Ok(())
 }
+fn hex_sha256(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(data)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 /// The installed unit is ours: the maintenance journal records the
-/// installation. Replace it only if this build's content differs, saving
-/// the installed one for rollback first.
-pub(super) fn refresh_registration(layout: &HostLayout) -> io::Result<()> {
+/// installation and `verify_unit` recognises it. Replace it only if this
+/// build's content differs. The installed one is first saved (temporary
+/// file, sync, rename, sync the directory) and bound to this upgrade by its
+/// digest in the journal; a backup without that binding is stale.
+pub(super) fn refresh_registration(
+    layout: &HostLayout,
+    journal: &mut LifecycleJournal,
+) -> io::Result<()> {
     use std::{io::Write, os::unix::fs::OpenOptionsExt};
     validate_service(layout)?;
-    let path = Path::new(UNIT);
-    check(path, false)?;
-    let installed = fs::read(path)?;
+    verify_unit(false)?;
+    let installed = fs::read(UNIT)?;
     if installed == UNIT_CONTENT.as_bytes() {
         return Ok(());
     }
     let saved = registration_backup(layout)?;
+    let temporary = saved.with_extension("tmp");
+    for stale in [&saved, &temporary] {
+        if fs::symlink_metadata(stale).is_ok() {
+            check(stale, false)?;
+            fs::remove_file(stale)?;
+        }
+    }
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&saved)?;
+        .open(&temporary)?;
     file.write_all(&installed)?;
     file.sync_all()?;
     drop(file);
+    fs::rename(&temporary, &saved)?;
     File::open(&layout.maintenance)?.sync_all()?;
+    journal.set_registration_backup(hex_sha256(&installed))?;
     write_unit(UNIT_CONTENT.as_bytes())
 }
-pub(super) fn restore_registration(layout: &HostLayout) -> io::Result<bool> {
+/// Put back the registration this upgrade saved; `Ok(false)` if it saved
+/// none. A backup whose digest is not the journal's is never restored.
+pub(super) fn restore_registration(
+    layout: &HostLayout,
+    journal: &LifecycleJournal,
+) -> io::Result<bool> {
+    let Some(expected) = journal.registration_backup() else {
+        return Ok(false);
+    };
     let saved = registration_backup(layout)?;
     if fs::symlink_metadata(&saved).is_err() {
-        return Ok(false);
+        // Restored before an interruption: the unit already matches.
+        check(Path::new(UNIT), false)?;
+        if hex_sha256(&fs::read(UNIT)?) == expected {
+            return Ok(true);
+        }
+        return Err(other("the saved service registration is missing"));
     }
     check(&saved, false)?;
-    write_unit(&fs::read(&saved)?)?;
+    let content = fs::read(&saved)?;
+    if hex_sha256(&content) != expected {
+        return Err(other(
+            "the saved service registration does not match this upgrade",
+        ));
+    }
+    write_unit(&content)?;
     fs::remove_file(&saved)?;
     Ok(true)
 }

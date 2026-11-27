@@ -362,7 +362,7 @@ async fn serve_until(
         match journal.upgrade_stage() {
             // `Disabling` changed nothing yet: this is still the old host.
             None | Some(UpgradeStage::Disabling) => {}
-            Some(UpgradeStage::Replacing) => bail!(
+            Some(UpgradeStage::Replacing | UpgradeStage::RollingBack) => bail!(
                 "an upgrade of this service is incomplete; run etd-host upgrade from the new payload again, or etd-host uninstall"
             ),
             Some(UpgradeStage::Starting) => {

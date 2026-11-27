@@ -37,19 +37,26 @@ fn manifest_backup(layout: &HostLayout) -> PathBuf {
 
 /// Undo an uncommitted upgrade: old image, manifest and registration, then
 /// the kernel directories in `published` (only ones no host has run with).
-/// Caller holds the host lock with the service stopped.
+/// `RollingBack` is recorded first, so no host starts on a half-restored
+/// install; only a finished restore clears the stage. Caller holds the host
+/// lock with the service stopped.
 pub(super) fn roll_back(
     layout: &HostLayout,
     journal: &mut LifecycleJournal,
     published: &[PathBuf],
 ) -> Result<()> {
+    journal.set_upgrade_stage(Some(UpgradeStage::RollingBack))?;
     NativeServiceManager
         .restore_host_image(layout)
         .context("cannot restore the previous host image")?;
+    if ci_upgrade_fault(layout, "crash-in-rollback") {
+        eprintln!("CI fault: exiting in the middle of a rollback");
+        std::process::exit(87);
+    }
     storage::restore_manifest(&layout.cores, &manifest_backup(layout))
         .context("cannot restore the previous kernel inventory")?;
     NativeServiceManager
-        .restore_registration(layout)
+        .restore_registration(layout, journal)
         .context("cannot restore the previous service registration")?;
     storage::remove_published_bundles(published)?;
     NativeServiceManager.discard_host_backup(layout)?;
@@ -195,26 +202,31 @@ pub async fn upgrade() -> Result<()> {
     // interrupted upgrade could not be restored.
     let prepared = async {
         let guard = stop_for_maintenance(&layout).await?;
+        // Before any restore: an interrupted new host may have migrated it.
+        let ledger_before = storage::ledger_header(&layout.state);
         let mut journal = require_journal(&layout, &install_id)?;
         if matches!(
             interrupted,
-            Some(UpgradeStage::Replacing | UpgradeStage::Starting)
+            Some(UpgradeStage::Replacing | UpgradeStage::Starting | UpgradeStage::RollingBack)
         ) {
             println!("restoring an interrupted upgrade first");
             // Kernel directories it published stay: a host may have run.
             roll_back(&layout, &mut journal, &[])
                 .context("cannot restore the interrupted upgrade")?;
         }
-        Ok((guard, journal))
+        Ok((guard, journal, ledger_before))
     }
     .await;
-    let (guard, mut journal) = match prepared {
+    let (guard, mut journal, ledger_before) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => return Err(resume_previous(&layout, &install_id, error).await),
     };
-    let ledger_before = storage::ledger_header(&layout.state);
     let mut published = Vec::new();
     let result: Result<storage::CoreMerge> = async {
+        ensure!(
+            !ci_upgrade_fault(&layout, "fail-before-replacing"),
+            "CI fault: failing before the upgrade replaces anything"
+        );
         NativeHostFilesystem.validate_service(&layout)?;
         // Leftovers of an earlier, committed upgrade.
         NativeServiceManager.discard_host_backup(&layout)?;
@@ -225,7 +237,7 @@ pub async fn upgrade() -> Result<()> {
             storage::upgrade_bundled_cores(&bundle_root, &layout.cores, &manifest_backup(&layout))
                 .await?;
         published.clone_from(&merge.published);
-        NativeServiceManager.refresh_registration(&layout)?;
+        NativeServiceManager.refresh_registration(&layout, &mut journal)?;
         NativeHostFilesystem.validate_service(&layout)?;
         if ci_upgrade_fault(&layout, "crash-after-replace") {
             eprintln!("CI fault: exiting with the upgrade at stage Replacing");
@@ -238,19 +250,25 @@ pub async fn upgrade() -> Result<()> {
     let merge = match result {
         Ok(merge) => merge,
         Err(error) => {
-            // No host has run with anything this attempt published.
-            if let Err(rollback) = roll_back(&layout, &mut journal, &published) {
+            // Backups belong to this attempt only once Replacing is
+            // recorded; before that, leftovers of an earlier upgrade must
+            // not come back. No host has run with anything published.
+            let replacing = matches!(
+                journal.upgrade_stage(),
+                Some(UpgradeStage::Replacing | UpgradeStage::Starting)
+            );
+            if replacing && let Err(rollback) = roll_back(&layout, &mut journal, &published) {
                 bail!(
                     "upgrade failed: {error:#}; rollback incomplete: {rollback:#}; the service stays disabled; retry etd-host upgrade or etd-host uninstall"
                 );
             }
             drop(guard);
-            return Err(resume_previous(
-                &layout,
-                &install_id,
-                error.context("upgrade rolled back"),
-            )
-            .await);
+            let error = if replacing {
+                error.context("upgrade rolled back")
+            } else {
+                error
+            };
+            return Err(resume_previous(&layout, &install_id, error).await);
         }
     };
     let notice = storage::kernel_selection_notice(&layout.state, &merge.dropped).await;
@@ -284,14 +302,22 @@ pub async fn upgrade() -> Result<()> {
             ),
         }
         let migrated = match (ledger_before, storage::ledger_header(&layout.state)) {
-            (Some(before), Some(after)) => before.maybe_migrated(&after),
-            _ => false,
+            (Some(before), Some(after)) => Some(before.maybe_migrated(&after)),
+            _ => None,
         };
         let mut error = error.context("the new host did not become ready; upgrade rolled back");
-        if migrated {
-            error = error.context(
-                "rolled back, but the ledger was (or may have been) migrated by the new version, so the previous host runs diagnostics-only; run the new upgrade again",
-            );
+        match migrated {
+            Some(false) => {}
+            Some(true) => {
+                error = error.context(
+                    "rolled back, but the ledger was (or may have been) migrated by the new version, so the previous host runs diagnostics-only; run the new upgrade again",
+                )
+            }
+            None => {
+                error = error.context(
+                    "rolled back; whether the new version migrated the ledger is unknown (its header could not be read): if the previous host runs diagnostics-only, run the new upgrade again",
+                )
+            }
         }
         if let Err(restart) = start_and_verify(&layout, &install_id).await {
             error = error.context(format!("the previous service did not restart: {restart:#}"));

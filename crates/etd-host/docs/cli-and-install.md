@@ -119,7 +119,8 @@ read as described in [The running image](#the-running-image); its embedded kerne
 table is the authority for the kernels it brings.
 
 The journal records the upgrade's stage, each written before its step: `Disabling`,
-`Replacing`, `Starting`. Under the maintenance lock, with the journal at `Installed`:
+`Replacing`, `Starting`, and `RollingBack` before any restore. Under the maintenance
+lock, with the journal at `Installed`:
 
 1. If no stage is recorded, the installed image already has the running image's
    bytes, every bundled kernel is present and verifies, and the manifest is current,
@@ -138,9 +139,15 @@ The journal records the upgrade's stage, each written before its step: `Disablin
    versions the new table trusts. Kernel directories are never deleted: ledger
    records may name them, and `remove-core` or uninstall reclaims them.
 5. Refresh the registration: on Unix, if the unit or plist differs from this build's,
-   save the installed one as `upgrade-registration` in the maintenance directory and
-   replace it (`daemon-reload` on Linux). The Windows SCM configuration is the same
-   for every build. Validate the install tree.
+   save the installed one as `upgrade-registration` in the maintenance directory
+   (temporary file, sync, rename, sync the directory), record its SHA-256 in the
+   journal, then replace it (`daemon-reload` on Linux). Only a backup with the
+   journal's digest is ever restored, and the digest is cleared with the stage. The
+   Windows SCM configuration is the same for every build. Validate the install tree.
+   A build accepts its own registration and those listed as earlier builds'
+   (`PREVIOUS_UNIT_CONTENTS` in `etd-sysfx-os`): a build that changes the unit must
+   list the old content there, so its upgrade can stop the old service and a
+   rollback can start it again.
 6. Record `Starting`, release the lock and start the service. The new host clears
    the stage itself once its self-check reaches Serving (not diagnostics-only); that
    commits the upgrade. `upgrade` waits for the verified endpoint (30 s) and then for
@@ -150,6 +157,8 @@ The journal records the upgrade's stage, each written before its step: `Disablin
 The ledger, the allow list, the repair index with its install key, and the state
 and maintenance directories are never touched; the ledger is never rolled back.
 
+- Every restore first records `RollingBack` and clears the stage only when all of
+  it is done.
 - **Failure before the start** (steps 2 to 5): restore the previous image, manifest
   and registration, remove the kernel directories this attempt published, clear the
   stage and restart the previous service. If the singleton lock cannot be taken
@@ -159,15 +168,20 @@ and maintenance directories are never touched; the ledger is never rolled back.
   clear the stage and restart the previous service. If the new host migrated the
   ledger (its SQLite `user_version` changed, or a write-ahead log is left), the
   previous host can only run diagnostics-only: the error says so and asks to run the
-  new upgrade again. If the new host committed after the wait ended, the upgrade
-  stands.
-- **A crash**: the stage stays. A host does not start while `Replacing` is recorded,
-  and `resume-service`, `reclaim` and `remove-core` refuse while any stage is
-  recorded. The next `upgrade` or `uninstall` restores the previous image, manifest
+  new upgrade again; if the ledger header cannot be read, it says that a migration is
+  unknown. If the new host committed after the wait ended, the upgrade stands.
+- **A crash**: the stage stays. A host does not start while `Replacing` or
+  `RollingBack` is recorded, and `resume-service`, `reclaim` and `remove-core` refuse
+  while any stage is recorded. The next `upgrade` or `uninstall` restores the previous image, manifest
   and registration first (keeping kernel directories). With `Disabling` nothing was
   replaced; the previous host still starts.
 - If a restore itself fails, the service stays disabled and the error says to retry
   `upgrade` or `uninstall`.
+- **Windows, uninstall after a crash at `Replacing`:** run from the installed image,
+  which is then the new one, `uninstall` restores the previous image and parks the
+  running one as `etd-host.failed`; removing the install directory then fails once,
+  because that file is still mapped. Running `uninstall` again (from the restored
+  image) completes. Installer front ends must offer that retry.
 
 If the upgrade drops the selected kernel version, it says so and names the instances
 set to run. Planning then fails with "selected kernel ... is not in this host's

@@ -241,6 +241,19 @@ mod tests {
     }
 
     #[test]
+    fn between_the_two_renames_no_image_is_the_installed_one() {
+        let (_root, paths, source) = fixture();
+        let source = source.canonicalize().unwrap();
+        fs::rename(&paths.executable, &paths.backup).unwrap();
+        // Missing executable, backup present: not installed, not an error.
+        assert!(!super::super::is_image(&source, &paths.executable).unwrap());
+        fs::write(&paths.executable, b"new image").unwrap();
+        let installed = paths.executable.canonicalize().unwrap();
+        assert!(super::super::is_image(&installed, &paths.executable).unwrap());
+        assert!(!super::super::is_image(&source, &paths.executable).unwrap());
+    }
+
+    #[test]
     fn a_copy_that_does_not_match_its_digest_changes_nothing() {
         // The digest is of the bytes read; a staged file that reads back
         // differently (here: a copy that lies) is never swapped in.

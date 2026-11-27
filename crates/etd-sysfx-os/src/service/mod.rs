@@ -177,12 +177,23 @@ pub trait ServiceManager {
     /// the previous one in the maintenance directory first. On Windows the
     /// SCM configuration this build writes ([`Self::start`]) is the same
     /// for every build, so there is nothing to save.
-    fn refresh_registration(&self, _layout: &HostLayout) -> io::Result<()> {
+    /// The backup is written atomically and bound to the active upgrade by
+    /// its digest in `journal`.
+    fn refresh_registration(
+        &self,
+        _layout: &HostLayout,
+        _journal: &mut LifecycleJournal,
+    ) -> io::Result<()> {
         Err(io::ErrorKind::Unsupported.into())
     }
     /// Put a registration saved by [`Self::refresh_registration`] back;
-    /// `Ok(false)` if none was saved.
-    fn restore_registration(&self, _layout: &HostLayout) -> io::Result<bool> {
+    /// `Ok(false)` if none was saved. A backup `journal` does not bind is
+    /// never restored.
+    fn restore_registration(
+        &self,
+        _layout: &HostLayout,
+        _journal: &LifecycleJournal,
+    ) -> io::Result<bool> {
         Err(io::ErrorKind::Unsupported.into())
     }
 }
@@ -251,26 +262,45 @@ impl ServiceManager for NativeServiceManager {
     fn discard_host_backup(&self, layout: &HostLayout) -> io::Result<()> {
         native::discard_host_backup(layout)
     }
-    fn refresh_registration(&self, layout: &HostLayout) -> io::Result<()> {
-        native::refresh_registration(layout)
+    fn refresh_registration(
+        &self,
+        layout: &HostLayout,
+        journal: &mut LifecycleJournal,
+    ) -> io::Result<()> {
+        native::refresh_registration(layout, journal)
     }
-    fn restore_registration(&self, layout: &HostLayout) -> io::Result<bool> {
-        native::restore_registration(layout)
+    fn restore_registration(
+        &self,
+        layout: &HostLayout,
+        journal: &LifecycleJournal,
+    ) -> io::Result<bool> {
+        native::restore_registration(layout, journal)
     }
 }
 
 /// CI fault injection for the privileged upgrade tests. Compiled only with
 /// the `ci-test-fixtures` feature (never in a product build): true when
-/// the protected maintenance directory holds `ci-upgrade-fault` naming
-/// `point`. Only an administrator can create that file.
+/// the protected maintenance directory holds `ci-upgrade-fault` with a
+/// line naming `point`. Only an administrator can create that file.
 #[cfg(feature = "ci-test-fixtures")]
 pub fn ci_upgrade_fault(layout: &HostLayout, point: &str) -> bool {
     fs::read_to_string(layout.maintenance.join("ci-upgrade-fault"))
-        .is_ok_and(|fault| fault.trim() == point)
+        .is_ok_and(|faults| faults.lines().any(|fault| fault.trim() == point))
 }
 #[cfg(not(feature = "ci-test-fixtures"))]
 pub fn ci_upgrade_fault(_: &HostLayout, _: &str) -> bool {
     false
+}
+
+/// Whether `current` (canonical) is `executable`. A missing executable is
+/// not the running image: between an upgrade's two renames there is none,
+/// and the next upgrade must still be able to restore it.
+pub(super) fn is_image(current: &Path, executable: &Path) -> io::Result<bool> {
+    match executable.canonicalize() {
+        Ok(installed) => Ok(current == installed),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn current_exe() -> io::Result<PathBuf> {
@@ -384,7 +414,7 @@ impl HostFilesystem for NativeHostFilesystem {
         native::prepare_maintenance(layout)
     }
     fn is_installed_image(&self, layout: &HostLayout) -> io::Result<bool> {
-        Ok(current_exe()? == layout.executable.canonicalize()?)
+        is_image(&current_exe()?, &layout.executable)
     }
     fn lock(&self, layout: &HostLayout) -> io::Result<HostLock> {
         if !layout.user_host {

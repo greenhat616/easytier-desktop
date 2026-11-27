@@ -664,10 +664,10 @@ pub(super) fn restore_host_image(layout: &HostLayout) -> io::Result<bool> {
 pub(super) fn discard_host_backup(layout: &HostLayout) -> io::Result<()> {
     super::image::discard(&image_paths(layout)?, image_acl)
 }
-pub(super) fn refresh_registration(_: &HostLayout) -> io::Result<()> {
+pub(super) fn refresh_registration(_: &HostLayout, _: &mut LifecycleJournal) -> io::Result<()> {
     Ok(())
 }
-pub(super) fn restore_registration(_: &HostLayout) -> io::Result<bool> {
+pub(super) fn restore_registration(_: &HostLayout, _: &LifecycleJournal) -> io::Result<bool> {
     Ok(false)
 }
 

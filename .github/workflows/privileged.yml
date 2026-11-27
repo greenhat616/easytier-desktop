@@ -75,8 +75,7 @@ jobs:
       - name: Install Linux libraries and network inspection tools
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev libssl-dev mold nftables iproute2
+          bash .github/scripts/install-ubuntu-packages.sh libdbus-1-dev libssl-dev mold nftables iproute2
           sudo systemctl start systemd-resolved
       - uses: ./.github/actions/setup-tools
         with:

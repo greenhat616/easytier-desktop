@@ -116,6 +116,9 @@ jobs:
         env:
           ETD_IPC_CI_ACCOUNTS: '1'
         run: cargo nextest run --locked --profile privileged -p etd-ipc --run-ignored only --test session_pipe_acl --test session_clients --test session_server_verify --no-fail-fast --success-output immediate
+      - name: Elevated session fence and worker inputs on Windows (administrator runner)
+        if: runner.os == 'Windows'
+        run: cargo nextest run --locked --profile privileged -p etd-sysfx-os --features ci-test-fixtures --run-ignored only --test windows_session_inputs --test windows_fence -E 'test(session_fence) | test(user_inputs_do_not_reach_the_elevated_workers)' --no-fail-fast --success-output immediate
       - name: Install roundtrip on Unix (root on disposable runner)
         if: runner.os != 'Windows'
         shell: bash

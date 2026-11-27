@@ -994,12 +994,25 @@ impl Actor {
         });
     }
 
-    /// A user host has no service manager: the UI starts it again.
+    /// A user host has no service manager: the UI starts it again. An
+    /// elevated session host is never restarted on its own (that would be an
+    /// unrequested UAC prompt, doc#13 #sequence outcome 3): the UI says it
+    /// exited and lets the user connect again or clean up.
     fn relaunch_if_needed(&mut self) {
         let HostLink::Reconnecting { attempt } = self.store.link else {
             return;
         };
         let Some(session) = &self.session else { return };
+        if session.target.mode == HostMode::ElevatedSession {
+            if !self.exiting
+                && attempt >= self.config.relaunch_after
+                && !self.store.session_host_exited
+            {
+                self.store.session_host_exited = true;
+                self.dirty = true;
+            }
+            return;
+        }
         if self.exiting
             || self.relaunching
             || session.target.mode != HostMode::User
@@ -1197,6 +1210,9 @@ impl Actor {
                 }
                 let was_connected = self.store.link == HostLink::Connected;
                 let reduced = reducer::apply_connection(&mut self.store, state);
+                if self.store.link == HostLink::Connected {
+                    self.store.session_host_exited = false;
+                }
                 self.on_reduced(reduced);
                 if !was_connected && self.store.link == HostLink::Connected {
                     self.look_up_unconfirmed();

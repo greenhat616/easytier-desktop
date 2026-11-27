@@ -2,7 +2,7 @@
 //!
 //! [`StateStore`] is the whole read model of the UI: views bind to it and
 //! never talk to the host themselves. It never holds a network secret.
-use crate::{LaunchError, Profile};
+use crate::{LaunchError, Profile, SessionRefusal};
 use etd_client::CallError;
 use etd_contract::v1::{InstanceExited, ManagementAccess, Node, Notice, Route, TrafficStats};
 use etd_contract::{
@@ -106,6 +106,17 @@ pub enum LaunchFailureKind {
     Unsupported,
     Spawn,
     Timeout,
+    /// The elevated session host refused: the system service is installed.
+    ServiceInstalled,
+    /// The elevated session host refused: the user's session directory does
+    /// not conform; an administrator has to delete it.
+    SessionDirectory,
+    /// The elevated session host refused: other users' sessions left system
+    /// changes behind; offer the all-users clean-up.
+    OtherUsersLeftovers,
+    /// The session pipe name is held by a process that is not our elevated
+    /// host (also: identity check of the session endpoint failed).
+    EndpointOccupied,
     Other,
 }
 
@@ -125,6 +136,18 @@ impl LaunchFailure {
             LaunchError::Unsupported(_) => LaunchFailureKind::Unsupported,
             LaunchError::Spawn(_) => LaunchFailureKind::Spawn,
             LaunchError::Timeout => LaunchFailureKind::Timeout,
+            LaunchError::SessionRefused(SessionRefusal::ServiceInstalled) => {
+                LaunchFailureKind::ServiceInstalled
+            }
+            LaunchError::SessionRefused(SessionRefusal::NotConforming) => {
+                LaunchFailureKind::SessionDirectory
+            }
+            LaunchError::SessionRefused(SessionRefusal::OtherUsersLeftovers) => {
+                LaunchFailureKind::OtherUsersLeftovers
+            }
+            LaunchError::SessionRefused(SessionRefusal::EndpointOccupied) => {
+                LaunchFailureKind::EndpointOccupied
+            }
             _ => LaunchFailureKind::Other,
         };
         Self {
@@ -134,6 +157,41 @@ impl LaunchFailure {
         }
     }
 }
+
+impl LaunchFailure {
+    /// What the user can do about it, in words they know (doc#13 #ipc: each
+    /// failure told apart with an action). `None`: the message says it all.
+    pub fn guidance(&self) -> Option<&'static str> {
+        Some(match self.kind {
+            LaunchFailureKind::ElevationDenied => {
+                "Administrator permission was not given. Press Connect to be asked again."
+            }
+            LaunchFailureKind::ServiceInstalled => {
+                "The EasyTier system service is installed on this computer. Connect through the service instead."
+            }
+            LaunchFailureKind::SessionDirectory => {
+                "Your EasyTier session folder under %ProgramData%\\EasyTierDesk.session has the wrong owner or permissions. Ask an administrator to delete your folder there, then connect again."
+            }
+            LaunchFailureKind::OtherUsersLeftovers => {
+                "Another user's EasyTier session left network changes behind. Clean them up (asks for administrator permission), then connect again."
+            }
+            LaunchFailureKind::EndpointOccupied => {
+                "Another program is using EasyTier's connection name, or the program answering is not EasyTier. Restart the computer, or ask an administrator to find the program."
+            }
+            LaunchFailureKind::Unsupported if self.mode == Some(HostMode::ElevatedSession) => {
+                "This account is not an administrator. Install the EasyTier system service (needs an administrator's password once)."
+            }
+            LaunchFailureKind::Spawn if self.mode == Some(HostMode::ElevatedSession) => {
+                "The EasyTier host did not start. Press Connect to try again."
+            }
+            _ => return None,
+        })
+    }
+}
+
+/// Text for an operation the host refused with `ELEVATION_REQUIRED`: admin
+/// operations need an elevated UI (msg#1408 ruling 3).
+pub const ELEVATION_REQUIRED_GUIDANCE: &str = "Run EasyTier Desktop as administrator to do this.";
 
 /// Whether the instance data can take further events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -292,6 +350,11 @@ impl Failure {
             _ => None,
         }
     }
+
+    /// What the user can do about it, when there is something.
+    pub fn guidance(&self) -> Option<&'static str> {
+        (self.code() == Some(ErrorCode::ElevationRequired)).then_some(ELEVATION_REQUIRED_GUIDANCE)
+    }
 }
 
 impl PartialEq for Failure {
@@ -360,6 +423,10 @@ pub struct StateStore {
     pub unverified_host: Option<String>,
     /// Set when restarting a vanished user host failed.
     pub relaunch_failure: Option<LaunchFailure>,
+    /// The elevated session host this UI was connected to is gone (doc#13
+    /// #sequence outcome 3). It is never restarted automatically: the user
+    /// presses Connect (one UAC prompt) or cleans up the leftovers.
+    pub session_host_exited: bool,
     pub sync: SyncState,
     /// Last event (or snapshot) reflected in the instance data.
     pub cursor: Option<EventCursor>,

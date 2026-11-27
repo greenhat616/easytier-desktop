@@ -790,3 +790,75 @@ fn what_was_clicked_before_exit_is_still_done() {
     let position = |wanted: fn(&HostCall) -> bool| calls.iter().position(wanted).unwrap();
     assert!(position(HostCall::is_mutation) < position(|c| matches!(c, HostCall::ReleaseLease(_))));
 }
+
+#[test]
+fn exiting_an_elevated_session_releases_the_lease() {
+    let mut app = App::connected(HostMode::ElevatedSession, &[RUNNING]);
+    let report = app.exit();
+    assert_eq!(report.phases(), ORDER);
+    assert_eq!(report.errors().count(), 0, "{report:?}");
+    assert_eq!(releases(&app), [LeaseRelease::StopInstances]);
+}
+
+/// doc#13 #sequence outcome 3: a lost session host is reported, never
+/// restarted on its own (that would be an unrequested UAC prompt).
+#[test]
+fn a_vanished_session_host_is_reported_not_restarted() {
+    let mut app = App::connected(HostMode::ElevatedSession, &[]);
+    app.host.reconnecting(1);
+    app.wait("first retry", |_, s| s.is_reconnecting());
+    thread::sleep(Duration::from_millis(30));
+    assert!(!app.last.session_host_exited, "one blip is not an exit");
+    app.host.reconnecting(5);
+    app.wait("exited", |_, s| s.session_host_exited);
+    thread::sleep(Duration::from_millis(30));
+    assert_eq!(
+        app.launcher.calls(),
+        [LauncherCall::Ensure(HostMode::ElevatedSession)],
+        "no second start"
+    );
+    // The host comes back (e.g. started by another Connect): cleared.
+    app.host.reconnected();
+    app.wait("cleared", |_, s| !s.session_host_exited);
+    app.exit();
+}
+
+#[test]
+fn session_refusals_and_elevation_required_read_as_actions() {
+    let mut app = App::start(HostMode::ElevatedSession);
+    for (error, kind) in [
+        (
+            LaunchError::ElevationDenied,
+            LaunchFailureKind::ElevationDenied,
+        ),
+        (
+            LaunchError::SessionRefused(etd_app::SessionRefusal::NotConforming),
+            LaunchFailureKind::SessionDirectory,
+        ),
+        (
+            LaunchError::SessionRefused(etd_app::SessionRefusal::OtherUsersLeftovers),
+            LaunchFailureKind::OtherUsersLeftovers,
+        ),
+        (
+            LaunchError::SessionRefused(etd_app::SessionRefusal::EndpointOccupied),
+            LaunchFailureKind::EndpointOccupied,
+        ),
+        (
+            LaunchError::SessionRefused(etd_app::SessionRefusal::ServiceInstalled),
+            LaunchFailureKind::ServiceInstalled,
+        ),
+    ] {
+        app.launcher.script_ensure(Err(error));
+        app.send(UserCommand::Connect(HostMode::ElevatedSession));
+        app.wait("refused", |_, s| {
+            matches!(&s.link, HostLink::LaunchFailed(f) if f.kind == kind && f.guidance().is_some())
+        });
+    }
+    app.exit();
+    let failure = etd_app::Failure(CallError::ElevationRequired);
+    assert_eq!(
+        failure.guidance(),
+        Some(etd_app::ELEVATION_REQUIRED_GUIDANCE)
+    );
+    assert_eq!(etd_app::Failure(lost()).guidance(), None);
+}

@@ -8,8 +8,14 @@
 //! The user host outlives the launcher on purpose: it ends through its lease,
 //! not when the UI drops a handle. Installing the service needs elevation and
 //! is not done here: [`LaunchError::NotInstalled`] lets the UI offer it. The
-//! elevated session form is not part of the first release.
-use crate::{HostLauncher, HostTarget, LaunchError};
+//! elevated session form (Windows) is added with
+//! [`LocalHostLauncher::with_session`]; see [`crate::launcher_session`].
+use crate::{
+    HostLauncher, HostTarget, LaunchError, SessionRefusal,
+    launcher_session::{
+        SESSION_HOST_ARGS, SessionParts, StartedProcess, refusal_of, start_elevated,
+    },
+};
 use async_trait::async_trait;
 use etd_contract::HostMode;
 use etd_ipc::{
@@ -243,6 +249,9 @@ pub struct LocalHostLauncher {
     /// The user host this launcher started. The lock also serializes
     /// `ensure`, so two callers cannot start two hosts.
     child: Mutex<Option<Box<dyn SpawnedHost>>>,
+    session: Option<SessionParts>,
+    /// The session host this launcher started; serializes its `ensure`.
+    session_child: Mutex<Option<Box<dyn StartedProcess>>>,
 }
 
 impl LocalHostLauncher {
@@ -271,7 +280,15 @@ impl LocalHostLauncher {
             spawner,
             timings,
             child: Mutex::new(None),
+            session: None,
+            session_child: Mutex::new(None),
         }
+    }
+
+    /// Also offer the elevated session form.
+    pub fn with_session(mut self, session: SessionParts) -> Self {
+        self.session = Some(session);
+        self
     }
 
     async fn reach(&self, endpoint: &Endpoint, expectation: &ServerExpectation) -> Reach {
@@ -369,6 +386,80 @@ impl LocalHostLauncher {
     }
 }
 
+impl LocalHostLauncher {
+    /// doc#13 #choose: the service whenever it is installed (never a session
+    /// host beside it), else a running session host, else start one: one
+    /// UAC prompt from an unelevated administrator, a direct start from an
+    /// elevated UI, `Unsupported` for a standard account.
+    async fn ensure_session(&self) -> Result<HostTarget, LaunchError> {
+        let parts = self
+            .session
+            .as_ref()
+            .ok_or(LaunchError::Unsupported(HostMode::ElevatedSession))?;
+        if let Some(service) = &self.service
+            && installed(&service.program)?
+        {
+            return self.ensure_service().await;
+        }
+        let config = &parts.config;
+        let mut child = self.session_child.lock().await;
+        match self.reach(&config.endpoint, &config.expectation).await {
+            Reach::Verified => return Ok(config.target()),
+            // Something answers on our session pipe and is not our elevated
+            // host: the name is taken.
+            Reach::Refused(_) => {
+                return Err(LaunchError::SessionRefused(
+                    SessionRefusal::EndpointOccupied,
+                ));
+            }
+            Reach::Absent => {}
+        }
+        let running = match child.as_mut() {
+            Some(process) => process.exit_code().map_err(launch_io)?.is_none(),
+            None => false,
+        };
+        if !running {
+            let (starter, program) = (parts.starter.clone(), config.program.clone());
+            let started = tokio::task::spawn_blocking(move || {
+                start_elevated(starter.as_ref(), &program, &SESSION_HOST_ARGS)
+            })
+            .await
+            .map_err(|error| LaunchError::Io(error.to_string()))??;
+            *child = Some(started);
+        }
+        let deadline = Instant::now() + self.timings.startup;
+        loop {
+            sleep(self.timings.poll).await;
+            let exit = match child.as_mut() {
+                Some(process) => process.exit_code().map_err(launch_io)?,
+                None => None,
+            };
+            match self.reach(&config.endpoint, &config.expectation).await {
+                Reach::Verified => return Ok(config.target()),
+                Reach::Refused(_) => {
+                    return Err(LaunchError::SessionRefused(
+                        SessionRefusal::EndpointOccupied,
+                    ));
+                }
+                Reach::Absent => {}
+            }
+            if let Some(code) = exit {
+                *child = None;
+                return Err(match refusal_of(code) {
+                    Some(refusal) => LaunchError::SessionRefused(refusal),
+                    None => LaunchError::Spawn(format!(
+                        "the host exited during start-up (exit code {code})"
+                    )),
+                });
+            }
+            if Instant::now() >= deadline {
+                // Not killed: it may be reclaiming an earlier run's leftovers.
+                return Err(LaunchError::Timeout);
+            }
+        }
+    }
+}
+
 fn refused(reason: &str) -> LaunchError {
     LaunchError::Io(format!(
         "the host endpoint failed verification or refused access: {reason}"
@@ -385,8 +476,8 @@ fn installed(program: &Path) -> Result<bool, LaunchError> {
 
 #[async_trait]
 impl HostLauncher for LocalHostLauncher {
-    /// The service when it answers or is installed, else a user host that is
-    /// already running.
+    /// The service when it answers or is installed, else a session host or a
+    /// user host that is already running. Never starts anything.
     async fn probe(&self) -> Result<Option<HostTarget>, LaunchError> {
         if let Some(service) = &self.service {
             match self.reach(&service.endpoint, &service.expectation).await {
@@ -397,6 +488,18 @@ impl HostLauncher for LocalHostLauncher {
                         return Ok(Some(service.target()));
                     }
                 }
+            }
+        }
+        if let Some(session) = &self.session {
+            let config = &session.config;
+            match self.reach(&config.endpoint, &config.expectation).await {
+                Reach::Verified => return Ok(Some(config.target())),
+                Reach::Refused(_) => {
+                    return Err(LaunchError::SessionRefused(
+                        SessionRefusal::EndpointOccupied,
+                    ));
+                }
+                Reach::Absent => {}
             }
         }
         if let Some(user) = &self.user {
@@ -413,6 +516,7 @@ impl HostLauncher for LocalHostLauncher {
         match want {
             HostMode::Service => self.ensure_service().await,
             HostMode::User => self.ensure_user().await,
+            HostMode::ElevatedSession => self.ensure_session().await,
             other => Err(LaunchError::Unsupported(other)),
         }
     }

@@ -9,6 +9,7 @@ pub mod tray;
 
 pub mod bridge;
 pub mod exit_gate;
+pub mod launcher_session;
 pub mod launcher_user;
 pub mod profiles_toml;
 pub mod reducer;

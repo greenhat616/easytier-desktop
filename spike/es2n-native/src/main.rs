@@ -151,8 +151,13 @@ type CloseStore = unsafe extern "system" fn(windows::Win32::Foundation::HANDLE) 
 type EnumRules = unsafe extern "system" fn(windows::Win32::Foundation::HANDLE, u32, u32, u16, *mut u32, *mut *mut FwRule) -> u32;
 type DeleteRule = unsafe extern "system" fn(windows::Win32::Foundation::HANDLE, PCWSTR) -> u32;
 type FreeRules = unsafe extern "system" fn(*mut FwRule) -> u32;
+type FreeRulesByHandle = unsafe extern "system" fn(windows::Win32::Foundation::HANDLE, *mut FwRule) -> u32;
+static HEADS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
 const FW_BINARY_2_27: u16 = 0x021B;
+fn version() -> u16 {
+    std::env::var("ETD_SPIKE_VERSION").ok().and_then(|v| u16::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(FW_BINARY_2_27)
+}
 const FW_STORE_TYPE_LOCAL: i32 = 2;
 const FW_POLICY_ACCESS_RIGHT_READ_WRITE: i32 = 2;
 const FW_RULE_STATUS_CLASS_ALL: u32 = 0xFFFF_0000;
@@ -177,6 +182,7 @@ struct FlatApi {
     enumerate: EnumRules,
     delete: DeleteRule,
     free: FreeRules,
+    free_by_handle: FreeRulesByHandle,
 }
 
 unsafe fn flat_api() -> windows::core::Result<FlatApi> {
@@ -203,6 +209,7 @@ unsafe fn flat_api() -> windows::core::Result<FlatApi> {
             enumerate: std::mem::transmute(get(c"FWEnumFirewallRules")?),
             delete: std::mem::transmute(get(c"FWDeleteFirewallRule")?),
             free: std::mem::transmute(get(c"FWFreeFirewallRules")?),
+            free_by_handle: std::mem::transmute(get(c"FWFreeFirewallRulesByHandle")?),
         })
     }
 }
@@ -246,12 +253,8 @@ unsafe fn flat_rows(api: &FlatApi, store: windows::Win32::Foundation::HANDLE, fl
     if rows.len() != count as usize {
         println!("list length {} != count {count}", rows.len());
     }
-    step("FWFreeFirewallRules call");
     if !head.is_null() {
-        let freed = unsafe { (api.free)(head) };
-        if freed != 0 {
-            println!("FWFreeFirewallRules: {freed}");
-        }
+        HEADS.lock().unwrap().push(head as usize);
     }
     Ok(rows)
 }
@@ -267,9 +270,10 @@ unsafe fn flat(expected: usize, a: &str, b: &str, failures: &mut Vec<String>) {
     let mut store = windows::Win32::Foundation::HANDLE::default();
     let started = Instant::now();
     let status = unsafe {
-        (api.open)(FW_BINARY_2_27, PCWSTR::null(), FW_STORE_TYPE_LOCAL, FW_POLICY_ACCESS_RIGHT_READ_WRITE, 0, &mut store)
+        (api.open)(version(), PCWSTR::null(), FW_STORE_TYPE_LOCAL, FW_POLICY_ACCESS_RIGHT_READ_WRITE, 0, &mut store)
     };
-    println!("FWOpenPolicyStore(2.27, LOCAL, READ_WRITE): {status} in {} ms", started.elapsed().as_millis());
+    println!("FWOpenPolicyStore({:#x}, LOCAL, READ_WRITE)", version());
+    println!("FWOpenPolicyStore: {status} in {} ms", started.elapsed().as_millis());
     if status != 0 {
         failures.push(format!("FWOpenPolicyStore: {status}"));
         return;
@@ -328,6 +332,16 @@ unsafe fn flat(expected: usize, a: &str, b: &str, failures: &mut Vec<String>) {
         Err(status) => failures.push(format!("re-enumerate: {status}")),
     }
     println!("second FWDeleteFirewallRule(a): {}", unsafe { (api.delete)(store, PCWSTR(HSTRING::from(a).as_ptr())) });
+    let strategy = std::env::var("ETD_SPIKE_FREE").unwrap_or_default();
+    for head in HEADS.lock().unwrap().drain(..) {
+        step(&format!("free {head:#x} with {strategy}"));
+        let freed = match strategy.as_str() {
+            "byhandle" => unsafe { (api.free_by_handle)(store, head as *mut FwRule) },
+            "plain" => unsafe { (api.free)(head as *mut FwRule) },
+            _ => 0,
+        };
+        step(&format!("freed: {freed}"));
+    }
     println!("FWClosePolicyStore: {}", unsafe { (api.close)(store) });
     loaded_planted(failures);
     for module in ["combase.dll", "ole32.dll", "oleaut32.dll", "wbemprox.dll", "fastprox.dll", "shell32.dll"] {

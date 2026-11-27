@@ -95,11 +95,18 @@ jobs:
           Start-Sleep -Seconds 10
           try {
             & C:\pm\plant.ps1
-            foreach ($mode in 'fwapi', 'natives') {
-              & spike/es2n-native/target/debug/es2n-native-spike.exe $count $mode
-              Write-Host "exit: $LASTEXITCODE"
-              if ($LASTEXITCODE -ne 0) { $code = 1 }
-            }
+            $env:ETD_SPIKE_FREE = 'byhandle'
+            & spike/es2n-native/target/debug/es2n-native-spike.exe $count fwapi
+            Write-Host "exit (2.27, FWFreeFirewallRulesByHandle): $LASTEXITCODE"
+            if ($LASTEXITCODE -ne 0) { $code = 1 }
+            $env:ETD_SPIKE_FREE = 'plain'
+            $env:ETD_SPIKE_VERSION = '0x0221'
+            & spike/es2n-native/target/debug/es2n-native-spike.exe $count fwapi
+            Write-Host "exit (2.33, FWFreeFirewallRules; rule a already deleted): $LASTEXITCODE"
+            Remove-Item Env:ETD_SPIKE_VERSION, Env:ETD_SPIKE_FREE
+            & spike/es2n-native/target/debug/es2n-native-spike.exe $count natives
+            Write-Host "exit (natives): $LASTEXITCODE"
+            if ($LASTEXITCODE -ne 0) { $code = 1 }
             & C:\pm\plant.ps1 -Remove
             Write-Host "PowerShell view afterwards:"
             foreach ($id in $a, $b) {
@@ -119,9 +126,8 @@ jobs:
             & C:\pm\Procmon64.exe /AcceptEula /Terminate
             Start-Sleep -Seconds 5
           }
-          & C:\pm\Procmon64.exe /AcceptEula /Quiet /OpenLog C:\pm\cap.pml /SaveAs C:\pm\cap.csv
-          for ($i = 0; $i -lt 60 -and !(Test-Path C:\pm\cap.csv); $i++) { Start-Sleep -Seconds 5 }
-          Start-Sleep -Seconds 10
+          Start-Process C:\pm\Procmon64.exe -ArgumentList '/AcceptEula','/Quiet','/OpenLog','C:\pm\cap.pml','/SaveAs','C:\pm\cap.csv' -Wait
+          Get-Item C:\pm\cap.pml, C:\pm\cap.csv | Format-Table Name, Length | Out-String | Write-Host
           $rows = Import-Csv C:\pm\cap.csv
           Write-Host "captured events: $($rows.Count)"
           $ours = $rows | Where-Object { $_.'Process Name' -match '^(es2n-native-spike|etd-host|install_roundtrip-[0-9a-f]+|windows_fence-[0-9a-f]+)\.exe$' }

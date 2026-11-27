@@ -2032,13 +2032,7 @@ mod tests {
                         .save(output.join(format!("gallery-motion-theme-{ms}ms.png")))
                         .unwrap();
                 }
-                cx.advance_clock(Duration::from_millis(500));
-                cx.update_window(handle, |_, window, cx| {
-                    window.click("theme-popup-close", cx);
-                    window.render_frame(cx);
-                })
-                .unwrap();
-                cx.advance_clock(Duration::from_millis(200));
+                cx.advance_clock(Duration::from_millis(700));
                 cx.run_until_parked();
                 cx.update(|cx| cx.set_reduce_motion(true));
             }

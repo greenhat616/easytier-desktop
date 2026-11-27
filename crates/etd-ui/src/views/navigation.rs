@@ -321,9 +321,20 @@ pub fn tab_view(
         let is_selected = ix == selected;
         // The divider sits between two unselected tabs.
         if ix > 0 && !is_selected && ix - 1 != selected {
-            strip = strip.child(div().my(px(8.)).w(px(1.)).h(px(16.)).bg(divider(cx)));
+            strip = strip.child(
+                div()
+                    .border_b_1()
+                    .border_color(stroke)
+                    .child(div().my(px(8.)).w(px(1.)).h(px(16.)).bg(divider(cx))),
+            );
         } else if ix > 0 {
-            strip = strip.child(div().w(px(1.)));
+            strip = strip.child(
+                div()
+                    .self_stretch()
+                    .w(px(1.))
+                    .border_b_1()
+                    .border_color(stroke),
+            );
         }
         let tab_id = SharedString::from(format!("{id}-{ix}"));
         let close_id = SharedString::from(format!("{id}-{ix}-close"));
@@ -366,6 +377,8 @@ pub fn tab_view(
                 .border_color(stroke)
         } else {
             header
+                .border_b_1()
+                .border_color(stroke)
                 .hover(move |s| s.bg(hover))
                 .active(move |s| s.bg(pressed))
         };
@@ -376,14 +389,26 @@ pub fn tab_view(
     let add_id = SharedString::from(format!("{id}-add"));
     let add = small_button(add_id.clone(), "Add tab", "fluent/add.svg")
         .on_click(move |_, window, cx| on_add(window, cx));
-    strip = strip.child(
-        div()
-            .ps(px(3.), cx)
-            .pb(px(3.))
-            .child(keyboard_focus(add_id, move |focus| {
-                add.track_focus(focus).into_any_element()
-            })),
-    );
+    strip = strip
+        .child(
+            div()
+                .ps(px(3.), cx)
+                .pb(px(3.))
+                .border_b_1()
+                .border_color(stroke)
+                .child(keyboard_focus(add_id, move |focus| {
+                    add.track_focus(focus).into_any_element()
+                })),
+        )
+        // The strip's bottom line runs on to the right edge; only the selected
+        // tab has none, so it joins the content.
+        .child(
+            div()
+                .flex_1()
+                .self_stretch()
+                .border_b_1()
+                .border_color(stroke),
+        );
     div()
         .id(id)
         .test_support()
@@ -395,14 +420,13 @@ pub fn tab_view(
                 .id(SharedString::from(format!("{id}-content")))
                 .test_support()
                 .role(Role::TabPanel)
-                .mt(px(-1.))
                 .p(px(16.))
                 .min_h(px(120.))
                 .bg(tertiary)
                 .border_1()
+                .border_t_0()
                 .border_color(stroke)
                 .rounded_b(px(8.))
-                .rounded_tr(px(8.))
                 .text_size(px(14.))
                 .line_height(px(20.))
                 .text_color(fg)

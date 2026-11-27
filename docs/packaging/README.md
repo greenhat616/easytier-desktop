@@ -163,6 +163,14 @@ No systemd unit is packaged: `etd-host install` writes
 protected folder `/usr/local/lib/easytier-desk`, and starts the service. State lives in
 `/var/lib/easytier-desk`, the maintenance lock in `/var/lib/easytier-desk-maintenance`.
 
+The protected copy under `/usr/local/lib/easytier-desk` is deliberately not owned by the
+package: `etd-host` copies its own image there so that the running service never
+depends on files the package manager replaces, and only `etd-host uninstall` removes it.
+Debian Policy (9.1.2) and the Fedora guidelines forbid a package from creating files
+under `/usr/local`, so these packages are fit for distribution from this project but
+not for a distribution's own repository: that would need the protected folder moved
+(an `etd-host` and sysfx layout change with a migration).
+
 ### Building
 
 ```sh
@@ -172,8 +180,14 @@ cargo xtask fetch-cores --target host
 cargo xtask dist        # target/dist/x86_64-unknown-linux-gnu/*.deb, *.rpm, *.pkg.tar.zst
 ```
 
+`dist` runs whatever `nfpm` is on `PATH` and checks only that it reports version 2.49.0;
+verifying where that binary came from is up to you. CI (the privileged `deb` job, and
+PK5's release workflow) downloads the release archive and checks its SHA-256 before
+use.
+
 Build on the oldest distribution you support (doc#16 plans Ubuntu 22.04 for PK5): the
-binaries need that glibc or newer.
+binaries need that glibc or newer, and `dist` writes that floor into the packages
+(see [Dependencies](#dependencies)).
 
 ### Maintainer scripts
 
@@ -185,7 +199,7 @@ tag.
 | Step | deb | rpm | Arch | Runs |
 | --- | --- | --- | --- | --- |
 | before unpacking a first install | `preinst install` | `%pre` with `1` | none | refuses if the service already exists |
-| first install | `postinst configure` (no old version) | `%post` with `1` | `post_install` | `etd-host install --owner easytier-desktop-package` |
+| first install, or its retry | `postinst configure` (no old version) | `%post` with `1` | `post_install` | `etd-host install --owner easytier-desktop-package` |
 | upgrade | `postinst configure <old>` | `%post` with `2`+ | `post_upgrade` | `etd-host upgrade --only-owner easytier-desktop-package` |
 | full removal | `prerm remove` | `%preun` with `0` | `pre_remove` | `etd-host uninstall --only-owner easytier-desktop-package` |
 | the old package during an upgrade | `prerm upgrade` | `%preun` with `1` | (not called) | nothing: the ledger and allow list stay |
@@ -195,27 +209,66 @@ tag.
 - **A service that already exists** (installed with the CLI): deb and rpm refuse before
   anything is unpacked and name the command to remove it
   (`/usr/local/lib/easytier-desk/etd-host uninstall`). pacman cannot abort from a hook, so
-  on Arch `post_install` leaves that service alone, prints how to remove it or let the
-  package manage it, and the package's upgrades and removal leave it alone too.
-- **No systemd** (a container): every hook prints a notice and succeeds; run
-  `/usr/lib/easytier-desktop/etd-host install` on a systemd host.
+  on Arch `post_install` says plainly that this package will not manage that service,
+  prints how to remove it or let the package manage it, and the package's upgrades and
+  removal leave it alone.
+- **A retried first install** (`dpkg --configure -a` after a configure that stopped once
+  the service had registered): `install --owner` again finds an installation recorded
+  with the same owner and only starts it. An installation recorded with no owner or
+  another one is refused, so the retry fails rather than taking it over.
+- **No systemd** (a container): every hook prints a notice and succeeds. On a systemd
+  host, run `/usr/lib/easytier-desktop/etd-host install --owner easytier-desktop-package`
+  so the package's later upgrades and removal manage that service. Without `--owner` the
+  service is ownerless: the hooks leave it alone, and you upgrade and remove it with
+  `etd-host` yourself.
+- Every hook runs with `PATH=/usr/sbin:/usr/bin:/sbin:/bin`, whatever the package manager
+  passed.
 
 ### What a failed hook leaves behind
 
-Package managers do not restore files when a script fails.
+Package managers do not restore files when a script fails, and they differ in what they
+record:
 
-- **First install fails** (`etd-host install` exits non-zero): `etd-host install` rolls
-  back what it created; dpkg leaves the package unpacked but half-configured (`iF`), rpm
-  reports the scriptlet failure with the package installed. Fix the cause, then
-  `dpkg --configure -a` (or reinstall), or remove the package.
-- **Upgrade fails** (`etd-host upgrade` exits non-zero): `etd-host upgrade` restores and
-  restarts the previous service, which keeps running its own image from the protected
-  folder. The new payload stays unpacked: dpkg marks the package half-configured. Once
-  the cause is gone, `dpkg --configure -a` reruns the postinst and completes the upgrade
-  (the deb suite checks both).
-- **Removal fails** (`etd-host uninstall` exits non-zero): dpkg and rpm keep the package
-  installed; run the removal again, `etd-host uninstall` resumes from its journal. pacman
-  removes the files anyway: run `/usr/local/lib/easytier-desk/etd-host uninstall`.
+| | deb | rpm | Arch |
+| --- | --- | --- | --- |
+| after a failed install or upgrade hook | the new files unpacked, the package half-configured (`iF`) | the transaction completes: the new files installed, the scriptlet failure reported | the transaction completes: the new files installed, the hook's error printed |
+| rerun the hook | `dpkg --configure -a` | none: run the command yourself | none: run the command yourself |
+
+**First install fails** (`etd-host install` exits non-zero). `etd-host install` rolls
+back what it created; if its rollback is incomplete it says so, and
+`/usr/lib/easytier-desktop/etd-host uninstall` resumes the cleanup. Fix the cause, then
+`dpkg --configure -a` on deb, or on rpm and Arch run
+`/usr/lib/easytier-desktop/etd-host install --owner easytier-desktop-package`; or remove
+the package.
+
+**Upgrade fails** (`etd-host upgrade` exits non-zero). The new payload is in
+`/usr/lib/easytier-desktop` but the service still runs from the protected folder.
+`etd-host upgrade` ends in one of these states and prints which:
+
+| What `etd-host upgrade` printed | The service | What to do |
+| --- | --- | --- |
+| `upgrade rolled back` / `upgrade stopped; the previous service was restarted` | the previous version, restored and serving | fix the cause, then rerun the upgrade (below) |
+| `…the ledger was (or may have been) migrated by the new version, so the previous host runs diagnostics-only` (or `whether the new version migrated the ledger is unknown`) | the previous version, diagnostics only: networks do not start | rerun the upgrade (below); the new version opens the migrated ledger |
+| `…the previous service did not restart` | stopped | rerun the upgrade, or `/usr/local/lib/easytier-desk/etd-host resume-service` |
+| `rollback incomplete…; the service stays disabled` or `an interrupted upgrade could not be restored` | disabled | rerun the upgrade, or `etd-host uninstall` and install again |
+
+Rerunning the upgrade: `dpkg --configure -a` on deb; on rpm and Arch,
+`/usr/lib/easytier-desktop/etd-host upgrade --only-owner easytier-desktop-package`. Until
+then the new `etd-ui` and `etd-ctl` talk to the previous host; if their contract versions
+differ they report a version mismatch instead of working.
+
+The deb suite exercises only the first row, and only the same build with a CI fault
+injected, not one release upgrading to another: it shows dpkg left at `iF`, the previous
+service serving, and `dpkg --configure -a` completing the upgrade.
+
+**Removal fails** (`etd-host uninstall` exits non-zero): dpkg and rpm keep the package
+installed; run the removal again, `etd-host uninstall` resumes from its journal. pacman
+removes the files anyway: run `/usr/local/lib/easytier-desk/etd-host uninstall`.
+
+**Downgrades are not supported.** apt, dnf and pacman will install an older package, but
+its postinst runs the older `etd-host upgrade`, which may refuse the ledger the newer
+version wrote or leave the host diagnostics-only, and on deb the package stays at `iF`.
+Recover by installing the newer package again.
 
 ### Dependencies
 
@@ -231,6 +284,14 @@ from `dpkg -S`) and the library names it holds for loading at run time:
 `etd-host` also runs `nft` and `ip` (`nftables`, `iproute2`). The deb names are installed
 by that job; the rpm and Arch names are their equivalents and are not installed by any
 test yet (PK5).
+
+- **The C library floor:** `dist` reads the highest `GLIBC_x.y` symbol version the three
+  binaries need and writes `libc6 (>= x.y)` (deb) and `glibc >= x.y` (rpm), so an older
+  distribution refuses the package instead of failing in its postinst. Arch is rolling
+  and gets no bound.
+- **A Vulkan driver** is recommended, not required (the loader is a dependency):
+  deb `Recommends: mesa-vulkan-drivers | vulkan-icd`, rpm `Recommends: mesa-vulkan-drivers`,
+  Arch `optdepends` `vulkan-driver`. Without one, `etd-ui` cannot open its window.
 
 ## Application icons
 
@@ -256,10 +317,13 @@ that `etd-host` (PK5 also checks the release artifacts).
 
 The `deb` suite (`tests/tier3/deb.py`) builds three test packages the same way and runs
 them on a fresh Ubuntu runner: a package over a CLI-installed service is refused by its
-preinst and the service keeps serving; a first install with its payload, links, desktop
-entry and icons, recorded as owned by the package; an upgrade keeping install id,
+preinst and the service keeps serving; a retried first install (`dpkg --unpack`, then
+`dpkg --configure`) that fails over a CLI-installed service without touching it and
+resumes the package's own registered service; a first install with its payload, links,
+desktop entry and icons (root-owned, with their modes), recorded as owned by the package; an upgrade keeping install id,
 install key and ledger settings; an upgrade whose new host never serves (rolled back by
 `etd-host`, the old service keeps serving, dpkg leaves the package half-configured) and
 its completion by `dpkg --configure -a`; and a purge compared with the machine before
 install. Every hook branch of the three formats, Arch `pre_remove` with a version
-argument included, is run against a stub `etd-host` by xtask's unit tests on Linux.
+argument included, is run against a stub `etd-host` by xtask's unit tests on Linux. The job
+also checks that every path in the deb and Arch packages is root's and every folder is 0755.

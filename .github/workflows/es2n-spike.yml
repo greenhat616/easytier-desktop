@@ -17,7 +17,7 @@ env:
 jobs:
   spike:
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Install pinned protoc
@@ -75,11 +75,30 @@ jobs:
           foreach ($i in $iids) { Set-ItemProperty (New-Item "$classes\Interface\$i\ProxyStubClsid32" -Force).PSPath '(default)' $bogus }
           Write-Host "planted: $($clsids.Count) classes ($($proxies -join ', ') as proxies), $($iids.Count) interfaces"
           '@ | Set-Content C:\pm\plant.ps1
+      - name: Capture helpers
+        shell: pwsh
+        run: |
+          @'
+          param([string]$Name, [string]$Processes)
+          & C:\pm\Procmon64.exe /AcceptEula /Terminate
+          Start-Sleep -Seconds 5
+          Start-Process C:\pm\Procmon64.exe -ArgumentList '/AcceptEula','/Quiet','/OpenLog',"C:\pm\$Name.pml",'/SaveAs',"C:\pm\$Name.csv" -Wait
+          $rows = Import-Csv "C:\pm\$Name.csv"
+          Write-Host "[$Name] captured events: $($rows.Count)"
+          $ours = @($rows | Where-Object { $_.'Process Name' -match $Processes })
+          $ours | Group-Object 'Process Name' | ForEach-Object { Write-Host "[$Name] $($_.Name): $($_.Count) events" }
+          $classes = @($ours | Where-Object { $_.Operation -like 'Reg*' -and $_.Path -match '^(HKCR|HKCU\Software\Classes|HKU\[^\]+_Classes)' })
+          Write-Host "[$Name] HKCR/HKCU classes registry events by our processes: $($classes.Count)"
+          $classes | Group-Object 'Process Name', Operation, Path, Result | Sort-Object Count -Descending | ForEach-Object { Write-Host ("  {0,5}  {1}" -f $_.Count, $_.Name) }
+          $classes | Export-Csv "C:\pm\$Name-classes.csv" -NoTypeInformation
+          $loads = @($ours | Where-Object { $_.Operation -eq 'Load Image' } | ForEach-Object { "$($_.'Time of Day') $($_.'Process Name') $($_.PID) $($_.Path)" })
+          $loads | Out-File "C:\pm\$Name-loads.txt"
+          Write-Host "[$Name] image loads by our processes: $($loads.Count) (combase/oleaut32/ole32/shell32 below)"
+          $loads | Where-Object { $_ -match '(combase|oleaut32|ole32|shell32|windows\.storage|FirewallAPI)\.dll' } | Write-Host
+          Remove-Item "C:\pm\$Name.csv"
+          '@ | Set-Content C:\pm\analyze.ps1
       - name: Native paths under HKCU plants, captured
         shell: pwsh
-        env:
-          CI: 'true'
-          ETD_HOST_CI_INSTALL: '1'
         run: |
           $ErrorActionPreference = 'Stop'
           $a = 'etd-es2n-a''q\b"c'
@@ -91,54 +110,50 @@ jobs:
           $env:ETD_SPIKE_A = $a
           $env:ETD_SPIKE_B = $b
           $code = 0
-          Start-Process C:\pm\Procmon64.exe -ArgumentList '/AcceptEula','/Quiet','/Minimized','/BackingFile','C:\pm\cap.pml'
+          & C:\pm\plant.ps1
+          Start-Process C:\pm\Procmon64.exe -ArgumentList '/AcceptEula','/Quiet','/Minimized','/BackingFile','C:\pm\native.pml'
           Start-Sleep -Seconds 10
           try {
-            & C:\pm\plant.ps1
             $env:ETD_SPIKE_FREE = 'byhandle'
             & spike/es2n-native/target/debug/es2n-native-spike.exe $count fwapi
             Write-Host "exit (2.27, FWFreeFirewallRulesByHandle): $LASTEXITCODE"
             if ($LASTEXITCODE -ne 0) { $code = 1 }
-            $env:ETD_SPIKE_FREE = 'plain'
-            $env:ETD_SPIKE_VERSION = '0x0221'
-            & spike/es2n-native/target/debug/es2n-native-spike.exe $count fwapi
-            Write-Host "exit (2.33, FWFreeFirewallRules; rule a already deleted): $LASTEXITCODE"
-            Remove-Item Env:ETD_SPIKE_VERSION, Env:ETD_SPIKE_FREE
+            Remove-Item Env:ETD_SPIKE_FREE
             & spike/es2n-native/target/debug/es2n-native-spike.exe $count natives
             Write-Host "exit (natives): $LASTEXITCODE"
             if ($LASTEXITCODE -ne 0) { $code = 1 }
-            & C:\pm\plant.ps1 -Remove
-            Write-Host "PowerShell view afterwards:"
-            foreach ($id in $a, $b) {
-              $found = @(Get-NetFirewallRule -PolicyStore PersistentStore -Name $id -ErrorAction SilentlyContinue).Count
-              $active = @(Get-NetFirewallRule -PolicyStore ActiveStore -Name $id -ErrorAction SilentlyContinue).Count
-              Write-Host "$id persistent=$found active=$active"
-              if ($id -eq $a -and ($found -ne 0 -or $active -ne 0)) { $code = 1 }
-              if ($id -eq $b -and ($found -ne 1 -or $active -ne 1)) { $code = 1 }
-            }
-            cargo nextest run --locked --profile privileged -p etd-host --run-ignored only --test install_roundtrip --success-output never
-            if ($LASTEXITCODE -ne 0) { Write-Host 'install_roundtrip failed'; $code = 1 }
-            cargo nextest run --locked --profile privileged -p etd-sysfx-os --run-ignored only --test windows_fence -E 'test(session_fence)' --success-output never
-            if ($LASTEXITCODE -ne 0) { Write-Host 'session_fence failed'; $code = 1 }
           } finally {
+            & C:\pm\analyze.ps1 -Name native -Processes '^es2n-native-spike\.exe$'
             & C:\pm\plant.ps1 -Remove
-            Remove-NetFirewallRule -Name $a, $b -ErrorAction SilentlyContinue
-            & C:\pm\Procmon64.exe /AcceptEula /Terminate
-            Start-Sleep -Seconds 5
           }
-          Start-Process C:\pm\Procmon64.exe -ArgumentList '/AcceptEula','/Quiet','/OpenLog','C:\pm\cap.pml','/SaveAs','C:\pm\cap.csv' -Wait
-          Get-Item C:\pm\cap.pml, C:\pm\cap.csv | Format-Table Name, Length | Out-String | Write-Host
-          $rows = Import-Csv C:\pm\cap.csv
-          Write-Host "captured events: $($rows.Count)"
-          $ours = $rows | Where-Object { $_.'Process Name' -match '^(es2n-native-spike|etd-host|install_roundtrip-[0-9a-f]+|windows_fence-[0-9a-f]+)\.exe$' }
-          $ours | Group-Object 'Process Name' | ForEach-Object { Write-Host "$($_.Name): $($_.Count) events" }
-          $classes = @($ours | Where-Object { $_.Operation -like 'Reg*' -and $_.Path -match '^(HKCR|HKCU\\Software\\Classes|HKU\\[^\\]+_Classes)' })
-          Write-Host "HKCR/HKCU classes registry events by our processes: $($classes.Count)"
-          $classes | Group-Object 'Process Name', Operation, Path, Result | Sort-Object Count -Descending | ForEach-Object { Write-Host ("{0,5}  {1}" -f $_.Count, $_.Name) }
-          $classes | Export-Csv C:\pm\classes.csv -NoTypeInformation
-          $ours | Where-Object { $_.Operation -eq 'Load Image' } | ForEach-Object { "$($_.'Process Name') $($_.Path)" } | Sort-Object -Unique | Out-File C:\pm\loads.txt
-          Get-Content C:\pm\loads.txt | Where-Object { $_ -like 'es2n-native-spike*' } | Write-Host
+          Write-Host "PowerShell view afterwards:"
+          foreach ($id in $a, $b) {
+            $found = @(Get-NetFirewallRule -PolicyStore PersistentStore -Name $id -ErrorAction SilentlyContinue).Count
+            $active = @(Get-NetFirewallRule -PolicyStore ActiveStore -Name $id -ErrorAction SilentlyContinue).Count
+            Write-Host "$id persistent=$found active=$active"
+            if ($id -eq $a -and ($found -ne 0 -or $active -ne 0)) { $code = 1 }
+            if ($id -eq $b -and ($found -ne 1 -or $active -ne 1)) { $code = 1 }
+          }
+          Remove-NetFirewallRule -Name $a, $b -ErrorAction SilentlyContinue
           exit $code
+      - name: Host install and fence paths, captured (no plants)
+        if: always()
+        shell: pwsh
+        env:
+          CI: 'true'
+          ETD_HOST_CI_INSTALL: '1'
+        run: |
+          Start-Process C:\pm\Procmon64.exe -ArgumentList '/AcceptEula','/Quiet','/Minimized','/BackingFile','C:\pm\host.pml'
+          Start-Sleep -Seconds 10
+          try {
+            cargo nextest run --locked --profile privileged -p etd-host --run-ignored only --test install_roundtrip -E 'test(install_connect_uninstall)' --success-output never --failure-output immediate
+            Write-Host "install_connect_uninstall exit under capture: $LASTEXITCODE"
+            cargo nextest run --locked --profile privileged -p etd-sysfx-os --run-ignored only --test windows_fence -E 'test(session_fence)' --success-output never --failure-output immediate
+            Write-Host "session_fence exit under capture: $LASTEXITCODE"
+          } finally {
+            & C:\pm\analyze.ps1 -Name host -Processes '^(etd-host|install_roundtrip-[0-9a-f]+|windows_fence-[0-9a-f]+)\.exe$'
+          }
+          exit 0
       - name: Today's session-form worker under the same plants (evidence, expected to fail)
         if: always()
         shell: pwsh
@@ -156,5 +171,5 @@ jobs:
         with:
           name: es2n-procmon
           path: |
-            C:\pm\classes.csv
-            C:\pm\loads.txt
+            C:\pm\*-classes.csv
+            C:\pm\*-loads.txt

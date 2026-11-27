@@ -1,5 +1,4 @@
-[windows]
-set shell := ["pwsh", "-NoLogo", "-NoProfile", "-Command"]
+set windows-shell := ["pwsh", "-NoLogo", "-NoProfile", "-Command"]
 
 default:
     @just --list
@@ -7,6 +6,7 @@ default:
 check:
     cargo check --locked --workspace
 
+# On shared desktops, follow the CI-first testing rules in AGENTS.md.
 test:
     cargo nextest run --locked --workspace --profile ci
 

@@ -7,8 +7,8 @@ use ::windows::{
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, WPARAM},
         Security::{
-            GetSidSubAuthority, GetSidSubAuthorityCount, TOKEN_MANDATORY_LABEL,
-            TokenIntegrityLevel, TokenSessionId,
+            GetSecurityDescriptorControl, GetSidSubAuthority, GetSidSubAuthorityCount,
+            SE_DACL_PROTECTED, TOKEN_MANDATORY_LABEL, TokenIntegrityLevel, TokenSessionId,
         },
         Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
         System::{
@@ -124,7 +124,7 @@ fn ensure_protected(path: &Path) -> io::Result<()> {
             Err(error) => return Err(not_conforming(path, error)),
         }
     }
-    validate_acl(path, false, true).map_err(|error| not_conforming(path, error))?;
+    validate_protected(path)?;
     if !fs::symlink_metadata(path)?.is_dir() {
         return Err(not_conforming(path, "not a directory"));
     }
@@ -141,6 +141,48 @@ fn require_dirs(layout: &HostLayout) -> io::Result<()> {
         if !present {
             return Err(not_conforming(dir, "missing, or not a directory"));
         }
+        protected_dacl(dir)?;
+    }
+    Ok(())
+}
+
+/// The protected descriptor on a directory the tree is rooted at: owner
+/// SYSTEM or Administrators, only SYSTEM and Administrators granted, and
+/// the whole DACL protected from inheritance (as `create_protected` sets
+/// it), so no change to a parent can reach into the tree.
+fn validate_protected(path: &Path) -> io::Result<()> {
+    validate_acl(path, false, true).map_err(|error| not_conforming(path, error))?;
+    protected_dacl(path)
+}
+
+fn protected_dacl(path: &Path) -> io::Result<()> {
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    let mut control = 0u16;
+    let mut revision = 0u32;
+    // SAFETY: the descriptor is allocated by the call and released by
+    // `Allocation`; the outputs are owned locals.
+    unsafe {
+        GetNamedSecurityInfoW(
+            &HSTRING::from(path.as_os_str()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            &mut sd,
+        )
+        .ok()
+        .map_err(|error| not_conforming(path, error))?;
+        let _allocation = Allocation(HLOCAL(sd.0));
+        GetSecurityDescriptorControl(sd, &mut control, &mut revision).map_err(other)?;
+    }
+    if control & SE_DACL_PROTECTED.0 == 0 {
+        return Err(not_conforming(
+            path,
+            "access control inherited, not protected",
+        ));
     }
     Ok(())
 }
@@ -196,9 +238,9 @@ pub(in crate::service) fn prepare_session(layout: &HostLayout) -> io::Result<()>
 
 pub(in crate::service) fn validate_session(layout: &HostLayout) -> io::Result<()> {
     let root = session_root()?;
-    validate_acl(&root, false, true).map_err(|error| not_conforming(&root, error))?;
+    validate_protected(&root)?;
     let user = user_root(layout)?;
-    validate_acl(user, false, true).map_err(|error| not_conforming(user, error))?;
+    validate_protected(user)?;
     verify_session_tree(user)?;
     require_dirs(layout)
 }
@@ -210,7 +252,7 @@ pub(in crate::service) fn session_layouts() -> io::Result<Vec<HostLayout>> {
         Err(error) => return Err(error),
         Ok(_) => (),
     }
-    validate_acl(&root, false, true).map_err(|error| not_conforming(&root, error))?;
+    validate_protected(&root)?;
     let mut layouts = Vec::new();
     for entry in fs::read_dir(&root)? {
         let path = entry?.path();
@@ -233,7 +275,7 @@ pub(in crate::service) fn remove_session_roots() -> io::Result<()> {
         Err(error) => return Err(error),
         Ok(_) => (),
     }
-    validate_acl(&root, false, true).map_err(|error| not_conforming(&root, error))?;
+    validate_protected(&root)?;
     verify_session_tree(&root)?;
     fs::remove_dir_all(root)
 }

@@ -70,7 +70,7 @@ Default host directories (`service`):
 | `windows/mod.rs` | Reclaimers, observer, sweeper, fence wiring |
 | `windows/wfp.rs`, `probe.rs`, `token.rs` | WFP fence of the host's form (persistent for the service, non-persistent for the elevated session); LocalService or restricted-token connection probe; host form from the process token |
 | `windows/interfaces.rs`, `registry.rs`, `magic.rs` | wintun identity, registry and boot marker, Magic DNS recovery replay |
-| `windows/execution.rs`, `system.ps1` | Constant PowerShell script for firewall, NRPT, profiles, registry and listener queries; no module autoloading, absolute imports, explicit environment (profile variables in the session tree under an elevated host that is not SYSTEM) |
+| `windows/execution.rs`, `system.ps1` | Constant PowerShell script for firewall, NRPT, profiles, registry and listener queries; no module autoloading, absolute imports, explicit environment (under an elevated host that is not SYSTEM: profile variables in the session tree, and the CLR profiler off as defence in depth against HKCU runtime settings) |
 | `windows/driver_refs.rs`, `appearance.rs` | Driver references into the kernel store; DWM / appearance |
 | `linux/mod.rs`, `network.rs`, `observe.rs` | Reclaimers, sweeper, links / routes / listeners, runtime directories |
 | `linux/fence.rs`, `resolved.rs` | nftables fence; resolve1 per-link DNS |

@@ -66,7 +66,7 @@ checks every workflow for this.
 | --- | --- | --- |
 | `etd-host --test install_roundtrip` | Install (including the bundled release kernel staged beside the test image), service start, peer identity and roles, uninstall leaves no service, directory or group | `ci.yml` job `privileged-install`, all three OSes |
 | `etd-sysfx-os --test windows_reclaim`, `windows_fence` | Real wintun, firewall and registry objects, same-name conflicts; WFP fence against a second account; elevated session fence against a restricted Medium copy of the runner token | `o1-windows.yml`; `session_fence` also `ci.yml` `privileged-install` on Windows |
-| `etd-sysfx-os --features ci-test-fixtures --test windows_session_inputs` | Elevated session workers ignore a planted personal module and a poisoned module analysis cache; explicit environment only | `ci.yml` `privileged-install` on Windows |
+| `etd-sysfx-os --features ci-test-fixtures --test windows_session_inputs` | Elevated session workers ignore a planted personal module, a poisoned module analysis cache and HKCU .NET profiler settings; explicit environment only | `ci.yml` `privileged-install` on Windows |
 | `etd-sysfx-os --test linux_reclaim`, `linux_fence` | netlink adapters, systemd-resolved, nftables fence by uid, distribution parsers | `o2-linux.yml` |
 | `etd-sysfx-os --test macos_reclaim`, `macos_fence`, `macos_resolver` | utun ownership, PF anchor fence against a second account, foreign resolver files untouched | `o3-macos.yml` |
 | `etd-ipc --test unix_service`, `stale_endpoint` | Root-owned service sockets, second-account rejection, stale endpoint recovery | Root runner; not yet wired into a workflow |

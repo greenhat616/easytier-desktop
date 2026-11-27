@@ -44,8 +44,20 @@ every module it uses by absolute path under `$PSHOME\Modules` (in every form); t
 worker keeps `-NoProfile` and an explicit environment, and under an elevated host that
 is not SYSTEM `USERPROFILE`, `APPDATA`, `LOCALAPPDATA` and `HOMEDRIVE`/`HOMEPATH` point
 at `<state_dir>\..\profile`, the protected empty directory of the session tree, with
-`PSModuleAnalysisCachePath=NUL`. That directory must exist as a plain directory; it is
-never created here and there is no fallback to the user's profile.
+`PSModuleAnalysisCachePath=NUL`. It is never created here: when it is absent (an
+administrator's command over the service layout) the worker gets no profile variables
+at all, as before; when it is present it must be a plain directory owned by SYSTEM or
+Administrators, or the worker fails closed. There is never a fallback to the user's
+profile.
+
+The .NET Framework runtime also reads its settings from the user's
+`HKCU\Software\Microsoft\.NETFramework`. On the CI runner, profiler settings there
+(`COR_ENABLE_PROFILING`, `COR_PROFILER`, `COR_PROFILER_PATH`) make an elevated
+PowerShell try to load the named DLL. The environment takes precedence, so workers of
+an elevated host that is not SYSTEM run with `COR_ENABLE_PROFILING=0`. This is defence
+in depth, not a fix: other runtime settings in HKCU are not neutralised and the list is
+not closed; replacing PowerShell with native APIs for the session form is the open
+alternative (topic#51).
 
 | Kind | Observed as | Reclaim |
 | --- | --- | --- |
@@ -201,7 +213,7 @@ a developer machine.
 
 | Platform | Test files | Workflow |
 | --- | --- | --- |
-| Windows | `windows_reclaim.rs`: volatile boot marker, network profile and signature cleanup, registry + NRPT + Magic DNS recovery, firewall reclaim and same-name conflict, real wintun after a kill (`ETD_O1_CORE`, the bundled v2.7.1 release kernel from `cargo xtask fetch-cores`). `windows_fence.rs`: WFP fence as LocalSystem (scheduled task) with a second local account as the denied client, and the elevated session fence as the runner's administrator (non-persistent filters, restricted Medium copy refused while the listener is up). `windows_session_inputs.rs` (feature `ci-test-fixtures`): a planted personal module and a poisoned module analysis cache do not reach the workers of an elevated host that is not SYSTEM, whose environment holds only the explicit variables | `.github/workflows/o1-windows.yml` (also clippy and unprivileged lib tests) |
+| Windows | `windows_reclaim.rs`: volatile boot marker, network profile and signature cleanup, registry + NRPT + Magic DNS recovery, firewall reclaim and same-name conflict, real wintun after a kill (`ETD_O1_CORE`, the bundled v2.7.1 release kernel from `cargo xtask fetch-cores`). `windows_fence.rs`: WFP fence as LocalSystem (scheduled task) with a second local account as the denied client, and the elevated session fence as the runner's administrator (non-persistent filters, restricted Medium copy refused while the listener is up). `windows_session_inputs.rs` (feature `ci-test-fixtures`): a planted personal module, a poisoned module analysis cache and HKCU .NET profiler settings (event 1022 for a worker-like control, none for the workers) do not reach the workers of an elevated host that is not SYSTEM, whose environment holds only the explicit variables | `.github/workflows/o1-windows.yml` (also clippy and unprivileged lib tests) |
 | Linux | `linux_reclaim.rs`: real link, route and resolve1, plus runs without resolved and without a system bus. `linux_fence.rs`: fence survives host death, second account, kernel-store image check | `.github/workflows/o2-linux.yml`; it also parses Debian 12 and Fedora 44 `nft` output with the lib's ignored fixture tests and checks the pinned kernel's TUN capability as root, with `CAP_NET_ADMIN`, and without |
 | macOS | `macos_reclaim.rs` (utun ownership, verify-only reclaim, unnamed utun records), `macos_fence.rs` (PF fence, host death, second account), `macos_resolver.rs` (rejected Magic DNS keeps foreign resolvers), lib test `missing_image_preserves_foreign_identity` | `.github/workflows/o3-macos.yml` (also the `etd-host` install roundtrip) |
 | all | `service/**` through `etd-host`'s `install_roundtrip` | `.github/workflows/ci.yml` job `privileged-install`; job `check` runs the unprivileged tests on all three systems |

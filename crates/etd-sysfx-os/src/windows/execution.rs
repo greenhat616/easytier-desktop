@@ -5,7 +5,16 @@
 //! is not SYSTEM (the elevated session) every user profile, HKCU and
 //! environment input is untrusted (doc#13#untrusted): the profile variables
 //! point at the protected, empty profile directory of the session tree,
-//! and the script imports its modules by absolute path with autoloading off.
+//! the script imports its modules by absolute path with autoloading off,
+//! and the CLR profiler is switched off in the environment.
+//!
+//! The last is defence in depth, not a fix: the .NET Framework runtime also
+//! reads its settings from the user's HKCU\Software\Microsoft\.NETFramework,
+//! which the user's non-elevated processes can write. The environment takes
+//! precedence, which neutralises the profiler (shown on the CI runner: with
+//! the HKCU profiler settings an elevated PowerShell tries to load the
+//! profiler DLL, with COR_ENABLE_PROFILING=0 it does not). Other runtime
+//! settings in HKCU are not neutralised; that list is not closed.
 use super::{
     WinError, encoded_command,
     token::{self, HostToken},
@@ -36,6 +45,45 @@ pub(super) fn set_worker_profile(profile: Option<PathBuf>) {
 
 /// FILE_ATTRIBUTE_REPARSE_POINT.
 const REPARSE_POINT: u32 = 0x400;
+
+/// Whether `path` is owned by SYSTEM or Administrators, which a
+/// non-elevated process cannot arrange.
+fn privileged_owner(path: &Path) -> Result<bool, WinError> {
+    use ::windows::{
+        Win32::{
+            Foundation::{HLOCAL, LocalFree},
+            Security::{
+                Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
+                IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+                WinBuiltinAdministratorsSid, WinLocalSystemSid,
+            },
+        },
+        core::HSTRING,
+    };
+    let mut owner = PSID::default();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: the out pointers are valid; the descriptor the call allocates
+    // holds the owner SID and is freed after its last use.
+    unsafe {
+        GetNamedSecurityInfoW(
+            &HSTRING::from(path.as_os_str()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            &mut descriptor,
+        )
+        .ok()
+        .map_err(WinError::windows)?;
+        let privileged = !owner.0.is_null()
+            && (IsWellKnownSid(owner, WinLocalSystemSid).as_bool()
+                || IsWellKnownSid(owner, WinBuiltinAdministratorsSid).as_bool());
+        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+        Ok(privileged)
+    }
+}
 
 /// The profile variables pointing at `profile`, which must be an existing
 /// plain directory (not a reparse point) on an absolute drive path. It is
@@ -124,17 +172,32 @@ impl Environment {
             ("windir".into(), root.as_os_str().to_owned()),
         ];
         if host == HostToken::Elevated {
-            // Fail closed: never the user's own profile.
+            vars.push(("COR_ENABLE_PROFILING".into(), "0".into()));
             let profile = WORKER_PROFILE
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-                .ok_or_else(|| {
-                    WinError::invalid(
-                        "an elevated host that is not SYSTEM has no protected worker profile directory",
-                    )
-                })?;
-            vars.extend(profile_vars(&profile)?);
+                .clone();
+            if let Some(profile) = profile {
+                match std::fs::symlink_metadata(&profile) {
+                    // No session tree: an administrator's command over the
+                    // service layout. No profile variables at all, as
+                    // before; never the user's own profile.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    // Present: it must be the protected directory, or fail
+                    // closed. A non-elevated process cannot make a
+                    // directory owned by SYSTEM or Administrators.
+                    _ => {
+                        let profile_vars = profile_vars(&profile)?;
+                        if !privileged_owner(&profile)? {
+                            return Err(WinError::invalid(format!(
+                                "worker profile directory {}: not owned by SYSTEM or Administrators",
+                                profile.display()
+                            )));
+                        }
+                        vars.extend(profile_vars);
+                    }
+                }
+            }
         }
         // The block for CreateProcessAsUserW must be sorted.
         vars.sort_by_key(|(name, _)| name.to_ascii_uppercase());
@@ -992,26 +1055,54 @@ mod tests {
     }
 
     #[test]
-    fn only_an_elevated_host_that_is_not_system_redirects_and_never_without_a_profile() {
-        set_worker_profile(None);
-        let refused = Environment::for_host(HostToken::Elevated).err().unwrap();
-        assert!(refused.message.contains("profile"), "{}", refused.message);
+    fn only_an_elevated_host_that_is_not_system_redirects() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        // No session tree: no profile variables, the profiler still off.
+        for profile in [None, Some(dir.path().join("missing"))] {
+            set_worker_profile(profile);
+            let environment = Environment::for_host(HostToken::Elevated).unwrap();
+            assert!(value(&environment.vars, "USERPROFILE").is_none());
+            assert_eq!(
+                value(&environment.vars, "COR_ENABLE_PROFILING").unwrap(),
+                "0"
+            );
+        }
+        // Present but not a plain directory: fail closed.
+        set_worker_profile(Some(file));
+        assert!(Environment::for_host(HostToken::Elevated).is_err());
+        // Neither SYSTEM nor a standard host changes its environment.
+        set_worker_profile(Some(dir.path().to_owned()));
         for host in [HostToken::System, HostToken::Standard] {
             let environment = Environment::for_host(host).unwrap();
             assert!(
                 value(&environment.vars, "USERPROFILE").is_none(),
                 "{host:?}"
             );
+            assert!(
+                value(&environment.vars, "COR_ENABLE_PROFILING").is_none(),
+                "{host:?}"
+            );
         }
-        test_profile();
-        let environment = Environment::for_host(HostToken::Elevated).unwrap();
-        assert!(value(&environment.vars, "USERPROFILE").is_some());
-        let names: Vec<_> = environment
-            .vars
-            .iter()
-            .map(|(name, _)| name.to_ascii_uppercase())
-            .collect();
-        assert!(names.is_sorted(), "{names:?}");
+        // A directory an elevated process created is owned by
+        // Administrators; a standard user's is not, and is refused.
+        let result = Environment::for_host(HostToken::Elevated);
+        if privileged_owner(dir.path()).unwrap() {
+            let environment = result.unwrap();
+            assert_eq!(
+                Path::new(value(&environment.vars, "USERPROFILE").unwrap()),
+                dir.path()
+            );
+            let names: Vec<_> = environment
+                .vars
+                .iter()
+                .map(|(name, _)| name.to_ascii_uppercase())
+                .collect();
+            assert!(names.is_sorted(), "{names:?}");
+        } else {
+            assert!(result.err().unwrap().message.contains("not owned"));
+        }
     }
 
     #[test]

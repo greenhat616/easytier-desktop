@@ -154,6 +154,27 @@ fn plain(path: &Path) -> String {
     text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned()
 }
 
+/// `path` with every short (8.3) component expanded. Links and junctions
+/// are not followed.
+fn long_path(path: &Path) -> Result<PathBuf, WinError> {
+    use ::windows::{Win32::Storage::FileSystem::GetLongPathNameW, core::HSTRING};
+    use std::os::windows::ffi::OsStringExt;
+    let wide = HSTRING::from(path.as_os_str());
+    let mut buffer = vec![0u16; 512];
+    loop {
+        // SAFETY: `wide` is NUL-terminated; the buffer is writable for its
+        // length.
+        let n = unsafe { GetLongPathNameW(&wide, Some(&mut buffer)) } as usize;
+        if n == 0 {
+            return Err(WinError::windows(::windows::core::Error::from_thread()));
+        }
+        if n < buffer.len() {
+            return Ok(PathBuf::from(OsString::from_wide(&buffer[..n])));
+        }
+        buffer.resize(n, 0);
+    }
+}
+
 /// The protected profile directory, or why it is refused: a plain
 /// directory owned by SYSTEM or Administrators whose DACL lets no one else
 /// write, and whose final path (all links and junctions resolved) is the
@@ -174,7 +195,9 @@ fn protected_profile_vars(profile: &Path) -> Result<Vec<(OsString, OsString)>, W
         return Err(refused("writable by others than SYSTEM and Administrators"));
     }
     let resolved = std::fs::canonicalize(profile).map_err(|e| refused(&e.to_string()))?;
-    if !plain(&resolved).eq_ignore_ascii_case(&plain(profile)) {
+    // Short (8.3) names are aliases, not links: compare long forms.
+    let long = long_path(profile).map_err(|e| refused(&e.message))?;
+    if !plain(&resolved).eq_ignore_ascii_case(&plain(&long)) {
         return Err(refused(&format!(
             "resolves to {} (a link or junction on the path)",
             resolved.display()

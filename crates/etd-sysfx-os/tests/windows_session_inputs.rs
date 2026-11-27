@@ -139,6 +139,25 @@ impl Drop for Profiler {
     }
 }
 
+/// The session tree's protected profile directory, as the composition root
+/// makes it: SYSTEM and Administrators only, nothing inherited.
+fn protected_profile(path: &std::path::Path) {
+    std::fs::create_dir(path).unwrap();
+    let status = std::process::Command::new("icacls.exe")
+        .arg(path)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-18:(OI)(CI)F",
+            "*S-1-5-32-544:(OI)(CI)F",
+            "/q",
+        ])
+        .no_window()
+        .status()
+        .unwrap();
+    assert!(status.success(), "icacls {}", path.display());
+}
+
 /// .NET Runtime 1022 events ("Loading profiler failed") naming `clsid`.
 fn profiler_attempts(clsid: &str) -> usize {
     ps(&format!(
@@ -160,7 +179,7 @@ async fn user_inputs_do_not_reach_the_elevated_workers() {
     let dir = tempfile::tempdir().unwrap();
     let profile = dir.path().join("profile");
     let state = dir.path().join("state");
-    std::fs::create_dir(&profile).unwrap();
+    protected_profile(&profile);
     std::fs::create_dir(&state).unwrap();
     let marker = dir.path().join("marker.txt");
     let _plants = plant(&marker);

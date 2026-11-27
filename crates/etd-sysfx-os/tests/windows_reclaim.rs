@@ -13,8 +13,28 @@ use std::{process::Command, sync::Arc};
 /// The runner is an elevated administrator, not SYSTEM: like the elevated
 /// session host, its management workers get the protected profile directory
 /// next to the state directory, which the composition root creates.
+/// The session tree's protected profile directory, as the composition root
+/// makes it: SYSTEM and Administrators only, nothing inherited.
+fn protected_profile(path: &std::path::Path) {
+    use std::os::windows::process::CommandExt;
+    std::fs::create_dir(path).unwrap();
+    let status = std::process::Command::new("icacls.exe")
+        .arg(path)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-18:(OI)(CI)F",
+            "*S-1-5-32-544:(OI)(CI)F",
+            "/q",
+        ])
+        .creation_flags(0x0800_0000)
+        .status()
+        .unwrap();
+    assert!(status.success(), "icacls {}", path.display());
+}
+
 fn session_state(dir: &std::path::Path) -> std::path::PathBuf {
-    std::fs::create_dir(dir.join("profile")).unwrap();
+    protected_profile(&dir.join("profile"));
     let state = dir.join("state");
     std::fs::create_dir(&state).unwrap();
     state

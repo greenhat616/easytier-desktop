@@ -444,6 +444,25 @@ fn restricted_connect(address: std::net::SocketAddr) -> String {
     }
 }
 
+/// The session tree's protected profile directory, as the composition root
+/// makes it: SYSTEM and Administrators only, nothing inherited.
+fn protected_profile(path: &std::path::Path) {
+    std::fs::create_dir(path).unwrap();
+    let status = std::process::Command::new("icacls.exe")
+        .arg(path)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-18:(OI)(CI)F",
+            "*S-1-5-32-544:(OI)(CI)F",
+            "/q",
+        ])
+        .no_window()
+        .status()
+        .unwrap();
+    assert!(status.success(), "icacls {}", path.display());
+}
+
 /// A permit-everyone filter for one loopback port inside our sublayer, at
 /// a higher weight than the fence's block: the fence's four filters stay
 /// complete, but anyone can connect. Added in a dynamic engine session, so
@@ -551,7 +570,7 @@ async fn session_fence() {
     let dir = tempfile::tempdir().unwrap();
     // The protected profile directory the composition root creates next
     // to the state directory.
-    std::fs::create_dir(dir.path().join("profile")).unwrap();
+    protected_profile(&dir.path().join("profile"));
     std::fs::create_dir(dir.path().join("state")).unwrap();
     let os = adapters(&OsConfig {
         state_dir: dir.path().join("state"),

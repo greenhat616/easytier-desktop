@@ -102,7 +102,11 @@ cargo xtask dist --bin-dir target/debug --cores target/debug/cores/2.7.1 --out o
    package installs). Links and directories are refused.
 2. Checks the staged bundle against `crates/etd-host/cores.lock` with `etd-host`'s own
    `core_lock.rs`: the executable and every companion with its SHA-256, and no other file.
-   Only the payload that was checked is packaged.
+   Only the payload that was checked is packaged. The staged `etd-host` must embed every
+   digest of that row (it was built from the same `cores.lock`) and must not carry the CI
+   fault hook (`ci-test-fixtures`, recognised by its `ci-upgrade-fault` file name); on
+   Windows `etd-ui.exe` must be a GUI-subsystem (release) build, so it opens no console.
+   `--allow-test-fixtures` lifts the last two checks for CI test packages.
 3. Runs the target's packager: on Windows (`dist/windows.rs`) it renders
    `packaging/windows/Product.wxs.tmpl` into `<out>/<triple>/Product.wxs` (MSI version,
    payload paths, one component per kernel file) and, unless `--dry-run`, runs
@@ -120,6 +124,7 @@ cargo xtask dist --bin-dir target/debug --cores target/debug/cores/2.7.1 --out o
 | `--package-version <x.y.z>` | Default the workspace version; no pre-release tag (installers order versions numerically) |
 | `--dry-run` | Skip the packaging tool |
 | `--sign-hook none` | Default; v1 packages are unsigned (issue #2) |
+| `--allow-test-fixtures` | CI test packages only: accept an `etd-host` built with `ci-test-fixtures` and a debug `etd-ui` |
 
 The MSI's design, custom actions and failure behaviour are in
 [`../docs/packaging/README.md`](../docs/packaging/README.md).
@@ -168,8 +173,9 @@ cargo nextest run -p xtask
 This runs the spawn-flag and CI-config checks over the real repository, the
 `fetch-cores` checks (the committed `cores.lock` covers exactly the pinned targets and
 companions, pin validation, `SHA256SUMS` parsing, extraction from a synthetic zip; no
-network), the `dist` checks (staging, bundle verification against a lock, MSI template
-rendering and custom-action conditions, MSI version limits), plus the
+network), the `dist` checks (staging, bundle verification against a lock, the staged host's
+fixture marker and embedded digests, the PE subsystem, MSI template rendering and
+placeholders, custom-action conditions, MSI version limits), plus the
 boundary rule tests in `src/boundaries/tests.rs`. Those generate synthetic workspaces
 of empty path crates in a temporary directory and run `cargo metadata --offline` on
 them, so each rule is exercised with Cargo's real metadata shape (every dependency kind,

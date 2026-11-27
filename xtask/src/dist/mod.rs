@@ -53,6 +53,39 @@ pub struct Args {
     /// Signing step for the built package.
     #[arg(long, value_enum, default_value = "none")]
     sign_hook: sign::SignHook,
+    /// Package a test build: an etd-host built with ci-test-fixtures and a
+    /// console-subsystem (debug) etd-ui. Only CI test packages use this.
+    #[arg(long)]
+    allow_test_fixtures: bool,
+}
+
+/// Compiled into etd-host only with the ci-test-fixtures feature (the CI
+/// upgrade fault's trigger file name).
+const TEST_FIXTURE_MARKER: &[u8] = b"ci-upgrade-fault";
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// The staged etd-host must be a release build of this tree: no test
+/// fixtures (unless allowed) and the kernel digests of this `cores.lock`
+/// embedded, so the package's kernels are the ones it will accept.
+fn check_host(host: &[u8], digests: &[String], allow_test_fixtures: bool) -> Result<()> {
+    ensure!(
+        allow_test_fixtures || !contains(host, TEST_FIXTURE_MARKER),
+        "etd-host was built with ci-test-fixtures (a CI fault hook); release packages must not \
+         carry it: build it with `cargo build --release -p etd-host`"
+    );
+    for digest in digests {
+        ensure!(
+            contains(host, digest.as_bytes()),
+            "etd-host does not embed kernel digest {digest} from {LOCK}: it was built from \
+             another cores.lock"
+        );
+    }
+    Ok(())
 }
 
 /// A staged, verified payload, ready for a packager.
@@ -68,6 +101,8 @@ pub(crate) struct Payload {
     pub dir: PathBuf,
     /// Where the package definition and the package go.
     pub out: PathBuf,
+    /// A CI test package (`--allow-test-fixtures`).
+    pub test_build: bool,
 }
 
 impl Payload {
@@ -196,6 +231,13 @@ pub fn run(root: &Path, args: Args) -> Result<()> {
         target.executable(),
         &dir.join("cores").join(&core_version),
     )?;
+    let suffix = if is_windows(&triple) { ".exe" } else { "" };
+    let host = fs::read(dir.join(format!("etd-host{suffix}")))?;
+    check_host(
+        &host,
+        &cores::digests(&lock, &triple, &core_version)?,
+        args.allow_test_fixtures,
+    )?;
     println!(
         "staged {} with the {triple} {core_version} kernel bundle matching {LOCK}",
         dir.display()
@@ -208,6 +250,7 @@ pub fn run(root: &Path, args: Args) -> Result<()> {
         core_files,
         dir,
         out,
+        test_build: args.allow_test_fixtures,
     };
     let package = if payload.is_windows() {
         windows::package(root, &payload, args.dry_run)?
@@ -280,6 +323,24 @@ mod tests {
         fs::remove_file(bins.join("etd-ctl.exe")).unwrap();
         let error = stage(&bins, &bundle, "2.7.1", true, &dir).unwrap_err();
         assert!(format!("{error:#}").contains("etd-ctl.exe"), "{error:#}");
+    }
+
+    #[test]
+    fn a_test_build_or_foreign_lock_host_is_refused() {
+        let digests = vec!["a".repeat(64), "b".repeat(64)];
+        let release = format!("prefix{}middle{}suffix", digests[0], digests[1]).into_bytes();
+        check_host(&release, &digests, false).unwrap();
+        let mut fixtures = release.clone();
+        fixtures.extend_from_slice(b"maintenance/ci-upgrade-fault");
+        let error = check_host(&fixtures, &digests, false).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("ci-test-fixtures"),
+            "{error:#}"
+        );
+        check_host(&fixtures, &digests, true).unwrap();
+        let foreign = format!("prefix{}suffix", digests[0]).into_bytes();
+        let error = check_host(&foreign, &digests, true).unwrap_err();
+        assert!(format!("{error:#}").contains(&digests[1]), "{error:#}");
     }
 
     #[test]

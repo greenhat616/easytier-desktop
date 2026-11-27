@@ -90,25 +90,62 @@ fn render(template: &str, payload: &Payload, payload_dir: &str) -> Result<String
             escape(&source)
         );
     }
-    let mut text = template.to_owned();
-    for (placeholder, value) in [
+    let values = [
         ("@VERSION@", escape(&msi_version(&payload.version)?)),
         ("@PAYLOAD@", escape(payload_dir)),
         ("@CORE_VERSION@", escape(&payload.core_version)),
         ("@CORE_COMPONENTS@", components.trim_end().to_owned()),
-    ] {
-        ensure!(
-            text.contains(placeholder),
-            "{TEMPLATE} has no {placeholder}"
-        );
+    ];
+    // Check the template's placeholders before filling any in: a value
+    // (such as a payload path) may itself contain an at sign.
+    let expected: BTreeSet<&str> = values.iter().map(|(name, _)| *name).collect();
+    let found = placeholders(template);
+    ensure!(
+        found == expected,
+        "{TEMPLATE} placeholders {found:?} differ from {expected:?}"
+    );
+    let mut text = template.to_owned();
+    for (placeholder, value) in values {
         text = text.replace(placeholder, &value);
     }
-    ensure!(
-        !text.contains('@'),
-        "{TEMPLATE} has an unknown @ placeholder"
-    );
     Ok(text)
 }
+
+/// Every `@NAME@` token (capital letters and underscores) in `template`.
+fn placeholders(template: &str) -> BTreeSet<&str> {
+    let mut found = BTreeSet::new();
+    let mut rest = template;
+    while let Some(start) = rest.find('@') {
+        let after = &rest[start + 1..];
+        match after.find('@') {
+            Some(end)
+                if end > 0
+                    && after[..end]
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b == b'_') =>
+            {
+                found.insert(&rest[start..start + end + 2]);
+                rest = &after[end + 1..];
+            }
+            _ => rest = after,
+        }
+    }
+    found
+}
+
+/// The PE optional header's Subsystem field: 2 is the Windows GUI, 3 the
+/// console.
+fn pe_subsystem(image: &[u8]) -> Result<u16> {
+    let field = |at: usize, len: usize| image.get(at..at + len).context("truncated PE image");
+    ensure!(field(0, 2)? == b"MZ", "not a PE image");
+    let pe = u32::from_le_bytes(field(0x3c, 4)?.try_into()?) as usize;
+    ensure!(field(pe, 4)? == b"PE\0\0", "not a PE image");
+    // Signature (4) + file header (20); Subsystem is at 68 in the optional
+    // header for both PE32 and PE32+.
+    Ok(u16::from_le_bytes(field(pe + 24 + 68, 2)?.try_into()?))
+}
+
+const GUI_SUBSYSTEM: u16 = 2;
 
 fn wix(args: &[&str]) -> Command {
     let mut command = Command::new("wix");
@@ -139,6 +176,12 @@ pub(super) fn package(root: &Path, payload: &Payload, dry_run: bool) -> Result<O
     let (file_arch, wix_arch) = arch(&payload.triple)?;
     let dir = std::path::absolute(&payload.dir)?;
     let dir = dir.to_str().context("payload path is not UTF-8")?;
+    let ui = fs::read(payload.dir.join("etd-ui.exe"))?;
+    ensure!(
+        payload.test_build || pe_subsystem(&ui)? == GUI_SUBSYSTEM,
+        "etd-ui.exe is not a Windows GUI program (a debug build opens a console); \
+         package a release build"
+    );
     let template = fs::read_to_string(root.join(TEMPLATE)).context(TEMPLATE)?;
     let source = payload.out.join("Product.wxs");
     fs::write(&source, render(&template, payload, dir)?)?;
@@ -192,6 +235,7 @@ mod tests {
             ],
             dir: PathBuf::from("unused"),
             out: PathBuf::from("unused"),
+            test_build: false,
         }
     }
 
@@ -231,11 +275,47 @@ mod tests {
         );
         assert!(text.contains(r#"<Custom Action="UpgradeHostService" Before="InstallFinalize""#));
         assert!(text.contains(r#"<Custom Action="InstallHostService" Before="InstallFinalize""#));
+        // A failed install's rollback removes only what this product made,
+        // and a first install over an existing service is refused up front.
+        assert!(text.contains("uninstall --only-owner [ProductCode]"));
+        assert!(text.contains("install --owner [ProductCode]"));
+        assert!(text.contains(
+            r#"Condition="Installed OR WIX_UPGRADE_DETECTED OR NOT ETD_SERVICE_PRESENT""#
+        ));
+        assert_eq!(text.matches("NOT ETD_SERVICE_PRESENT AND NOT").count(), 2);
+        assert!(text.contains("WIX_UPGRADE_DETECTED AND ETD_SERVICE_PRESENT AND"));
+        assert!(text.contains(r#"AllowSameVersionUpgrades="yes""#));
+        assert!(
+            !text.contains("Secure="),
+            "ETD_ALLOW_USER is for administrators only"
+        );
         assert!(text.contains(r#"Execute="rollback" Impersonate="no""#));
         // Every action runs without a console window, as LocalSystem.
         assert_eq!(text.matches(r#"DllEntry="WixQuietExec""#).count(), 4);
         assert_eq!(text.matches(r#"Impersonate="no""#).count(), 4);
         assert!(text.contains(r#"Scope="perMachine""#));
+    }
+
+    #[test]
+    fn an_at_sign_in_the_payload_path_is_not_a_placeholder() {
+        let text = render(&template(), &payload(), r"C:\Users\me@example\payload").unwrap();
+        assert!(text.contains(r"C:\Users\me@example\payload\etd-host.exe"));
+        let broken = template().replace("@CORE_VERSION@", "@CORE_VERSIONS@");
+        assert!(render(&broken, &payload(), "C:\\p").is_err());
+    }
+
+    #[test]
+    fn the_subsystem_is_read_from_the_pe_header() {
+        let mut image = vec![0u8; 0x200];
+        image[..2].copy_from_slice(b"MZ");
+        image[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        image[0x80..0x84].copy_from_slice(b"PE\0\0");
+        image[0x80 + 24 + 68..0x80 + 24 + 70].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(pe_subsystem(&image).unwrap(), GUI_SUBSYSTEM);
+        image[0x80 + 24 + 68] = 3;
+        assert_eq!(pe_subsystem(&image).unwrap(), 3);
+        assert!(pe_subsystem(&image[..0x90]).is_err());
+        assert!(pe_subsystem(b"not a program").is_err());
     }
 
     #[test]

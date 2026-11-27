@@ -69,6 +69,18 @@ pub(super) fn verify(
     Ok(names)
 }
 
+/// The SHA-256 digests `lock` pins for `triple` `version`: the executable
+/// and every companion.
+pub(super) fn digests(lock: &str, triple: &str, version: &str) -> Result<Vec<String>> {
+    let table = core_lock::parse(lock).map_err(anyhow::Error::msg)?;
+    let row = table
+        .get(&(triple, version))
+        .with_context(|| format!("{LOCK} has no {triple} {version} rows"))?;
+    let mut digests: Vec<String> = row.exe.iter().map(|digest| (*digest).to_owned()).collect();
+    digests.extend(row.files.values().map(|digest| (*digest).to_owned()));
+    Ok(digests)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

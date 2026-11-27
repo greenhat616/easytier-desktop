@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+<defs><linearGradient id="s-strut" x1="0" y1="24" x2="24" y2="0" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#2D5BE0"/><stop offset="1" stop-color="#22A9E8"/></linearGradient>
+<linearGradient id="s-t" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5FDDF6"/><stop offset="1" stop-color="#1590D8"/></linearGradient>
+<linearGradient id="s-l" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#6E9DFB"/><stop offset="1" stop-color="#2648C9"/></linearGradient>
+<linearGradient id="s-r" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#4FDCC6"/><stop offset="1" stop-color="#0F8F98"/></linearGradient></defs>
+<path d="M12 5 L5 19 L19 19 Z" fill="none" stroke="url(#s-strut)" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="12" cy="5" r="4.5" fill="url(#s-t)"/><circle cx="5" cy="19" r="4.5" fill="url(#s-l)"/><circle cx="19" cy="19" r="4.5" fill="url(#s-r)"/></svg>

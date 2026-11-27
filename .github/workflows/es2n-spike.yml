@@ -17,7 +17,7 @@ env:
 jobs:
   spike:
     runs-on: windows-latest
-    timeout-minutes: 50
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Install pinned protoc
@@ -29,9 +29,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.152
-      - name: Build the spike and the captured tests
+      - name: Build the spikes and the captured tests
         run: |
-          cargo build --manifest-path spike/es2n-wmi/Cargo.toml
+          cargo build --manifest-path spike/es2n-native/Cargo.toml
           cargo xtask fetch-cores --target host --bundle target/debug/cores
           cargo nextest list --locked --profile privileged -p etd-host --run-ignored only --test install_roundtrip
           cargo nextest list --locked --profile privileged -p etd-sysfx-os --run-ignored only --test windows_fence
@@ -42,9 +42,44 @@ jobs:
           New-Item -ItemType Directory -Path C:\pm | Out-Null
           Invoke-WebRequest https://download.sysinternals.com/files/ProcessMonitor.zip -OutFile C:\pm\pm.zip
           Expand-Archive C:\pm\pm.zip -DestinationPath C:\pm
-          Get-AuthenticodeSignature C:\pm\Procmon64.exe | Format-List Status, SignerCertificate | Out-String | Write-Host
+          (Get-AuthenticodeSignature C:\pm\Procmon64.exe).Status
+      - name: Plant script
+        shell: pwsh
+        run: |
+          @'
+          param([switch]$Remove)
+          $classes = 'HKCU:\Software\Classes'
+          $bogus = '{E7D0E5A1-2B4C-4F6D-9E8A-0123456789AB}'
+          $dir = 'C:\etd-es2n-spike-planted'
+          $iids = '{9556DC99-828C-11CF-A37E-00AA003240C7}','{027947E1-D731-11CE-A357-000000000001}','{DC12A681-737F-11CF-884D-00AA004B2E24}','{44ACA674-E8FC-11D0-A07C-00C04FB68820}','{44ACA675-E8FC-11D0-A07C-00C04FB68820}','{F309AD18-D86A-11D0-A075-00C04FB68820}'
+          $proxies = @($iids | ForEach-Object { (Get-ItemProperty "HKLM:\SOFTWARE\Classes\Interface\$_\ProxyStubClsid32" -ErrorAction SilentlyContinue).'(default)' } | Where-Object { $_ } | Sort-Object -Unique)
+          $clsids = @{ locator='{4590F811-1D3A-11D0-891F-00AA004B2E24}'; context='{674B6698-EE92-11D0-AD71-00C04FD8FDFF}'; fwpolicy='{E2B3C97F-6AE1-41AC-817A-F6F92166D7DD}'; bogus=$bogus }
+          for ($i = 0; $i -lt $proxies.Count; $i++) { $clsids["proxy$i"] = $proxies[$i] }
+          if ($Remove) {
+            foreach ($c in $clsids.Values) { Remove-Item "$classes\CLSID\$c" -Recurse -Force -ErrorAction SilentlyContinue }
+            foreach ($i in $iids) { Remove-Item "$classes\Interface\$i" -Recurse -Force -ErrorAction SilentlyContinue }
+            Write-Host 'unplanted'
+            return
+          }
+          foreach ($label in $clsids.Keys) {
+            $c = $clsids[$label]
+            if (Test-Path "$classes\CLSID\$c") { throw "HKCU already has $c" }
+            $k = New-Item "$classes\CLSID\$c\InprocServer32" -Force
+            Set-ItemProperty $k.PSPath '(default)' "$dir\$label.dll"
+            Set-ItemProperty $k.PSPath 'ThreadingModel' 'Both'
+            if ($label -ne 'bogus') {
+              Set-ItemProperty (New-Item "$classes\CLSID\$c\TreatAs" -Force).PSPath '(default)' $bogus
+              Set-ItemProperty (New-Item "$classes\CLSID\$c\AutoTreatAs" -Force).PSPath '(default)' $bogus
+            }
+          }
+          foreach ($i in $iids) { Set-ItemProperty (New-Item "$classes\Interface\$i\ProxyStubClsid32" -Force).PSPath '(default)' $bogus }
+          Write-Host "planted: $($clsids.Count) classes ($($proxies -join ', ') as proxies), $($iids.Count) interfaces"
+          '@ | Set-Content C:\pm\plant.ps1
       - name: Native paths under HKCU plants, captured
         shell: pwsh
+        env:
+          CI: 'true'
+          ETD_HOST_CI_INSTALL: '1'
         run: |
           $ErrorActionPreference = 'Stop'
           $a = 'etd-es2n-a''q\b"c'
@@ -59,10 +94,13 @@ jobs:
           Start-Process C:\pm\Procmon64.exe -ArgumentList '/AcceptEula','/Quiet','/Minimized','/BackingFile','C:\pm\cap.pml'
           Start-Sleep -Seconds 10
           try {
+            & C:\pm\plant.ps1
             foreach ($mode in 'fwapi', 'natives') {
-              & spike/es2n-wmi/target/debug/es2n-wmi-spike.exe $count $mode
+              & spike/es2n-native/target/debug/es2n-native-spike.exe $count $mode
+              Write-Host "exit: $LASTEXITCODE"
               if ($LASTEXITCODE -ne 0) { $code = 1 }
             }
+            & C:\pm\plant.ps1 -Remove
             Write-Host "PowerShell view afterwards:"
             foreach ($id in $a, $b) {
               $found = @(Get-NetFirewallRule -PolicyStore PersistentStore -Name $id -ErrorAction SilentlyContinue).Count
@@ -76,6 +114,7 @@ jobs:
             cargo nextest run --locked --profile privileged -p etd-sysfx-os --run-ignored only --test windows_fence -E 'test(session_fence)' --success-output never
             if ($LASTEXITCODE -ne 0) { Write-Host 'session_fence failed'; $code = 1 }
           } finally {
+            & C:\pm\plant.ps1 -Remove
             Remove-NetFirewallRule -Name $a, $b -ErrorAction SilentlyContinue
             & C:\pm\Procmon64.exe /AcceptEula /Terminate
             Start-Sleep -Seconds 5
@@ -85,16 +124,27 @@ jobs:
           Start-Sleep -Seconds 10
           $rows = Import-Csv C:\pm\cap.csv
           Write-Host "captured events: $($rows.Count)"
-          $ours = $rows | Where-Object { $_.'Process Name' -match '^(es2n-wmi-spike|etd-host|install_roundtrip-[0-9a-f]+|windows_fence-[0-9a-f]+)\.exe$' }
+          $ours = $rows | Where-Object { $_.'Process Name' -match '^(es2n-native-spike|etd-host|install_roundtrip-[0-9a-f]+|windows_fence-[0-9a-f]+)\.exe$' }
           $ours | Group-Object 'Process Name' | ForEach-Object { Write-Host "$($_.Name): $($_.Count) events" }
-          $classes = $ours | Where-Object { $_.Operation -like 'Reg*' -and $_.Path -match '^(HKCR|HKCU\\Software\\Classes|HKU\\[^\\]+_Classes)' }
-          Write-Host "HKCR/HKCU classes registry events by our processes: $(@($classes).Count)"
-          $classes | Group-Object 'Process Name' | ForEach-Object { Write-Host "  $($_.Name): $($_.Count)" }
-          $classes | Select-Object -First 80 'Process Name', PID, Operation, Path, Result | Format-Table -AutoSize | Out-String -Width 400 | Write-Host
+          $classes = @($ours | Where-Object { $_.Operation -like 'Reg*' -and $_.Path -match '^(HKCR|HKCU\\Software\\Classes|HKU\\[^\\]+_Classes)' })
+          Write-Host "HKCR/HKCU classes registry events by our processes: $($classes.Count)"
+          $classes | Group-Object 'Process Name', Operation, Path, Result | Sort-Object Count -Descending | ForEach-Object { Write-Host ("{0,5}  {1}" -f $_.Count, $_.Name) }
           $classes | Export-Csv C:\pm\classes.csv -NoTypeInformation
-          $loads = $ours | Where-Object { $_.Operation -eq 'Load Image' } | Group-Object 'Process Name', Path | ForEach-Object { $_.Name }
-          $loads | Out-File C:\pm\loads.txt
+          $ours | Where-Object { $_.Operation -eq 'Load Image' } | ForEach-Object { "$($_.'Process Name') $($_.Path)" } | Sort-Object -Unique | Out-File C:\pm\loads.txt
+          Get-Content C:\pm\loads.txt | Where-Object { $_ -like 'es2n-native-spike*' } | Write-Host
           exit $code
+      - name: Today's session-form worker under the same plants (evidence, expected to fail)
+        if: always()
+        shell: pwsh
+        run: |
+          & C:\pm\plant.ps1
+          try {
+            cargo nextest run --locked --profile privileged -p etd-sysfx-os --run-ignored only --test windows_fence -E 'test(session_fence)' --success-output never --failure-output immediate
+            Write-Host "session_fence exit under plants: $LASTEXITCODE"
+          } finally {
+            & C:\pm\plant.ps1 -Remove
+          }
+          exit 0
       - uses: actions/upload-artifact@v4
         if: always()
         with:

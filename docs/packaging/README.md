@@ -290,8 +290,8 @@ from `dpkg -S`) and the library names it holds for loading at run time:
 
 `etd-host` also runs `nft` and `ip` (`nftables`, `iproute2`), and the icons go into
 `hicolor-icon-theme`'s folders, so every format depends on that package, which owns them. The deb names are installed
-by that job; the rpm and Arch names are their equivalents and are not installed by any
-test yet (PK5).
+by that job and by the release workflow's Ubuntu 22.04 smoke test; the rpm and Arch names
+are installed by its Fedora and Arch Linux container smoke tests.
 
 - **The C library floor:** `dist` reads the highest `GLIBC_x.y` symbol version the three
   binaries need and writes `libc6 (>= x.y)` (deb) and `glibc >= x.y` (rpm), so an older
@@ -314,6 +314,7 @@ cache:
 | `smoke-windows` | windows-latest | `tests/tier3/release.py msi_release`: install, upgrade, uninstall, machine compared with before |
 | `smoke-linux` | ubuntu-22.04 | `release.py deb_release`: the same with apt, on the oldest supported Ubuntu |
 | `smoke-rpm` | Fedora 43 container | `.github/scripts/rpm-smoke.sh`: scriptlets parse, root-owned files and modes, upgrade, and erasing leaves the file system as before the install (empty folders included); no systemd, so the hooks only print their notice |
+| `smoke-arch` | Arch Linux container (`base-20261122.0.629543`, by digest) | `.github/scripts/arch-smoke.sh`: the same for the Arch package with pacman (`.INSTALL` parses, files, upgrade, removal leaves nothing) |
 | `checksums` | ubuntu-latest | read-only: the two package artifacts by name, which must hold exactly the four release packages, and `SHA256SUMS.txt` over them |
 | `release` | ubuntu-latest | only on a `v*` tag, and the only job with `contents: write`: a **draft** GitHub release with the packages, the sums and an unsigned-package notice, which a maintainer reviews and publishes |
 
@@ -327,8 +328,7 @@ A manual run never gets write permission.
 The smoke upgrades go to a test-only package of the next patch version (the same
 binaries with bytes appended to `etd-host`), which is never published. The packages
 are unsigned (issue #2): `dist` runs `--sign-hook none`, and a placeholder step fails
-if `ETD_SIGNING_ENABLED` is set. The Arch package is built and checked for fixtures but
-not installed by any smoke test.
+if `ETD_SIGNING_ENABLED` is set.
 
 ## Application icons
 

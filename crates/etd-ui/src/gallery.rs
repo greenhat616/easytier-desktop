@@ -733,6 +733,11 @@ mod tests {
             );
             assert!(window.find("copy-ip-copied").visible());
             assert_eq!(window.find("copy-ip").label(), Some("Copied"));
+            // The note sits under the button, not over it.
+            assert!(
+                window.find("copy-ip-copied").bounds().top()
+                    >= window.find("copy-ip").bounds().bottom()
+            );
         })
         .unwrap();
         step(cx, 2100);

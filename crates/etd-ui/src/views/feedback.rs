@@ -7,7 +7,7 @@ use std::time::Duration;
 use gpui_kit::{
     AnyElement, AnyView, App, ClipboardItem, ElementId, Hsla, InteractiveElement as _, IntoElement,
     ParentElement as _, RenderOnce, Role, SharedString, StatefulInteractiveElement as _,
-    Styled as _, TestSupportExt as _, Window, anchored,
+    Styled as _, TestSupportExt as _, Window,
     component::{ActiveTheme as _, Icon, Sizable as _, Size, tooltip::Tooltip},
     deferred, div, px,
 };
@@ -228,12 +228,12 @@ impl RenderOnce for CopyButton {
             );
         let note = showing.then(|| {
             deferred(
-                anchored().child(
+                div().absolute().top(px(36.)).left_0().child(
                     div()
                         .id(SharedString::from(format!("{id}-copied")))
                         .test_support()
                         .role(Role::Status)
-                        .mt(px(4.))
+                        .whitespace_nowrap()
                         .bg(acrylic_in_app(cx))
                         .border_1()
                         .border_color(theme::flyout_stroke(cx))
@@ -250,6 +250,7 @@ impl RenderOnce for CopyButton {
             .with_priority(3)
         });
         div()
+            .relative()
             .flex()
             .flex_col()
             .child(keyboard_focus(id, move |focus| {

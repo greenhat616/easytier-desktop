@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const TEMPLATE: &str = "packaging/windows/Product.wxs.tmpl";
+/// The product icon (Add/Remove Programs), relative to the workspace root.
+const ICON: &str = "packaging/assets/icons/app.ico";
 /// The pinned WiX release; CI installs exactly this version.
 pub(crate) const WIX_VERSION: &str = "7.0.1";
 const WIX_EULA: &str = "wix7";
@@ -74,7 +76,7 @@ fn identifier(name: &str) -> String {
     format!("Core_{body}")
 }
 
-fn render(template: &str, payload: &Payload, payload_dir: &str) -> Result<String> {
+fn render(template: &str, payload: &Payload, payload_dir: &str, icon: &str) -> Result<String> {
     let mut components = String::new();
     let mut ids = BTreeSet::new();
     for name in &payload.core_files {
@@ -95,6 +97,7 @@ fn render(template: &str, payload: &Payload, payload_dir: &str) -> Result<String
         ("@PAYLOAD@", escape(payload_dir)),
         ("@CORE_VERSION@", escape(&payload.core_version)),
         ("@CORE_COMPONENTS@", components.trim_end().to_owned()),
+        ("@ICON@", escape(icon)),
     ];
     // Check the template's placeholders before filling any in: a value
     // (such as a payload path) may itself contain an at sign.
@@ -182,9 +185,16 @@ pub(super) fn package(root: &Path, payload: &Payload, dry_run: bool) -> Result<O
         "etd-ui.exe is not a Windows GUI program (a debug build opens a console); \
          package a release build"
     );
+    let icon = std::path::absolute(root.join(ICON))?;
+    let bytes = fs::read(&icon).with_context(|| format!("product icon {ICON}"))?;
+    ensure!(
+        bytes.starts_with(&[0, 0, 1, 0]),
+        "{ICON} is not a Windows icon file"
+    );
+    let icon = icon.to_str().context("icon path is not UTF-8")?;
     let template = fs::read_to_string(root.join(TEMPLATE)).context(TEMPLATE)?;
     let source = payload.out.join("Product.wxs");
-    fs::write(&source, render(&template, payload, dir)?)?;
+    fs::write(&source, render(&template, payload, dir, icon)?)?;
     println!("rendered {}", source.display());
     if dry_run {
         return Ok(None);
@@ -249,7 +259,15 @@ mod tests {
 
     #[test]
     fn the_template_renders_every_kernel_file_and_no_placeholder() {
-        let text = render(&template(), &payload(), r"C:\b & c\payload").unwrap();
+        let text = render(
+            &template(),
+            &payload(),
+            r"C:\b & c\payload",
+            r"C:\r\app.ico",
+        )
+        .unwrap();
+        assert!(text.contains(r#"<Icon Id="ProductIcon" SourceFile="C:\r\app.ico" />"#));
+        assert!(text.contains(r#"<Property Id="ARPPRODUCTICON" Value="ProductIcon" />"#));
         assert!(text.contains(r#"Version="0.2.3""#), "{text}");
         assert!(text.contains(r#"Name="2.7.1""#));
         assert!(text.contains(r#"Source="C:\b &amp; c\payload\etd-host.exe""#));
@@ -298,10 +316,16 @@ mod tests {
 
     #[test]
     fn an_at_sign_in_the_payload_path_is_not_a_placeholder() {
-        let text = render(&template(), &payload(), r"C:\Users\me@example\payload").unwrap();
+        let text = render(
+            &template(),
+            &payload(),
+            r"C:\Users\me@example\payload",
+            "i@c.ico",
+        )
+        .unwrap();
         assert!(text.contains(r"C:\Users\me@example\payload\etd-host.exe"));
         let broken = template().replace("@CORE_VERSION@", "@CORE_VERSIONS@");
-        assert!(render(&broken, &payload(), "C:\\p").is_err());
+        assert!(render(&broken, &payload(), "C:\\p", "i.ico").is_err());
     }
 
     #[test]
@@ -331,6 +355,6 @@ mod tests {
     fn colliding_bundle_identifiers_are_refused() {
         let mut payload = payload();
         payload.core_files = vec!["a-b.dll".into(), "a_b.dll".into()];
-        assert!(render(&template(), &payload, "C:\\p").is_err());
+        assert!(render(&template(), &payload, "C:\\p", "i.ico").is_err());
     }
 }

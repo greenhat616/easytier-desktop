@@ -51,6 +51,12 @@ jobs:
           - os: windows-latest
             suite: session-exclusion
             session_test: session_and_service_exclude_each_other
+          # Defensive acceptance on a disposable runner (doc#13#wbs ES5,
+          # topic#51 msg#2205): planted DLLs and a same-name PowerShell
+          # module are never loaded by the elevated session host.
+          - os: windows-latest
+            suite: session-planted
+            session_test: session_ignores_planted_modules
           - os: windows-latest
             suite: preflight
           - os: windows-latest

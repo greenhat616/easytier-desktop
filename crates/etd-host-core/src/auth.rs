@@ -7,8 +7,9 @@ pub mod allow_list;
 
 /// Maps OS peer credentials to a contract role using the allow list kept in
 /// the ledger (`HostSettings::allow_list`). Returns `None` for unknown
-/// peers. Implementations grant [`Role::Admin`] only to elevated tokens on
-/// Windows (administration re-elevates every time).
+/// peers. Implementations grant [`Role::Admin`] only to elevated peers on
+/// every OS: an elevated token on Windows, uid 0 on Unix (administration
+/// re-elevates every time).
 pub trait Authorizer: Send + Sync {
     fn role_of(&self, peer: &PeerIdentity) -> Option<Role>;
 }

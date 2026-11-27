@@ -19,7 +19,7 @@ that embeds the trusted kernel table. Binary only.
 | `upgrade` | Replace the installed service with this build and merge its kernels, keeping all state (administrator; run from the new payload). |
 | `uninstall` / `uninstall --status` | Stop, reclaim everything, remove the service; or report an unfinished uninstall. |
 | `resume-service` | Re-enable a service disabled by an uninstall that stopped before reclaim finished. |
-| `reclaim [--mode ...] [--all [--purge]]` | Reclaim ownership records while the host is stopped. |
+| `reclaim [--mode ...] [--all --purge]` | Reclaim ownership records while the host is stopped. `--purge` also removes product records and every configuration and requires `--all`, its explicit switch; `--all` alone changes nothing. |
 | `remove-core <version> [--mode ...]` | Reclaim a kernel's binary-scoped records, then delete it from the store. |
 | `doctor` | Print version, directories and adapter availability; no privileges needed. |
 | `--console-ctrl <pid>` (hidden) | Windows graceful-stop helper; see `etd_proc::console_ctrl`. |

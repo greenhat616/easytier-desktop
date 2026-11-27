@@ -11,7 +11,9 @@ pub const SERVICE_PIPE_NAME: &str = r"\\.\pipe\easytier-desk-host";
 pub const SERVICE_SOCKET_PATH: &str = "/run/easytier-desk/host.sock";
 #[cfg(target_os = "macos")]
 pub const SERVICE_SOCKET_PATH: &str = "/Library/Application Support/easytier-desk/run/host.sock";
-/// Unix group whose members may connect to the service socket (mode 0660).
+/// Name of the Unix group the service install creates. The service host seeds
+/// it into the allow list (control role), so its members reach the socket
+/// through a named ACL entry; the socket itself stays mode 0600, owned by root.
 pub const SERVICE_SOCKET_GROUP: &str = "easytier-desk";
 
 /// Which host owns a listener and its singleton lock. Independent of the
@@ -80,7 +82,9 @@ pub struct ListenerPolicy {
     /// in addition to SYSTEM / Administrators (Windows) or root (Unix).
     pub allow_users: Vec<OsUserId>,
     pub allow_groups: Vec<OsGroupId>,
-    /// Unix socket group (mode 0660); `None` keeps the socket root-only.
+    /// Owning group of the Unix socket, which then gets mode 0660. `None`:
+    /// mode 0600, reachable only through the ACL entries of `allow_users` and
+    /// `allow_groups`. The service host leaves it `None`.
     pub unix_group: Option<String>,
 }
 

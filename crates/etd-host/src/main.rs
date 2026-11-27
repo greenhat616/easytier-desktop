@@ -1,8 +1,9 @@
 //! The host binary: composition root (HR).
 //!
 //! CLI notes (frozen rule, F0): maintenance subcommands that change the
-//! kernel store (install or remove a kernel version) and `reclaim --all
-//! --purge` run only with the service stopped. They take the machine-wide
+//! kernel store (`remove-core`; kernels are only installed from the bundle by
+//! `install` and `upgrade`) and `reclaim --all --purge` run only with the
+//! service stopped. They take the machine-wide
 //! singleton lock themselves, so they are the only ledger writer; if the
 //! lock is held they refuse and tell the administrator to stop the service.
 //! Removing a kernel: `ReclaimEngine::reclaim_core`, then
@@ -76,8 +77,12 @@ enum Action {
     Reclaim {
         #[arg(long, value_enum, default_value = "service")]
         mode: Mode,
+        /// Required with `--purge`, to make a whole-ledger purge explicit.
+        /// Without `--purge` it changes nothing: every instance is reclaimed.
         #[arg(long)]
         all: bool,
+        /// Also reclaim product and kernel-binary records and remove every
+        /// instance configuration. Requires `--all`.
         #[arg(long, requires = "all")]
         purge: bool,
     },

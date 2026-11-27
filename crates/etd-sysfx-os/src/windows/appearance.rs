@@ -21,9 +21,12 @@ use ::windows::{
             SystemInformation::OSVERSIONINFOW,
         },
         UI::WindowsAndMessaging::{
-            GWLP_HINSTANCE, GetSystemMetrics, GetWindowLongPtrW, GetWindowThreadProcessId,
-            ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_SHARED, LoadImageW, SM_CXICON, SM_CXSMICON,
-            SM_CYICON, SM_CYSMICON, SendMessageW, WM_SETICON,
+            GWL_EXSTYLE, GWLP_HINSTANCE, GetSystemMetrics, GetWindowLongPtrW,
+            GetWindowThreadProcessId, HWND_TOPMOST, ICON_BIG, ICON_SMALL, IMAGE_ICON,
+            IsWindowVisible, LR_SHARED, LoadImageW, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON,
+            SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            SendMessageW, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_SETICON, WS_EX_APPWINDOW,
+            WS_EX_TOOLWINDOW,
         },
     },
     core::{BOOL, IInspectable, PCWSTR, w},
@@ -268,6 +271,48 @@ pub fn set_window_icon_from_resource(hwnd: NonZeroIsize, resource_id: u16) -> bo
         }
     }
     applied
+}
+
+/// Keeps an application-owned window above other windows and out of the
+/// taskbar and Alt+Tab: WS_EX_TOPMOST through `SetWindowPos(HWND_TOPMOST)`,
+/// and WS_EX_TOOLWINDOW in place of WS_EX_APPWINDOW. The shell only reads
+/// the taskbar style when a window is shown, so a visible window is hidden
+/// and shown again around the change. Only HWNDs owned by the current
+/// process are accepted.
+pub fn pin_window_on_top(hwnd: NonZeroIsize) -> bool {
+    let hwnd = HWND(hwnd.get() as *mut c_void);
+    let mut owner = 0;
+    // SAFETY: HWND is borrowed from the UI; owner is a valid output buffer.
+    if unsafe { GetWindowThreadProcessId(hwnd, Some(&mut owner)) } == 0
+        || owner != std::process::id()
+    {
+        return false;
+    }
+    // SAFETY: `hwnd` is verified to belong to the current process; these
+    // calls only change its own styles, z-order and visibility.
+    unsafe {
+        let visible = IsWindowVisible(hwnd).as_bool();
+        if visible {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let style = (style | WS_EX_TOOLWINDOW.0 as isize) & !(WS_EX_APPWINDOW.0 as isize);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style);
+        let pinned = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        )
+        .is_ok();
+        if visible {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        pinned
+    }
 }
 
 #[cfg(test)]

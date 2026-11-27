@@ -33,53 +33,47 @@ const HOOKS: [(&str, &[&str]); 3] = [
     ("arch", &["postinstall", "postupgrade", "preremove"]),
 ];
 
-/// Runtime libraries of the release etd-ui and etd-host (from `ldd` and the
-/// owning packages on Ubuntu; see docs/packaging/README.md), and the tools
-/// etd-host runs, per format.
+/// What the binaries need on the target, per format. From the privileged
+/// deb job, which prints both: the libraries `ldd` shows etd-ui linking
+/// (xcb, xkbcommon, glibc; etd-host and etd-ctl link glibc only), the ones
+/// etd-ui loads at run time (Vulkan, EGL, Wayland; renderdoc is an optional
+/// debugging hook), and the tools etd-host runs (nft, ip).
 const DEB_DEPENDS: &[&str] = &[
     "libc6",
     "libgcc-s1",
-    "libdbus-1-3",
-    "libfontconfig1",
-    "libfreetype6",
-    "libx11-6",
-    "libx11-xcb1",
     "libxcb1",
+    "libxcb-xkb1",
     "libxkbcommon0",
     "libxkbcommon-x11-0",
-    "libwayland-client0",
     "libvulkan1",
+    "libegl1",
+    "libwayland-client0",
+    "libwayland-egl1",
     "nftables",
     "iproute2",
 ];
 const RPM_DEPENDS: &[&str] = &[
     "glibc",
     "libgcc",
-    "dbus-libs",
-    "fontconfig",
-    "freetype",
-    "libX11",
-    "libX11-xcb",
     "libxcb",
     "libxkbcommon",
     "libxkbcommon-x11",
-    "libwayland-client",
     "vulkan-loader",
+    "libglvnd-egl",
+    "libwayland-client",
+    "libwayland-egl",
     "nftables",
     "iproute",
 ];
 const ARCH_DEPENDS: &[&str] = &[
     "glibc",
     "gcc-libs",
-    "dbus",
-    "fontconfig",
-    "freetype2",
-    "libx11",
     "libxcb",
     "libxkbcommon",
     "libxkbcommon-x11",
-    "wayland",
     "vulkan-icd-loader",
+    "libglvnd",
+    "wayland",
     "nftables",
     "iproute2",
 ];

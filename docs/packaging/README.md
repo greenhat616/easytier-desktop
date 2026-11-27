@@ -219,11 +219,18 @@ Package managers do not restore files when a script fails.
 
 ### Dependencies
 
-The Depends lists in `xtask/src/dist/linux.rs` name the libraries the release binaries
-load (`ldd`, mapped to Ubuntu packages by `dpkg -S` in the privileged `deb` job, which
-prints them) and the tools `etd-host` runs (`nftables`, `iproute2`). The deb names are
-installed by that job; the rpm and Arch names are their equivalents and are not
-installed by any test yet (PK5).
+The Depends lists in `xtask/src/dist/linux.rs` come from the privileged `deb` job,
+which prints, per binary, the libraries it links (`ldd`, with the owning Ubuntu package
+from `dpkg -S`) and the library names it holds for loading at run time:
+
+| Binary | Links | Loads at run time |
+| --- | --- | --- |
+| `etd-ui` | glibc, libgcc, libxcb, libxcb-xkb, libxkbcommon, libxkbcommon-x11 | Vulkan, EGL, Wayland client and EGL (renderdoc is an optional debugging hook, not a dependency) |
+| `etd-host`, `etd-ctl` | glibc, libgcc | nothing more |
+
+`etd-host` also runs `nft` and `ip` (`nftables`, `iproute2`). The deb names are installed
+by that job; the rpm and Arch names are their equivalents and are not installed by any
+test yet (PK5).
 
 ## Application icons
 

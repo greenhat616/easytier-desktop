@@ -1,0 +1,64 @@
+name: MJ tool qualification
+on:
+  push:
+    branches: [wbs/MJ-tool-probe]
+permissions:
+  contents: read
+jobs:
+  lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: jdx/mise-action@924e7c586e33d7d4bae9c14e26c5d22e2beb6e78
+        with:
+          version: 2026.11.14
+          install: false
+          cache: false
+      - run: mise lock
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - run: mise lock --check
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tool-lock
+          path: mise.lock
+  verify:
+    needs: lock
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v4
+        with:
+          name: tool-lock
+      - uses: jdx/mise-action@924e7c586e33d7d4bae9c14e26c5d22e2beb6e78
+        with:
+          version: 2026.11.14
+          install_args: --locked
+          cache: false
+      - name: Verify archives and export executable paths
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          mise lock --check
+          $protoc = mise which protoc
+          $include = Join-Path (mise where protoc) include
+          if (!(Test-Path (Join-Path $include 'google/protobuf/descriptor.proto'))) { throw 'Missing descriptor.proto' }
+          $env:PATH = ((mise bin-paths) -join [IO.Path]::PathSeparator) + [IO.Path]::PathSeparator + $env:PATH
+          Get-Command protoc,cargo-nextest,buf,just,python
+          & $protoc --version
+          "$protoc"
+          mise exec -- just --list
+          mise exec -- python --version
+      - name: Check sudo inherits real locked binaries
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$(mise bin-paths | paste -sd:):$PATH"
+          export PROTOC_INCLUDE="$(mise where protoc)/include"
+          sudo env "PATH=$PATH" "PROTOC_INCLUDE=$PROTOC_INCLUDE" sh -ec 'cargo-nextest nextest --version; protoc --version; test -r "$PROTOC_INCLUDE/google/protobuf/descriptor.proto"'

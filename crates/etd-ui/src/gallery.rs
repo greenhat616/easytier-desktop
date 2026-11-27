@@ -1803,6 +1803,39 @@ mod tests {
                     .save(output.join(format!("gallery-{page}-{name}.png")))
                     .unwrap();
             }
+            // Page transitions mid-flight, in the light theme: frames of
+            // Entrance and Slide from right with motion on.
+            if name == "light" {
+                cx.update(|cx| cx.set_reduce_motion(false));
+                for (kind, label) in [(0, "entrance"), (3, "slide")] {
+                    cx.update_window(handle, |_, window, cx| {
+                        window.click("gallery-nav-page-transitions", cx);
+                        window.render_frame(cx);
+                        window.click(
+                            SharedString::from(format!("page-transition-kind-{kind}")),
+                            cx,
+                        );
+                        window.render_frame(cx);
+                        window.click("page-forward", cx);
+                        window.render_frame(cx);
+                    })
+                    .unwrap();
+                    let mut at = 0;
+                    for ms in [100, 200, 300, 400] {
+                        cx.advance_clock(Duration::from_millis(ms - at));
+                        at = ms;
+                        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                            .unwrap();
+                        cx.capture_screenshot(handle)
+                            .unwrap()
+                            .save(output.join(format!("gallery-motion-{label}-{ms}ms.png")))
+                            .unwrap();
+                    }
+                    cx.advance_clock(Duration::from_millis(200));
+                    cx.run_until_parked();
+                }
+                cx.update(|cx| cx.set_reduce_motion(true));
+            }
             // Navigation page.
             cx.update_window(handle, |_, window, cx| {
                 window.click("gallery-nav-navigation", cx);

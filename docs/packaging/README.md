@@ -288,7 +288,8 @@ from `dpkg -S`) and the library names it holds for loading at run time:
 | `etd-ui` | glibc, libgcc, libxcb, libxcb-xkb, libxkbcommon, libxkbcommon-x11 | Vulkan, EGL, Wayland client and EGL (renderdoc is an optional debugging hook, not a dependency) |
 | `etd-host`, `etd-ctl` | glibc, libgcc | nothing more |
 
-`etd-host` also runs `nft` and `ip` (`nftables`, `iproute2`). The deb names are installed
+`etd-host` also runs `nft` and `ip` (`nftables`, `iproute2`), and the icons go into
+`hicolor-icon-theme`'s folders, so every format depends on that package, which owns them. The deb names are installed
 by that job; the rpm and Arch names are their equivalents and are not installed by any
 test yet (PK5).
 

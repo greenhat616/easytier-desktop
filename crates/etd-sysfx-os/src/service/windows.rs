@@ -19,12 +19,17 @@ use ::windows::{
             Com::CoTaskMemFree,
             Threading::{GetCurrentProcess, OpenProcessToken},
         },
-        UI::Shell::{
-            FOLDERID_LocalAppData, FOLDERID_ProgramData, FOLDERID_ProgramFiles, KF_FLAG_DEFAULT,
-            SHGetKnownFolderPath,
+        System::{
+            LibraryLoader::{GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW},
+            Registry::{
+                HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+                RRF_SUBKEY_WOW6464KEY, RegGetValueW,
+            },
+            SystemInformation::GetSystemWindowsDirectoryW,
         },
+        UI::Shell::{FOLDERID_LocalAppData, KF_FLAG_DEFAULT},
     },
-    core::{GUID, HSTRING, PWSTR},
+    core::{GUID, HSTRING, PWSTR, s, w},
 };
 use std::{
     ffi::OsString,
@@ -60,23 +65,145 @@ fn denied() -> io::Error {
     )
 }
 
-fn known(id: &GUID) -> io::Result<PathBuf> {
-    // SAFETY: the returned NUL-terminated COM allocation lives until freed.
+/// The current user's LocalAppData (the user host only). shell32 is loaded
+/// for this call alone, from System32, so the privileged hosts, which only
+/// use the machine locations below, never load it.
+pub(super) fn local_app_data() -> io::Result<PathBuf> {
+    shell_known_folder(&FOLDERID_LocalAppData)
+}
+
+fn shell_known_folder(id: &GUID) -> io::Result<PathBuf> {
+    type KnownFolderPath =
+        unsafe extern "system" fn(*const GUID, u32, HANDLE, *mut PWSTR) -> ::windows::core::HRESULT;
+    // SAFETY: shell32 from System32 only; the export has the documented
+    // SHGetKnownFolderPath signature; the returned NUL-terminated COM
+    // allocation is copied, then freed.
     unsafe {
-        let ptr = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None).map_err(other)?;
+        let shell32 =
+            LoadLibraryExW(w!("shell32.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32).map_err(other)?;
+        let procedure = GetProcAddress(shell32, s!("SHGetKnownFolderPath"))
+            .ok_or_else(|| io::Error::other("SHGetKnownFolderPath is missing"))?;
+        let known: KnownFolderPath = std::mem::transmute(procedure);
+        let mut ptr = PWSTR::null();
+        known(id, KF_FLAG_DEFAULT.0 as u32, HANDLE::default(), &mut ptr)
+            .ok()
+            .map_err(other)?;
         let value = PathBuf::from(OsString::from_wide(ptr.as_wide()));
         CoTaskMemFree(Some(ptr.0.cast()));
         Ok(value)
     }
 }
-pub(super) fn local_app_data() -> io::Result<PathBuf> {
-    known(&FOLDERID_LocalAppData)
-}
+/// `%ProgramData%`, from the machine profile list (HKLM, 64-bit view), not
+/// from the shell or any environment.
 pub(super) fn program_data() -> io::Result<PathBuf> {
-    known(&FOLDERID_ProgramData)
+    machine_location(
+        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList",
+        "ProgramData",
+    )
 }
+/// `%ProgramFiles%` (the native one), from HKLM's 64-bit view.
 pub(super) fn program_files() -> io::Result<PathBuf> {
-    known(&FOLDERID_ProgramFiles)
+    machine_location(
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion",
+        "ProgramFilesDir",
+    )
+}
+
+fn machine_location(subkey: &str, value: &str) -> io::Result<PathBuf> {
+    let raw = hklm_string(subkey, value)?;
+    expand_system_drive(&raw, &system_drive()?)
+}
+
+/// A string value under HKLM (64-bit view), unexpanded.
+fn hklm_string(subkey: &str, value: &str) -> io::Result<String> {
+    let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND | RRF_SUBKEY_WOW6464KEY;
+    let (subkey, value) = (HSTRING::from(subkey), HSTRING::from(value));
+    let mut len = 0u32;
+    // SAFETY: a size query with owned outputs.
+    unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            &subkey,
+            &value,
+            flags,
+            None,
+            None,
+            Some(&mut len),
+        )
+    }
+    .ok()
+    .map_err(other)?;
+    let mut buffer = vec![0u16; (len as usize).div_ceil(2) + 1];
+    let mut len = (buffer.len() * 2) as u32;
+    // SAFETY: the buffer holds `len` bytes.
+    unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            &subkey,
+            &value,
+            flags,
+            None,
+            Some(buffer.as_mut_ptr().cast()),
+            Some(&mut len),
+        )
+    }
+    .ok()
+    .map_err(other)?;
+    let units = &buffer[..(len as usize / 2)];
+    let units = units.strip_suffix(&[0]).unwrap_or(units);
+    String::from_utf16(units).map_err(other)
+}
+
+/// `C:` of the Windows directory (GetSystemWindowsDirectoryW: the
+/// system's, not a per-user or environment value).
+fn system_drive() -> io::Result<String> {
+    let mut buffer = vec![0u16; 32768];
+    // SAFETY: the buffer is writable.
+    let n = unsafe { GetSystemWindowsDirectoryW(Some(&mut buffer)) } as usize;
+    if n == 0 || n >= buffer.len() {
+        return Err(io::Error::last_os_error());
+    }
+    let windows = String::from_utf16(&buffer[..n]).map_err(other)?;
+    let drive = windows.get(..2).unwrap_or_default();
+    let bytes = drive.as_bytes();
+    if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        Ok(drive.to_ascii_uppercase())
+    } else {
+        Err(io::Error::other(format!(
+            "unexpected Windows directory {windows}"
+        )))
+    }
+}
+
+/// Expand `%SystemDrive%` (any case) to `drive`; any other variable, or a
+/// result that is not an absolute path on a drive, is refused.
+fn expand_system_drive(raw: &str, drive: &str) -> io::Result<PathBuf> {
+    const VARIABLE: &str = "%SystemDrive%";
+    let mut out = String::new();
+    let mut rest = raw;
+    while let Some(at) = rest.find('%') {
+        let candidate = rest.get(at..at + VARIABLE.len());
+        if !candidate.is_some_and(|text| text.eq_ignore_ascii_case(VARIABLE)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected variable in machine location {raw}"),
+            ));
+        }
+        out.push_str(&rest[..at]);
+        out.push_str(drive);
+        rest = &rest[at + VARIABLE.len()..];
+    }
+    out.push_str(rest);
+    let bytes = out.as_bytes();
+    let absolute =
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\';
+    if !absolute || out.contains(r"\..") || out.contains('/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("machine location is not an absolute local path: {raw}"),
+        ));
+    }
+    Ok(PathBuf::from(out))
 }
 pub(super) fn elevated() -> io::Result<bool> {
     let mut token = HANDLE::default();
@@ -1118,5 +1245,50 @@ mod driver_removal_tests {
             guarded_install_removal(&cores, |_| panic!("missing tree needs no query"), || Ok(()))
                 .unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod location_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_system_drive_is_expanded_in_machine_locations() {
+        let expand =
+            |raw: &str| expand_system_drive(raw, "D:").map(|path| path.display().to_string());
+        assert_eq!(
+            expand(r"%SystemDrive%\ProgramData").unwrap(),
+            r"D:\ProgramData"
+        );
+        assert_eq!(
+            expand(r"%SYSTEMDRIVE%\ProgramData").unwrap(),
+            r"D:\ProgramData"
+        );
+        assert_eq!(expand(r"C:\Program Files").unwrap(), r"C:\Program Files");
+        for refused in [
+            r"%USERPROFILE%\ProgramData",
+            r"%SystemDrive%\%ProgramData%",
+            r"%SystemDrive",
+            r"ProgramData",
+            r"\\server\share\ProgramData",
+            r"%SystemDrive%\..\ProgramData",
+            "C:/ProgramData",
+        ] {
+            assert!(expand(refused).is_err(), "{refused}");
+        }
+    }
+
+    /// The registry-only machine locations are the ones the shell reports.
+    #[test]
+    fn machine_locations_match_the_known_folders() {
+        use ::windows::Win32::UI::Shell::{FOLDERID_ProgramData, FOLDERID_ProgramFiles};
+        assert_eq!(
+            program_data().unwrap(),
+            shell_known_folder(&FOLDERID_ProgramData).unwrap()
+        );
+        assert_eq!(
+            program_files().unwrap(),
+            shell_known_folder(&FOLDERID_ProgramFiles).unwrap()
+        );
     }
 }

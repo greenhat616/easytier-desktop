@@ -1,0 +1,71 @@
+name: ES4 smoke portable zip (temporary)
+
+# Temporary, topic#51: a release-mode, crt-static portable build of
+# wbs/ES4-ui for the human's UAC smoke test. Lives only on wbs/ES4-smoke
+# (wbs/ES4-ui plus this file) and is deleted with that branch.
+on:
+  push:
+    branches: [wbs/ES4-smoke]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_BUILD_JOBS: '4'
+
+jobs:
+  portable:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-tools
+        with:
+          tools: protoc python
+      # crt-static for the product binaries only: --target keeps the flag
+      # off build scripts and proc macros.
+      - name: Build the release binaries (crt-static)
+        shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo build --release --locked --target x86_64-pc-windows-msvc -p etd-ui -p etd-host -p etd-ctl
+      # The product's layout: etd-ui, etd-host, etd-ctl beside
+      # cores/<version>/, verified against crates/etd-host/cores.lock by
+      # `xtask dist` (its --dry-run stages and checks without WiX).
+      - name: Stage and verify the portable layout
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo xtask fetch-cores --target x86_64-pc-windows-msvc
+          $out = Join-Path $env:RUNNER_TEMP 'dist'
+          cargo xtask dist --target x86_64-pc-windows-msvc --out $out --dry-run --sign-hook none
+          $payload = Join-Path $out 'x86_64-pc-windows-msvc/payload'
+          foreach ($exe in 'etd-ui.exe', 'etd-host.exe', 'etd-ctl.exe') {
+            $vcrt = & dumpbin /dependents (Join-Path $payload $exe) 2>$null | Select-String -Pattern 'VCRUNTIME|MSVCP|api-ms-win-crt'
+            if ($vcrt) { Write-Output "$exe imports: $vcrt" }
+          }
+          $short = $env:GITHUB_SHA.Substring(0, 7)
+          $zip = Join-Path $env:RUNNER_TEMP "easytier-desktop-es4-smoke-$short.zip"
+          Compress-Archive -Path (Join-Path $payload '*') -DestinationPath $zip
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Output "zip: $zip"
+          Write-Output "SHA256: $hash"
+          "$hash  $(Split-Path $zip -Leaf)" | Set-Content -LiteralPath "$zip.sha256" -Encoding ascii
+          Get-ChildItem -LiteralPath $payload -Recurse -File | ForEach-Object { "{0,12}  {1}" -f $_.Length, $_.FullName.Substring($payload.Length + 1) }
+          "ZIP=$zip" >> $env:GITHUB_ENV
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: es4-smoke-portable
+          path: |
+            ${{ env.ZIP }}
+            ${{ env.ZIP }}.sha256
+          if-no-files-found: error
+          retention-days: 14

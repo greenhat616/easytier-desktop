@@ -66,10 +66,6 @@ fn connect(
     }
 }
 
-fn no_window(command: &mut Command) -> &mut Command {
-    command.creation_flags(CREATE_NO_WINDOW)
-}
-
 /// The UI's path on an unelevated administrator (the smoke test's): every
 /// start through `ShellExecuteEx runas`. The runner's token is already
 /// elevated, so no prompt is shown.
@@ -113,7 +109,8 @@ fn a_killed_session_host_is_cleaned_up_like_the_ui_does() {
             .unwrap_or_else(|error| panic!("{how}: start: {error}"));
         let pid = connect(&config, host.as_mut()).peer.pid;
         let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
-        let killed = no_window(&mut Command::new(system.join("taskkill.exe")))
+        let killed = Command::new(system.join("taskkill.exe"))
+            .creation_flags(CREATE_NO_WINDOW)
             .args(["/F", "/PID", &pid.to_string()])
             .output()
             .unwrap();
@@ -131,7 +128,8 @@ fn a_killed_session_host_is_cleaned_up_like_the_ui_does() {
             reclaim_session_leftovers(starter, &config.program, false, Duration::from_secs(120))
         {
             // Again, captured: the UI's start shows no output.
-            let again = no_window(&mut Command::new(&config.program))
+            let again = Command::new(&config.program)
+                .creation_flags(CREATE_NO_WINDOW)
                 .args(RECLAIM_ARGS)
                 .output()
                 .unwrap();

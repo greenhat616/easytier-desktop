@@ -235,7 +235,10 @@ fn fly(f: &Flight, t: f32, destination: Visual, window: &mut Window, cx: &mut Ap
         .h(extent.height)
         .relative()
         .overflow_hidden()
-        .child(div().absolute().inset_0().opacity(1. - e).child(source))
+        // The destination's look fades in over the source's, which stays
+        // opaque underneath: fading both would leave an opaque card
+        // translucent mid-flight.
+        .child(div().absolute().inset_0().child(source))
         .child(div().absolute().inset_0().opacity(e).child(target));
     if f.config == ConnectedConfig::Gravity {
         copy = copy.shadow_lg();

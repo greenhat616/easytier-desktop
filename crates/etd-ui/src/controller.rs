@@ -364,16 +364,16 @@ impl UiController {
                     cleaner.clean_up(all_users)
                 })
                 .await
+                .map_err(etd_app::launcher_session::CleanupError::from)
                 .and_then(|result| result);
+            if let Err(error) = &result {
+                tracing::warn!(%error, "the elevated session clean-up failed");
+            }
             cx.update(|cx| {
                 ctrl.model.update(cx, |m, cx| {
                     m.cleanup_status = Some(match result {
                         Ok(()) => InstallStatus::Succeeded,
-                        Err(error) => InstallStatus::Failed(
-                            etd_app::LaunchFailure::new(Some(HostMode::ElevatedSession), &error)
-                                .guidance()
-                                .map_or_else(|| error.to_string(), str::to_owned),
-                        ),
+                        Err(error) => InstallStatus::Failed(error.user_text()),
                     });
                     cx.notify();
                 });

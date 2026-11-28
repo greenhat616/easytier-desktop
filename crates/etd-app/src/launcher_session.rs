@@ -196,6 +196,81 @@ pub fn on_own_thread<T: Send + 'static>(
     }
 }
 
+/// Why the session clean-up failed. Not a [`LaunchError`]: no host is
+/// started, so the host-start wording and guidance do not apply.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CleanupError {
+    /// The user declined the UAC prompt.
+    #[error("administrator permission was not given")]
+    Declined,
+    /// This account cannot elevate (a standard user), or there is no
+    /// session form on this platform.
+    #[error("the clean-up needs an administrator account")]
+    Unsupported,
+    /// `etd-host reclaim` could not be started.
+    #[error("cannot start the clean-up: {0}")]
+    Start(String),
+    /// It refused with one of the session host's refusal exit codes.
+    #[error("{0}")]
+    Refused(SessionRefusal),
+    /// It ended with another non-zero exit code: it printed why to a console
+    /// nobody sees (a UAC start cannot redirect output).
+    #[error("the clean-up stopped with exit code {0}")]
+    Exit(u32),
+    #[error("the clean-up did not finish within {} seconds", .0.as_secs())]
+    Timeout(Duration),
+    /// Waiting on the process, or the thread it ran on, failed.
+    #[error("cannot follow the clean-up: {0}")]
+    Io(String),
+}
+
+impl CleanupError {
+    /// The text after "Clean-up failed: ": what happened and what the user
+    /// can do, in words they know.
+    pub fn user_text(&self) -> String {
+        const RETRY: &str = "Press Clean Up to try again.";
+        const FIND_OUT: &str = "Some network changes may remain. To see why, run \"etd-host reclaim --mode elevated-session\" in a PowerShell opened with \"Run as administrator\".";
+        match self {
+            Self::Declined => {
+                "Administrator permission was not given. Press Clean Up to be asked again.".into()
+            }
+            Self::Unsupported => {
+                "This account is not an administrator, so it cannot clean up the elevated session."
+                    .into()
+            }
+            Self::Start(detail) => format!("The clean-up could not start ({detail}). {RETRY}"),
+            Self::Refused(SessionRefusal::ServiceInstalled) => {
+                "The EasyTier system service is installed on this computer; it cleans up on its own."
+                    .into()
+            }
+            Self::Refused(SessionRefusal::NotConforming) => {
+                "Your EasyTier session folder under %ProgramData%\\EasyTierDesk.session has the wrong owner or permissions. Ask an administrator to delete your folder there.".into()
+            }
+            Self::Refused(refusal) => format!("{refusal}. {RETRY}"),
+            Self::Exit(code) => {
+                format!("The clean-up stopped with an error (exit code {code}). {FIND_OUT}")
+            }
+            Self::Timeout(limit) => format!(
+                "The clean-up did not finish within {} seconds. {FIND_OUT}",
+                limit.as_secs()
+            ),
+            Self::Io(detail) => format!("Lost track of the clean-up ({detail}). {RETRY}"),
+        }
+    }
+}
+
+impl From<LaunchError> for CleanupError {
+    fn from(error: LaunchError) -> Self {
+        match error {
+            LaunchError::ElevationDenied => Self::Declined,
+            LaunchError::Unsupported(_) => Self::Unsupported,
+            LaunchError::SessionRefused(refusal) => Self::Refused(refusal),
+            LaunchError::Spawn(detail) => Self::Start(detail),
+            other => Self::Io(other.to_string()),
+        }
+    }
+}
+
 /// `etd-host reclaim --mode elevated-session [--all-users]` started the same
 /// way as the host (one UAC prompt when unelevated) and waited for up to
 /// `limit`. Runs no instance (doc#13 #lifetime "clean up leftovers").
@@ -206,7 +281,7 @@ pub fn reclaim_session_leftovers(
     program: &Path,
     all_users: bool,
     limit: Duration,
-) -> Result<(), LaunchError> {
+) -> Result<(), CleanupError> {
     let args: &[&str] = if all_users {
         &RECLAIM_ALL_USERS_ARGS
     } else {
@@ -217,18 +292,17 @@ pub fn reclaim_session_leftovers(
     loop {
         match process
             .exit_code()
-            .map_err(|error| LaunchError::Io(error.to_string()))?
+            .map_err(|error| CleanupError::Io(error.to_string()))?
         {
             Some(0) => return Ok(()),
             Some(code) => {
-                return Err(match refusal_of(code) {
-                    Some(refusal) => LaunchError::SessionRefused(refusal),
-                    None => LaunchError::Spawn(format!(
-                        "the clean-up did not finish (exit code {code}); system changes may remain"
-                    )),
-                });
+                return Err(
+                    refusal_of(code).map_or(CleanupError::Exit(code), CleanupError::Refused)
+                );
             }
-            None if std::time::Instant::now() >= deadline => return Err(LaunchError::Timeout),
+            None if std::time::Instant::now() >= deadline => {
+                return Err(CleanupError::Timeout(limit));
+            }
             None => std::thread::sleep(Duration::from_millis(200)),
         }
     }

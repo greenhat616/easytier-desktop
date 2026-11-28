@@ -10,6 +10,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use etd_app::launcher_session::CleanupError;
 use etd_app::{
     AppServices, HostClientFactory, HostLauncher, HostTarget, LaunchError, ProfileStore,
     launcher_session::{ElevationStarter, UiElevation},
@@ -285,7 +286,7 @@ impl ElevationStarter for WindowsElevationStarter {
 pub trait SessionCleaner: Send + Sync {
     /// Blocking until any prompt is answered; called on a thread of its own
     /// ([`etd_app::launcher_session::on_own_thread`]).
-    fn clean_up(&self, all_users: bool) -> Result<(), LaunchError>;
+    fn clean_up(&self, all_users: bool) -> Result<(), CleanupError>;
 }
 
 /// The sibling `etd-host`, Windows only.
@@ -308,9 +309,9 @@ impl PlatformSessionCleaner {
 }
 
 impl SessionCleaner for PlatformSessionCleaner {
-    fn clean_up(&self, all_users: bool) -> Result<(), LaunchError> {
+    fn clean_up(&self, all_users: bool) -> Result<(), CleanupError> {
         let (Some(starter), Some(program)) = (&self.starter, &self.program) else {
-            return Err(LaunchError::Unsupported(HostMode::ElevatedSession));
+            return Err(CleanupError::Unsupported);
         };
         etd_app::launcher_session::reclaim_session_leftovers(
             starter.as_ref(),

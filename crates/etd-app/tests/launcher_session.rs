@@ -4,9 +4,9 @@
 //! exits are reported, and that nothing starts without `ensure`.
 use async_trait::async_trait;
 use etd_app::launcher_session::{
-    ElevatedSessionConfig, ElevationStarter, HostChoice, HostChoiceFile, RECLAIM_ALL_USERS_ARGS,
-    RECLAIM_ARGS, SESSION_HOST_ARGS, SessionParts, StartError, StartedProcess, UiElevation,
-    reclaim_session_leftovers, refusal_of,
+    CleanupError, ElevatedSessionConfig, ElevationStarter, HostChoice, HostChoiceFile,
+    RECLAIM_ALL_USERS_ARGS, RECLAIM_ARGS, SESSION_HOST_ARGS, SessionParts, StartError,
+    StartedProcess, UiElevation, reclaim_session_leftovers, refusal_of,
 };
 use etd_app::launcher_user::{
     ConnectorFactory, HostSpawner, LauncherTimings, LocalHostLauncher, ServiceHostConfig,
@@ -491,22 +491,66 @@ fn clean_up_runs_reclaim_elevated_and_reports_its_outcome() {
     assert!(starts.iter().all(|(how, _, _)| *how == "consent"));
 
     let world = World::new(UiElevation::Limited, Start::Cancelled);
-    assert!(matches!(
+    assert_eq!(
         reclaim_session_leftovers(&world, &program(), false, Duration::from_secs(1)),
-        Err(LaunchError::ElevationDenied)
-    ));
+        Err(CleanupError::Declined)
+    );
     let world = World::new(UiElevation::Elevated, Start::Exits(5));
-    assert!(matches!(
+    assert_eq!(
         reclaim_session_leftovers(&world, &program(), false, Duration::from_secs(1)),
-        Err(LaunchError::SessionRefused(
-            SessionRefusal::OtherUsersLeftovers
-        ))
-    ));
+        Err(CleanupError::Refused(SessionRefusal::OtherUsersLeftovers))
+    );
+    let world = World::new(UiElevation::Elevated, Start::Exits(1));
+    assert_eq!(
+        reclaim_session_leftovers(&world, &program(), false, Duration::from_secs(1)),
+        Err(CleanupError::Exit(1))
+    );
     let world = World::new(UiElevation::Elevated, Start::StaysSilent);
-    assert!(matches!(
+    assert_eq!(
         reclaim_session_leftovers(&world, &program(), false, Duration::from_millis(50)),
-        Err(LaunchError::Timeout)
-    ));
+        Err(CleanupError::Timeout(Duration::from_millis(50)))
+    );
+}
+
+/// The smoke test's step 4 (msg#2290): a failed clean-up said "The EasyTier
+/// host did not start", the host-start guidance, which hid its exit code.
+#[test]
+fn a_failed_clean_up_says_what_failed_not_that_a_host_did_not_start() {
+    let failures = [
+        CleanupError::Declined,
+        CleanupError::Unsupported,
+        CleanupError::Start("not found".into()),
+        CleanupError::Refused(SessionRefusal::ServiceInstalled),
+        CleanupError::Refused(SessionRefusal::NotConforming),
+        CleanupError::Refused(SessionRefusal::OtherUsersLeftovers),
+        CleanupError::Exit(1),
+        CleanupError::Timeout(Duration::from_secs(300)),
+        CleanupError::Io("gone".into()),
+    ];
+    for failure in &failures {
+        let text = failure.user_text();
+        assert!(!text.contains("host did not start"), "{text}");
+        assert!(!text.is_empty());
+    }
+    assert!(CleanupError::Exit(1).user_text().contains("exit code 1"));
+    assert!(
+        CleanupError::Exit(1)
+            .user_text()
+            .contains("etd-host reclaim --mode elevated-session")
+    );
+    assert!(
+        CleanupError::Declined
+            .user_text()
+            .contains("Press Clean Up to be asked again")
+    );
+    assert_eq!(
+        CleanupError::from(LaunchError::ElevationDenied),
+        CleanupError::Declined
+    );
+    assert_eq!(
+        CleanupError::from(LaunchError::Spawn("x".into())),
+        CleanupError::Start("x".into())
+    );
 }
 
 #[test]

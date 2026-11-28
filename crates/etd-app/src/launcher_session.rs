@@ -166,12 +166,41 @@ pub fn start_elevated(
 pub struct SessionParts {
     pub config: ElevatedSessionConfig,
     pub starter: Arc<dyn ElevationStarter>,
+    /// The saved first-run choice. Unless it is the session form, a probe
+    /// that cannot verify the session pipe logs it and looks further.
+    pub choice: Option<HostChoiceFile>,
+}
+
+/// Runs `work` on a thread of its own and hands its result back.
+///
+/// For the UAC consent call and the clean-up, which block until the user
+/// answers: a new thread can become the COM single-threaded apartment
+/// `ShellExecuteEx` needs, no pool thread is held, and the thread is not
+/// joined, so the UI exits without waiting for an open prompt.
+pub fn on_own_thread<T: Send + 'static>(
+    name: &str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> impl Future<Output = Result<T, LaunchError>> + Send + 'static {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            let _ = tx.send(work());
+        })
+        .map(drop)
+        .map_err(|error| LaunchError::Spawn(format!("cannot start a thread: {error}")));
+    async move {
+        spawned?;
+        rx.await
+            .map_err(|_| LaunchError::Io("the thread ended without a result".into()))
+    }
 }
 
 /// `etd-host reclaim --mode elevated-session [--all-users]` started the same
 /// way as the host (one UAC prompt when unelevated) and waited for up to
 /// `limit`. Runs no instance (doc#13 #lifetime "clean up leftovers").
-/// Blocking: call it off the UI thread.
+/// Blocking until the user answered any prompt: run it with
+/// [`on_own_thread`].
 pub fn reclaim_session_leftovers(
     starter: &dyn ElevationStarter,
     program: &Path,

@@ -246,9 +246,29 @@ fn service_config(installed: bool) -> ServiceHostConfig {
 }
 
 fn launcher(world: &World, service_installed: bool) -> LocalHostLauncher {
+    launcher_with(world, service_installed, false, None)
+}
+
+/// `user`: also offer a user host on `pipe("user")`; `choice`: the saved
+/// first-run choice.
+fn launcher_with(
+    world: &World,
+    service_installed: bool,
+    user: bool,
+    choice: Option<HostChoiceFile>,
+) -> LocalHostLauncher {
+    let user = user.then(|| UserHostConfig {
+        program: "etd-host".into(),
+        args: Vec::new(),
+        endpoint: pipe("user"),
+        expectation: ServerExpectation {
+            exe_dir: "dir".into(),
+            requirement: ServerRequirement::CurrentUser,
+        },
+    });
     LocalHostLauncher::with_parts(
         Some(service_config(service_installed)),
-        None,
+        user,
         Arc::new(world.clone()),
         Arc::new(world.clone()),
         LauncherTimings {
@@ -260,6 +280,7 @@ fn launcher(world: &World, service_installed: bool) -> LocalHostLauncher {
     .with_session(SessionParts {
         config: session_config(),
         starter: Arc::new(world.clone()),
+        choice,
     })
 }
 
@@ -621,7 +642,47 @@ async fn an_unverifiable_session_pipe_fails_closed() {
             matches!(&error, LaunchError::Io(text) if text.contains("could not be verified")),
             "{answer:?}: {error:?}"
         );
-        assert!(matches!(launcher.probe().await, Err(LaunchError::Io(_))));
+        // Nothing chosen yet: probing logs it and finds nothing else.
+        assert_eq!(launcher.probe().await.unwrap(), None);
         assert!(world.starts().is_empty(), "{answer:?}");
+    }
+}
+
+/// opus nit 4: a same-user process holding the session pipe must not hide
+/// the user's service or user host; it only blocks probing when the session
+/// form is the saved choice.
+#[tokio::test]
+async fn an_unusable_session_pipe_blocks_probing_only_for_the_chosen_session_form() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("host-choice");
+    let choice = HostChoiceFile::new(&path);
+    for answer in [Answer::Impostor, Answer::Busy, Answer::Hangs] {
+        let world = World::new(UiElevation::Limited, Start::Listens);
+        world.answer(&session_pipe(), answer);
+        world.answer(&pipe("user"), Answer::Verified);
+        let _ = std::fs::remove_file(&path);
+        for saved in [None, Some(HostChoice::Service)] {
+            if let Some(saved) = saved {
+                choice.save(saved).unwrap();
+            }
+            let found = launcher_with(&world, false, true, Some(choice.clone()))
+                .probe()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(found.mode, HostMode::User, "{answer:?} {saved:?}");
+        }
+        choice.save(HostChoice::ElevatedSession).unwrap();
+        let result = launcher_with(&world, false, true, Some(choice.clone()))
+            .probe()
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(LaunchError::SessionRefused(_) | LaunchError::Io(_))
+            ),
+            "{answer:?}: {result:?}"
+        );
+        assert!(world.starts().is_empty());
     }
 }

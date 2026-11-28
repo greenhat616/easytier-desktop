@@ -13,7 +13,8 @@
 use crate::{
     HostLauncher, HostTarget, LaunchError, SessionRefusal,
     launcher_session::{
-        SESSION_HOST_ARGS, SessionParts, StartedProcess, refusal_of, start_elevated,
+        HostChoice, HostChoiceFile, SESSION_HOST_ARGS, SessionParts, StartedProcess, on_own_thread,
+        refusal_of, start_elevated,
     },
 };
 use async_trait::async_trait;
@@ -485,11 +486,10 @@ impl SessionLauncher {
         };
         if !running {
             let (starter, program) = (self.parts.starter.clone(), config.program.clone());
-            let started = tokio::task::spawn_blocking(move || {
+            let started = on_own_thread("etd-session-start", move || {
                 start_elevated(starter.as_ref(), &program, &SESSION_HOST_ARGS)
             })
-            .await
-            .map_err(|error| LaunchError::Io(error.to_string()))??;
+            .await??;
             *child = Some(started);
         }
         let deadline = Instant::now() + self.timings.startup;
@@ -608,11 +608,22 @@ impl HostLauncher for LocalHostLauncher {
             if let Some(pending) = session.pending() {
                 return outcome(pending).await.map(Some);
             }
-            match session.reach().await {
+            let chosen = session.parts.choice.as_ref().and_then(HostChoiceFile::load)
+                == Some(HostChoice::ElevatedSession);
+            let problem = match session.reach().await {
                 SessionReach::Verified => return Ok(Some(session.parts.config.target())),
-                SessionReach::Occupied => return Err(occupied()),
-                SessionReach::Unverified(reason) => return Err(unverified(&reason)),
-                SessionReach::Absent => {}
+                SessionReach::Absent => None,
+                SessionReach::Occupied => Some(occupied()),
+                SessionReach::Unverified(reason) => Some(unverified(&reason)),
+            };
+            if let Some(error) = problem {
+                // Fail closed for the user's chosen form; otherwise a same-user
+                // process holding the session pipe must not hide the service
+                // or user host.
+                if chosen {
+                    return Err(error);
+                }
+                tracing::warn!(%error, "the elevated session pipe is unusable; probing on");
             }
         }
         if let Some(user) = &self.user {

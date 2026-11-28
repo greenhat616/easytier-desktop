@@ -184,8 +184,9 @@ pub fn ui_elevation() -> Option<UiElevation> {
 }
 
 /// [`ElevationStarter`] on `etd-sysfx-os`: `ShellExecuteEx runas` with
-/// `SW_HIDE`, or `CreateProcessW` without inherited handles from an elevated
-/// UI.
+/// `SW_HIDE` (the OS creates the process; no environment or handle control),
+/// or, from an elevated UI, `CreateProcessW` without inherited handles and
+/// with a minimal environment.
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WindowsElevationStarter;

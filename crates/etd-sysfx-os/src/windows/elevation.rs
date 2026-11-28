@@ -3,9 +3,22 @@
 //! split-token administrator and the direct start from a UI that is already
 //! elevated. Nothing here elevates the calling process.
 //!
-//! Both starts take an absolute program path and fixed arguments, open no
-//! window, pass no handles, and return the process so the caller can see an
-//! early exit and its exit code.
+//! Both starts take an absolute program path and fixed, quote-free
+//! arguments, use System32 as working directory, and return the process so
+//! the caller can see an early exit and its exit code. What else each one
+//! controls differs:
+//!
+//! - [`start_direct`] (`CreateProcessW`) controls everything a child gets:
+//!   `bInheritHandles = FALSE`, an explicit environment of `SystemRoot` and
+//!   `windir` only, `CREATE_NO_WINDOW`.
+//! - [`start_with_consent`] (`ShellExecuteExW runas`) has no environment,
+//!   handle-inheritance or creation-flag parameters. The elevated process is
+//!   created by Windows' Application Information service after consent, not
+//!   by this process; in practice it inherits none of our handles and gets
+//!   an environment built for the elevated token, but that is OS behaviour,
+//!   not something this call sets or the API guarantees. `nShow = SW_HIDE`
+//!   asks for no visible window. The host must not trust its environment
+//!   either way (doc#13 #untrusted).
 use std::{
     ffi::OsStr,
     io,
@@ -97,10 +110,12 @@ impl HostProcess {
     }
 }
 
-/// Start `program` elevated through the UAC consent prompt (`runas`), with
-/// no window. Blocks until the user answered the prompt; run it off the UI
-/// thread. A declined prompt is an error whose raw OS code is
-/// [`ERROR_CANCELLED`].
+/// Start `program` elevated through the UAC consent prompt (`runas`),
+/// asking for no window (`SW_HIDE`). It sets no environment and no handle
+/// inheritance: `ShellExecuteExW` has no such parameters (see the module
+/// documentation). Blocks until the user answered the prompt and cannot be
+/// cancelled; run it off the UI thread. A declined prompt is an error whose
+/// raw OS code is [`ERROR_CANCELLED`].
 pub fn start_with_consent(program: &Path, args: &[&str]) -> io::Result<HostProcess> {
     let file = absolute_program(program)?;
     let parameters = wide(command_arguments(args)?);

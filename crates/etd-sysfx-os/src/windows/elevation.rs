@@ -22,6 +22,7 @@
 use std::{
     ffi::OsStr,
     io,
+    num::NonZeroIsize,
     os::windows::{
         ffi::OsStrExt,
         io::{AsRawHandle, FromRawHandle, OwnedHandle},
@@ -31,7 +32,7 @@ use std::{
 
 use ::windows::{
     Win32::{
-        Foundation::{HANDLE, WAIT_OBJECT_0},
+        Foundation::{HANDLE, HWND, WAIT_OBJECT_0},
         Security::{GetTokenInformation, TOKEN_QUERY, TokenElevation, TokenElevationType},
         System::{
             Com::{
@@ -49,7 +50,7 @@ use ::windows::{
                 SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
                 ShellExecuteExW,
             },
-            WindowsAndMessaging::SW_HIDE,
+            WindowsAndMessaging::{IsWindow, SW_HIDE},
         },
     },
     core::{HRESULT, PCWSTR, PWSTR, w},
@@ -113,16 +114,32 @@ impl HostProcess {
 /// Start `program` elevated through the UAC consent prompt (`runas`),
 /// asking for no window (`SW_HIDE`). It sets no environment and no handle
 /// inheritance: `ShellExecuteExW` has no such parameters (see the module
-/// documentation). Blocks until the user answered the prompt and cannot be
-/// cancelled; run it off the UI thread. A declined prompt is an error whose
-/// raw OS code is [`ERROR_CANCELLED`].
-pub fn start_with_consent(program: &Path, args: &[&str]) -> io::Result<HostProcess> {
+/// documentation). `owner`, the UI's main window while it is open, lets the
+/// prompt come to the foreground. A declined prompt is an error whose raw OS
+/// code is [`ERROR_CANCELLED`].
+///
+/// Blocks until the user answered the prompt and cannot be cancelled. Call it
+/// on a thread of its own: it makes that thread a COM single-threaded
+/// apartment, as `ShellExecuteEx` requires, and refuses a thread that is
+/// already multithreaded.
+pub fn start_with_consent(
+    owner: Option<NonZeroIsize>,
+    program: &Path,
+    args: &[&str],
+) -> io::Result<HostProcess> {
     let file = absolute_program(program)?;
+    // A window that is gone (closed to the tray meanwhile) is no owner.
+    let owner = owner
+        .map(|hwnd| HWND(hwnd.get() as *mut _))
+        // SAFETY: IsWindow only tests the value.
+        .filter(|hwnd| unsafe { IsWindow(Some(*hwnd)) }.as_bool())
+        .unwrap_or_default();
     let parameters = wide(command_arguments(args)?);
     let directory = wide(system_directory()?.as_os_str());
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        hwnd: owner,
         lpVerb: w!("runas"),
         lpFile: PCWSTR(file.as_ptr()),
         lpParameters: PCWSTR(parameters.as_ptr()),
@@ -130,17 +147,21 @@ pub fn start_with_consent(program: &Path, args: &[&str]) -> io::Result<HostProce
         nShow: SW_HIDE.0,
         ..Default::default()
     };
-    // ShellExecuteEx wants COM on the calling thread; this thread is ours
-    // for the call (the caller runs it on a blocking worker).
-    // SAFETY: plain apartment initialisation, undone below when it was ours.
-    let initialised =
-        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) }.is_ok();
+    // ShellExecuteEx needs a single-threaded apartment on this thread.
+    // SAFETY: plain apartment initialisation, undone below.
+    let apartment =
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+    if apartment.is_err() {
+        // RPC_E_CHANGED_MODE: already a multithreaded apartment.
+        return Err(io::Error::other(format!(
+            "the UAC start needs a single-threaded COM apartment: {}",
+            ::windows::core::Error::from(apartment)
+        )));
+    }
     // SAFETY: `info` and the strings it points to outlive the call.
     let result = unsafe { ShellExecuteExW(&mut info) };
-    if initialised {
-        // SAFETY: balances the successful CoInitializeEx above.
-        unsafe { CoUninitialize() };
-    }
+    // SAFETY: balances the successful CoInitializeEx above (S_OK or S_FALSE).
+    unsafe { CoUninitialize() };
     if let Err(error) = result {
         return Err(
             if error.code() == HRESULT::from_win32(ERROR_CANCELLED as u32) {

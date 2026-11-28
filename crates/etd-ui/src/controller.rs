@@ -357,10 +357,14 @@ impl UiController {
         });
         let ctrl = self.clone();
         cx.spawn(async move |cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { cleaner.clean_up(all_users) })
-                .await;
+            // Its own thread, not GPUI's pool: the UAC call needs a COM STA
+            // and may wait for the user indefinitely.
+            let result =
+                etd_app::launcher_session::on_own_thread("etd-session-cleanup", move || {
+                    cleaner.clean_up(all_users)
+                })
+                .await
+                .and_then(|result| result);
             cx.update(|cx| {
                 ctrl.model.update(cx, |m, cx| {
                     m.cleanup_status = Some(match result {
@@ -576,6 +580,7 @@ impl UiController {
                             active_gen == generation && handle.window_id() == closed_id
                         });
                 if matches {
+                    crate::composition::clear_prompt_owner();
                     *gone_ctrl.active_window.borrow_mut() = None;
                     gone_ctrl.handle_window_input(WindowInput::WindowGone { generation }, cx);
                 }
@@ -588,6 +593,7 @@ impl UiController {
         *self.active_window.borrow_mut() = Some((generation, handle));
         let _ = handle.update(cx, |_, window, cx| {
             crate::theme::bind_window(window, cx);
+            crate::composition::set_prompt_owner(window);
             window.activate_window();
         });
         Ok(())

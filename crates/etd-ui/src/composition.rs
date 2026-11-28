@@ -163,12 +163,45 @@ fn session_parts() -> Option<etd_app::launcher_session::SessionParts> {
         Some(etd_app::launcher_session::SessionParts {
             config,
             starter: Arc::new(WindowsElevationStarter),
+            choice: etd_app::launcher_session::HostChoiceFile::default_path()
+                .map(etd_app::launcher_session::HostChoiceFile::new),
         })
     }
     #[cfg(not(windows))]
     {
         None
     }
+}
+
+/// The main window's HWND while it is open: the owner of UAC prompts, so they
+/// come to the foreground. 0 while there is none.
+#[cfg(windows)]
+static PROMPT_OWNER: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+#[cfg(windows)]
+fn prompt_owner() -> Option<std::num::NonZeroIsize> {
+    std::num::NonZeroIsize::new(PROMPT_OWNER.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Records `window` as the owner of UAC prompts (Windows; elsewhere nothing).
+pub fn set_prompt_owner(window: &gpui_kit::Window) {
+    #[cfg(windows)]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        if let Ok(handle) = HasWindowHandle::window_handle(window)
+            && let RawWindowHandle::Win32(handle) = handle.as_raw()
+        {
+            PROMPT_OWNER.store(handle.hwnd.get(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = window;
+}
+
+/// The main window is gone: prompts have no owner.
+pub fn clear_prompt_owner() {
+    #[cfg(windows)]
+    PROMPT_OWNER.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The elevation of this UI process, `None` where there is no session form.
@@ -221,7 +254,7 @@ impl ElevationStarter for WindowsElevationStarter {
         etd_app::launcher_session::StartError,
     > {
         use etd_sysfx_os::windows::elevation::{ERROR_CANCELLED, start_with_consent};
-        start_with_consent(program, args)
+        start_with_consent(prompt_owner(), program, args)
             .map(|process| Box::new(StartedHost(process)) as _)
             .map_err(|error| {
                 if error.raw_os_error() == Some(ERROR_CANCELLED) {
@@ -250,7 +283,8 @@ impl ElevationStarter for WindowsElevationStarter {
 /// #lifetime): `etd-host reclaim --mode elevated-session [--all-users]`,
 /// started like the session host (one UAC prompt when unelevated).
 pub trait SessionCleaner: Send + Sync {
-    /// Blocking; called on a background executor off the GPUI UI thread.
+    /// Blocking until any prompt is answered; called on a thread of its own
+    /// ([`etd_app::launcher_session::on_own_thread`]).
     fn clean_up(&self, all_users: bool) -> Result<(), LaunchError>;
 }
 

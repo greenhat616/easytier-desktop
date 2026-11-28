@@ -1,6 +1,7 @@
 """Fail if a shipped Windows binary imports a C runtime a clean machine lacks.
 
     python check-pe-imports.py <folder> [<folder> ...]
+    python check-pe-imports.py --names <image>
 
 Every .exe and .dll under the folders is read (PE32 or PE32+) and its import
 table listed. The VC++ runtime (vcruntime*, msvcp*, concrt*, vccorlib*), the
@@ -72,4 +73,9 @@ def main(folders):
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--names"]:
+        # python check-pe-imports.py --names <image>: its imports, one a line.
+        for name in dict.fromkeys(imports(Path(sys.argv[2]))):
+            print(name)
+        sys.exit(0)
     sys.exit(main(sys.argv[1:]))

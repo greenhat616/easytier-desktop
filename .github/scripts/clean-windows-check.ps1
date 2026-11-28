@@ -5,7 +5,7 @@
 # something). The command-line binaries run --version; etd-ui, a GUI with no
 # such flag, must get past the loader: it is started and must either keep
 # running or exit with anything but a loader failure.
-param([Parameter(Mandatory)] [string] $Payload)
+param([Parameter(Mandatory)] [string] $Payload, [Parameter(Mandatory)] [string] $UiImports)
 $ErrorActionPreference = 'Stop'
 
 $system = Join-Path $env:SystemRoot 'System32'
@@ -33,8 +33,23 @@ foreach ($exe in (Join-Path $Payload 'etd-host.exe'), (Join-Path $Payload 'etd-c
 $ui = Start-Process -FilePath (Join-Path $Payload 'etd-ui.exe') -PassThru
 if ($ui.WaitForExit(15000)) {
     $code = $ui.ExitCode
-    if ($loader -contains $code) { throw "etd-ui.exe could not be loaded: $(Format-Code $code)" }
-    Write-Output "etd-ui.exe loaded and exited $(Format-Code $code) (no desktop in a container)"
+    if ($code -eq -1073741515) {
+        # Server Core leaves out parts of the desktop stack etd-ui draws
+        # with. Name the imports it lacks: none may be a C runtime, and the
+        # failure must be explained by them.
+        $missing = @(Get-Content -LiteralPath $UiImports | Where-Object {
+            $_ -and $_ -notlike 'api-ms-*' -and $_ -notlike 'ext-ms-*' -and
+            -not (Test-Path -LiteralPath (Join-Path $system $_)) -and -not (Test-Path -LiteralPath (Join-Path $Payload $_))
+        })
+        if ($missing.Count -eq 0) { throw "etd-ui.exe could not be loaded ($(Format-Code $code)) though every DLL it imports is present" }
+        $runtime = @($missing | Where-Object { $_ -match '^(vcruntime|msvcp|concrt|vccorlib|ucrtbase|api-ms-win-crt-)' })
+        if ($runtime.Count -gt 0) { throw "etd-ui.exe needs a C runtime this machine lacks: $($runtime -join ', ')" }
+        Write-Output "etd-ui.exe imports $($missing -join ', '), which Server Core leaves out (desktop graphics and UI); no C runtime is among them"
+    } elseif ($loader -contains $code) {
+        throw "etd-ui.exe could not be loaded: $(Format-Code $code)"
+    } else {
+        Write-Output "etd-ui.exe loaded and exited $(Format-Code $code) (no desktop in a container)"
+    }
 } else {
     Stop-Process -Id $ui.Id -Force
     Write-Output 'etd-ui.exe loaded and was still running after 15 s'

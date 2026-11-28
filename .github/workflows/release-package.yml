@@ -278,9 +278,15 @@ jobs:
           $process = Start-Process msiexec.exe -ArgumentList '/a', "`"$msi`"", '/qn', "TARGETDIR=`"$extract`"" -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "msiexec /a exited $($process.ExitCode)" }
           $payload = (Get-ChildItem -LiteralPath $extract -Recurse -Filter etd-host.exe | Select-Object -First 1).DirectoryName
-          docker run --rm --isolation process -v "${payload}:C:\etd:ro" -v "$env:GITHUB_WORKSPACE\.github\scripts:C:\scripts:ro" `
+          # etd-ui's imports, read here (the container has no Python).
+          $checks = Join-Path $env:RUNNER_TEMP 'checks'
+          New-Item -ItemType Directory -Force $checks | Out-Null
+          python -I .github/scripts/check-pe-imports.py --names (Join-Path $payload 'etd-ui.exe') |
+            Set-Content -LiteralPath (Join-Path $checks 'etd-ui.imports') -Encoding ascii
+          docker run --rm --isolation process -v "${payload}:C:\etd:ro" -v "${checks}:C:\checks:ro" `
+            -v "$env:GITHUB_WORKSPACE\.github\scripts:C:\scripts:ro" `
             mcr.microsoft.com/windows/servercore@sha256:f1a914079973258061ddbc95a9af579eab2ee252a6fddb254b1be5d769761acd `
-            powershell -NoProfile -ExecutionPolicy Bypass -File C:\scripts\clean-windows-check.ps1 -Payload C:\etd
+            powershell -NoProfile -ExecutionPolicy Bypass -File C:\scripts\clean-windows-check.ps1 -Payload C:\etd -UiImports C:\checks\etd-ui.imports
 
   smoke-windows:
     needs: [version, package-windows]

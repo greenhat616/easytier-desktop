@@ -360,6 +360,13 @@ fn open_once(name: &str) -> io::Result<std::fs::File> {
 /// client and offering its next instance) is waited for with
 /// `WaitNamedPipeW`, for up to [`BUSY_WAIT`]; any other error is returned at
 /// once, so callers can still tell "no such pipe" from the rest.
+///
+/// `BUSY_WAIT` bounds every open. Callers that wrap `connect` in their own
+/// timeout (the desktop launcher's probes) cut it shorter; the others (the
+/// host waiting for the service after install, the client's reconnect and
+/// tonic connect) wait up to `BUSY_WAIT`. A `WaitNamedPipeW` already running
+/// when an outer timeout fires cannot be cancelled and keeps its blocking
+/// thread until it returns, at most `BUSY_WAIT` later.
 async fn open_client(name: &str) -> io::Result<std::fs::File> {
     let deadline = std::time::Instant::now() + BUSY_WAIT;
     loop {

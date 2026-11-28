@@ -41,8 +41,8 @@ use ::windows::{
             SystemInformation::GetSystemWindowsDirectoryW,
             Threading::{
                 CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetCurrentProcess,
-                GetExitCodeProcess, OpenProcessToken, PROCESS_INFORMATION, STARTUPINFOW,
-                WaitForSingleObject,
+                GetCurrentProcessId, GetExitCodeProcess, OpenProcessToken, PROCESS_INFORMATION,
+                STARTUPINFOW, WaitForSingleObject,
             },
         },
         UI::{
@@ -50,7 +50,7 @@ use ::windows::{
                 SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
                 ShellExecuteExW,
             },
-            WindowsAndMessaging::{IsWindow, SW_HIDE},
+            WindowsAndMessaging::{GetWindowThreadProcessId, IsWindow, SW_HIDE},
         },
     },
     core::{HRESULT, PCWSTR, PWSTR, w},
@@ -128,11 +128,20 @@ pub fn start_with_consent(
     args: &[&str],
 ) -> io::Result<HostProcess> {
     let file = absolute_program(program)?;
-    // A window that is gone (closed to the tray meanwhile) is no owner.
+    // A window that is gone (closed to the tray meanwhile), or whose handle
+    // value now belongs to another process's window, is no owner.
     let owner = owner
         .map(|hwnd| HWND(hwnd.get() as *mut _))
-        // SAFETY: IsWindow only tests the value.
-        .filter(|hwnd| unsafe { IsWindow(Some(*hwnd)) }.as_bool())
+        .filter(|hwnd| {
+            let mut process = 0u32;
+            // SAFETY: both calls only test the handle value; `process` is
+            // writable.
+            unsafe {
+                IsWindow(Some(*hwnd)).as_bool()
+                    && GetWindowThreadProcessId(*hwnd, Some(&mut process)) != 0
+                    && process == GetCurrentProcessId()
+            }
+        })
         .unwrap_or_default();
     let parameters = wide(command_arguments(args)?);
     let directory = wide(system_directory()?.as_os_str());

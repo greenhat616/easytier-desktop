@@ -33,7 +33,7 @@ use windows::{
             FILE_FLAG_OVERLAPPED, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_WRITE_DATA,
             READ_CONTROL, SECURITY_IDENTIFICATION, SYNCHRONIZE,
         },
-        System::Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId},
+        System::Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, WaitNamedPipeW},
     },
     core::HSTRING,
 };
@@ -332,18 +332,57 @@ pub(super) async fn connect(
     let proof = proof(expect)?;
     let name = pipe_name(endpoint)?;
     let before = SystemTime::now();
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .access_mode(client_mask())
-        .custom_flags(FILE_FLAG_OVERLAPPED.0)
-        .security_qos_flags(SECURITY_IDENTIFICATION.0)
-        .open(name)?;
+    let file = open_client(name).await?;
     let mut pipe = unsafe { NamedPipeClient::from_raw_handle(file.into_raw_handle())? };
     let server =
         identity::server_identity(&pipe, &expect.exe_dir, proof, before).map_err(denied)?;
     pipe.write_u8(1).await?;
     Ok((Box::new(pipe), server))
+}
+
+/// `ERROR_PIPE_BUSY`: every instance of the pipe is connected.
+const ERROR_PIPE_BUSY: i32 = 231;
+/// How long [`open_client`] waits for a busy pipe to offer an instance.
+const BUSY_WAIT: Duration = Duration::from_secs(2);
+
+/// Opens the client end once.
+fn open_once(name: &str) -> io::Result<std::fs::File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .access_mode(client_mask())
+        .custom_flags(FILE_FLAG_OVERLAPPED.0)
+        .security_qos_flags(SECURITY_IDENTIFICATION.0)
+        .open(name)
+}
+
+/// Opens the client end. A busy pipe (the server is between accepting one
+/// client and offering its next instance) is waited for with
+/// `WaitNamedPipeW`, for up to [`BUSY_WAIT`]; any other error is returned at
+/// once, so callers can still tell "no such pipe" from the rest.
+async fn open_client(name: &str) -> io::Result<std::fs::File> {
+    let deadline = std::time::Instant::now() + BUSY_WAIT;
+    loop {
+        let error = match open_once(name) {
+            Ok(file) => return Ok(file),
+            Err(error) => error,
+        };
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if error.raw_os_error() != Some(ERROR_PIPE_BUSY) || remaining.is_zero() {
+            return Err(error);
+        }
+        let wide = HSTRING::from(name);
+        let millis = u32::try_from(remaining.as_millis())
+            .unwrap_or(u32::MAX)
+            .max(1);
+        // WaitNamedPipeW blocks, so not on the async worker. Its result does
+        // not matter: the next open decides.
+        let _ = tokio::task::spawn_blocking(move || {
+            // SAFETY: `wide` is a NUL-terminated name that outlives the call.
+            let _ = unsafe { WaitNamedPipeW(&wide, millis) };
+        })
+        .await;
+    }
 }
 
 fn win_error(error: windows::core::Error) -> io::Error {
@@ -377,6 +416,41 @@ pub(super) fn image_matches(image: &Path, host: &Path) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// In-process pipe only: no second process, no network.
+    #[tokio::test]
+    async fn a_busy_pipe_is_waited_for_and_other_errors_are_not() {
+        let name = format!(r"\.\pipe\etd-ipc-busy-test-{}", std::process::id());
+        let first = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&name)
+            .unwrap();
+        // Takes the only instance: every instance is now connected.
+        let _held = open_client(&name).await.unwrap();
+        assert_eq!(
+            open_once(&name).unwrap_err().raw_os_error(),
+            Some(ERROR_PIPE_BUSY)
+        );
+        let offer = tokio::spawn({
+            let name = name.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                ServerOptions::new().create(&name).unwrap()
+            }
+        });
+        let started = std::time::Instant::now();
+        open_client(&name).await.unwrap();
+        assert!(started.elapsed() < BUSY_WAIT);
+        drop((offer.await.unwrap(), first));
+
+        // No such pipe: reported at once, not waited for.
+        let started = std::time::Instant::now();
+        let missing = open_client(r"\.\pipe\etd-ipc-busy-test-missing")
+            .await
+            .unwrap_err();
+        assert_eq!(missing.raw_os_error(), Some(2));
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
 
     #[test]
     fn pending_slots_are_counted_and_released_per_account() {

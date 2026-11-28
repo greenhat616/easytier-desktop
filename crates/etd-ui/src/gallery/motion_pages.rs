@@ -12,8 +12,14 @@ use gpui_kit::{
 };
 
 use super::{Gallery, section};
+use gpui_kit::{
+    AppContext as _,
+    component::slider::{SliderState, SliderValue},
+};
+
 use crate::views::{
-    controls::fluent_radio_group,
+    connected::{ConnectedConfig, connected, prepare},
+    controls::{fluent_radio_group, fluent_slider},
     easing::{Easing, EasingMode},
     motion::{PopupKind, PopupMotion},
     page_transition::{PageTransition, page_frame},
@@ -49,10 +55,19 @@ pub(super) struct MotionDemo {
     pub(super) popup_open: bool,
     /// Implicit transitions: opacity, translation, brush, rotation, scale.
     pub(super) implicit: [bool; 5],
+    pub(super) connected_config: usize,
+    pub(super) connected_detail: bool,
+    pub(super) comp_x: gpui_kit::Entity<SliderState>,
+    pub(super) comp_y: gpui_kit::Entity<SliderState>,
+    pub(super) clip_left: gpui_kit::Entity<SliderState>,
+    pub(super) clip_right: gpui_kit::Entity<SliderState>,
+    pub(super) clip_top: gpui_kit::Entity<SliderState>,
+    pub(super) clip_bottom: gpui_kit::Entity<SliderState>,
+    pub(super) spring_hover: bool,
 }
 
 impl MotionDemo {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(cx: &mut Context<Gallery>) -> Self {
         Self {
             easing_far: [false; 4],
             easing_choice: 2,
@@ -70,6 +85,15 @@ impl MotionDemo {
             last_added: true,
             popup_open: false,
             implicit: [false; 5],
+            connected_config: 0,
+            connected_detail: false,
+            comp_x: ranged_slider(-80., 80., cx),
+            comp_y: ranged_slider(-50., 50., cx),
+            clip_left: ranged_slider(0., 70., cx),
+            clip_right: ranged_slider(0., 70., cx),
+            clip_top: ranged_slider(0., 40., cx),
+            clip_bottom: ranged_slider(0., 40., cx),
+            spring_hover: false,
         }
     }
 }
@@ -911,4 +935,347 @@ pub(super) fn parallax_page(window: &mut Window, cx: &mut Context<Gallery>) -> V
         )
         .into_any_element();
     vec![section("ParallaxView, vertical shift 500", [frame], cx)]
+}
+
+/// Connected animation configurations in the sample's order.
+const CONNECTED: [(&str, ConnectedConfig); 4] = [
+    ("Default", ConnectedConfig::Gravity),
+    ("Gravity", ConnectedConfig::Gravity),
+    ("Direct", ConnectedConfig::Direct),
+    ("Basic", ConnectedConfig::Basic),
+];
+
+/// The flying element: a rounded accent card with an icon.
+fn hero(cx: &gpui_kit::App) -> AnyElement {
+    div()
+        .size_full()
+        .rounded(px(8.))
+        .bg(gpui_kit::rgb(0x8764B8))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            gpui_kit::component::Icon::default()
+                .path("fluent/people-community.svg")
+                .with_size(Size::Size(px(32.)))
+                .text_color(gpui_kit::white()),
+        )
+        .text_color(cx.theme().foreground)
+        .into_any_element()
+}
+
+/// ConnectedAnimationPage's third sample: SamplePage1's source element
+/// flies to SamplePage2's 150x200 destination; both pages swap with no
+/// page transition (SuppressNavigationTransitionInfo), and SamplePage2's
+/// text arrives with EntranceThemeTransition.
+pub(super) fn connected_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<AnyElement> {
+    let names: Vec<&'static str> = CONNECTED.iter().map(|(n, _)| *n).collect();
+    let controls = div()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px(32.))
+        .child(fluent_radio_group(
+            "connected-config",
+            "Configuration",
+            &names,
+            view.motion.connected_config,
+            false,
+            cx.listener(|this, ix: &usize, _, cx| {
+                this.motion.connected_config = *ix;
+                cx.notify();
+            }),
+            cx,
+        ))
+        .child(
+            row()
+                .child(button("connected-forward", "Navigate", cx, |this, cx| {
+                    if !this.motion.connected_detail {
+                        let config = CONNECTED[this.motion.connected_config].1;
+                        prepare("connected-hero", config, cx);
+                        this.motion.connected_detail = true;
+                    }
+                }))
+                .child(button("connected-back", "Back", cx, |this, cx| {
+                    if this.motion.connected_detail {
+                        let config = CONNECTED[this.motion.connected_config].1;
+                        prepare("connected-hero", config, cx);
+                        this.motion.connected_detail = false;
+                    }
+                })),
+        )
+        .into_any_element();
+    let detail = view.motion.connected_detail;
+    let page = if detail {
+        div()
+            .id("connected-page-2")
+            .test_support()
+            .size_full()
+            .p(px(24.))
+            .flex()
+            .flex_row()
+            .gap(px(24.))
+            .child(
+                div()
+                    .id("connected-destination")
+                    .test_support()
+                    .flex_shrink_0()
+                    .w(px(150.))
+                    .h(px(200.))
+                    .child(connected("connected-hero", |_, cx| hero(cx))),
+            )
+            .child(arrive(
+                "connected-text",
+                Arrival::Entrance {
+                    order: 0,
+                    stagger: false,
+                },
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .text_size(px(20.))
+                            .line_height(px(28.))
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .child(t("Weekend LAN")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .line_height(px(20.))
+                            .child(t("The card flew here from the list.")),
+                    )
+                    .into_any_element(),
+            ))
+    } else {
+        div()
+            .id("connected-page-1")
+            .test_support()
+            .size_full()
+            .p(px(24.))
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(
+                div()
+                    .text_size(px(14.))
+                    .line_height(px(20.))
+                    .child(t("Pick the card, then Navigate.")),
+            )
+            .child(
+                div()
+                    .id("connected-source")
+                    .test_support()
+                    .w(px(100.))
+                    .h(px(100.))
+                    .child(connected("connected-hero", |_, cx| hero(cx))),
+            )
+    };
+    let frame = div()
+        .w_full()
+        .h(px(280.))
+        .rounded(px(8.))
+        .border_1()
+        .border_color(crate::theme::card_stroke(cx))
+        .bg(crate::theme::card_fill(cx))
+        .child(page)
+        .into_any_element();
+    vec![section("Connected animation", [controls, frame], cx)]
+}
+
+/// The Composition sample's sliders that GPUI can follow: translation of a
+/// 160x100 target (X within 80 px, Y within 50 px) and an inset clip
+/// (left/right up to 70 px, top/bottom up to 40 px), plus the animation
+/// interop sample's hover spring (damping 0.6, period 50 ms) moving a
+/// button instead of scaling it. Rotation, anchor point, skew and scale
+/// are GPUI gaps.
+pub(super) fn composition_page(
+    view: &Gallery,
+    window: &mut Window,
+    cx: &mut Context<Gallery>,
+) -> Vec<AnyElement> {
+    let m = &view.motion;
+    let value =
+        |state: &gpui_kit::Entity<SliderState>, cx: &Context<Gallery>| state.read(cx).value().end();
+    let (x, y) = (value(&m.comp_x, cx), value(&m.comp_y, cx));
+    let (cl, cr, ct, cb) = (
+        value(&m.clip_left, cx),
+        value(&m.clip_right, cx),
+        value(&m.clip_top, cx),
+        value(&m.clip_bottom, cx),
+    );
+    let accent = crate::theme::accent_fill(crate::theme::ControlState::Rest, cx);
+    let stage = |child: AnyElement| {
+        div()
+            .relative()
+            .w(px(360.))
+            .h(px(220.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(crate::theme::card_stroke(cx))
+            .child(child)
+            .into_any_element()
+    };
+    let translated = stage(
+        div()
+            .id("composition-target")
+            .test_support()
+            .absolute()
+            .left(px(100. + x))
+            .top(px(60. + y))
+            .w(px(160.))
+            .h(px(100.))
+            .rounded(px(4.))
+            .bg(accent)
+            .into_any_element(),
+    );
+    // InsetClip: only the part inside the insets shows.
+    let clipped = stage(
+        div()
+            .id("composition-clip")
+            .test_support()
+            .absolute()
+            .left(px(100. + cl))
+            .top(px(60. + ct))
+            .w(px((160. - cl - cr).max(0.)))
+            .h(px((100. - ct - cb).max(0.)))
+            .overflow_hidden()
+            .child(
+                div()
+                    .absolute()
+                    .left(px(-cl))
+                    .top(px(-ct))
+                    .w(px(160.))
+                    .h(px(100.))
+                    .bg(gpui_kit::rgb(0x0078D4))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(gpui_kit::white())
+                    .child(t("Clipped")),
+            )
+            .into_any_element(),
+    );
+    let lift = gpui_kit::base::spring(
+        "composition-spring",
+        if m.spring_hover { -20. } else { 0. },
+        gpui_kit::base::Spring::new(Duration::from_millis(50)).with_damping(0.6),
+        window,
+        cx,
+    );
+    let view_handle = cx.entity().downgrade();
+    let spring = div()
+        .relative()
+        .h(px(80.))
+        .child(
+            div()
+                .id("composition-spring")
+                .test_support()
+                .absolute()
+                .top(px(30. + lift))
+                .left_0()
+                .w(px(100.))
+                .h(px(50.))
+                .rounded(px(4.))
+                .bg(accent)
+                .text_color(gpui_kit::white())
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_hover(move |hovered, _, cx| {
+                    let hovered = *hovered;
+                    view_handle
+                        .update(cx, |this, cx| {
+                            this.motion.spring_hover = hovered;
+                            cx.notify();
+                        })
+                        .ok();
+                })
+                .child(t("Hover me")),
+        )
+        .into_any_element();
+    let sliders = |a: AnyElement, b: AnyElement| {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .w(px(240.))
+            .child(a)
+            .child(b)
+            .into_any_element()
+    };
+    let note = div()
+        .text_size(px(12.))
+        .line_height(px(16.))
+        .text_color(crate::theme::text_secondary(cx))
+        .child(t(
+            "GPUI cannot rotate, skew or scale an element, so the sample's rotation, anchor point and transform matrix are left out.",
+        ))
+        .into_any_element();
+    vec![
+        section(
+            "Translation",
+            [
+                note,
+                row()
+                    .child(sliders(
+                        fluent_slider(
+                            "composition-x",
+                            "Translation X",
+                            &m.comp_x,
+                            false,
+                            window,
+                            cx,
+                        ),
+                        fluent_slider(
+                            "composition-y",
+                            "Translation Y",
+                            &m.comp_y,
+                            false,
+                            window,
+                            cx,
+                        ),
+                    ))
+                    .child(translated)
+                    .into_any_element(),
+            ],
+            cx,
+        ),
+        section(
+            "InsetClip",
+            [row()
+                .child(sliders(
+                    sliders(
+                        fluent_slider("clip-left", "Left", &m.clip_left, false, window, cx),
+                        fluent_slider("clip-right", "Right", &m.clip_right, false, window, cx),
+                    ),
+                    sliders(
+                        fluent_slider("clip-top", "Top", &m.clip_top, false, window, cx),
+                        fluent_slider("clip-bottom", "Bottom", &m.clip_bottom, false, window, cx),
+                    ),
+                ))
+                .child(clipped)
+                .into_any_element()],
+            cx,
+        ),
+        section(
+            "Spring (damping 0.6, period 50 ms), on translation",
+            [spring],
+            cx,
+        ),
+    ]
+}
+
+fn ranged_slider(min: f32, max: f32, cx: &mut Context<Gallery>) -> gpui_kit::Entity<SliderState> {
+    let state = cx.new(|_| {
+        SliderState::new()
+            .min(min)
+            .max(max)
+            .step(1.)
+            .default_value(SliderValue::Single(if min < 0. { 0. } else { min }))
+    });
+    cx.observe(&state, |_, _, cx| cx.notify()).detach();
+    state
 }

@@ -41,7 +41,8 @@ pub enum PopupKind {
     /// [`POPUP_IN`]'s.
     Flyout,
     /// A Popup with PopupThemeTransition at its default 40 px offset
-    /// (DependencyProperty.cpp:687-689), with [`POPUP_IN`]'s timing.
+    /// (DependencyProperty.cpp:687-689): it rises from 40 px below, with
+    /// [`POPUP_IN`]'s timing.
     Popup,
     /// ContentDialog (ContentDialog_themeresources.xaml DialogShowing /
     /// DialogHidden): LayoutRoot, smoke included, fades in over 83 ms
@@ -180,14 +181,17 @@ impl RenderOnce for Animated {
                             .child(self.surface),
                     ),
                     PopupKind::Flyout | PopupKind::Popup => {
-                        let offset = if kind == PopupKind::Flyout { 50. } else { 40. };
+                        // A flyout drops in from 50 px above its anchor
+                        // (FlyoutBase); a plain popup rises from its
+                        // positive FromVerticalOffset, 40 px below.
+                        let offset = if kind == PopupKind::Flyout { -50. } else { 40. };
                         let ms = t * entrance * 1000.;
                         let decel = cubic_bezier(0.1, 0.9, 0.2, 1.)(t);
                         let fade = ((ms - 83.) / 83.).clamp(0., 1.);
                         div()
                             .id(self.id)
                             .relative()
-                            .top(px(-offset * (1. - decel)))
+                            .top(px(offset * (1. - decel)))
                             .opacity(fade)
                             .child(self.surface)
                     }

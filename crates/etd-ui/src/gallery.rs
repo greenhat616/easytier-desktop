@@ -83,6 +83,8 @@ enum Page {
     ThemeTransitions,
     Implicit,
     Parallax,
+    Connected,
+    Composition,
     Easing,
 }
 
@@ -120,7 +122,7 @@ impl Gallery {
             closed: [false; 4],
             clicks: 0,
             pseudo: false,
-            motion: motion_pages::MotionDemo::new(),
+            motion: motion_pages::MotionDemo::new(cx),
         }
     }
 }
@@ -268,6 +270,22 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
         "fluent/grid.svg",
         cx,
     );
+    let connected = nav(
+        Page::Connected,
+        "gallery-nav-connected",
+        "Connected animation",
+        "fluent/link.svg",
+        "fluent/link.svg",
+        cx,
+    );
+    let composition = nav(
+        Page::Composition,
+        "gallery-nav-composition",
+        "Composition",
+        "fluent/color.svg",
+        "fluent/color.svg",
+        cx,
+    );
     let easing = nav(
         Page::Easing,
         "gallery-nav-easing",
@@ -294,6 +312,8 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
         .child(theme_transitions)
         .child(implicit)
         .child(parallax)
+        .child(connected)
+        .child(composition)
         .child(easing)
         .child(settings);
     if !view.collapsed {
@@ -669,6 +689,14 @@ impl Render for Gallery {
                 motion_pages::implicit_transitions_page(self, window, cx),
             ),
             Page::Parallax => ("ParallaxView", motion_pages::parallax_page(window, cx)),
+            Page::Connected => (
+                "Connected animation",
+                motion_pages::connected_page(self, cx),
+            ),
+            Page::Composition => (
+                "Composition",
+                motion_pages::composition_page(self, window, cx),
+            ),
             Page::Easing => (
                 "Easing functions",
                 motion_pages::easing_page(self, window, cx),
@@ -925,6 +953,93 @@ mod tests {
     /// timings: a MenuFlyout fades for 83 ms, a ContentDialog for 83 ms and
     /// an Expander's content slides up for 167 ms. An Expander that is open
     /// when it first appears does not slide in.
+    /// A connected animation flies a copy from the source's place to the
+    /// destination's over 300 ms (Gravity), dipping on the way; the spring
+    /// moves the button on hover.
+    #[gpui_kit::test]
+    fn gallery_connected_animation_flies_between_pages(cx: &mut TestAppContext) {
+        use std::time::Duration;
+        let (handle, _view) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            theme::install_palette(cx);
+            cx.set_reduce_motion(false);
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Default::default(),
+                        size: size(px(1440.), px(1300.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| Gallery::new(window, cx)),
+            )
+            .unwrap()
+        });
+        let step = |cx: &mut TestAppContext, ms: u64| {
+            for _ in 0..(ms / 25) {
+                cx.executor().advance_clock(Duration::from_millis(25));
+                cx.run_until_parked();
+                cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                    .unwrap();
+            }
+        };
+        let mut source = Bounds::default();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("gallery-nav-connected", cx);
+            window.render_frame(cx);
+            source = window.find("connected-source").bounds();
+            window.click("connected-forward", cx);
+            window.render_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 100);
+        let mut destination = Bounds::default();
+        cx.update_window(handle, |_, window, _| {
+            destination = window.find("connected-destination").bounds();
+            let flight = window.find("connected-flight").bounds();
+            assert!(
+                flight.size.width > source.size.width && flight.size.width < destination.size.width,
+                "growing from 100 to 150 wide: {flight:?}"
+            );
+        })
+        .unwrap();
+        step(cx, 100);
+        cx.update_window(handle, |_, window, _| {
+            // About 66 % in, the Gravity dip puts it below the straight path.
+            let flight = window.find("connected-flight").bounds();
+            assert!(flight.top() > destination.top(), "dipping: {flight:?}");
+        })
+        .unwrap();
+        step(cx, 200);
+        cx.update_window(handle, |_, window, _| {
+            assert!(window.try_find("connected-flight").is_none(), "landed");
+        })
+        .unwrap();
+
+        // The spring lifts the button 20 px on hover.
+        let mut rest = px(0.);
+        cx.update_window(handle, |_, window, cx| {
+            window.click("gallery-nav-composition", cx);
+            window.render_frame(cx);
+            rest = window.find("composition-spring").bounds().top();
+            window.hover("composition-spring", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 500);
+        cx.update_window(handle, |_, window, _| {
+            let top = window.find("composition-spring").bounds().top();
+            assert!(
+                (top - (rest - px(20.))).abs() < px(1.),
+                "lifted: {top:?} from {rest:?}"
+            );
+        })
+        .unwrap();
+    }
+
     /// Theme and implicit transitions and ParallaxView follow WinUI's
     /// timing: the measured theme storyboards, the source's offsets and
     /// delays, and the implicit transitions' 300 ms.
@@ -1967,6 +2082,8 @@ mod tests {
                 "theme-transitions",
                 "implicit",
                 "parallax",
+                "connected",
+                "composition",
                 "easing",
             ] {
                 cx.update_window(handle, |_, window, cx| {
@@ -2033,6 +2150,34 @@ mod tests {
                         .unwrap();
                 }
                 cx.advance_clock(Duration::from_millis(700));
+                // Connected animation, Gravity: the card flying to page 2.
+                cx.update_window(handle, |_, window, cx| {
+                    window.click("gallery-nav-connected", cx);
+                    window.render_frame(cx);
+                    window.click("connected-forward", cx);
+                    window.render_frame(cx);
+                    window.render_frame(cx);
+                })
+                .unwrap();
+                let mut at = 0;
+                for ms in [60, 120, 200, 260] {
+                    cx.advance_clock(Duration::from_millis(ms - at));
+                    at = ms;
+                    cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                        .unwrap();
+                    cx.capture_screenshot(handle)
+                        .unwrap()
+                        .save(output.join(format!("gallery-motion-connected-{ms}ms.png")))
+                        .unwrap();
+                }
+                cx.advance_clock(Duration::from_millis(300));
+                cx.update_window(handle, |_, window, cx| {
+                    window.click("connected-back", cx);
+                    window.render_frame(cx);
+                })
+                .unwrap();
+                cx.advance_clock(Duration::from_millis(400));
+                cx.run_until_parked();
                 cx.run_until_parked();
                 cx.update(|cx| cx.set_reduce_motion(true));
             }
@@ -2075,6 +2220,8 @@ mod tests {
                 "theme-transitions",
                 "implicit",
                 "parallax",
+                "connected",
+                "composition",
                 "easing",
                 "settings",
             ] {

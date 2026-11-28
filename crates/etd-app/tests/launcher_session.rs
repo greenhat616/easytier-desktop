@@ -22,7 +22,7 @@ use std::{
     collections::HashMap,
     io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
     time::Duration,
 };
 
@@ -31,6 +31,10 @@ enum Answer {
     Verified,
     Absent,
     Impostor,
+    /// `ERROR_PIPE_BUSY`: something holds the pipe.
+    Busy,
+    /// Never answers within the connect limit.
+    Hangs,
 }
 
 /// What the started session host does.
@@ -54,6 +58,8 @@ struct World {
     /// Every start: how, program, arguments.
     starts: Arc<Mutex<Vec<StartRecord>>>,
     user_spawns: Arc<Mutex<u32>>,
+    /// While set, a start waits: the UAC prompt is open.
+    prompt_open: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl World {
@@ -64,6 +70,23 @@ impl World {
             start: Arc::new(Mutex::new(start)),
             starts: Arc::default(),
             user_spawns: Arc::default(),
+            prompt_open: Arc::default(),
+        }
+    }
+    /// Starts wait until [`World::answer_prompt`].
+    fn hold_prompt(&self) {
+        *self.prompt_open.0.lock().unwrap() = true;
+    }
+    fn answer_prompt(&self) {
+        *self.prompt_open.0.lock().unwrap() = false;
+        self.prompt_open.1.notify_all();
+    }
+    /// Waits until `n` starts were made.
+    async fn starts_reach(&self, n: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while self.starts().len() < n {
+            assert!(std::time::Instant::now() < deadline, "no start");
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
     fn answer(&self, endpoint: &Endpoint, answer: Answer) {
@@ -86,6 +109,12 @@ impl World {
             program.to_path_buf(),
             args.iter().map(|a| (*a).to_owned()).collect(),
         ));
+        let (open, answered) = &*self.prompt_open;
+        drop(
+            answered
+                .wait_while(open.lock().unwrap(), |open| *open)
+                .unwrap(),
+        );
         match *self.start.lock().unwrap() {
             Start::Listens => {
                 self.answer(&session_pipe(), Answer::Verified);
@@ -140,7 +169,12 @@ impl Connector for FakeConnector {
             .get(endpoint)
             .unwrap_or(&Answer::Absent);
         match answer {
-            Answer::Absent => Err(io::ErrorKind::NotFound.into()),
+            Answer::Absent => Err(io::Error::from_raw_os_error(2)),
+            Answer::Busy => Err(io::Error::from_raw_os_error(231)),
+            Answer::Hangs => {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Err(io::ErrorKind::NotFound.into())
+            }
             Answer::Impostor => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "the server token is not elevated",
@@ -465,4 +499,129 @@ fn the_host_choice_is_remembered() {
     assert_eq!(file.load(), Some(HostChoice::Service));
     std::fs::write(dir.path().join("nested").join("host-choice"), "garbage").unwrap();
     assert_eq!(file.load(), None);
+}
+
+/// The bridge abandons a Connect when another Connect or a probe supersedes
+/// it, but the consent call cannot be cancelled: the pending prompt stays
+/// the one launch, and later calls get its outcome.
+#[tokio::test]
+async fn a_superseded_connect_keeps_the_pending_prompt() {
+    let world = World::new(UiElevation::Limited, Start::Listens);
+    world.hold_prompt();
+    let launcher = Arc::new(launcher(&world, false));
+    let first = tokio::spawn({
+        let launcher = launcher.clone();
+        async move { launcher.ensure(HostMode::ElevatedSession).await }
+    });
+    world.starts_reach(1).await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+
+    let again = tokio::spawn({
+        let launcher = launcher.clone();
+        async move { launcher.ensure(HostMode::ElevatedSession).await }
+    });
+    let probe = tokio::spawn({
+        let launcher = launcher.clone();
+        async move { launcher.probe().await }
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !again.is_finished() && !probe.is_finished(),
+        "they wait for the prompt"
+    );
+    world.answer_prompt();
+    assert_eq!(
+        again.await.unwrap().unwrap().mode,
+        HostMode::ElevatedSession
+    );
+    assert_eq!(
+        probe.await.unwrap().unwrap().unwrap().mode,
+        HostMode::ElevatedSession
+    );
+    assert_eq!(world.starts().len(), 1, "exactly one prompt");
+}
+
+/// Nobody waits any more when the user accepts: the host it started is
+/// still this launcher's, and the next Connect uses it without a prompt.
+#[tokio::test]
+async fn a_prompt_answered_after_everyone_left_still_counts() {
+    let world = World::new(UiElevation::Limited, Start::Listens);
+    world.hold_prompt();
+    let launcher = Arc::new(launcher(&world, false));
+    let first = tokio::spawn({
+        let launcher = launcher.clone();
+        async move { launcher.ensure(HostMode::ElevatedSession).await }
+    });
+    world.starts_reach(1).await;
+    first.abort();
+    world.answer_prompt();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(
+        launcher
+            .ensure(HostMode::ElevatedSession)
+            .await
+            .unwrap()
+            .mode,
+        HostMode::ElevatedSession
+    );
+    assert_eq!(world.starts().len(), 1);
+}
+
+#[tokio::test]
+async fn concurrent_callers_share_one_denied_prompt() {
+    let world = World::new(UiElevation::Limited, Start::Cancelled);
+    world.hold_prompt();
+    let launcher = Arc::new(launcher(&world, false));
+    let ensure = || {
+        let launcher = launcher.clone();
+        tokio::spawn(async move { launcher.ensure(HostMode::ElevatedSession).await })
+    };
+    let (first, second) = (ensure(), ensure());
+    world.starts_reach(1).await;
+    let probe = tokio::spawn({
+        let launcher = launcher.clone();
+        async move { launcher.probe().await }
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    world.answer_prompt();
+    for result in [first.await.unwrap(), second.await.unwrap()] {
+        assert!(
+            matches!(result, Err(LaunchError::ElevationDenied)),
+            "{result:?}"
+        );
+    }
+    assert!(matches!(
+        probe.await.unwrap(),
+        Err(LaunchError::ElevationDenied)
+    ));
+    assert_eq!(world.starts().len(), 1, "one prompt for all of them");
+
+    // The answer was given: the user's next Connect asks again.
+    assert!(matches!(
+        launcher.ensure(HostMode::ElevatedSession).await,
+        Err(LaunchError::ElevationDenied)
+    ));
+    assert_eq!(world.starts().len(), 2);
+}
+
+/// Only "no such pipe" lets a host start; anything unverifiable is
+/// reported and nothing is started beside it.
+#[tokio::test]
+async fn an_unverifiable_session_pipe_fails_closed() {
+    for answer in [Answer::Busy, Answer::Hangs] {
+        let world = World::new(UiElevation::Limited, Start::Listens);
+        world.answer(&session_pipe(), answer);
+        let launcher = launcher(&world, false);
+        let error = launcher
+            .ensure(HostMode::ElevatedSession)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, LaunchError::Io(text) if text.contains("could not be verified")),
+            "{answer:?}: {error:?}"
+        );
+        assert!(matches!(launcher.probe().await, Err(LaunchError::Io(_))));
+        assert!(world.starts().is_empty(), "{answer:?}");
+    }
 }

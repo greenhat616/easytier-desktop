@@ -5,7 +5,8 @@
 //! current-user-elevated identity check.
 //!
 //! The OS side (token elevation, `ShellExecuteEx runas`, the inheritance-free
-//! direct start) is behind [`ElevationStarter`], implemented by the UI with
+//! direct start; see `etd_sysfx_os::windows::elevation` for what each one
+//! controls) is behind [`ElevationStarter`], implemented by the UI with
 //! `etd-sysfx-os`; this module holds the decisions. Nothing here prompts on
 //! its own: only [`crate::HostLauncher::ensure`] for the session form, which
 //! the user's Connect triggers, starts a host.
@@ -27,15 +28,22 @@ pub const RECLAIM_ARGS: [&str; 3] = ["reclaim", "--mode", "elevated-session"];
 pub const RECLAIM_ALL_USERS_ARGS: [&str; 4] =
     ["reclaim", "--mode", "elevated-session", "--all-users"];
 
-/// The session host's exit code for each refusal (etd-host `SessionRefusal`).
+/// The refusal behind the session host's exit code
+/// ([`etd_ipc::session_exit`], shared with etd-host).
 pub fn refusal_of(exit_code: u32) -> Option<SessionRefusal> {
-    match exit_code {
-        3 => Some(SessionRefusal::ServiceInstalled),
-        4 => Some(SessionRefusal::NotConforming),
-        5 => Some(SessionRefusal::OtherUsersLeftovers),
-        6 => Some(SessionRefusal::EndpointOccupied),
-        _ => None,
-    }
+    use etd_ipc::session_exit as exit;
+    let code = u8::try_from(exit_code).ok()?;
+    [
+        (exit::SERVICE_INSTALLED, SessionRefusal::ServiceInstalled),
+        (exit::NOT_CONFORMING, SessionRefusal::NotConforming),
+        (
+            exit::OTHER_USERS_LEFTOVERS,
+            SessionRefusal::OtherUsersLeftovers,
+        ),
+        (exit::ENDPOINT_UNAVAILABLE, SessionRefusal::EndpointOccupied),
+    ]
+    .into_iter()
+    .find_map(|(known, refusal)| (known == code).then_some(refusal))
 }
 
 /// The elevated session host started by the UI.
@@ -74,9 +82,9 @@ impl ElevatedSessionConfig {
 
 fn session_endpoint(user: &etd_ipc::OsUserId) -> io::Result<Endpoint> {
     match user {
-        etd_ipc::OsUserId::WindowsSid(sid) if cfg!(windows) => Ok(Endpoint::NamedPipe(format!(
-            r"\\.\pipe\easytier-desk-session-{sid}"
-        ))),
+        etd_ipc::OsUserId::WindowsSid(sid) if cfg!(windows) => {
+            Ok(Endpoint::NamedPipe(etd_ipc::session_pipe_name(sid)))
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "the elevated session host exists on Windows only",
@@ -108,17 +116,21 @@ pub enum StartError {
     Failed(io::Error),
 }
 
-/// Starts programs elevated. Implementations take an absolute program and
-/// fixed arguments, open no window and pass no handles.
+/// Starts programs elevated. Both starts take an absolute program and fixed
+/// arguments and ask for no window; only [`ElevationStarter::start_direct`]
+/// controls the environment and handle inheritance.
 pub trait ElevationStarter: Send + Sync {
     fn elevation(&self) -> io::Result<UiElevation>;
-    /// `runas` through the UAC consent prompt. Blocks until it was answered.
+    /// `runas` through the UAC consent prompt, with no window requested.
+    /// Blocks until it was answered and cannot be cancelled. The OS creates
+    /// the process: the caller cannot set its environment or handles.
     fn start_with_consent(
         &self,
         program: &Path,
         args: &[&str],
     ) -> Result<Box<dyn StartedProcess>, StartError>;
-    /// From an elevated UI: no inherited handles, a minimal environment.
+    /// From an elevated UI: no inherited handles, a minimal environment, no
+    /// window.
     fn start_direct(
         &self,
         program: &Path,

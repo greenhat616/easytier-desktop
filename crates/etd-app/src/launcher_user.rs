@@ -30,7 +30,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::Mutex,
+    sync::{Mutex, watch},
     time::{Instant, sleep, timeout},
 };
 
@@ -249,9 +249,7 @@ pub struct LocalHostLauncher {
     /// The user host this launcher started. The lock also serializes
     /// `ensure`, so two callers cannot start two hosts.
     child: Mutex<Option<Box<dyn SpawnedHost>>>,
-    session: Option<SessionParts>,
-    /// The session host this launcher started; serializes its `ensure`.
-    session_child: Mutex<Option<Box<dyn StartedProcess>>>,
+    session: Option<Arc<SessionLauncher>>,
 }
 
 impl LocalHostLauncher {
@@ -281,13 +279,18 @@ impl LocalHostLauncher {
             timings,
             child: Mutex::new(None),
             session: None,
-            session_child: Mutex::new(None),
         }
     }
 
     /// Also offer the elevated session form.
-    pub fn with_session(mut self, session: SessionParts) -> Self {
-        self.session = Some(session);
+    pub fn with_session(mut self, parts: SessionParts) -> Self {
+        self.session = Some(Arc::new(SessionLauncher {
+            parts,
+            connectors: self.connectors.clone(),
+            timings: self.timings,
+            child: Mutex::new(None),
+            pending: std::sync::Mutex::new(None),
+        }));
         self
     }
 
@@ -388,11 +391,9 @@ impl LocalHostLauncher {
 
 impl LocalHostLauncher {
     /// doc#13 #choose: the service whenever it is installed (never a session
-    /// host beside it), else a running session host, else start one: one
-    /// UAC prompt from an unelevated administrator, a direct start from an
-    /// elevated UI, `Unsupported` for a standard account.
+    /// host beside it), else the session launch: see [`SessionLauncher`].
     async fn ensure_session(&self) -> Result<HostTarget, LaunchError> {
-        let parts = self
+        let session = self
             .session
             .as_ref()
             .ok_or(LaunchError::Unsupported(HostMode::ElevatedSession))?;
@@ -401,25 +402,89 @@ impl LocalHostLauncher {
         {
             return self.ensure_service().await;
         }
-        let config = &parts.config;
-        let mut child = self.session_child.lock().await;
-        match self.reach(&config.endpoint, &config.expectation).await {
-            Reach::Verified => return Ok(config.target()),
-            // Something answers on our session pipe and is not our elevated
-            // host: the name is taken.
-            Reach::Refused(_) => {
-                return Err(LaunchError::SessionRefused(
-                    SessionRefusal::EndpointOccupied,
-                ));
+        outcome(session.join_or_start()).await
+    }
+}
+
+type LaunchOutcome = Result<HostTarget, LaunchError>;
+
+/// Starts and finds the elevated session host.
+///
+/// A launch runs as its own task, not in the caller's future: the UAC
+/// consent call blocks until the user answers and cannot be cancelled, so a
+/// Connect or probe that the bridge abandons must not lose the answer or
+/// free the way for a second prompt. Every `ensure(ElevatedSession)` and
+/// `probe` while a launch is pending waits for that same launch and gets its
+/// outcome; only a Connect after it resolved starts a new one.
+struct SessionLauncher {
+    parts: SessionParts,
+    connectors: Arc<dyn ConnectorFactory>,
+    timings: LauncherTimings,
+    /// The session host started last. Only launch tasks touch it, one at a
+    /// time.
+    child: Mutex<Option<Box<dyn StartedProcess>>>,
+    /// The launch in progress: its outcome once it resolved.
+    pending: std::sync::Mutex<Option<watch::Receiver<Option<LaunchOutcome>>>>,
+}
+
+impl SessionLauncher {
+    /// The launch still in progress, if any.
+    fn pending(&self) -> Option<watch::Receiver<Option<LaunchOutcome>>> {
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.as_ref().filter(|rx| in_progress(rx)).cloned()
+    }
+
+    /// Joins the launch in progress, or starts one.
+    fn join_or_start(self: &Arc<Self>) -> watch::Receiver<Option<LaunchOutcome>> {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(rx) = pending.as_ref().filter(|rx| in_progress(rx)) {
+            return rx.clone();
+        }
+        let (tx, rx) = watch::channel(None);
+        let launcher = self.clone();
+        tokio::spawn(async move {
+            let outcome = launcher.launch().await;
+            tx.send_replace(Some(outcome));
+        });
+        *pending = Some(rx.clone());
+        rx
+    }
+
+    async fn reach(&self) -> SessionReach {
+        let config = &self.parts.config;
+        let connector = self.connectors.connector(&config.expectation);
+        match timeout(self.timings.connect, connector.connect(&config.endpoint)).await {
+            Ok(Ok(_)) => SessionReach::Verified,
+            Ok(Err(error)) if no_such_pipe(&error) => SessionReach::Absent,
+            Ok(Err(error)) if error.kind() == io::ErrorKind::PermissionDenied => {
+                SessionReach::Occupied
             }
-            Reach::Absent => {}
+            Ok(Err(error)) => SessionReach::Unverified(error.to_string()),
+            Err(_) => {
+                SessionReach::Unverified(format!("no answer within {:?}", self.timings.connect))
+            }
+        }
+    }
+
+    /// A running session host, else start one: one UAC prompt from an
+    /// unelevated administrator, a direct start from an elevated UI,
+    /// `Unsupported` for a standard account.
+    async fn launch(&self) -> LaunchOutcome {
+        let config = &self.parts.config;
+        let mut child = self.child.lock().await;
+        match self.reach().await {
+            SessionReach::Verified => return Ok(config.target()),
+            SessionReach::Occupied => return Err(occupied()),
+            // Fail closed: something may be there, so no second host.
+            SessionReach::Unverified(reason) => return Err(unverified(&reason)),
+            SessionReach::Absent => {}
         }
         let running = match child.as_mut() {
             Some(process) => process.exit_code().map_err(launch_io)?.is_none(),
             None => false,
         };
         if !running {
-            let (starter, program) = (parts.starter.clone(), config.program.clone());
+            let (starter, program) = (self.parts.starter.clone(), config.program.clone());
             let started = tokio::task::spawn_blocking(move || {
                 start_elevated(starter.as_ref(), &program, &SESSION_HOST_ARGS)
             })
@@ -428,20 +493,20 @@ impl LocalHostLauncher {
             *child = Some(started);
         }
         let deadline = Instant::now() + self.timings.startup;
+        let mut last_unverified = None;
         loop {
             sleep(self.timings.poll).await;
             let exit = match child.as_mut() {
                 Some(process) => process.exit_code().map_err(launch_io)?,
                 None => None,
             };
-            match self.reach(&config.endpoint, &config.expectation).await {
-                Reach::Verified => return Ok(config.target()),
-                Reach::Refused(_) => {
-                    return Err(LaunchError::SessionRefused(
-                        SessionRefusal::EndpointOccupied,
-                    ));
-                }
-                Reach::Absent => {}
+            match self.reach().await {
+                SessionReach::Verified => return Ok(config.target()),
+                SessionReach::Occupied => return Err(occupied()),
+                // Our host may be busy accepting: keep waiting, and report
+                // it if it never verifies.
+                SessionReach::Unverified(reason) => last_unverified = Some(reason),
+                SessionReach::Absent => {}
             }
             if let Some(code) = exit {
                 *child = None;
@@ -454,10 +519,58 @@ impl LocalHostLauncher {
             }
             if Instant::now() >= deadline {
                 // Not killed: it may be reclaiming an earlier run's leftovers.
-                return Err(LaunchError::Timeout);
+                return Err(last_unverified.map_or(LaunchError::Timeout, |r| unverified(&r)));
             }
         }
     }
+}
+
+/// What answers on the session pipe. Only "no such pipe" counts as absent.
+enum SessionReach {
+    Verified,
+    Absent,
+    /// Something answered that is not this user's elevated host.
+    Occupied,
+    /// Something may be there but could not be verified (busy, no answer in
+    /// time, any other error).
+    Unverified(String),
+}
+
+/// `ERROR_FILE_NOT_FOUND` from opening the pipe (or a plain `NotFound`
+/// without an OS code).
+fn no_such_pipe(error: &io::Error) -> bool {
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    match error.raw_os_error() {
+        Some(code) => code == ERROR_FILE_NOT_FOUND,
+        None => error.kind() == io::ErrorKind::NotFound,
+    }
+}
+
+fn in_progress(rx: &watch::Receiver<Option<LaunchOutcome>>) -> bool {
+    // A closed channel without an outcome is a launch task that was torn
+    // down (runtime shutdown): not in progress.
+    rx.borrow().is_none() && rx.has_changed().is_ok()
+}
+
+async fn outcome(mut rx: watch::Receiver<Option<LaunchOutcome>>) -> LaunchOutcome {
+    match rx.wait_for(Option::is_some).await {
+        Ok(done) => done
+            .clone()
+            .unwrap_or_else(|| Err(LaunchError::Io("no launch outcome".into()))),
+        Err(_) => Err(LaunchError::Io(
+            "the session host launch was interrupted".into(),
+        )),
+    }
+}
+
+fn occupied() -> LaunchError {
+    LaunchError::SessionRefused(SessionRefusal::EndpointOccupied)
+}
+
+fn unverified(reason: &str) -> LaunchError {
+    LaunchError::Io(format!(
+        "the session host's endpoint could not be verified, so no host was started: {reason}"
+    ))
 }
 
 fn refused(reason: &str) -> LaunchError {
@@ -491,15 +604,15 @@ impl HostLauncher for LocalHostLauncher {
             }
         }
         if let Some(session) = &self.session {
-            let config = &session.config;
-            match self.reach(&config.endpoint, &config.expectation).await {
-                Reach::Verified => return Ok(Some(config.target())),
-                Reach::Refused(_) => {
-                    return Err(LaunchError::SessionRefused(
-                        SessionRefusal::EndpointOccupied,
-                    ));
-                }
-                Reach::Absent => {}
+            // A launch in progress (a UAC prompt may be open): its outcome.
+            if let Some(pending) = session.pending() {
+                return outcome(pending).await.map(Some);
+            }
+            match session.reach().await {
+                SessionReach::Verified => return Ok(Some(session.parts.config.target())),
+                SessionReach::Occupied => return Err(occupied()),
+                SessionReach::Unverified(reason) => return Err(unverified(&reason)),
+                SessionReach::Absent => {}
             }
         }
         if let Some(user) = &self.user {

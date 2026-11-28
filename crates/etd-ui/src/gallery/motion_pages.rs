@@ -1221,20 +1221,28 @@ pub(super) fn composition_page(
                 note,
                 row()
                     .child(sliders(
-                        fluent_slider(
-                            "composition-x",
+                        labeled(
                             "Translation X",
-                            &m.comp_x,
-                            false,
-                            window,
+                            fluent_slider(
+                                "composition-x",
+                                "Translation X",
+                                &m.comp_x,
+                                false,
+                                window,
+                                cx,
+                            ),
                             cx,
                         ),
-                        fluent_slider(
-                            "composition-y",
+                        labeled(
                             "Translation Y",
-                            &m.comp_y,
-                            false,
-                            window,
+                            fluent_slider(
+                                "composition-y",
+                                "Translation Y",
+                                &m.comp_y,
+                                false,
+                                window,
+                                cx,
+                            ),
                             cx,
                         ),
                     ))
@@ -1248,12 +1256,35 @@ pub(super) fn composition_page(
             [row()
                 .child(sliders(
                     sliders(
-                        fluent_slider("clip-left", "Left", &m.clip_left, false, window, cx),
-                        fluent_slider("clip-right", "Right", &m.clip_right, false, window, cx),
+                        labeled(
+                            "Left",
+                            fluent_slider("clip-left", "Left", &m.clip_left, false, window, cx),
+                            cx,
+                        ),
+                        labeled(
+                            "Right",
+                            fluent_slider("clip-right", "Right", &m.clip_right, false, window, cx),
+                            cx,
+                        ),
                     ),
                     sliders(
-                        fluent_slider("clip-top", "Top", &m.clip_top, false, window, cx),
-                        fluent_slider("clip-bottom", "Bottom", &m.clip_bottom, false, window, cx),
+                        labeled(
+                            "Top",
+                            fluent_slider("clip-top", "Top", &m.clip_top, false, window, cx),
+                            cx,
+                        ),
+                        labeled(
+                            "Bottom",
+                            fluent_slider(
+                                "clip-bottom",
+                                "Bottom",
+                                &m.clip_bottom,
+                                false,
+                                window,
+                                cx,
+                            ),
+                            cx,
+                        ),
                     ),
                 ))
                 .child(clipped)
@@ -1266,6 +1297,23 @@ pub(super) fn composition_page(
             cx,
         ),
     ]
+}
+
+/// A slider under its label (the sample's slider headers).
+fn labeled(label: &'static str, slider: AnyElement, cx: &Context<Gallery>) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .child(
+            div()
+                .text_size(px(14.))
+                .line_height(px(20.))
+                .text_color(cx.theme().foreground)
+                .child(t(label)),
+        )
+        .child(slider)
+        .into_any_element()
 }
 
 fn ranged_slider(min: f32, max: f32, cx: &mut Context<Gallery>) -> gpui_kit::Entity<SliderState> {

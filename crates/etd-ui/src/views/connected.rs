@@ -176,6 +176,8 @@ impl RenderOnce for Connected {
             |_, _, _, _| {},
         )
         .absolute()
+        .top_0()
+        .left_0()
         .size_full();
         let own = (self.visual)(window, cx);
         let overlay = flight.map(|f| {

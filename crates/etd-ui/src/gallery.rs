@@ -1010,7 +1010,13 @@ mod tests {
         cx.update_window(handle, |_, window, _| {
             // About 66 % in, the Gravity dip puts it below the straight path.
             let flight = window.find("connected-flight").bounds();
-            assert!(flight.top() > destination.top(), "dipping: {flight:?}");
+            // The straight path runs from the source's top to the
+            // destination's; the dip adds up to 80 px below it.
+            let straight = source.top().max(destination.top());
+            assert!(
+                flight.top() > straight && flight.top() < straight + px(80.),
+                "dipping: {flight:?}"
+            );
         })
         .unwrap();
         step(cx, 200);

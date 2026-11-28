@@ -1,2 +1,10 @@
 [alias]
 xtask = "run --package xtask --"
+
+# Link the C runtime statically into every Windows binary: the packages and
+# the portable layout ship no VC++ runtime, and a clean Windows machine has
+# none (release-package.yml checks the imports and runs the binaries in a
+# Server Core container without it). Applies to build scripts and proc
+# macros too, which is harmless.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

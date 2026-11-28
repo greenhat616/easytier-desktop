@@ -48,9 +48,14 @@ jobs:
           $out = Join-Path $env:RUNNER_TEMP 'dist'
           cargo xtask dist --target x86_64-pc-windows-msvc --out $out --dry-run --sign-hook none
           $payload = Join-Path $out 'x86_64-pc-windows-msvc/payload'
+          # crt-static: no binary may name the dynamic VC runtime (dumpbin is
+          # not on the runner's PATH; the import names are plain ASCII).
           foreach ($exe in 'etd-ui.exe', 'etd-host.exe', 'etd-ctl.exe') {
-            $vcrt = & dumpbin /dependents (Join-Path $payload $exe) 2>$null | Select-String -Pattern 'VCRUNTIME|MSVCP|api-ms-win-crt'
-            if ($vcrt) { Write-Output "$exe imports: $vcrt" }
+            $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Join-Path $payload $exe)))
+            foreach ($dll in 'VCRUNTIME140.dll', 'MSVCP140.dll', 'api-ms-win-crt-runtime') {
+              if ($text.IndexOf($dll, [StringComparison]::OrdinalIgnoreCase) -ge 0) { throw "${exe} still imports ${dll}" }
+            }
+            Write-Output "${exe}: no dynamic VC runtime import"
           }
           $short = $env:GITHUB_SHA.Substring(0, 7)
           $zip = Join-Path $env:RUNNER_TEMP "easytier-desktop-es4-smoke-$short.zip"

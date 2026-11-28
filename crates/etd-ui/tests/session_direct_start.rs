@@ -91,15 +91,98 @@ impl ElevationStarter for ThroughConsent {
     }
 }
 
-/// The smoke test's steps 3 and 4 (msg#2290): the session host is killed
-/// (Task Manager's End task), then the UI's Clean Up runs
+fn system32(program: &str) -> PathBuf {
+    PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+        .join("System32")
+        .join(program)
+}
+
+/// Runs a System32 tool, without a window, and requires it to succeed.
+fn system_tool(program: &str, args: &[&str]) {
+    let output = Command::new(system32(program))
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{program} {args:?}: {output:?}");
+}
+
+/// `HKLM\SOFTWARE\EasyTier\MagicDNS`: upstream EasyTier's key.
+const MAGIC_DNS: &str = r"HKLM\SOFTWARE\EasyTier\MagicDNS";
+
+/// What other software leaves on a real machine and no ledger of ours
+/// records (the smoke test's machine, msg#2290): a `wintun` driver service
+/// (shared with upstream EasyTier and other VPNs; registered here, never
+/// started, its image absent) and upstream EasyTier's MagicDNS key. Removed
+/// again on drop.
+struct ForeignObjects;
+
+impl ForeignObjects {
+    fn plant() -> Self {
+        let image = system32(r"drivers\etd-ci-absent-wintun.sys");
+        system_tool(
+            "sc.exe",
+            &[
+                "create",
+                "wintun",
+                "type=",
+                "kernel",
+                "start=",
+                "demand",
+                "binPath=",
+                image.to_str().unwrap(),
+            ],
+        );
+        system_tool("reg.exe", &["add", MAGIC_DNS, "/f"]);
+        Self
+    }
+}
+
+impl Drop for ForeignObjects {
+    fn drop(&mut self) {
+        for (program, args) in [
+            ("sc.exe", &["delete", "wintun"][..]),
+            ("reg.exe", &["delete", MAGIC_DNS, "/f"][..]),
+        ] {
+            let _ = Command::new(system32(program))
+                .creation_flags(CREATE_NO_WINDOW)
+                .args(args)
+                .output();
+        }
+    }
+}
+
+/// `etd-host reclaim --mode elevated-session`, its output captured (the
+/// UI's hidden start cannot capture it).
+fn reclaim_captured(program: &Path) -> std::process::Output {
+    Command::new(program)
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(RECLAIM_ARGS)
+        .output()
+        .unwrap()
+}
+
+fn describe(output: &std::process::Output) -> String {
+    format!(
+        "{}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+/// The smoke test's steps 3 and 4 (msg#2290) on a machine with other
+/// software's EasyTier-looking objects: the session host is killed (Task
+/// Manager's End task), then the UI's Clean Up runs
 /// `etd-host reclaim --mode elevated-session` the same way, through runas
-/// and, from an elevated UI, directly. A failure carries the reclaim's own
-/// output, which the UI's hidden start cannot capture.
+/// and, from an elevated UI, directly. The foreign objects are not this
+/// ledger's: they are listed, left in place, and do not fail the clean-up.
+/// A failure carries the reclaim's own output.
 #[test]
 #[ignore = "elevated Windows CI runner only"]
 fn a_killed_session_host_is_cleaned_up_like_the_ui_does() {
     let config = ElevatedSessionConfig::standard(host_program()).unwrap();
+    let _foreign = ForeignObjects::plant();
     let starters: [(&str, &dyn ElevationStarter); 2] = [
         ("runas", &ThroughConsent),
         ("direct", &WindowsElevationStarter),
@@ -108,8 +191,7 @@ fn a_killed_session_host_is_cleaned_up_like_the_ui_does() {
         let mut host = start_elevated(starter, &config.program, &SESSION_HOST_ARGS)
             .unwrap_or_else(|error| panic!("{how}: start: {error}"));
         let pid = connect(&config, host.as_mut()).peer.pid;
-        let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
-        let killed = Command::new(system.join("taskkill.exe"))
+        let killed = Command::new(system32("taskkill.exe"))
             .creation_flags(CREATE_NO_WINDOW)
             .args(["/F", "/PID", &pid.to_string()])
             .output()
@@ -127,22 +209,25 @@ fn a_killed_session_host_is_cleaned_up_like_the_ui_does() {
         if let Err(error) =
             reclaim_session_leftovers(starter, &config.program, false, Duration::from_secs(120))
         {
-            // Again, captured: the UI's start shows no output.
-            let again = Command::new(&config.program)
-                .creation_flags(CREATE_NO_WINDOW)
-                .args(RECLAIM_ARGS)
-                .output()
-                .unwrap();
             panic!(
                 "{how}: Clean Up after a killed host failed: {error:?}\n\
-                 the same reclaim run again from the test: {}\n\
-                 stdout:\n{}\nstderr:\n{}",
-                again.status,
-                String::from_utf8_lossy(&again.stdout),
-                String::from_utf8_lossy(&again.stderr),
+                 the same reclaim run again from the test: {}",
+                describe(&reclaim_captured(&config.program)),
             );
         }
         eprintln!("{how}: Clean Up after a killed host succeeded");
+    }
+
+    // The CLI lists what it left in place.
+    let listed = reclaim_captured(&config.program);
+    let stdout = String::from_utf8_lossy(&listed.stdout).to_ascii_lowercase();
+    assert!(listed.status.success(), "{}", describe(&listed));
+    for name in ["wintun", r"easytier\magicdns"] {
+        assert!(
+            stdout.contains("not proven ours") && stdout.contains(name),
+            "{name} not listed: {}",
+            describe(&listed)
+        );
     }
 }
 

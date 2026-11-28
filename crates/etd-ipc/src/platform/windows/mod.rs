@@ -420,7 +420,7 @@ mod tests {
     /// In-process pipe only: no second process, no network.
     #[tokio::test]
     async fn a_busy_pipe_is_waited_for_and_other_errors_are_not() {
-        let name = format!(r"\.\pipe\etd-ipc-busy-test-{}", std::process::id());
+        let name = format!(r"\\.\pipe\etd-ipc-busy-test-{}", std::process::id());
         let first = ServerOptions::new()
             .first_pipe_instance(true)
             .create(&name)
@@ -445,7 +445,7 @@ mod tests {
 
         // No such pipe: reported at once, not waited for.
         let started = std::time::Instant::now();
-        let missing = open_client(r"\.\pipe\etd-ipc-busy-test-missing")
+        let missing = open_client(r"\\.\pipe\etd-ipc-busy-test-missing")
             .await
             .unwrap_err();
         assert_eq!(missing.raw_os_error(), Some(2));

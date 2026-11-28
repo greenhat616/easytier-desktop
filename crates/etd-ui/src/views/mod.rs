@@ -1,18 +1,22 @@
 //! Root GPUI view (`MainView`) and sub-views bound strictly to [`etd_app::StateStore`].
 
 pub mod banners;
+pub mod connected;
 pub mod controls;
 pub mod dialogs;
+pub mod easing;
 pub mod feedback;
 pub mod instances;
 pub mod layout;
 pub mod menus;
 pub mod motion;
 pub mod navigation;
+pub mod page_transition;
 pub mod popout;
 pub mod progress;
 pub mod pseudo;
 pub mod reclaim;
+pub mod theme_transition;
 pub mod ui;
 
 use etd_app::UserCommand;

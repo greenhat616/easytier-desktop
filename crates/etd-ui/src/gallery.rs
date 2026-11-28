@@ -1,6 +1,7 @@
 //! Interactive, host-free specimen view of the same Fluent wrappers used
 //! by the desktop. All activation is in-memory; no bridge, tray, services,
 //! network profiles or production preferences are opened.
+mod motion_pages;
 mod pages;
 
 use crate::{
@@ -78,6 +79,13 @@ enum Page {
     Navigation,
     Layout,
     Feedback,
+    Transitions,
+    ThemeTransitions,
+    Implicit,
+    Parallax,
+    Connected,
+    Composition,
+    Easing,
 }
 
 struct Gallery {
@@ -90,6 +98,7 @@ struct Gallery {
     closed: [bool; 4],
     clicks: usize,
     pseudo: bool,
+    motion: motion_pages::MotionDemo,
 }
 
 impl Gallery {
@@ -113,6 +122,7 @@ impl Gallery {
             closed: [false; 4],
             clicks: 0,
             pseudo: false,
+            motion: motion_pages::MotionDemo::new(cx),
         }
     }
 }
@@ -228,6 +238,62 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
         "fluent/info.svg",
         cx,
     );
+    let page_transitions = nav(
+        Page::Transitions,
+        "gallery-nav-page-transitions",
+        "Page transitions",
+        "fluent/arrow-right.svg",
+        "fluent/arrow-right.svg",
+        cx,
+    );
+    let theme_transitions = nav(
+        Page::ThemeTransitions,
+        "gallery-nav-theme-transitions",
+        "Theme transitions",
+        "fluent/arrow-sync.svg",
+        "fluent/arrow-sync.svg",
+        cx,
+    );
+    let implicit = nav(
+        Page::Implicit,
+        "gallery-nav-implicit",
+        "Implicit transitions",
+        "fluent/arrow-clockwise.svg",
+        "fluent/arrow-clockwise.svg",
+        cx,
+    );
+    let parallax = nav(
+        Page::Parallax,
+        "gallery-nav-parallax",
+        "ParallaxView",
+        "fluent/grid.svg",
+        "fluent/grid.svg",
+        cx,
+    );
+    let connected = nav(
+        Page::Connected,
+        "gallery-nav-connected",
+        "Connected animation",
+        "fluent/link.svg",
+        "fluent/link.svg",
+        cx,
+    );
+    let composition = nav(
+        Page::Composition,
+        "gallery-nav-composition",
+        "Composition",
+        "fluent/color.svg",
+        "fluent/color.svg",
+        cx,
+    );
+    let easing = nav(
+        Page::Easing,
+        "gallery-nav-easing",
+        "Easing functions",
+        "fluent/play.svg",
+        "fluent/play.svg",
+        cx,
+    );
     let mut sidebar = Sidebar::new("gallery-sidebar")
         .w(px(220.))
         .h_full()
@@ -242,6 +308,13 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
         .child(navigation)
         .child(layout)
         .child(feedback)
+        .child(page_transitions)
+        .child(theme_transitions)
+        .child(implicit)
+        .child(parallax)
+        .child(connected)
+        .child(composition)
+        .child(easing)
         .child(settings);
     if !view.collapsed {
         sidebar = sidebar.footer(div().w_full().child(theme_menu(cx)));
@@ -603,6 +676,31 @@ impl Render for Gallery {
             Page::Navigation => ("Navigation", pages::navigation_page(self, cx)),
             Page::Layout => ("Layout", pages::layout_page(self, window, cx)),
             Page::Feedback => ("Status & info", pages::feedback_page(self, cx)),
+            Page::Transitions => (
+                "Page transitions",
+                motion_pages::page_transitions_page(self, cx),
+            ),
+            Page::ThemeTransitions => (
+                "Theme transitions",
+                motion_pages::theme_transitions_page(self, window, cx),
+            ),
+            Page::Implicit => (
+                "Implicit transitions",
+                motion_pages::implicit_transitions_page(self, window, cx),
+            ),
+            Page::Parallax => ("ParallaxView", motion_pages::parallax_page(window, cx)),
+            Page::Connected => (
+                "Connected animation",
+                motion_pages::connected_page(self, cx),
+            ),
+            Page::Composition => (
+                "Composition",
+                motion_pages::composition_page(self, window, cx),
+            ),
+            Page::Easing => (
+                "Easing functions",
+                motion_pages::easing_page(self, window, cx),
+            ),
         };
         div()
             .id("gallery-root")
@@ -855,6 +953,341 @@ mod tests {
     /// timings: a MenuFlyout fades for 83 ms, a ContentDialog for 83 ms and
     /// an Expander's content slides up for 167 ms. An Expander that is open
     /// when it first appears does not slide in.
+    /// A connected animation flies a copy from the source's place to the
+    /// destination's over 300 ms (Gravity), dipping on the way; the spring
+    /// moves the button on hover.
+    #[gpui_kit::test]
+    fn gallery_connected_animation_flies_between_pages(cx: &mut TestAppContext) {
+        use std::time::Duration;
+        let (handle, _view) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            theme::install_palette(cx);
+            cx.set_reduce_motion(false);
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Default::default(),
+                        size: size(px(1440.), px(1300.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| Gallery::new(window, cx)),
+            )
+            .unwrap()
+        });
+        let step = |cx: &mut TestAppContext, ms: u64| {
+            for _ in 0..(ms / 25) {
+                cx.executor().advance_clock(Duration::from_millis(25));
+                cx.run_until_parked();
+                cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                    .unwrap();
+            }
+        };
+        let mut source = Bounds::default();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("gallery-nav-connected", cx);
+            window.render_frame(cx);
+            source = window.find("connected-source").bounds();
+            window.click("connected-forward", cx);
+            window.render_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 100);
+        let mut destination = Bounds::default();
+        cx.update_window(handle, |_, window, _| {
+            destination = window.find("connected-destination").bounds();
+            let flight = window.find("connected-flight").bounds();
+            assert!(
+                flight.size.width > source.size.width && flight.size.width < destination.size.width,
+                "growing from 100 to 150 wide: {flight:?}"
+            );
+        })
+        .unwrap();
+        step(cx, 100);
+        cx.update_window(handle, |_, window, _| {
+            // About 66 % in, the Gravity dip puts it below the straight path.
+            let flight = window.find("connected-flight").bounds();
+            // The straight path runs from the source's top to the
+            // destination's; the dip adds up to 80 px below it.
+            let straight = source.top().max(destination.top());
+            assert!(
+                flight.top() > straight && flight.top() < straight + px(80.),
+                "dipping: {flight:?}"
+            );
+        })
+        .unwrap();
+        step(cx, 200);
+        cx.update_window(handle, |_, window, _| {
+            assert!(window.try_find("connected-flight").is_none(), "landed");
+        })
+        .unwrap();
+
+        // The spring lifts the button 20 px on hover.
+        let mut rest = px(0.);
+        cx.update_window(handle, |_, window, cx| {
+            window.click("gallery-nav-composition", cx);
+            window.render_frame(cx);
+            rest = window.find("composition-spring").bounds().top();
+            window.hover("composition-spring", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 500);
+        cx.update_window(handle, |_, window, _| {
+            let top = window.find("composition-spring").bounds().top();
+            assert!(
+                (top - (rest - px(20.))).abs() < px(1.),
+                "lifted: {top:?} from {rest:?}"
+            );
+        })
+        .unwrap();
+    }
+
+    /// Theme and implicit transitions and ParallaxView follow WinUI's
+    /// timing: the measured theme storyboards, the source's offsets and
+    /// delays, and the implicit transitions' 300 ms.
+    #[gpui_kit::test]
+    fn gallery_theme_transitions_follow_winui_timing(cx: &mut TestAppContext) {
+        use std::time::Duration;
+        let (handle, _view) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            theme::install_palette(cx);
+            cx.set_reduce_motion(false);
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Default::default(),
+                        size: size(px(1440.), px(2400.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| Gallery::new(window, cx)),
+            )
+            .unwrap()
+        });
+        let step = |cx: &mut TestAppContext, ms: u64| {
+            for _ in 0..(ms / 50) {
+                cx.executor().advance_clock(Duration::from_millis(50));
+                cx.run_until_parked();
+                cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                    .unwrap();
+            }
+        };
+        let top = |cx: &mut TestAppContext, id: &'static str| {
+            cx.update_window(handle, |_, window, _| window.find(id).bounds().top())
+                .unwrap()
+        };
+        let left = |cx: &mut TestAppContext, id: &'static str| {
+            cx.update_window(handle, |_, window, _| window.find(id).bounds().left())
+                .unwrap()
+        };
+        // Entrance, five at once: the fifth waits 5 x 35 ms, 28 px down.
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("gallery-nav-theme-transitions", cx);
+            window.render_frame(cx);
+            window.click("entrance-add-five", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 150);
+        let waiting = top(cx, "entrance-item-104");
+        step(cx, 1000);
+        assert_eq!(waiting - top(cx, "entrance-item-104"), px(28.));
+
+        // Reposition: hiding green moves blue 85 px left over 367 ms.
+        let before = left(cx, "reposition-blue");
+        cx.update_window(handle, |_, window, cx| {
+            window.click("reposition-toggle", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 100);
+        let moving = left(cx, "reposition-blue");
+        assert!(
+            moving < before && moving > before - px(85.),
+            "sliding: {moving:?} from {before:?}"
+        );
+        step(cx, 400);
+        assert_eq!(left(cx, "reposition-blue"), before - px(85.));
+
+        // Add/Delete: the deleted item fades for 100 ms; the rest close the
+        // gap after 220 ms.
+        let second = top(cx, "add-delete-item-1");
+        cx.update_window(handle, |_, window, cx| {
+            window.click("add-delete-delete", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 50);
+        cx.update_window(handle, |_, window, _| {
+            assert!(window.try_find("add-delete-item-0").is_some(), "fading");
+        })
+        .unwrap();
+        step(cx, 150);
+        cx.update_window(handle, |_, window, _| {
+            assert!(window.try_find("add-delete-item-0").is_none(), "gone");
+        })
+        .unwrap();
+        assert_eq!(top(cx, "add-delete-item-1"), second, "waits 220 ms");
+        step(cx, 500);
+        assert_eq!(top(cx, "add-delete-item-1"), second - px(32.));
+
+        // Implicit translation: 300 ms on (0.8,0,0.2,1).
+        cx.update_window(handle, |_, window, cx| {
+            window.click("gallery-nav-implicit", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let start = left(cx, "implicit-translate");
+        cx.update_window(handle, |_, window, cx| {
+            window.click("implicit-translate-toggle", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 150);
+        let mid = left(cx, "implicit-translate") - start;
+        assert!(mid > px(20.) && mid < px(180.), "halfway: {mid:?}");
+        step(cx, 200);
+        assert_eq!(left(cx, "implicit-translate") - start, px(200.));
+
+        // ParallaxView: scrolling moves the background up.
+        cx.update_window(handle, |_, window, cx| {
+            window.click("gallery-nav-parallax", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let resting = top(cx, "parallax-background");
+        cx.update_window(handle, |_, window, cx| {
+            window.scroll(
+                "parallax-list",
+                gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-300.))),
+                cx,
+            );
+            window.render_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert!(
+            top(cx, "parallax-background") < resting,
+            "background moved up"
+        );
+    }
+
+    /// Page transitions and easing functions run on WinUI's timing
+    /// (ThemeTransitions.cpp, EasingFunctions.cpp).
+    #[gpui_kit::test]
+    fn gallery_page_transitions_and_easings_follow_winui_timing(cx: &mut TestAppContext) {
+        use std::time::Duration;
+        let (handle, _view) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            theme::install_palette(cx);
+            cx.set_reduce_motion(false);
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Default::default(),
+                        size: size(px(1440.), px(1300.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| Gallery::new(window, cx)),
+            )
+            .unwrap()
+        });
+        let step = |cx: &mut TestAppContext, ms: u64| {
+            cx.executor().advance_clock(Duration::from_millis(ms));
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        };
+        // Entrance: the old page fades for 150 ms while the new one waits
+        // 140 px down, then rises by 450 ms.
+        let mut frame_top = px(0.);
+        let mut frame_left = px(0.);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("gallery-nav-page-transitions", cx);
+            window.render_frame(cx);
+            frame_top = window.find("sample-page-0").bounds().top();
+            window.click("page-forward", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 100);
+        cx.update_window(handle, |_, window, _| {
+            assert!(
+                window.try_find("sample-page-0").is_some(),
+                "old page leaving"
+            );
+            assert_eq!(
+                window.find("sample-page-1").bounds().top(),
+                frame_top + px(140.)
+            );
+        })
+        .unwrap();
+        step(cx, 200);
+        cx.update_window(handle, |_, window, _| {
+            let top = window.find("sample-page-1").bounds().top();
+            assert!(
+                top > frame_top && top < frame_top + px(140.),
+                "rising: {top:?}"
+            );
+        })
+        .unwrap();
+        step(cx, 200);
+        cx.update_window(handle, |_, window, cx| {
+            assert!(window.try_find("sample-page-0").is_none(), "old page gone");
+            assert_eq!(window.find("sample-page-1").bounds().top(), frame_top);
+            frame_left = window.find("sample-page-1").bounds().left();
+            // Slide from right: the new page waits 200 px to the right.
+            window.click("page-transition-kind-3", cx);
+            window.render_frame(cx);
+            window.click("page-forward", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 100);
+        cx.update_window(handle, |_, window, _| {
+            let old = window.find("sample-page-1").bounds().left();
+            let new = window.find("sample-page-0").bounds().left();
+            assert_eq!(new, frame_left + px(200.), "new page waits 200 px right");
+            assert!(
+                old < frame_left && old > frame_left - px(150.),
+                "old page leaving left"
+            );
+        })
+        .unwrap();
+        step(cx, 400);
+        // Easing: CircleEase InOut over 500 ms is halfway at 250 ms.
+        let mut start = px(0.);
+        cx.update_window(handle, |_, window, cx| {
+            window.click("gallery-nav-easing", cx);
+            window.render_frame(cx);
+            start = window.find("easing-square-0").bounds().left();
+            window.click("easing-animate-0", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        step(cx, 250);
+        cx.update_window(handle, |_, window, _| {
+            let x = window.find("easing-square-0").bounds().left() - start;
+            assert!((x - px(100.)).abs() < px(8.), "halfway at 250 ms: {x:?}");
+        })
+        .unwrap();
+        step(cx, 300);
+        cx.update_window(handle, |_, window, _| {
+            let x = window.find("easing-square-0").bounds().left() - start;
+            assert_eq!(x, px(200.));
+        })
+        .unwrap();
+    }
+
     #[gpui_kit::test]
     fn gallery_motion_follows_winui_timing(cx: &mut TestAppContext) {
         use std::time::Duration;
@@ -1649,6 +2082,111 @@ mod tests {
             })
             .unwrap();
             cx.run_until_parked();
+            // Motion pages, at rest.
+            for page in [
+                "page-transitions",
+                "theme-transitions",
+                "implicit",
+                "parallax",
+                "connected",
+                "composition",
+                "easing",
+            ] {
+                cx.update_window(handle, |_, window, cx| {
+                    window.click(SharedString::from(format!("gallery-nav-{page}")), cx);
+                    window.render_frame(cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.capture_screenshot(handle)
+                    .unwrap()
+                    .save(output.join(format!("gallery-{page}-{name}.png")))
+                    .unwrap();
+            }
+            // Page transitions mid-flight, in the light theme: frames of
+            // Entrance and Slide from right with motion on.
+            if name == "light" {
+                cx.update(|cx| cx.set_reduce_motion(false));
+                for (kind, label) in [(0, "entrance"), (3, "slide")] {
+                    cx.update_window(handle, |_, window, cx| {
+                        window.click("gallery-nav-page-transitions", cx);
+                        window.render_frame(cx);
+                        window.click(
+                            SharedString::from(format!("page-transition-kind-{kind}")),
+                            cx,
+                        );
+                        window.render_frame(cx);
+                        window.click("page-forward", cx);
+                        window.render_frame(cx);
+                    })
+                    .unwrap();
+                    let mut at = 0;
+                    for ms in [100, 200, 300, 400] {
+                        cx.advance_clock(Duration::from_millis(ms - at));
+                        at = ms;
+                        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                            .unwrap();
+                        cx.capture_screenshot(handle)
+                            .unwrap()
+                            .save(output.join(format!("gallery-motion-{label}-{ms}ms.png")))
+                            .unwrap();
+                    }
+                    cx.advance_clock(Duration::from_millis(200));
+                    cx.run_until_parked();
+                }
+                // Theme transitions: five squares arriving staggered, and
+                // the popup coming in.
+                cx.update_window(handle, |_, window, cx| {
+                    window.click("gallery-nav-theme-transitions", cx);
+                    window.render_frame(cx);
+                    window.click("entrance-add-five", cx);
+                    window.click("theme-popup-show", cx);
+                    window.render_frame(cx);
+                })
+                .unwrap();
+                let mut at = 0;
+                for ms in [50, 150, 300, 600] {
+                    cx.advance_clock(Duration::from_millis(ms - at));
+                    at = ms;
+                    cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                        .unwrap();
+                    cx.capture_screenshot(handle)
+                        .unwrap()
+                        .save(output.join(format!("gallery-motion-theme-{ms}ms.png")))
+                        .unwrap();
+                }
+                cx.advance_clock(Duration::from_millis(700));
+                // Connected animation, Gravity: the card flying to page 2.
+                cx.update_window(handle, |_, window, cx| {
+                    window.click("gallery-nav-connected", cx);
+                    window.render_frame(cx);
+                    window.click("connected-forward", cx);
+                    window.render_frame(cx);
+                    window.render_frame(cx);
+                })
+                .unwrap();
+                let mut at = 0;
+                for ms in [60, 120, 200, 260] {
+                    cx.advance_clock(Duration::from_millis(ms - at));
+                    at = ms;
+                    cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                        .unwrap();
+                    cx.capture_screenshot(handle)
+                        .unwrap()
+                        .save(output.join(format!("gallery-motion-connected-{ms}ms.png")))
+                        .unwrap();
+                }
+                cx.advance_clock(Duration::from_millis(300));
+                cx.update_window(handle, |_, window, cx| {
+                    window.click("connected-back", cx);
+                    window.render_frame(cx);
+                })
+                .unwrap();
+                cx.advance_clock(Duration::from_millis(400));
+                cx.run_until_parked();
+                cx.run_until_parked();
+                cx.update(|cx| cx.set_reduce_motion(true));
+            }
             // Navigation page.
             cx.update_window(handle, |_, window, cx| {
                 window.click("gallery-nav-navigation", cx);
@@ -1684,6 +2222,13 @@ mod tests {
                 "navigation",
                 "layout",
                 "feedback",
+                "page-transitions",
+                "theme-transitions",
+                "implicit",
+                "parallax",
+                "connected",
+                "composition",
+                "easing",
                 "settings",
             ] {
                 cx.update_window(handle, |_, window, cx| {

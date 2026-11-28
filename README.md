@@ -154,7 +154,11 @@ ToolTip, a status badge, a copy button, ProgressBar, an empty state and
 selection cards, and an always-on-top pop-out window with its own title
 bar). They live in `etd-ui`'s `views::controls`, `views::menus`,
 `views::dialogs`, `views::navigation`, `views::layout`, `views::motion`,
-`views::feedback`, `views::progress` and `views::popout` and take their values
+`views::feedback`, `views::progress` and `views::popout`, plus WinUI
+Gallery's Motion pages (page, theme and implicit transitions, connected
+animation, ParallaxView, Composition and easing functions) in
+`views::page_transition`, `views::theme_transition`, `views::connected` and
+`views::easing`, and take their values
 from the WinUI theme resources and the Windows Community Toolkit
 SettingsControls. Each is a Tab stop with the WinUI focus visual; open
 flyouts take Up, Down and Escape and give focus back when they close.

@@ -30,10 +30,10 @@ pub enum SessionRefusal {
 }
 
 impl SessionRefusal {
-    pub const EXIT_SERVICE_INSTALLED: u8 = 3;
-    pub const EXIT_NOT_CONFORMING: u8 = 4;
-    pub const EXIT_OTHER_USERS_LEFTOVERS: u8 = 5;
-    pub const EXIT_ENDPOINT_UNAVAILABLE: u8 = 6;
+    pub const EXIT_SERVICE_INSTALLED: u8 = etd_ipc::session_exit::SERVICE_INSTALLED;
+    pub const EXIT_NOT_CONFORMING: u8 = etd_ipc::session_exit::NOT_CONFORMING;
+    pub const EXIT_OTHER_USERS_LEFTOVERS: u8 = etd_ipc::session_exit::OTHER_USERS_LEFTOVERS;
+    pub const EXIT_ENDPOINT_UNAVAILABLE: u8 = etd_ipc::session_exit::ENDPOINT_UNAVAILABLE;
 
     pub fn exit_code(&self) -> u8 {
         match self {
@@ -87,7 +87,7 @@ impl std::error::Error for SessionRefusal {}
 /// `\\.\pipe\easytier-desk-session-<SID>`.
 #[cfg(windows)]
 pub(super) fn endpoint_name(sid: &str) -> String {
-    format!(r"\\.\pipe\easytier-desk-session-{sid}")
+    etd_ipc::session_pipe_name(sid)
 }
 
 fn refusal(error: std::io::Error) -> anyhow::Error {

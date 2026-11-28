@@ -34,9 +34,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-const EXIT_SERVICE_INSTALLED: i32 = 3;
-const EXIT_NOT_CONFORMING: i32 = 4;
-const EXIT_OTHER_USERS_LEFTOVERS: i32 = 5;
+const EXIT_SERVICE_INSTALLED: i32 = etd_ipc::session_exit::SERVICE_INSTALLED as i32;
+const EXIT_NOT_CONFORMING: i32 = etd_ipc::session_exit::NOT_CONFORMING as i32;
+const EXIT_OTHER_USERS_LEFTOVERS: i32 = etd_ipc::session_exit::OTHER_USERS_LEFTOVERS as i32;
 /// Not a real account: a second user's session root made by the test.
 const OTHER_SID: &str = "S-1-5-21-1000-2000-3000-1999";
 const STRAY_SID: &str = "S-1-5-21-1000-2000-3000-1998";

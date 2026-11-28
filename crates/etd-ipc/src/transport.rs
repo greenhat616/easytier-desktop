@@ -16,6 +16,26 @@ pub const SERVICE_SOCKET_PATH: &str = "/Library/Application Support/easytier-des
 /// through a named ACL entry; the socket itself stays mode 0600, owned by root.
 pub const SERVICE_SOCKET_GROUP: &str = "easytier-desk";
 
+/// Windows named pipe of a user's elevated session host
+/// (`\\.\pipe\easytier-desk-session-<SID>`).
+pub fn session_pipe_name(sid: &str) -> String {
+    format!(r"\\.\pipe\easytier-desk-session-{sid}")
+}
+
+/// Exit codes of `etd-host run|reclaim --mode elevated-session` when it
+/// refuses to serve. The host exits with them and the UI maps them to its
+/// messages; this is their one definition.
+pub mod session_exit {
+    /// The system service is registered, or its state directory is left.
+    pub const SERVICE_INSTALLED: u8 = 3;
+    /// A protected session directory exists but does not conform.
+    pub const NOT_CONFORMING: u8 = 4;
+    /// Other users' session ledgers still hold open records.
+    pub const OTHER_USERS_LEFTOVERS: u8 = 5;
+    /// The session pipe name is taken by another process.
+    pub const ENDPOINT_UNAVAILABLE: u8 = 6;
+}
+
 /// Which host owns a listener and its singleton lock. Independent of the
 /// endpoint name and of the access list used for an individual connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

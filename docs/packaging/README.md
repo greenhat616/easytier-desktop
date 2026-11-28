@@ -26,6 +26,13 @@ verifies against its embedded `cores.lock`; the service never runs them from the
 unknown-publisher warning), with a fixed UpgradeCode for major upgrades and a Start menu
 shortcut to `etd-ui.exe`.
 
+The Windows binaries link the C runtime statically (`.cargo/config.toml` sets
+`target-feature=+crt-static` for `x86_64-pc-windows-msvc`), so neither the MSI nor the
+portable layout needs the VC++ Redistributable. The bundled `easytier-core.exe` imports
+only system DLLs (its `msvcrt.dll` is the Windows one). The release workflow refuses a
+binary that imports the VC++ runtime or the UCRT and starts the payload in a Server Core
+container that has no runtime.
+
 ### Building
 
 ```powershell
@@ -309,8 +316,9 @@ cache:
 
 | Job | Runner | What |
 | --- | --- | --- |
-| `package-windows` | windows-latest | release binaries, WiX 7.0.1, `cargo xtask dist` → the MSI; its administrative image (`msiexec /a`) must carry no CI test-fixtures marker |
+| `package-windows` | windows-latest | release binaries, WiX 7.0.1, `cargo xtask dist` → the MSI; in its administrative image (`msiexec /a`) no file may carry the CI test-fixtures marker and no `.exe` or `.dll` may import the VC++ runtime or the UCRT (`.github/scripts/check-pe-imports.py`) |
 | `package-linux` | **ubuntu-22.04** | release binaries, nfpm 2.49.0 (SHA-256 checked) → deb, rpm and Arch; the C library floor must be 2.35 or older, and the extracted deb, rpm and Arch contents must carry no CI test-fixtures marker |
+| `smoke-windows-clean` | windows-2022, Server Core ltsc2022 container (by digest) | `.github/scripts/clean-windows-check.ps1`: in an image without the VC++ runtime (checked), `etd-host`, `etd-ctl` and `easytier-core` run `--version` and `etd-ui` gets past the loader |
 | `smoke-windows` | windows-latest | `tests/tier3/release.py msi_release`: install, upgrade, uninstall, machine compared with before |
 | `smoke-linux` | ubuntu-22.04 | `release.py deb_release`: the same with apt, on the oldest supported Ubuntu |
 | `smoke-rpm` | Fedora 43 container | `.github/scripts/rpm-smoke.sh`: scriptlets parse, root-owned files and modes, upgrade, and erasing leaves the file system as before the install (empty folders included); no systemd, so the hooks only print their notice |

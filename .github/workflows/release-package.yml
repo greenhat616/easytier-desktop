@@ -135,7 +135,7 @@ jobs:
         run: |
           echo "release signing is not implemented yet (issue #2)"
           exit 1
-      - name: Check the MSI carries no CI test fixtures
+      - name: Check the MSI carries no CI test fixtures and no dynamic C runtime
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -147,6 +147,9 @@ jobs:
           $python = mise which python
           & $python -I $env:FIXTURE_CHECK $extract
           if ($LASTEXITCODE -ne 0) { throw 'the MSI carries the CI test-fixtures marker' }
+          # Every .exe and .dll: no VC++ runtime or UCRT import (crt-static).
+          & $python -I .github/scripts/check-pe-imports.py $extract
+          if ($LASTEXITCODE -ne 0) { throw 'a shipped binary imports a C runtime the MSI does not ship' }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-windows
@@ -247,6 +250,43 @@ jobs:
             ${{ runner.temp }}/next/x86_64-unknown-linux-gnu/*.rpm
             ${{ runner.temp }}/next/x86_64-unknown-linux-gnu/*.pkg.tar.zst
           if-no-files-found: error
+
+  # The release payload on a Windows without the VC++ runtime: Server Core
+  # ltsc2022 (pinned by digest) in a process-isolated container on a
+  # Windows Server 2022 runner.
+  smoke-windows-clean:
+    needs: [version, package-windows]
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-windows
+          path: ${{ runner.temp }}/release
+      - name: Start every shipped binary without the VC++ runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $msi = Join-Path $env:RUNNER_TEMP "release/easytier-desktop-$env:VERSION-x86_64.msi"
+          $extract = Join-Path $env:RUNNER_TEMP 'payload'
+          $process = Start-Process msiexec.exe -ArgumentList '/a', "`"$msi`"", '/qn', "TARGETDIR=`"$extract`"" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "msiexec /a exited $($process.ExitCode)" }
+          $payload = (Get-ChildItem -LiteralPath $extract -Recurse -Filter etd-host.exe | Select-Object -First 1).DirectoryName
+          # etd-ui's imports, read here (the container has no Python).
+          $checks = Join-Path $env:RUNNER_TEMP 'checks'
+          New-Item -ItemType Directory -Force $checks | Out-Null
+          python -I .github/scripts/check-pe-imports.py --names (Join-Path $payload 'etd-ui.exe') |
+            Set-Content -LiteralPath (Join-Path $checks 'etd-ui.imports') -Encoding ascii
+          docker run --rm --isolation process -v "${payload}:C:\etd:ro" -v "${checks}:C:\checks:ro" `
+            -v "$env:GITHUB_WORKSPACE\.github\scripts:C:\scripts:ro" `
+            mcr.microsoft.com/windows/servercore@sha256:f1a914079973258061ddbc95a9af579eab2ee252a6fddb254b1be5d769761acd `
+            powershell -NoProfile -ExecutionPolicy Bypass -File C:\scripts\clean-windows-check.ps1 -Payload C:\etd -UiImports C:\checks\etd-ui.imports
 
   smoke-windows:
     needs: [version, package-windows]
@@ -403,7 +443,7 @@ jobs:
   # Read-only: gather the four release packages and their checksums. A
   # dispatch stops here with an artifact; nothing gets write permission.
   checksums:
-    needs: [version, package-windows, package-linux, smoke-windows, smoke-linux, smoke-rpm, smoke-arch]
+    needs: [version, package-windows, package-linux, smoke-windows, smoke-windows-clean, smoke-linux, smoke-rpm, smoke-arch]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:

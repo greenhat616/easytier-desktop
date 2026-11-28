@@ -201,7 +201,12 @@ pub fn menu_content(
                 .line_height(px(20.))
                 .text_color(ink)
                 .child(lead)
-                .child(div().flex_1().min_w_0().child(item.label.clone()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(crate::views::pseudo::t(item.label.clone())),
+                )
                 .children(item.accelerator.map(|a| {
                     div()
                         .ms(px(24.), cx)

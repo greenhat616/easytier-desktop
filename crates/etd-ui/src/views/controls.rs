@@ -45,7 +45,7 @@ fn body(text: impl Into<SharedString>) -> gpui_kit::Div {
     div()
         .text_size(px(14.))
         .line_height(px(20.))
-        .child(text.into())
+        .child(crate::views::pseudo::t(text))
 }
 
 /// CaptionTextBlockStyle 12/16 in `TextFillColorSecondary`.
@@ -54,7 +54,7 @@ fn caption(text: impl Into<SharedString>, cx: &App) -> gpui_kit::Div {
         .text_size(px(12.))
         .line_height(px(16.))
         .text_color(theme::text_secondary(cx))
-        .child(text.into())
+        .child(crate::views::pseudo::t(text))
 }
 
 /// Header icon, title and description shared by SettingsCard and the

@@ -25,12 +25,14 @@ use crate::views::{
         split_button, toggle_button,
     },
     dialogs::{DialogButtons, DialogResult, content_dialog, flyout_panel, teaching_tip},
+    feedback::{Status, TOOLTIP_SHOW_DELAY, copy_button, fluent_tooltip, status_badge},
     layout::{expander, scroll_viewer},
     menus::{BarCommand, MenuCheck, MenuEntry, MenuHandler, MenuItem, command_bar, menu_flyout},
     navigation::{
         IndexHandler, Tab, breadcrumb_bar, nav_selection_indicator, nav_view_item, selector_bar,
         tab_view,
     },
+    progress::{CardChoice, ProgressState, empty_state, progress_bar, selection_cards},
     ui::{BtnStyle, action_button, settings_switch},
 };
 
@@ -81,6 +83,9 @@ pub(super) struct DemoState {
     tab_selected: usize,
     next_tab: usize,
     layout_open: [bool; 2],
+    mode_choice: usize,
+    /// The room pop-out, while it is open; one at a time.
+    pub(super) popout: Option<gpui_kit::AnyWindowHandle>,
     stack_horizontal: bool,
     stack_spacing: Entity<SliderState>,
     grid_columns: Entity<SliderState>,
@@ -141,6 +146,8 @@ impl DemoState {
             tab_selected: 0,
             next_tab: 3,
             layout_open: [true, false],
+            mode_choice: 0,
+            popout: None,
             stack_horizontal: false,
             stack_spacing,
             grid_columns,
@@ -162,6 +169,9 @@ impl Gallery {
     }
     pub(super) fn demo_dialog_result(&self) -> SharedString {
         self.demo.dialog_result.clone()
+    }
+    pub(super) fn demo_mode(&self) -> usize {
+        self.demo.mode_choice
     }
     pub(super) fn demo_layout(&self) -> [bool; 2] {
         self.demo.layout_open
@@ -1472,4 +1482,443 @@ pub(super) fn layout_page(
         section("Grid", [grid_row], cx),
         section("ScrollViewer", [scroller], cx),
     ]
+}
+
+#[inline(never)]
+pub(super) fn feedback_page(view: &Gallery, cx: &mut Context<Gallery>) -> Vec<AnyElement> {
+    use gpui_kit::{StatefulInteractiveElement as _, component::Sizable as _};
+    let fg = cx.theme().foreground;
+    let badges = div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .gap(px(8.))
+        .child(status_badge(
+            "badge-success",
+            Status::Success,
+            "18 ms · Direct",
+            cx,
+        ))
+        .child(status_badge(
+            "badge-caution",
+            Status::Caution,
+            "Relayed",
+            cx,
+        ))
+        .child(status_badge(
+            "badge-critical",
+            Status::Critical,
+            "Offline",
+            cx,
+        ))
+        .child(status_badge(
+            "badge-info",
+            Status::Informational,
+            "Connecting",
+            cx,
+        ))
+        .child(status_badge(
+            "badge-neutral",
+            Status::Neutral,
+            "Stopped",
+            cx,
+        ))
+        .into_any_element();
+    // A badge in a narrow column truncates and shows its text in a tooltip.
+    let narrow = div()
+        .w(px(140.))
+        .flex()
+        .child(status_badge(
+            "badge-long",
+            Status::Success,
+            "42 ms · Direct via relay-eu-west-1",
+            cx,
+        ))
+        .into_any_element();
+
+    let ip_row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(4.))
+        .child(
+            div()
+                .text_size(px(14.))
+                .line_height(px(20.))
+                .text_color(fg)
+                .child("10.144.144.3"),
+        )
+        .child(copy_button(
+            "copy-ip",
+            "Copy IP address",
+            "Copied",
+            "10.144.144.3",
+        ))
+        .into_any_element();
+
+    let hint = div()
+        .id("tooltip-target")
+        .test_support()
+        .tooltip(fluent_tooltip(
+            "Peers exchange traffic directly when they can, and through a relay when they cannot.",
+        ))
+        .tooltip_show_delay(TOOLTIP_SHOW_DELAY)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(4.))
+        .text_size(px(14.))
+        .line_height(px(20.))
+        .text_color(fg)
+        .child("Connection type")
+        .child(
+            gpui_kit::component::Icon::default()
+                .path("fluent/info.svg")
+                .with_size(gpui_kit::component::Size::Size(px(16.)))
+                .text_color(crate::theme::text_secondary(cx)),
+        )
+        .into_any_element();
+
+    let caption = |text: &'static str, cx: &Context<Gallery>| {
+        div()
+            .text_size(px(12.))
+            .line_height(px(16.))
+            .text_color(crate::theme::text_secondary(cx))
+            .child(crate::views::pseudo::t(text))
+            .into_any_element()
+    };
+    let bars = div()
+        .w(px(360.))
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .child(caption("Creating virtual adapter (step 1 of 2)", cx))
+        .child(progress_bar(
+            "progress-determinate",
+            "Creating virtual adapter",
+            Some(0.4),
+            ProgressState::Running,
+            cx,
+        ))
+        .child(caption("Connecting", cx))
+        .child(progress_bar(
+            "progress-indeterminate",
+            "Connecting",
+            None,
+            ProgressState::Running,
+            cx,
+        ))
+        .child(caption("Paused", cx))
+        .child(progress_bar(
+            "progress-paused",
+            "Paused",
+            Some(0.6),
+            ProgressState::Paused,
+            cx,
+        ))
+        .child(caption("Failed", cx))
+        .child(progress_bar(
+            "progress-error",
+            "Failed",
+            Some(0.8),
+            ProgressState::Error,
+            cx,
+        ))
+        .into_any_element();
+
+    let empty = empty_state(
+        "empty-networks",
+        "fluent/globe.svg",
+        "No networks yet",
+        "Create a network or join one with a share link.",
+        Some(action_button(
+            "empty-create",
+            "Create network",
+            BtnStyle::new(ButtonVariant::Primary, Size::Medium),
+            cx.listener(|this, _: &gpui_kit::ClickEvent, _, cx| {
+                this.demo.last = "Create network".into();
+                cx.notify();
+            }),
+        )),
+        cx,
+    );
+
+    let popout = div()
+        .flex()
+        .flex_col()
+        .items_start()
+        .gap(px(8.))
+        .child(
+            div()
+                .text_size(px(14.))
+                .line_height(px(20.))
+                .text_color(fg)
+                .child(crate::views::pseudo::t(
+                    "Keeps one room's status above other windows, even while the main window is hidden.",
+                )),
+        )
+        .child(action_button(
+            "popout-open",
+            "Pop out",
+            BtnStyle::new(ButtonVariant::Default, Size::Medium),
+            cx.listener(|this, _: &gpui_kit::ClickEvent, _, cx| this.open_popout(cx)),
+        ))
+        .into_any_element();
+
+    let cards = selection_cards(
+        "mode-cards",
+        "How do you want to use EasyTier?",
+        &[
+            CardChoice {
+                icon: "fluent/people-community.svg",
+                title: "Simple",
+                description: "Join or create a room with friends. Settings stay out of the way.",
+            },
+            CardChoice {
+                icon: "fluent/developer-board.svg",
+                title: "Professional",
+                description: "Manage several networks, peers, routes and access rules.",
+            },
+        ],
+        view.demo.mode_choice,
+        {
+            let view = cx.entity().downgrade();
+            Rc::new(move |ix, _, cx| {
+                view.update(cx, |this, cx| {
+                    this.demo.mode_choice = ix;
+                    cx.notify();
+                })
+                .ok();
+            })
+        },
+        cx,
+    );
+
+    vec![
+        section("Status badge", [badges, narrow], cx),
+        section("Copy button", [ip_row], cx),
+        section("ToolTip", [hint], cx),
+        section("ProgressBar", [bars], cx),
+        section("Empty state", [empty], cx),
+        section("Selection cards", [cards], cx),
+        section("Pop-out window", [popout], cx),
+    ]
+}
+
+/// The room status pop-out (doc#23 S3): an always-on-top, resizable window
+/// with its own title bar, the room's address, and a scrolling peer list.
+pub(super) struct RoomPopOut;
+
+/// Demo peers: name, virtual address, status, latency text.
+const PEERS: [(&str, &str, Status, &str); 9] = [
+    (
+        "alice-desktop",
+        "10.144.144.4",
+        Status::Success,
+        "12 ms · Direct",
+    ),
+    (
+        "bob-laptop",
+        "10.144.144.5",
+        Status::Success,
+        "18 ms · Direct",
+    ),
+    (
+        "carol-nas",
+        "10.144.144.6",
+        Status::Caution,
+        "64 ms · Relayed",
+    ),
+    (
+        "dave-steamdeck",
+        "10.144.144.7",
+        Status::Success,
+        "23 ms · Direct",
+    ),
+    (
+        "erin-phone",
+        "10.144.144.8",
+        Status::Caution,
+        "97 ms · Relayed",
+    ),
+    (
+        "frank-server-in-the-basement",
+        "10.144.144.9",
+        Status::Success,
+        "5 ms · Direct",
+    ),
+    (
+        "grace-tablet",
+        "10.144.144.10",
+        Status::Informational,
+        "Connecting",
+    ),
+    ("heidi-pc", "10.144.144.11", Status::Critical, "Offline"),
+    (
+        "ivan-mini",
+        "10.144.144.12",
+        Status::Success,
+        "31 ms · Direct",
+    ),
+];
+
+impl gpui_kit::Render for RoomPopOut {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::views::popout;
+        let fg = cx.theme().foreground;
+        let secondary = crate::theme::text_secondary(cx);
+        let header = div()
+            .flex_shrink_0()
+            .px(px(16.))
+            .pb(px(12.))
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(20.))
+                            .line_height(px(28.))
+                            .font_semibold()
+                            .child(crate::views::pseudo::t("Weekend LAN")),
+                    )
+                    .child(status_badge(
+                        "popout-badge",
+                        Status::Success,
+                        "Connected",
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .line_height(px(20.))
+                            .text_color(secondary)
+                            .child("10.144.144.3"),
+                    )
+                    .child(copy_button(
+                        "popout-copy",
+                        "Copy IP address",
+                        "Copied",
+                        "10.144.144.3",
+                    )),
+            );
+        let mut rows = div().flex().flex_col().pb(px(4.));
+        for (ix, (name, ip, status, latency)) in PEERS.into_iter().enumerate() {
+            let row = div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(12.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(14.))
+                                .line_height(px(20.))
+                                .child(crate::views::pseudo::t(name)),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(12.))
+                                .line_height(px(16.))
+                                .text_color(secondary)
+                                .child(ip),
+                        ),
+                )
+                .child(div().flex_shrink_0().max_w(px(160.)).child(status_badge(
+                    SharedString::from(format!("popout-peer-{ix}-badge")),
+                    status,
+                    latency,
+                    cx,
+                )))
+                .into_any_element();
+            rows = rows.child(popout::list_view_item(
+                SharedString::from(format!("popout-peer-{ix}")),
+                format!("{name}, {ip}, {latency}"),
+                row,
+                cx,
+            ));
+        }
+        div()
+            .id("popout-root")
+            .test_support()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(popout::surface(cx))
+            .text_color(fg)
+            .child(popout::title_bar(
+                "popout-title",
+                "fluent/people-community.svg",
+                "Weekend LAN",
+                "Close",
+                Rc::new(|_, window, _| window.remove_window()),
+                window,
+                cx,
+            ))
+            .child(header)
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .px(px(16.))
+                    .pb(px(4.))
+                    .text_size(px(14.))
+                    .line_height(px(20.))
+                    .font_semibold()
+                    .child(crate::views::pseudo::t("Peers")),
+            )
+            .child(crate::views::layout::scroll_viewer_fill(
+                "popout-peers",
+                rows.into_any_element(),
+                window,
+                cx,
+            ))
+    }
+}
+
+impl Gallery {
+    /// Opens the room pop-out, or brings the open one forward: one per room.
+    pub(super) fn open_popout(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.demo.popout
+            && handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+        {
+            return;
+        }
+        let options = crate::views::popout::window_options(
+            "Weekend LAN",
+            px(420.),
+            px(520.),
+            gpui_kit::size(px(320.), px(240.)),
+            cx,
+        );
+        self.demo.popout = gpui_kit::open_window(options, cx, |window, cx| {
+            crate::views::popout::pin(window);
+            cx.new(|_| RoomPopOut)
+        })
+        .ok()
+        .map(|(handle, _)| handle);
+    }
 }

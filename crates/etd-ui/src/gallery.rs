@@ -77,6 +77,7 @@ enum Page {
     Dialogs,
     Navigation,
     Layout,
+    Feedback,
 }
 
 struct Gallery {
@@ -88,6 +89,7 @@ struct Gallery {
     collapsed: bool,
     closed: [bool; 4],
     clicks: usize,
+    pseudo: bool,
 }
 
 impl Gallery {
@@ -110,6 +112,7 @@ impl Gallery {
             collapsed: false,
             closed: [false; 4],
             clicks: 0,
+            pseudo: false,
         }
     }
 }
@@ -217,6 +220,14 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
         "fluent/grid.svg",
         cx,
     );
+    let feedback = nav(
+        Page::Feedback,
+        "gallery-nav-feedback",
+        "Status & info",
+        "fluent/info.svg",
+        "fluent/info.svg",
+        cx,
+    );
     let mut sidebar = Sidebar::new("gallery-sidebar")
         .w(px(220.))
         .h_full()
@@ -230,6 +241,7 @@ fn gallery_sidebar(view: &Gallery, cx: &mut Context<Gallery>) -> AnyElement {
         .child(dialogs)
         .child(navigation)
         .child(layout)
+        .child(feedback)
         .child(settings);
     if !view.collapsed {
         sidebar = sidebar.footer(div().w_full().child(theme_menu(cx)));
@@ -247,7 +259,12 @@ fn section(
         .flex()
         .flex_col()
         .gap_3()
-        .child(div().font_semibold().text_size(px(20.)).child(title))
+        .child(
+            div()
+                .font_semibold()
+                .text_size(px(20.))
+                .child(crate::views::pseudo::t(title)),
+        )
         .child(
             div()
                 .flex()
@@ -308,7 +325,12 @@ fn gallery_buttons(cx: &mut Context<Gallery>) -> AnyElement {
                 .items_start()
                 .flex_1()
                 .gap_2()
-                .child(div().text_sm().font_semibold().child(label))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .child(crate::views::pseudo::t(label)),
+                )
                 .children(cells)
                 .into_any_element(),
         );
@@ -580,6 +602,7 @@ impl Render for Gallery {
             Page::Dialogs => ("Dialogs & flyouts", pages::dialogs_page(self, cx)),
             Page::Navigation => ("Navigation", pages::navigation_page(self, cx)),
             Page::Layout => ("Layout", pages::layout_page(self, window, cx)),
+            Page::Feedback => ("Status & info", pages::feedback_page(self, cx)),
         };
         div()
             .id("gallery-root")
@@ -604,12 +627,36 @@ impl Render for Gallery {
                             .items_center()
                             .justify_between()
                             .px(px(24.))
-                            .child(div().font_semibold().text_size(px(24.)).child(title))
                             .child(
                                 div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!("Local actions: {}", self.clicks)),
+                                    .font_semibold()
+                                    .text_size(px(24.))
+                                    .child(crate::views::pseudo::t(title)),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(24.))
+                                    // Doc#24's +40 % pseudo-locale check.
+                                    .child(crate::views::ui::fluent_switch(
+                                        "gallery-pseudo",
+                                        "Pseudo-locale",
+                                        self.pseudo,
+                                        false,
+                                        cx.listener(|this, on: &bool, _, cx| {
+                                            this.pseudo = *on;
+                                            crate::views::pseudo::set(*on);
+                                            cx.notify();
+                                        }),
+                                    ))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!("Local actions: {}", self.clicks)),
+                                    ),
                             ),
                     )
                     .child(
@@ -639,6 +686,170 @@ impl Render for Gallery {
 mod tests {
     use super::*;
     use gpui_kit::{TestAppContext, test::TestWindowExt as _};
+
+    /// "Pop out" opens one always-on-top, resizable room window with its
+    /// own title bar and a scrolling peer list; a second press brings the same one forward, and its close
+    /// button closes it.
+    #[gpui_kit::test]
+    fn gallery_pops_out_one_room_window(cx: &mut TestAppContext) {
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            theme::install_palette(cx);
+            cx.set_reduce_motion(true);
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Default::default(),
+                        size: size(px(1440.), px(1300.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| Gallery::new(window, cx)),
+            )
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("gallery-nav-feedback", cx);
+            window.render_frame(cx);
+            window.click("popout-open", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let popout = view
+            .read_with(cx, |g, _| g.demo.popout)
+            .expect("pop-out opened");
+        assert_eq!(cx.windows().len(), 2);
+        cx.update_window(popout, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("popout-title").bounds().size.height, px(32.));
+            assert_eq!(
+                window.find("popout-title-close").bounds().size.width,
+                px(46.)
+            );
+            assert_eq!(window.find("popout-title-close").label(), Some("Close"));
+            assert!(window.find("popout-badge").visible());
+            // S3's peer list: 40 px rows inset 4,2 that scroll in the space
+            // left under the header.
+            let row = window.find("popout-peer-0").bounds();
+            assert!(row.size.height >= px(40.));
+            let list = window.find("popout-peers").bounds();
+            let last = window.find("popout-peer-8").bounds();
+            assert!(last.bottom() > list.bottom(), "nine peers overflow 520 px");
+            window.scroll(
+                "popout-peers-area",
+                gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-400.))),
+                cx,
+            );
+            window.render_frame(cx);
+            assert!(window.find("popout-peer-8").bounds().bottom() <= list.bottom() + px(1.));
+        })
+        .unwrap();
+        // A second press brings the same window forward.
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("popout-open", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(cx.windows().len(), 2);
+        assert_eq!(view.read_with(cx, |g, _| g.demo.popout), Some(popout));
+        cx.update_window(popout, |_, window, cx| {
+            window.click("popout-title-close", cx)
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(cx.windows().len(), 1);
+        // With it closed, "Pop out" opens a new one.
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("popout-open", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(cx.windows().len(), 2);
+    }
+
+    /// The copy button writes to the clipboard and says "Copied" for two
+    /// seconds, also from the keyboard; a status badge is 20 px tall and
+    /// a narrow one truncates.
+    #[gpui_kit::test]
+    fn gallery_feedback_controls(cx: &mut TestAppContext) {
+        use std::time::Duration;
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            theme::install_palette(cx);
+            cx.set_reduce_motion(true);
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Default::default(),
+                        size: size(px(1440.), px(1300.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| Gallery::new(window, cx)),
+            )
+            .unwrap()
+        });
+        let step = |cx: &mut TestAppContext, ms: u64| {
+            cx.executor().advance_clock(Duration::from_millis(ms));
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        };
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("gallery-nav-feedback", cx);
+            window.render_frame(cx);
+            let badge = window.find("badge-success").bounds();
+            assert_eq!(badge.size.height, px(20.));
+            let narrow = window.find("badge-long").bounds();
+            assert!(narrow.size.width <= px(140.));
+            assert_eq!(window.find("copy-ip").label(), Some("Copy IP address"));
+            window.click("copy-ip", cx);
+            window.render_frame(cx);
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+                Some("10.144.144.3")
+            );
+            assert!(window.find("copy-ip-copied").visible());
+            assert_eq!(window.find("copy-ip").label(), Some("Copied"));
+            // The note sits under the button, not over it.
+            assert!(
+                window.find("copy-ip-copied").bounds().top()
+                    >= window.find("copy-ip").bounds().bottom()
+            );
+        })
+        .unwrap();
+        step(cx, 2100);
+        cx.update_window(handle, |_, window, cx| {
+            assert!(window.try_find("copy-ip-copied").is_none());
+            // Enter on the focused button copies again.
+            window.press("enter", cx);
+            window.render_frame(cx);
+            assert!(window.find("copy-ip-copied").visible());
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            // ProgressBar: 3 px tall; 40 % determinate.
+            let bar = window.find("progress-determinate").bounds();
+            assert_eq!(bar.size.height, px(3.));
+            // Selection cards: one Tab stop; arrows and clicks choose.
+            assert_eq!(view.read(cx).demo_mode(), 0);
+            window.click("mode-cards-1", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_mode(), 1);
+            assert_eq!(window.find("mode-cards-1").selected(), Some(true));
+            window.press("left", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).demo_mode(), 0);
+            assert!(window.find("empty-networks").visible());
+        })
+        .unwrap();
+    }
 
     /// With motion allowed, popups and expanders linger for WinUI's exit
     /// timings: a MenuFlyout fades for 83 ms, a ContentDialog for 83 ms and
@@ -1402,6 +1613,42 @@ mod tests {
                 .unwrap()
                 .save(output.join(format!("gallery-layout-{name}.png")))
                 .unwrap();
+            // Status & info page, with the copy confirmation showing.
+            cx.update_window(handle, |_, window, cx| {
+                window.click("gallery-nav-feedback", cx);
+                window.render_frame(cx);
+                window.click("copy-ip", cx);
+                window.render_frame(cx);
+                assert!(window.find("copy-ip-copied").visible());
+                window.click("mode-cards-1", cx);
+                window.render_frame(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(format!("gallery-feedback-{name}.png")))
+                .unwrap();
+            // The room pop-out window on its own.
+            cx.update_window(handle, |_, window, cx| window.click("popout-open", cx))
+                .unwrap();
+            cx.run_until_parked();
+            let popout = cx
+                .update(|cx| cx.windows())
+                .into_iter()
+                .find(|w| *w != handle)
+                .expect("pop-out opened");
+            cx.update_window(popout, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+            cx.capture_screenshot(popout)
+                .unwrap()
+                .save(output.join(format!("gallery-popout-{name}.png")))
+                .unwrap();
+            cx.update_window(popout, |_, window, cx| {
+                window.click("popout-title-close", cx)
+            })
+            .unwrap();
+            cx.run_until_parked();
             // Navigation page.
             cx.update_window(handle, |_, window, cx| {
                 window.click("gallery-nav-navigation", cx);
@@ -1418,6 +1665,43 @@ mod tests {
                 .unwrap()
                 .save(output.join(format!("gallery-navigation-{name}.png")))
                 .unwrap();
+
+            // Doc#24's pseudo-locale check: every page once with labels
+            // 40 % longer, in the light theme.
+            if name != "light" {
+                continue;
+            }
+            cx.update_window(handle, |_, window, cx| {
+                window.click("gallery-pseudo", cx);
+                window.render_frame(cx);
+            })
+            .unwrap();
+            for page in [
+                "controls",
+                "basic-input",
+                "menus",
+                "dialogs",
+                "navigation",
+                "layout",
+                "feedback",
+                "settings",
+            ] {
+                cx.update_window(handle, |_, window, cx| {
+                    window.click(SharedString::from(format!("gallery-nav-{page}")), cx);
+                    window.render_frame(cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.capture_screenshot(handle)
+                    .unwrap()
+                    .save(output.join(format!("gallery-pseudo-{page}.png")))
+                    .unwrap();
+            }
+            cx.update_window(handle, |_, window, cx| {
+                window.click("gallery-pseudo", cx);
+                window.render_frame(cx);
+            })
+            .unwrap();
         }
     }
 }

@@ -21,9 +21,12 @@ use ::windows::{
             SystemInformation::OSVERSIONINFOW,
         },
         UI::WindowsAndMessaging::{
-            GWLP_HINSTANCE, GetSystemMetrics, GetWindowLongPtrW, GetWindowThreadProcessId,
-            ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_SHARED, LoadImageW, SM_CXICON, SM_CXSMICON,
-            SM_CYICON, SM_CYSMICON, SendMessageW, WM_SETICON,
+            GWL_EXSTYLE, GWLP_HINSTANCE, GetSystemMetrics, GetWindowLongPtrW,
+            GetWindowThreadProcessId, HWND_TOPMOST, ICON_BIG, ICON_SMALL, IMAGE_ICON,
+            IsWindowVisible, LR_SHARED, LoadImageW, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON,
+            SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            SendMessageW, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_SETICON, WS_EX_APPWINDOW,
+            WS_EX_TOOLWINDOW,
         },
     },
     core::{BOOL, IInspectable, PCWSTR, w},
@@ -270,9 +273,109 @@ pub fn set_window_icon_from_resource(hwnd: NonZeroIsize, resource_id: u16) -> bo
     applied
 }
 
+/// Keeps an application-owned window above other windows and out of the
+/// taskbar and Alt+Tab: WS_EX_TOPMOST through `SetWindowPos(HWND_TOPMOST)`,
+/// and WS_EX_TOOLWINDOW in place of WS_EX_APPWINDOW. The shell only reads
+/// the taskbar style when a window is shown, so a visible window is hidden
+/// and shown again around the change. Only HWNDs owned by the current
+/// process are accepted.
+pub fn pin_window_on_top(hwnd: NonZeroIsize) -> bool {
+    let hwnd = HWND(hwnd.get() as *mut c_void);
+    let mut owner = 0;
+    // SAFETY: HWND is borrowed from the UI; owner is a valid output buffer.
+    if unsafe { GetWindowThreadProcessId(hwnd, Some(&mut owner)) } == 0
+        || owner != std::process::id()
+    {
+        return false;
+    }
+    // SAFETY: `hwnd` is verified to belong to the current process; these
+    // calls only change its own styles, z-order and visibility.
+    unsafe {
+        let visible = IsWindowVisible(hwnd).as_bool();
+        if visible {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let style = (style | WS_EX_TOOLWINDOW.0 as isize) & !(WS_EX_APPWINDOW.0 as isize);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style);
+        let pinned = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        )
+        .is_ok();
+        if visible {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        pinned
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinning_refuses_a_window_of_another_process() {
+        use ::windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow;
+        // SAFETY: GetDesktopWindow only returns a handle; nothing is changed.
+        let desktop = unsafe { GetDesktopWindow() };
+        let hwnd = NonZeroIsize::new(desktop.0 as isize).expect("desktop window");
+        assert!(!pin_window_on_top(hwnd));
+    }
+
+    /// Creates a real top-level window, so it runs in Windows CI only
+    /// (ci.yml), never on a developer's desktop.
+    #[test]
+    #[ignore = "creates a real Win32 window; Windows CI only"]
+    fn pinning_makes_a_window_topmost_and_a_tool_window() {
+        use ::windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
+        };
+        // SAFETY: a plain window of the system STATIC class, owned by this
+        // thread and destroyed below.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_APPWINDOW,
+                w!("STATIC"),
+                w!("etd pin test"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                200,
+                120,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("create a test window");
+        // SAFETY: `hwnd` was created above and is still alive.
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        let style = || unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
+        assert_ne!(style() & WS_EX_APPWINDOW.0, 0);
+        assert_eq!(style() & WS_EX_TOPMOST.0, 0);
+
+        let pinned = pin_window_on_top(NonZeroIsize::new(hwnd.0 as isize).unwrap());
+        let after = style();
+        // SAFETY: `hwnd` was created above and is still alive.
+        let visible = unsafe { IsWindowVisible(hwnd).as_bool() };
+        // SAFETY: as above; the window is not used afterwards.
+        unsafe { DestroyWindow(hwnd) }.expect("destroy the test window");
+
+        assert!(pinned);
+        assert_ne!(after & WS_EX_TOOLWINDOW.0, 0, "tool window");
+        assert_eq!(after & WS_EX_APPWINDOW.0, 0, "app window cleared");
+        assert_ne!(after & WS_EX_TOPMOST.0, 0, "topmost");
+        assert!(visible, "shown again after the style change");
+    }
 
     #[test]
     fn parses_rgb_and_system_foreground() {

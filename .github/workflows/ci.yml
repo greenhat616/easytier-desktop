@@ -98,6 +98,10 @@ jobs:
         run: cargo xtask fetch-cores --target host --bundle "${{ runner.temp }}/etd-cores" --github-env ETD_EASYTIER_CORE
       - name: Real-kernel session
         run: cargo nextest run --locked --profile ci -p etd-core-easytier --test session_real --run-ignored only --success-output immediate
+      # Real Win32 windows: the pop-out's topmost/tool-window pinning.
+      - name: Window pinning
+        if: runner.os == 'Windows'
+        run: cargo nextest run --locked --profile ci -p etd-sysfx-os --lib --run-ignored only -E 'test(pinning_makes_a_window_topmost)' --success-output immediate
       - name: Doc tests
         run: cargo test --locked --workspace --doc
   privileged-install:

@@ -37,8 +37,8 @@ impl AppearanceSnapshot {
 
 #[cfg(windows)]
 pub use crate::windows::appearance::{
-    AppearanceWatch, mica_backdrop_accepted, query_taskbar_dark, query_tray_icon_px,
-    set_window_dark_mode, set_window_icon_from_resource,
+    AppearanceWatch, mica_backdrop_accepted, pin_window_on_top, query_taskbar_dark,
+    query_tray_icon_px, set_window_dark_mode, set_window_icon_from_resource,
 };
 
 #[cfg(not(windows))]
@@ -59,6 +59,12 @@ impl AppearanceWatch {
 /// Non-Windows has no Windows DWM material; the UI chooses an opaque fallback.
 #[cfg(not(windows))]
 pub fn mica_backdrop_accepted(_hwnd: NonZeroIsize) -> bool {
+    false
+}
+
+/// Non-Windows windows are kept on top by the toolkit's window kind.
+#[cfg(not(windows))]
+pub fn pin_window_on_top(_hwnd: NonZeroIsize) -> bool {
     false
 }
 

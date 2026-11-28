@@ -101,7 +101,12 @@ pub fn expander(
         .text_size(px(14.))
         .line_height(px(20.))
         .text_color(fg)
-        .child(div().flex_1().min_w_0().child(header))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(crate::views::pseudo::t(header)),
+        )
         .child(chevron);
     head = if expanded {
         head.rounded_t(px(4.))
@@ -158,6 +163,27 @@ pub fn scroll_viewer(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
+    scroll_viewer_in(id, Some(height), content, window, cx)
+}
+
+/// A [`scroll_viewer`] that fills the rest of a flex column instead of
+/// taking a fixed height, for content in a resizable window.
+pub fn scroll_viewer_fill(
+    id: &'static str,
+    content: AnyElement,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    scroll_viewer_in(id, None, content, window, cx)
+}
+
+fn scroll_viewer_in(
+    id: &'static str,
+    height: Option<f32>,
+    content: AnyElement,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
     let handle = window
         .use_keyed_state(
             SharedString::from(format!("{id}-fluent-scroll")),
@@ -169,11 +195,14 @@ pub fn scroll_viewer(
     let thumb = scroll_thumb(cx);
     let track = acrylic_in_app_fallback(cx);
     let transparent = gpui_kit::transparent_black();
-    div()
-        .id(id)
+    let outer = div().id(id);
+    let outer = match height {
+        Some(height) => outer.h(px(height)),
+        None => outer.flex_1().min_h_0(),
+    };
+    outer
         .test_support()
         .relative()
-        .h(px(height))
         .w_full()
         .child(
             div()

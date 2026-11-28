@@ -93,7 +93,13 @@ pub fn nav_view_item(
                 .justify_center()
                 .children(icon.map(|i| glyph(i, 16., fg))),
         )
-        .child(div().flex_1().min_w_0().ms(px(4.), cx).child(label));
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .ms(px(4.), cx)
+                .child(crate::views::pseudo::t(label)),
+        );
     if let Some(open) = expanded {
         item = item
             .aria_expanded(open)
@@ -222,7 +228,7 @@ pub fn breadcrumb_bar(
                     .aria_label(SharedString::from(*label))
                     .px(px(1.))
                     .py(px(3.))
-                    .child(*label),
+                    .child(crate::views::pseudo::t(*label)),
             );
             continue;
         }
@@ -238,7 +244,7 @@ pub fn breadcrumb_bar(
             .hover(move |s| s.text_color(hover))
             .active(move |s| s.text_color(pressed))
             .on_click(move |_, window, cx| on_click(ix, window, cx))
-            .child(*label);
+            .child(crate::views::pseudo::t(*label));
         bar = bar
             .child(keyboard_focus(item_id, move |focus| {
                 crumb.track_focus(focus).into_any_element()
@@ -298,7 +304,7 @@ pub fn selector_bar(
             .hover(move |s| s.text_color(hover))
             .active(move |s| s.text_color(pressed))
             .on_click(move |_, window, cx| on_select(ix, window, cx))
-            .child(*label)
+            .child(crate::views::pseudo::t(*label))
             .children(is_selected.then(|| {
                 div()
                     .absolute()
@@ -429,7 +435,13 @@ pub fn tab_view(
             .text_color(fg)
             .on_click(move |_, window, cx| on_select(ix, window, cx))
             .child(div().me(px(10.), cx).child(glyph(tab.icon, 16., fg)))
-            .child(div().flex_1().min_w_0().truncate().child(tab.label))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(crate::views::pseudo::t(tab.label)),
+            )
             .child(div().ms(px(4.), cx).child(close));
         header = if is_selected {
             header
@@ -503,6 +515,8 @@ mod tests {
 
     use crate::theme::{self, ControlState, contrast};
     use crate::views::dialogs;
+    use crate::views::feedback::{Status, status_colors};
+    use crate::views::progress::{ProgressState, indicator_color};
 
     /// `top` composited over the opaque `bottom`, as 0xRRGGBB.
     fn over(top: Hsla, bottom: Hsla) -> u32 {
@@ -572,6 +586,40 @@ mod tests {
                         ) >= 3.,
                         "scroll bar thumb {mode:?}"
                     );
+                    for state in [
+                        ProgressState::Running,
+                        ProgressState::Paused,
+                        ProgressState::Error,
+                    ] {
+                        assert!(
+                            contrast(
+                                over(indicator_color(state, cx), surface),
+                                over(surface, surface)
+                            ) >= 3.,
+                            "{state:?} progress indicator {mode:?}"
+                        );
+                    }
+                    for status in [
+                        Status::Success,
+                        Status::Caution,
+                        Status::Critical,
+                        Status::Informational,
+                        Status::Neutral,
+                    ] {
+                        let (dot, fill) = status_colors(status, cx);
+                        let fill = over(fill, surface);
+                        assert!(
+                            contrast(over(fg, surface), fill) >= 4.5,
+                            "{status:?} badge text {mode:?}"
+                        );
+                        // The text carries the status; the coloured dots
+                        // still reach 3:1. Neutral's SystemFillColorSolidNeutral
+                        // dot is grey on grey by design and is left out.
+                        assert!(
+                            status == Status::Neutral || contrast(over(dot, surface), fill) >= 3.,
+                            "{status:?} badge dot {mode:?}"
+                        );
+                    }
                 }
                 for (what, fill) in [
                     ("dialog body", layer),

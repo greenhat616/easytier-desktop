@@ -58,3 +58,11 @@ Copyright (c) 2020 Microsoft Corporation; MIT license in `LICENSE.txt`. The file
 - `speaker-2.svg` — `assets/Speaker 2/SVG/ic_fluent_speaker_2_24_regular.svg`
 - `grid.svg` — `assets/Grid/SVG/ic_fluent_grid_24_regular.svg`
 - `chat.svg` — `assets/Chat/SVG/ic_fluent_chat_24_regular.svg`
+- `window-new.svg` — `assets/Window New/SVG/ic_fluent_window_new_24_regular.svg`
+- `people-community.svg` — `assets/People Community/SVG/ic_fluent_people_community_24_regular.svg`
+- `share.svg` — `assets/Share/SVG/ic_fluent_share_24_regular.svg`
+- `broom.svg` — `assets/Broom/SVG/ic_fluent_broom_24_regular.svg`
+- `developer-board.svg` — `assets/Developer Board/SVG/ic_fluent_developer_board_24_regular.svg`
+- `person-lock.svg` — `assets/Person Lock/SVG/ic_fluent_person_lock_24_regular.svg`
+- `document-text.svg` — `assets/Document Text/SVG/ic_fluent_document_text_24_regular.svg`
+- `key.svg` — `assets/Key/SVG/ic_fluent_key_24_regular.svg`

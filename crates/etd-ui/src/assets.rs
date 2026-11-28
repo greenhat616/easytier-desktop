@@ -120,6 +120,29 @@ const FLUENT: &[(&str, &[u8])] = &[
         include_bytes!("../assets/fluent/speaker-2.svg"),
     ),
     ("chat.svg", include_bytes!("../assets/fluent/chat.svg")),
+    (
+        "window-new.svg",
+        include_bytes!("../assets/fluent/window-new.svg"),
+    ),
+    (
+        "people-community.svg",
+        include_bytes!("../assets/fluent/people-community.svg"),
+    ),
+    ("share.svg", include_bytes!("../assets/fluent/share.svg")),
+    ("broom.svg", include_bytes!("../assets/fluent/broom.svg")),
+    (
+        "developer-board.svg",
+        include_bytes!("../assets/fluent/developer-board.svg"),
+    ),
+    (
+        "person-lock.svg",
+        include_bytes!("../assets/fluent/person-lock.svg"),
+    ),
+    (
+        "document-text.svg",
+        include_bytes!("../assets/fluent/document-text.svg"),
+    ),
+    ("key.svg", include_bytes!("../assets/fluent/key.svg")),
     ("globe.svg", include_bytes!("../assets/fluent/globe.svg")),
     (
         "globe-filled.svg",
